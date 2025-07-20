@@ -1,4 +1,4 @@
-# Project title
+# Analytic Plans
 
 **Required.** Brief overview of the project, ideally one sentence.
 
@@ -18,7 +18,40 @@
 
 ## Description
 
-**Required.** A more detailed overview of the project, but not so detailed as to be confused with detailed documentation. This section may include a link to more in-depth resources, such as a white paper, article, or actual documentation.
+```
+[
+  {
+    "information_requirement": "Plain-language question or statement defining the specific adversary behavior or condition we need to know (minus the tactic code/name).",
+    "tactic_id": "MITRE ATT&CK tactic identifier (e.g., TA0001) extracted from the original IR to preserve standardized categorization.",
+    "tactic_name": "Human-readable MITRE ATT&CK tactic name corresponding to tactic_id (e.g., Initial Access).",
+    "indicators": [
+      {
+        "technique_id": "MITRE ATT&CK (or framework) technique or sub-technique ID (e.g., T1078 or T1055.009) tied to this indicator group.",
+        "name": "Canonical technique name matching technique_id (e.g., Valid Accounts).",
+        "evidence": [
+          {
+            "description": "Specific observable pattern or condition that signals the technique may be occurring.",
+            "data_sources": [
+              "Normalized list of telemetry / log source types required to detect this evidence."
+            ],
+            "data_platforms": [
+              "List of systems or collection platforms providing the data sources (e.g., endpoints, network sensors)."
+            ],
+            "nai": "Named Area / Area of Interest (site-specific collection focus or asset scope to monitor).",
+            "action": "Analytic or investigative procedure to operationalize the evidence (query logic, correlation, statistical method, or response step)."
+          }
+        ]
+      }
+    ],
+    "version": "Schema version of this analytic object (incremented when structure or controlled vocabulary changes).",
+    "date_created": "Original creation date of this analytic record (immutable provenance timestamp).",
+    "last_updated": "Most recent date any content within this analytic object was modified.",
+    "contributors": [
+      "List of authors or maintainers responsible for creation or curation of this analytic."
+    ]
+  }
+]
+```
 
 ## Dependencies
 
