@@ -65,7 +65,8 @@ def main():
     config = load_config(Path("config/asom.yml"))
     detect_chain = config.get("detect_chain", {})
     attack_chain = config.get("attack_chain", {})
-    plans_dir = Path(config.get("analytic_plans_dir", "."))
+    plan_dirs_config = config.get("analytic_plan_dirs", {})
+    plan_dirs_list = [Path(p) for p in plan_dirs_config.values() if p]
     output_dir = Path(config.get("output_dir", "."))
     output_basename = config.get("output_basename", "asom_report")
     column_widths = config.get("column_widths_pixels", {})
@@ -73,17 +74,21 @@ def main():
     
     output_dir.mkdir(exist_ok=True, parents=True)
 
+    if not plan_dirs_list:
+        logger.critical("Configuration key 'analytic_plan_dirs' is empty or not found. No directories to process.")
+        return
+
     if not detect_chain and not attack_chain:
         logger.warning("Both 'detect_chain' and 'attack_chain' are empty in the config. No data to process.")
         logger.info("Script finished.")
         return
 
     # --- 2. Build Raw ASOM Data ---
-    logger.info("Building ASOM from analytic plans...")
+    logger.info(f"Building ASOM from {len(plan_dirs_list)} specified analytic plan directories...")
     raw_asom = build_asom(
         detect_chain=detect_chain,
         attack_chain=attack_chain,
-        directory=plans_dir
+        directories=plan_dirs_list
     )
     if not raw_asom:
         logger.warning("ASOM generation resulted in no data. Check chains and input files.")

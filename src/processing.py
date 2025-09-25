@@ -47,16 +47,16 @@ def _filter_indicators(ir_obj: dict, allowed_ids: Set[str]) -> dict:
 def build_asom(
     detect_chain: Dict[str, List[str]],
     attack_chain: Dict[str, List[str]],
-    directory: Path,
+    directories: List[Path],
     filter_indicators: bool = True,
     deduplicate: bool = True
 ) -> List[dict]:
     """
     Builds an ASOM by processing detect and attack chains against analytic plan files.
 
-    The function processes all JSON files in the given directory, filters them based on
-    the combined tactics and techniques from both chains, and then sorts the results
-    to ensure that items from the 'detect_chain' appear first.
+    The function processes all JSON files in the given list of directories, filters
+    them based on the combined tactics and techniques from both chains, and then sorts
+    the results to ensure that items from the 'detect_chain' appear first.
     """
     # Combine chains and create a master map of all tactics and techniques
     full_chain = {**detect_chain, **attack_chain}
@@ -70,9 +70,17 @@ def build_asom(
     # This list preserves the order of detect tactics for final sorting
     detect_tactic_ids_ordered = [_normalize_tactic_key(t)[0] for t in detect_chain.keys()]
 
+    # Gather all .json files from all specified directories
+    all_files: List[Path] = []
+    for directory in directories:
+        if directory.is_dir():
+            all_files.extend(directory.glob("*.json"))
+        else:
+            logger.warning(f"Directory '{directory}' specified in config does not exist. Skipping.")
+
     # Process all JSON files and collect all matching IR objects
     all_results: List[dict] = []
-    for path in sorted(directory.glob("*.json")):
+    for path in sorted(all_files):
         try:
             data = _load_json_safely(path)
         except Exception as e:
