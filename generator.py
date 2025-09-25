@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import logging
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 import base64
@@ -120,7 +119,7 @@ def generate_analytic_plan(prompt):
         api_key=os.environ.get("GEMINI_API_KEY"),
     )
 
-    model = "gemini-2.5-flash"
+    model = "gemini-1.5-flash"
     contents = [
         types.Content(
             role="user",
@@ -130,16 +129,15 @@ def generate_analytic_plan(prompt):
         ),
     ]
     generate_content_config = types.GenerateContentConfig(
-        thinking_config = types.ThinkingConfig(
-            thinking_budget=-1,
-        ),
+        # Set the temperature to a value between 0 and 1.0.
+        temperature=0.7,
     )
 
     # Send the request to the generative model.
-    response = client.models.generate_content(
-        model=model,              # The specified target model
-        contents=contents,        # The constructed multi-turn conversation history
-        config=generate_content_config, # Configuration including response format and system instructions
+    response = client.generate_content(
+        model=model,            # The specified target model
+        contents=contents,      # The constructed multi-turn conversation history
+        generation_config=generate_content_config, # Configuration including response format and system instructions
     )
 
     # Return the text content of the model's response, which should be the generated ASOM JSON.
@@ -152,12 +150,14 @@ def main():
 
     # --- 1. Load Configuration ---
     config = load_config(Path("config/generator.yml"))
-    output_dir = Path(config.get("output_directory", "analytic-plans"))
+    output_dirs_map = config.get("output_directories", {})
+    default_output_dir = Path(output_dirs_map.get("default", "techniques"))
     matrices = config.get("matrices", ["enterprise"])
     filter_techniques = config.get("techniques", [])
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directory set to: '{output_dir}'")
+    if not output_dirs_map:
+        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
+        raise SystemExit(1)
 
     # --- 2. Build Technique Dictionary ---
     technique_dict = build_technique_dictionary(matrices)
@@ -174,8 +174,7 @@ def main():
     
     logger.info(f"Will generate analytic plans for {len(target_techniques)} techniques.")
 
-    # --- 3. Generate and Group Analytic Plans ---
-    tactic_files = defaultdict(list)
+    # --- 3. Generate and Save Analytic Plans ---
     for i, (full_key, tech_data) in enumerate(target_techniques.items()):
         logger.info(f"[{i+1}/{len(target_techniques)}] Generating plan for {full_key}...")
         
@@ -188,6 +187,17 @@ def main():
             f"Detection: {tech_data['detection']}"
         )
         
+        # --- Determine the correct output directory for this technique ---
+        matrix_type = tech_data.get('matrix')
+        if matrix_type and matrix_type in output_dirs_map:
+            output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
+            output_dir = default_output_dir
+        
+        # Ensure the target directory exists before writing
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         # This is where you would call your actual AI model
         plan_blob = generate_analytic_plan(prompt)
 
