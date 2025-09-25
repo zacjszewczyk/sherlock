@@ -114,12 +114,12 @@ def load_config(path: Path) -> dict:
             logger.critical(f"Error parsing YAML configuration: {e}")
             raise SystemExit(1)
 
-def generate_analytic_plan(prompt):
+def generate_analytic_plan(prompt, model):
     client = genai.Client(
         api_key=os.environ.get("GEMINI_API_KEY"),
     )
 
-    model = "gemini-1.5-flash"
+    model = model
     contents = [
         types.Content(
             role="user",
@@ -134,10 +134,10 @@ def generate_analytic_plan(prompt):
     )
 
     # Send the request to the generative model.
-    response = client.generate_content(
+    response = client.models.generate_content(
         model=model,            # The specified target model
         contents=contents,      # The constructed multi-turn conversation history
-        generation_config=generate_content_config, # Configuration including response format and system instructions
+        config=generate_content_config, # Configuration including response format and system instructions
     )
 
     # Return the text content of the model's response, which should be the generated ASOM JSON.
@@ -154,6 +154,7 @@ def main():
     default_output_dir = Path(output_dirs_map.get("default", "techniques"))
     matrices = config.get("matrices", ["enterprise"])
     filter_techniques = config.get("techniques", [])
+    model = config.get("model", "gemini-2.5-flash")
 
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
@@ -212,7 +213,7 @@ def main():
         )
         
         # This is where you would call your actual AI model
-        plan_blob = generate_analytic_plan(prompt)
+        plan_blob = generate_analytic_plan(prompt, model)
 
         # --- Extract JSON from the raw text blob ---
         json_str = None
