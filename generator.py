@@ -176,7 +176,31 @@ def main():
 
     # --- 3. Generate and Save Analytic Plans ---
     for i, (full_key, tech_data) in enumerate(target_techniques.items()):
+        
+        # --- Determine the correct output directory for this technique ---
+        matrix_type = tech_data.get('matrix')
+        if matrix_type and matrix_type in output_dirs_map:
+            output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
+            output_dir = default_output_dir
+
+        # --- Extract Technique ID and check if file already exists ---
+        try:
+            technique_id = full_key.split(" - ")[0].strip()
+        except IndexError:
+            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping.")
+            continue
+
+        file_path = output_dir / f"{technique_id}.json"
+        if file_path.exists():
+            logger.warning(f"Plan for {technique_id} already exists at '{file_path}'. Skipping generation.")
+            continue
+            
         logger.info(f"[{i+1}/{len(target_techniques)}] Generating plan for {full_key}...")
+        
+        # Ensure the target directory exists before writing
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         prompt = (
             f"{BASE_PROMPT}\n\n"
@@ -187,30 +211,15 @@ def main():
             f"Detection: {tech_data['detection']}"
         )
         
-        # --- Determine the correct output directory for this technique ---
-        matrix_type = tech_data.get('matrix')
-        if matrix_type and matrix_type in output_dirs_map:
-            output_dir = Path(output_dirs_map[matrix_type])
-        else:
-            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
-            output_dir = default_output_dir
-        
-        # Ensure the target directory exists before writing
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         # This is where you would call your actual AI model
         plan_blob = generate_analytic_plan(prompt)
 
         # --- Extract JSON from the raw text blob ---
         json_str = None
-        # First, try to find JSON within markdown code fences (e.g., ```json ... ```)
         match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", plan_blob)
         if match:
-            # If a match is found, use the content inside the fences
             json_str = match.group(1).strip()
         else:
-            # If no code fences, fall back to finding the first '[' or '{' 
-            # and the last ']' or '}'
             start_index = -1
             first_bracket = plan_blob.find('[')
             first_curly = plan_blob.find('{')
@@ -229,43 +238,25 @@ def main():
 
         if not json_str:
             logger.error(f"Could not find a valid JSON object in the response for {full_key}. Skipping.")
-            continue # Move to the next item in the loop
-        
-        # --- Extract Technique ID for filename ---
-        try:
-            # Parse the technique ID (e.g., "T1548.002") from the full key string
-            technique_id = full_key.split(" - ")[0].strip()
-        except IndexError:
-            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping file save.")
             continue
 
         # --- Parse, add metadata, and save the file ---
         try:
-            # Use the extracted json_str here instead of the raw blob
             plan_data = json.loads(json_str)
-
             if isinstance(plan_data, list):
-                # Get the current date once to use for all objects in this response
                 current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-                # Add the metadata keys to each parsed object
                 for ir_object in plan_data:
                     ir_object["version"] = "1.0"
                     ir_object["date_created"] = current_date_str
                     ir_object["last_updated"] = current_date_str
-                    ir_object["contributors"] = [
-                        "Zachary Szewczyk"
-                    ]
+                    ir_object["contributors"] = ["Zachary Szewczyk"]
 
-                # --- Save the file for this specific technique ---
-                file_path = output_dir / f"{technique_id}.json"
                 try:
                     with open(file_path, "w", encoding="utf-8") as f:
                         json.dump(plan_data, f, indent=2)
                     logger.info(f"Successfully saved plan for {technique_id} to '{file_path}'.")
                 except IOError as e:
                     logger.error(f"Failed to write file for {technique_id}: {e}")
-
             else:
                 logger.warning(f"Expected a list from AI for {full_key}, but got {type(plan_data)}. Skipping file write.")
 
