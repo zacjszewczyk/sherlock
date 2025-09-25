@@ -4,8 +4,12 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-
+import base64
+import os
+from google import genai
+from google.genai import types
 import yaml
+import re
 
 # Add project root to path to allow src imports
 import sys
@@ -13,6 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.attack_retriever import build_technique_dictionary
 from src.colorlog import make_console_handler
+
+# Define a module-level logger to be accessible by all functions
+logger = logging.getLogger(__name__)
+
+with open(".GEMINI_API_KEY", "r") as fd:
+    os.environ["GEMINI_API_KEY"] = fd.read().strip()
 
 BASE_PROMPT = """
 I need you to generate an analytic plan. The analytic plan consists of the following components:
@@ -65,7 +75,7 @@ Based on these definitions, please generate a detailed analytic plan in plain, u
    }
 ]
 
-Based on that format, generate an analytic plan for the following technique:
+Based on that format, generate an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
 """
 
 def setup_logging() -> tuple[str, Path]:
@@ -78,6 +88,7 @@ def setup_logging() -> tuple[str, Path]:
     fmt = "%(asctime)s %(levelname)-8s %(name)s :: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
+    # Configure the root logger
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
@@ -91,7 +102,6 @@ def setup_logging() -> tuple[str, Path]:
 
 def load_config(path: Path) -> dict:
     """Loads the YAML configuration file."""
-    logger = logging.getLogger("config")
     if not path.exists():
         logger.critical(f"Configuration file not found at '{path}'. Exiting.")
         raise SystemExit(1)
@@ -105,45 +115,39 @@ def load_config(path: Path) -> dict:
             logger.critical(f"Error parsing YAML configuration: {e}")
             raise SystemExit(1)
 
-def generate_analytic_plan(prompt: str) -> str:
-    """
-    Placeholder function for calling an AI model to generate an analytic plan.
-    
-    Replace this with your actual API call to a generative AI model.
-    This function should take the full prompt as a string and return the
-    model's raw JSON string output.
-    """
-    logger.warning("Using placeholder AI response. Replace 'generate_analytic_plan' with a real API call.")
-    # This is a dummy response structure.
-    placeholder_response = [
-        {
-            "information_requirement": "Has the adversary achieved persistence?",
-            "tactic_id": "TA0003",
-            "tactic_name": "Persistence",
-            "indicators": [
-                {
-                    "technique_id": "T1547.001",
-                    "name": "Registry Run Keys / Startup Folder",
-                    "evidence": [
-                        {
-                            "description": "A new or modified entry is found in a common registry run key (e.g., HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run) pointing to an unfamiliar executable.",
-                            "data_sources": ["Windows Registry Auditing", "Sysmon Event ID 13"],
-                            "data_platforms": ["TBD"],
-                            "nai": "Endpoint Devices",
-                            "action": "Monitor for changes to critical registry keys. Baseline known good entries and alert on any additions or modifications from untrusted processes."
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-    return json.dumps(placeholder_response, indent=2)
+def generate_analytic_plan(prompt):
+    client = genai.Client(
+        api_key=os.environ.get("GEMINI_API_KEY"),
+    )
 
+    model = "gemini-2.5-flash"
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text=prompt),
+            ],
+        ),
+    ]
+    generate_content_config = types.GenerateContentConfig(
+        thinking_config = types.ThinkingConfig(
+            thinking_budget=-1,
+        ),
+    )
+
+    # Send the request to the generative model.
+    response = client.models.generate_content(
+        model=model,              # The specified target model
+        contents=contents,        # The constructed multi-turn conversation history
+        config=generate_content_config, # Configuration including response format and system instructions
+    )
+
+    # Return the text content of the model's response, which should be the generated ASOM JSON.
+    return response.text
 
 def main():
     """Main script execution."""
     run_ts, log_path = setup_logging()
-    logger = logging.getLogger("main")
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
     # --- 1. Load Configuration ---
@@ -178,42 +182,85 @@ def main():
         prompt = (
             f"{BASE_PROMPT}\n\n"
             f"Technique: {full_key}\n\n"
+            f"Matrix: MITRE ATT&CK for {tech_data['matrix'].upper()}\n\n"
             f"Tactic(s): {tech_data['tactic']}\n\n"
             f"Description: {tech_data['description']}\n\n"
             f"Detection: {tech_data['detection']}"
         )
         
         # This is where you would call your actual AI model
-        plan_json_str = generate_analytic_plan(prompt)
+        plan_blob = generate_analytic_plan(prompt)
 
-        try:
-            plan_data = json.loads(plan_json_str)
-            if isinstance(plan_data, list):
-                for ir_object in plan_data:
-                    tactic_id = ir_object.get("tactic_id")
-                    if tactic_id:
-                        tactic_files[tactic_id].append(ir_object)
-                    else:
-                        logger.warning(f"Generated object for {full_key} is missing 'tactic_id'. Skipping.")
+        # --- Extract JSON from the raw text blob ---
+        json_str = None
+        # First, try to find JSON within markdown code fences (e.g., ```json ... ```)
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", plan_blob)
+        if match:
+            # If a match is found, use the content inside the fences
+            json_str = match.group(1).strip()
+        else:
+            # If no code fences, fall back to finding the first '[' or '{' 
+            # and the last ']' or '}'
+            start_index = -1
+            first_bracket = plan_blob.find('[')
+            first_curly = plan_blob.find('{')
+            
+            if first_bracket != -1 and first_curly != -1:
+                start_index = min(first_bracket, first_curly)
+            elif first_bracket != -1:
+                start_index = first_bracket
             else:
-                 logger.warning(f"Expected a list from AI for {full_key}, but got {type(plan_data)}. Skipping.")
-        except json.JSONDecodeError:
-            logger.error(f"Failed to parse JSON response for {full_key}. Skipping.")
+                start_index = first_curly
 
-    # --- 4. Save Files ---
-    logger.info("Saving generated analytic plans to disk...")
-    if not tactic_files:
-        logger.warning("No analytic plans were successfully generated. No files will be written.")
-        return
+            if start_index != -1:
+                end_index = max(plan_blob.rfind(']'), plan_blob.rfind('}'))
+                if end_index > start_index:
+                    json_str = plan_blob[start_index : end_index + 1]
 
-    for tactic_id, ir_list in tactic_files.items():
-        file_path = output_dir / f"{tactic_id}.json"
+        if not json_str:
+            logger.error(f"Could not find a valid JSON object in the response for {full_key}. Skipping.")
+            continue # Move to the next item in the loop
+        
+        # --- Extract Technique ID for filename ---
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(ir_list, f, indent=2)
-            logger.info(f"Successfully saved {len(ir_list)} IR(s) to '{file_path}'.")
-        except IOError as e:
-            logger.error(f"Failed to write to file '{file_path}': {e}")
+            # Parse the technique ID (e.g., "T1548.002") from the full key string
+            technique_id = full_key.split(" - ")[0].strip()
+        except IndexError:
+            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping file save.")
+            continue
+
+        # --- Parse, add metadata, and save the file ---
+        try:
+            # Use the extracted json_str here instead of the raw blob
+            plan_data = json.loads(json_str)
+
+            if isinstance(plan_data, list):
+                # Get the current date once to use for all objects in this response
+                current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+                # Add the metadata keys to each parsed object
+                for ir_object in plan_data:
+                    ir_object["version"] = "1.0"
+                    ir_object["date_created"] = current_date_str
+                    ir_object["last_updated"] = current_date_str
+                    ir_object["contributors"] = [
+                        "Zachary Szewczyk"
+                    ]
+
+                # --- Save the file for this specific technique ---
+                file_path = output_dir / f"{technique_id}.json"
+                try:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        json.dump(plan_data, f, indent=2)
+                    logger.info(f"Successfully saved plan for {technique_id} to '{file_path}'.")
+                except IOError as e:
+                    logger.error(f"Failed to write file for {technique_id}: {e}")
+
+            else:
+                logger.warning(f"Expected a list from AI for {full_key}, but got {type(plan_data)}. Skipping file write.")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse extracted JSON for {full_key}. Error: {e}. Skipping file write.")
             
     logger.info("Script finished successfully.")
 

@@ -100,6 +100,7 @@ def build_technique_dictionary(matrices: list[str]) -> dict:
             technique_dict[full_key] = {
                 "technique_id": tid,
                 "name": name,
+                "matrix": matrix_name,
                 "tactic": ", ".join(sorted(set(tactic_names))),
                 "description": tech.get("description", "").strip(),
                 "detection": tech.get("x_mitre_detection", "").strip(),
