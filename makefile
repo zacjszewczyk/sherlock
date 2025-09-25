@@ -34,3 +34,6 @@ pull:
 	@git checkout master
 	@git pull origin master
 	@git -c http.sslverify=false pull gitlab master
+
+digest:
+	@gitingest . --exclude-pattern "notebooks/*,techniques/*,enterprise-attack.json,environment.yml,conda-bootstrap.sh,README.md,LICENSE.md,makefile"
