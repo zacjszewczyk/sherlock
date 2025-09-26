@@ -22,3 +22,5 @@ conda install -n base mamba -y
 # "$PREFIX/bin/conda" run -n watson python -m ipykernel install --user --name "watson" --display-name "Python (watson)"
 
 # echo "Done. Open a new shell to use 'conda activate'."
+
+# conda env update --name watson --file environment.yml
