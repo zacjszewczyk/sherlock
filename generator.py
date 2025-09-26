@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-import json
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
-import base64
-import os
-from google import genai
-from google.genai import types
-import yaml
-import re
 
-# Add project root to path to allow src imports
 import sys
+from pathlib import Path
+# Add project root to path to allow src imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.attack_retriever import build_technique_dictionary
 from src.colorlog import make_console_handler
 
 # Define a module-level logger to be accessible by all functions
 logger = logging.getLogger(__name__)
 
-with open(".GEMINI_API_KEY", "r") as fd:
-    os.environ["GEMINI_API_KEY"] = fd.read().strip()
+logger.info("Importing built-in modules.")
+import json
+from datetime import datetime, timezone
+import base64
+import os
+import re
+import requests
+import urllib3
+
+logger.info("Importing installed modules")
+from asksageclient import AskSageClient
+from google import genai
+from google.genai import types
+import yaml
+
+logger.info("Importing project-specific modules.")
+from src.attack_retriever import build_technique_dictionary
 
 BASE_PROMPT = """
 I need you to generate an analytic plan. The analytic plan consists of the following components:
@@ -114,41 +120,183 @@ def load_config(path: Path) -> dict:
             logger.critical(f"Error parsing YAML configuration: {e}")
             raise SystemExit(1)
 
-def generate_analytic_plan(prompt, model):
-    client = genai.Client(
-        api_key=os.environ.get("GEMINI_API_KEY"),
-    )
-
-    model = model
-    contents = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(text=prompt),
-            ],
-        ),
-    ]
-    generate_content_config = types.GenerateContentConfig(
-        # Set the temperature to a value between 0 and 1.0.
-        temperature=0.7,
-    )
-
-    # Send the request to the generative model.
-    response = client.models.generate_content(
-        model=model,            # The specified target model
-        contents=contents,      # The constructed multi-turn conversation history
-        config=generate_content_config, # Configuration including response format and system instructions
-    )
-
-    # Return the text content of the model's response, which should be the generated ASOM JSON.
-    return response.text
+def generate_analytic_plan(prompt, model, ask_sage_client, max_retries=3, retry_delay=1):    
+    # Validate inputs
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError("Prompt must be a non-empty string")
+    
+    if not model or not isinstance(model, str):
+        raise ValueError("Model must be a non-empty string")
+    
+    # Primary attempt with Gemini
+    for attempt in range(max_retries):
+        try:
+            # Initialize Gemini client with API key
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                logger.warning("GEMINI_API_KEY not found in environment variables")
+                raise ValueError("GEMINI_API_KEY environment variable is not set")
+            
+            client = genai.Client(api_key=api_key)
+            
+            # Generate content using Gemini
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=prompt),
+                        ],
+                    ),
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.7,
+                    # max_output_tokens=2048,
+                    # top_p=0.95,
+                    # top_k=40,
+                ),
+            )
+            
+            # Validate response
+            if response and hasattr(response, 'text'):
+                logger.info(f"Successfully generated response using {model}")
+                return response.text
+            else:
+                logger.warning("Response received but no text content found")
+                raise ValueError("Invalid response format from Gemini")
+                
+        except exceptions.ResourceExhausted as e:
+            # Handle 429 Too Many Requests specifically
+            logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                wait_time = retry_delay * (2 ** attempt)
+                logger.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+                continue
+            else:
+                # All retries exhausted, fall back to backup model
+                logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
+                break
+                
+        except exceptions.GoogleAPIError as e:
+            # Handle other Google API errors
+            error_message = str(e)
+            
+            # Check for rate limiting in error message
+            if "429" in error_message or "quota" in error_message.lower() or "rate" in error_message.lower():
+                logger.warning(f"Rate limit detected in error message: {error_message}")
+                
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.info(f"Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.info("Falling back to AskSage backup model")
+                    break
+            else:
+                # For non-rate-limit errors, log and re-raise
+                logger.error(f"Google API error: {error_message}")
+                raise
+                
+        except Exception as e:
+            # Handle any other unexpected errors
+            error_message = str(e)
+            
+            # Check if it's a rate limit error in disguise
+            if "429" in error_message or "Too Many Requests" in error_message:
+                logger.warning(f"Rate limit detected in general exception: {error_message}")
+                
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.info(f"Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.info("Falling back to AskSage backup model")
+                    break
+            else:
+                # For non-rate-limit errors, log the error
+                logger.error(f"Unexpected error with Gemini: {error_message}")
+                # Attempt fallback instead of failing completely
+                break
+    
+    # Fallback to AskSage backup model
+    try:
+        logger.info("Using AskSage backup model: google-gemini-2.5-pro")
+        
+        # Validate ask_sage_client
+        if not ask_sage_client:
+            raise ValueError("ask_sage_client is not initialized")
+        
+        response = ask_sage_client.query(
+            prompt,
+            persona="default",
+            dataset="none",
+            limit_references=0,
+            temperature=0.7,  # Match the temperature from primary model
+            live=0,
+            model="google-gemini-2.5-pro",
+            system_prompt=None
+        )
+        
+        # Validate response structure
+        if not response or not isinstance(response, dict):
+            raise ValueError("Invalid response from AskSage API")
+        
+        if 'message' not in response:
+            logger.error(f"Response missing 'message' field: {response}")
+            raise ValueError("Response from AskSage API does not contain 'message' field")
+        
+        message = response['message']
+        
+        if not message:
+            raise ValueError("Empty message received from AskSage API")
+        
+        logger.info("Successfully generated response using AskSage backup model")
+        return message
+        
+    except Exception as e:
+        logger.error(f"Backup model also failed: {str(e)}")
+        raise Exception(f"Both primary and backup models failed. Last error: {str(e)}")
 
 def main():
     """Main script execution."""
+    
     run_ts, log_path = setup_logging()
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
+    # --- 0. Instantiate models ---
+
+    logger.info("Loading Gemini API key")
+    try:
+        with open(".GEMINI_API_KEY", "r") as fd:
+            os.environ["GEMINI_API_KEY"] = fd.read().strip()
+    except:
+        logger.info("Failed to import Gemini API key")
+    
+    logger.info("Loading Sage API key")
+    try:
+        with open("./credentials.json", "r") as file:
+            credentials = json.load(file)
+            # Validate required keys
+            if 'credentials' not in credentials or 'api_key' not in credentials['credentials']:
+                logger.error("Missing required keys in the credentials file.")
+                raise
+    
+        # Extract the API key and email from the credentials
+        sage_api_key = credentials['credentials']['api_key']
+        sage_email = credentials['credentials']['Ask_sage_user_info']['username']
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Credentials file not found at ./credentials.json")
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON format in the credentials file: ./credentials.json")
+    
     # --- 1. Load Configuration ---
+    logger.info("Loading configuration")
     config = load_config(Path("config/generator.yml"))
     output_dirs_map = config.get("output_directories", {})
     default_output_dir = Path(output_dirs_map.get("default", "techniques"))
@@ -161,6 +309,7 @@ def main():
         raise SystemExit(1)
 
     # --- 2. Build Technique Dictionary ---
+    logger.info("Building technique dictionary")
     technique_dict = build_technique_dictionary(matrices)
     
     target_techniques = {}
@@ -175,7 +324,30 @@ def main():
     
     logger.info(f"Will generate analytic plans for {len(target_techniques)} techniques.")
 
-    # --- 3. Generate and Save Analytic Plans ---
+    # --- 3. Instantiate Sage client ---
+    logger.info("Instantiating Sage client")
+    # Disable SSL warnings
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    # Monkey-patch requests to disable SSL verification globally
+    old_request = requests.Session.request
+    
+    def new_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return old_request(self, method, url, **kwargs)
+    
+    requests.Session.request = new_request
+
+    # Now create your client
+    ask_sage_client = AskSageClient(
+        sage_email, 
+        sage_api_key, 
+        user_base_url="https://api.genai.army.mil/user/", 
+        server_base_url="https://api.genai.army.mil/server/"
+    )
+
+    # --- 4. Generate and Save Analytic Plans ---
+    logger.info("Generating analytic plans")
     for i, (full_key, tech_data) in enumerate(target_techniques.items()):
         
         # --- Determine the correct output directory for this technique ---
@@ -213,7 +385,7 @@ def main():
         )
         
         # This is where you would call your actual AI model
-        plan_blob = generate_analytic_plan(prompt, model)
+        plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
 
         # --- Extract JSON from the raw text blob ---
         json_str = None
