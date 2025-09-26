@@ -19,11 +19,13 @@ import os
 import re
 import requests
 import urllib3
+import time  # Added for retry delays
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
 from google import genai
 from google.genai import types
+from google.genai import errors  # Added for proper exception handling
 import yaml
 
 logger.info("Importing project-specific modules.")
@@ -166,63 +168,41 @@ def generate_analytic_plan(prompt, model, ask_sage_client, max_retries=3, retry_
                 logger.warning("Response received but no text content found")
                 raise ValueError("Invalid response format from Gemini")
                 
-        except exceptions.ResourceExhausted as e:
-            # Handle 429 Too Many Requests specifically
-            logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            
-            if attempt < max_retries - 1:
-                # Exponential backoff
-                wait_time = retry_delay * (2 ** attempt)
-                logger.info(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-                continue
-            else:
-                # All retries exhausted, fall back to backup model
-                logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
-                break
-                
-        except exceptions.GoogleAPIError as e:
-            # Handle other Google API errors
+        except (errors.ClientError, errors.APIError) as e:
+            # Handle Google API errors including rate limiting
             error_message = str(e)
+            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
             
-            # Check for rate limiting in error message
-            if "429" in error_message or "quota" in error_message.lower() or "rate" in error_message.lower():
-                logger.warning(f"Rate limit detected in error message: {error_message}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.info(f"Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.info("Falling back to AskSage backup model")
-                    break
-            else:
-                # For non-rate-limit errors, log and re-raise
+            # Check for rate limiting (429 status code or quota-related messages)
+            if (error_code == 429 or 
+                "429" in error_message or 
+                "RESOURCE_EXHAUSTED" in error_message or
+                "quota" in error_message.lower() or 
+                "rate" in error_message.lower()):
                 logger.error(f"Google API error: {error_message}")
-                raise
+                logger.info("Attempting to use AskSage backup model due to API error")
+                break
+            else:
+                logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {error_message}")
                 
-        except Exception as e:
-            # Handle any other unexpected errors
-            error_message = str(e)
-            
-            # Check if it's a rate limit error in disguise
-            if "429" in error_message or "Too Many Requests" in error_message:
-                logger.warning(f"Rate limit detected in general exception: {error_message}")
+                # Try to extract retry delay from error message
+                retry_after = retry_delay * (2 ** attempt)  # Default exponential backoff
+                
+                # Look for specific retry delay in error message
+                import re
+                retry_match = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
+                if retry_match:
+                    suggested_delay = float(retry_match.group(1))
+                    retry_after = min(suggested_delay + 1, 120)  # Cap at 2 minutes
+                    logger.info(f"Using suggested retry delay: {retry_after} seconds")
                 
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.info(f"Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
+                    logger.info(f"Waiting {retry_after} seconds before retry...")
+                    time.sleep(retry_after)
                     continue
                 else:
-                    logger.info("Falling back to AskSage backup model")
+                    logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
                     break
-            else:
-                # For non-rate-limit errors, log the error
-                logger.error(f"Unexpected error with Gemini: {error_message}")
-                # Attempt fallback instead of failing completely
-                break
     
     # Fallback to AskSage backup model
     try:
@@ -385,7 +365,11 @@ def main():
         )
         
         # This is where you would call your actual AI model
-        plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+        try:
+            plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+        except Exception as e:
+            logger.error(f"Failed to generate plan for {full_key}: {str(e)}")
+            continue
 
         # --- Extract JSON from the raw text blob ---
         json_str = None
