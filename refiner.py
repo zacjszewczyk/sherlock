@@ -20,6 +20,7 @@ import requests
 import urllib3
 import time
 from typing import Any, Dict, List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
@@ -32,7 +33,7 @@ logger.info("Importing project-specific modules.")
 from src.attack_retriever import build_technique_dictionary
 
 BASE_PROMPT = """
-I need you to refine an analytic plan. The analytic plan consists of the following components:
+I need you to generate an analytic plan. The analytic plan consists of the following components:
 
 1.  Information Requirements (IRs): These identify the information that the commander considers most important. For example, 'Has the adversary gained initial access? (TA0001 - Initial Access)' (PIR) or 'What data is available for threat detection and modeling? (D3-D - Detect)' (FFIR). Note that PIRs are tagged with a MITRE ATT&CK tactic, and FFIRs are tagged with a MITRE D3FEND tactic. We call these "CCIR" generally.
 
@@ -52,7 +53,7 @@ I need you to refine an analytic plan. The analytic plan consists of the followi
 
 7.  Actions: These are high-level instructions that guide the analysts' search for evidence. For the evidence associated with the indicator 'T1078 - Valid Accounts' and the associated PIR 'Has the adversary gained initial access? (TA0001 - Initial Access)', an action could be: 'For each successful login (Windows Event ID 4624), enrich with geolocation data from the source IP (Zeek conn.log). Establish a multi-faceted baseline for each user account including typical login times, source countries/ISPs, and devices used. Use a scoring system where deviations from the baseline (e.g., rare country, login at 3 AM, new device) add to a risk score. A high cumulative risk score, identified using statistical models or descriptive statistics (e.g., multiple metrics exceeding 2 standard deviations from the norm), indicates a likely compromised account.' For the evidence associated with the indicator 'D3-NTA' and the associated FFIR 'What data is available for threat detection and modeling? (D3-D - Detect)', an action could be: 'Inventory available network log sources (e.g., networking appliances, Zeek, PCAP). For each source, perform a time series analysis to visualize data volume over at least the last 30 days to identify collection gaps or anomalies. Use descriptive statistics to summarize key fields like protocol distribution in Zeek conn.log and the frequency of top requested domains in dns.log to establish a cursory understanding of network activity. Compare across data sources to validate collection consistency and identify individual sensor blind spots.' Focus mostly on simple detections, but also look for opportunities to incorporate basic data science techniques here, such as percentiles, entropy scores, statistics, and other, similar methods.
 
-Based on these definitions, you will refine to improve a detailed analytic plan in plain, unstyled text in the JSON format below. Provide specific and relevant examples for each component within this format.
+Based on these definitions, please generate a detailed analytic plan in plain, unstyled text in the JSON format below. Provide specific and relevant examples for each component within this format.
 
 [
   {
@@ -82,7 +83,7 @@ Based on these definitions, you will refine to improve a detailed analytic plan 
    }
 ]
 
-Based on that format, improve an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
+Based on that format, generate an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
 """
 
 # ---------------------------
@@ -130,10 +131,6 @@ def parse_date(date_str: str) -> Optional[datetime]:
         return None
 
 def semver_tuple(v: str) -> Tuple[int, ...]:
-    """
-    Convert version string into a tuple of ints for comparison.
-    Supports 'X', 'X.Y', 'X.Y.Z'. Non-numeric parts are treated as zero.
-    """
     if not isinstance(v, str):
         return (0, )
     parts = v.strip().split(".")
@@ -142,7 +139,6 @@ def semver_tuple(v: str) -> Tuple[int, ...]:
         try:
             out.append(int(p))
         except ValueError:
-            # Try float for '1.0' then cast major/minor
             try:
                 fp = float(p)
                 out.append(int(round(fp)))
@@ -152,7 +148,6 @@ def semver_tuple(v: str) -> Tuple[int, ...]:
 
 def compare_versions(a: str, b: str) -> int:
     ta, tb = semver_tuple(a), semver_tuple(b)
-    # pad to same length
     la, lb = len(ta), len(tb)
     if la < lb:
         ta = ta + (0,) * (lb - la)
@@ -161,7 +156,6 @@ def compare_versions(a: str, b: str) -> int:
     return (ta > tb) - (ta < tb)
 
 def increment_version(v: str) -> str:
-    """Increment semantic version; if X.Y[.Z], bump patch else minor -> fallback +0.1 string."""
     if not isinstance(v, str) or not v:
         return "1.1"
     parts = v.split(".")
@@ -174,18 +168,12 @@ def increment_version(v: str) -> str:
     return ".".join(str(x) for x in nums[:3])
 
 def extract_json(blob: str) -> Optional[str]:
-    """
-    Extract JSON array/object from a text blob. Prefers direct JSON, then fenced blocks, then bracket slicing.
-    """
     s = blob.strip()
-    # If it starts with JSON, try direct
     if s.startswith("[") or s.startswith("{"):
         return s
-    # Code fence
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s)
     if m:
         return m.group(1).strip()
-    # Fallback: bracket slice
     first_bracket = min((i for i in [s.find("["), s.find("{")] if i != -1), default=-1)
     if first_bracket != -1:
         last_square = s.rfind("]")
@@ -196,9 +184,6 @@ def extract_json(blob: str) -> Optional[str]:
     return None
 
 def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (max_last_updated_iso, max_version_str) across IR objects.
-    """
     max_dt = None
     max_ver = None
     for ir in plan:
@@ -223,7 +208,6 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
         try:
             api_key = os.environ.get("GEMINI_API_KEY")
             if not api_key:
-                logger.warning("GEMINI_API_KEY not found in environment variables")
                 raise ValueError("GEMINI_API_KEY environment variable is not set")
 
             client = genai.Client(api_key=api_key)
@@ -234,25 +218,19 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
             )
 
             if response and hasattr(response, "text") and response.text:
-                logger.info(f"Successfully generated response using {model}")
                 return response.text
 
-            logger.warning("Response received but no text content found")
             raise ValueError("Invalid response format from Gemini")
 
         except (errors.ClientError, errors.APIError) as e:
             error_message = str(e)
             error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
-            # If clearly rate/quota limited, break to fallback
             if (error_code == 429 or
                 "429" in error_message or
                 "RESOURCE_EXHAUSTED" in error_message or
                 "quota" in error_message.lower() or
                 "rate" in error_message.lower()):
-                logger.error(f"Google API error: {error_message}")
-                logger.info("Attempting to use AskSage backup model due to API error")
                 break
-            # else backoff and retry
             retry_after = retry_delay * (2 ** attempt)
             m = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
             if m:
@@ -261,50 +239,204 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
                 except Exception:
                     pass
             if attempt < max_retries - 1:
-                logger.info(f"Waiting {retry_after} seconds before retry...")
                 time.sleep(retry_after)
                 continue
-            logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
             break
 
     # Fallback: AskSage (Gemini-through-AskSage model)
-    try:
-        logger.info("Using AskSage backup model: google-gemini-2.5-pro")
-        if not ask_sage_client:
-            raise ValueError("ask_sage_client is not initialized")
-        response = ask_sage_client.query(
-            prompt,
-            persona="default",
-            dataset="none",
-            limit_references=0,
-            temperature=0.7,
-            live=0,
-            model="google-gemini-2.5-pro",
-            system_prompt=None,
-        )
-        if not response or not isinstance(response, dict):
-            raise ValueError("Invalid response from AskSage API")
-        if "message" not in response or not response["message"]:
-            raise ValueError("Response from AskSage API does not contain 'message' field")
-        logger.info("Successfully generated response using AskSage backup model")
-        return response["message"]
-    except Exception as e:
-        logger.error(f"Backup model also failed: {str(e)}")
-        raise Exception(f"Both primary and backup models failed. Last error: {str(e)}")
+    response = ask_sage_client.query(
+        prompt,
+        persona="default",
+        dataset="none",
+        limit_references=0,
+        temperature=0.7,
+        live=0,
+        model="google-gemini-2.5-pro",
+        system_prompt=None,
+    )
+    if not response or not isinstance(response, dict) or not response.get("message"):
+        raise Exception("Both primary and backup models failed or returned empty content.")
+    return response["message"]
 
 # ---------------------------
-# Main Refinement Logic
+# Worker (picklable)
+# ---------------------------
+
+def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Worker process function: refine a single technique plan. Returns a summary dict.
+    """
+    # Light, per-process prep
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    # Monkey-patch requests verify (in worker context)
+    old_request = requests.Session.request
+    def new_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return old_request(self, method, url, **kwargs)
+    requests.Session.request = new_request
+
+    # Ensure GEMINI key is present in worker
+    gemini_api_key = job.get("gemini_api_key")
+    if gemini_api_key:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+
+    # Build AskSage client in worker
+    ask_sage_client = AskSageClient(
+        job["sage_email"],
+        job["sage_api_key"],
+        user_base_url="https://api.genai.army.mil/user/",
+        server_base_url="https://api.genai.army.mil/server/",
+    )
+
+    try:
+        full_key: str = job["full_key"]
+        tech_data: Dict[str, Any] = job["tech_data"]
+
+        matrix_type = tech_data.get("matrix")
+        output_dirs_map = job["output_dirs_map"]
+        default_output_dir = Path(job["default_output_dir"])
+        if matrix_type and matrix_type in output_dirs_map:
+            output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            output_dir = default_output_dir
+
+        # Technique ID / file path
+        try:
+            technique_id = full_key.split(" - ")[0].strip()
+        except Exception:
+            return {"technique": full_key, "status": "fail", "reason": "parse_id"}
+
+        file_path = output_dir / f"{technique_id}.json"
+        if not file_path.exists():
+            return {"technique": technique_id, "status": "missing"}
+
+        # Load existing plan
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                existing_plan = json.load(f)
+            if not isinstance(existing_plan, list):
+                return {"technique": technique_id, "status": "skip", "reason": "not_list"}
+        except Exception as e:
+            return {"technique": technique_id, "status": "skip", "reason": f"read_error: {e}"}
+
+        # Skip rules
+        plan_last_updated_max, plan_version_max = compute_plan_metadata(existing_plan)
+
+        if job.get("skip_if_updated_after"):
+            cutoff_dt = parse_date(job["skip_if_updated_after"])
+            plan_dt = parse_date(plan_last_updated_max) if plan_last_updated_max else None
+            if cutoff_dt and plan_dt and plan_dt > cutoff_dt:
+                return {"technique": technique_id, "status": "skip", "reason": "updated_after_cutoff"}
+
+        if job.get("skip_if_version_gt") and plan_version_max:
+            if compare_versions(plan_version_max, str(job["skip_if_version_gt"])) > 0:
+                return {"technique": technique_id, "status": "skip", "reason": "version_gt"}
+
+        # Build prompt
+        refine_guidance = (job.get("refine_guidance") or "").strip()
+        matrix_banner = f"Matrix: MITRE ATT&CK for {tech_data.get('matrix','').upper()}"
+        refine_block = (
+            f"{BASE_PROMPT}\n\n"
+            f"You are given an EXISTING analytic plan to refine. Keep the JSON schema identical and retain "
+            f"the top-level array-of-objects structure. Improve clarity, specificity, and operational utility, "
+            f"but do not remove required fields.\n\n"
+            f"Technique: {full_key}\n"
+            f"{matrix_banner}\n"
+            f"Tactic(s): {tech_data.get('tactic','')}\n\n"
+            f"Description: {tech_data.get('description','')}\n\n"
+            f"Detection: {tech_data.get('detection','')}\n\n"
+            f"Existing plan JSON:\n```json\n{json.dumps(existing_plan, indent=2)}\n```\n\n"
+        )
+        if refine_guidance:
+            refine_block += f"REFINEMENT GUIDANCE (apply carefully):\n{refine_guidance}\n\n"
+        refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
+
+        # LLM call
+        raw = refine_with_llm(
+            prompt=refine_block,
+            model=job["model"],
+            ask_sage_client=ask_sage_client,
+            max_retries=job["max_retries"],
+            retry_delay=job["retry_delay"],
+        )
+
+        # Extract & parse
+        json_str = extract_json(raw)
+        if not json_str:
+            return {"technique": technique_id, "status": "fail", "reason": "no_json"}
+
+        try:
+            refined_plan = json.loads(json_str)
+            if not isinstance(refined_plan, list):
+                return {"technique": technique_id, "status": "fail", "reason": "not_list_refined"}
+        except json.JSONDecodeError as e:
+            return {"technique": technique_id, "status": "fail", "reason": f"json_error: {e}"}
+
+        # Update metadata
+        today_iso = job["today_iso"]
+        _, base_version_max = compute_plan_metadata(existing_plan)
+        new_version = increment_version(base_version_max or "1.0")
+
+        existing_dates = [ir.get("date_created") for ir in existing_plan if ir.get("date_created")]
+        min_created = min(existing_dates) if existing_dates else None
+        contrib_union = []
+        seen = set()
+        for ir in existing_plan:
+            for c in (ir.get("contributors") or []):
+                if c not in seen:
+                    seen.add(c)
+                    contrib_union.append(c)
+        if not contrib_union:
+            contrib_union = ["Zachary Szewczyk"]
+
+        for ir in refined_plan:
+            ir["last_updated"] = today_iso
+            ir["version"] = new_version
+            if "date_created" not in ir and min_created:
+                ir["date_created"] = min_created
+            if "contributors" not in ir or not isinstance(ir["contributors"], list) or not ir["contributors"]:
+                ir["contributors"] = contrib_union
+            else:
+                existing_c = set(ir["contributors"])
+                for c in contrib_union:
+                    if c not in existing_c:
+                        ir["contributors"].append(c)
+
+        # Backup + write
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if job["make_backup"]:
+                backups_dir = Path(job["backups_dir"])
+                backups_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backups_dir / f"{technique_id}_{job['run_ts']}.json"
+                with open(backup_path, "w", encoding="utf-8") as bf:
+                    json.dump(existing_plan, bf, indent=2)
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(refined_plan, f, indent=2)
+        except Exception as e:
+            return {"technique": technique_id, "status": "fail", "reason": f"write_error: {e}"}
+
+        return {"technique": technique_id, "status": "ok"}
+
+    except Exception as e:
+        return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
+
+# ---------------------------
+# Main
 # ---------------------------
 
 def main():
     run_ts, log_path = setup_logging()
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
-    # --- 0. Instantiate models (keys) ---
+    # --- 0. Keys ---
     logger.info("Loading Gemini API key")
+    gemini_api_key = None
     try:
         with open(".GEMINI_API_KEY", "r") as fd:
-            os.environ["GEMINI_API_KEY"] = fd.read().strip()
+            gemini_api_key = fd.read().strip()
+            os.environ["GEMINI_API_KEY"] = gemini_api_key
     except Exception:
         logger.info("Failed to import Gemini API key")
 
@@ -322,7 +454,7 @@ def main():
     except json.JSONDecodeError:
         raise ValueError("Invalid JSON format in the credentials file: ./credentials.json")
 
-    # --- 1. Load Configuration ---
+    # --- 1. Config ---
     logger.info("Loading configuration")
     config = load_config(Path("config/refine.yml"))
 
@@ -332,232 +464,105 @@ def main():
     filter_techniques = config.get("techniques", [])
     model = config.get("model", "gemini-2.5-flash")
     refine_guidance = config.get("refine_guidance", "").strip()
-    skip_if_updated_after = config.get("skip_if_updated_after")  # e.g., "2025-09-01" or None
-    skip_if_version_gt = config.get("skip_if_version_gt")        # e.g., "1.2" or None
+    skip_if_updated_after = config.get("skip_if_updated_after")
+    skip_if_version_gt = config.get("skip_if_version_gt")
     make_backup = bool(config.get("backup", True))
     max_retries = int(config.get("max_retries", 3))
     retry_delay = int(config.get("retry_delay", 1))
+    num_cores = config.get("num_cores", 0)
 
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
         raise SystemExit(1)
 
-    # --- 2. Build Technique Dictionary ---
+    # --- 2. Techniques ---
     logger.info("Building technique dictionary")
     technique_dict = build_technique_dictionary(matrices)
 
-    target_techniques: Dict[str, Dict[str, Any]] = {}
     if filter_techniques:
         logger.info(f"Filtering for {len(filter_techniques)} specific techniques from config.")
         wanted = set(filter_techniques)
-        for full_key, tech_data in technique_dict.items():
-            if tech_data['technique_id'] in wanted:
-                target_techniques[full_key] = tech_data
+        target_techniques = {k: v for k, v in technique_dict.items() if v['technique_id'] in wanted}
     else:
-        logger.info("Processing all available techniques from selected matrices.")
         target_techniques = technique_dict
 
-    logger.info(f"Will refine analytic plans for up to {len(target_techniques)} techniques (only those with existing plans).")
+    logger.info(f"Will attempt to refine plans for up to {len(target_techniques)} techniques (existing files only).")
 
-    # --- 3. Instantiate Sage client ---
-    logger.info("Instantiating Sage client")
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    old_request = requests.Session.request
-    def new_request(self, method, url, **kwargs):
-        kwargs['verify'] = False
-        return old_request(self, method, url, **kwargs)
-    requests.Session.request = new_request
-
-    ask_sage_client = AskSageClient(
-        sage_email,
-        sage_api_key,
-        user_base_url="https://api.genai.army.mil/user/",
-        server_base_url="https://api.genai.army.mil/server/"
-    )
-
-    # --- 4. Iterate and Refine ---
+    # --- 3. Prep jobs ---
     today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     backups_dir = Path("backups") / f"refiner_{run_ts}"
-    if make_backup:
-        backups_dir.mkdir(parents=True, exist_ok=True)
 
-    refined_count = 0
-    skipped_count = 0
-    missing_count = 0
-    failed_count = 0
+    jobs: List[Dict[str, Any]] = []
+    for full_key, tech_data in target_techniques.items():
+        jobs.append({
+            "full_key": full_key,
+            "tech_data": tech_data,
+            "output_dirs_map": output_dirs_map,
+            "default_output_dir": str(default_output_dir),
+            "refine_guidance": refine_guidance,
+            "model": model,
+            "max_retries": max_retries,
+            "retry_delay": retry_delay,
+            "skip_if_updated_after": skip_if_updated_after,
+            "skip_if_version_gt": skip_if_version_gt,
+            "make_backup": make_backup,
+            "backups_dir": str(backups_dir),
+            "run_ts": run_ts,
+            "today_iso": today_iso,
+            "sage_email": sage_email,
+            "sage_api_key": sage_api_key,
+            "gemini_api_key": gemini_api_key,
+        })
 
-    for i, (full_key, tech_data) in enumerate(target_techniques.items()):
-        # Resolve output dir by matrix
-        matrix_type = tech_data.get("matrix")
-        if matrix_type and matrix_type in output_dirs_map:
-            output_dir = Path(output_dirs_map[matrix_type])
+    # --- 4. Execute (single-core or multi-core) ---
+    refined_count = skipped_count = missing_count = failed_count = 0
+
+    # Normalize num_cores
+    try:
+        if num_cores is None:
+            num_workers = 1
         else:
-            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
-            output_dir = default_output_dir
+            num_workers = int(num_cores)
+    except Exception:
+        num_workers = 1
 
-        # Technique ID and file path
-        try:
-            technique_id = full_key.split(" - ")[0].strip()
-        except IndexError:
-            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping.")
-            failed_count += 1
-            continue
-
-        file_path = output_dir / f"{technique_id}.json"
-        if not file_path.exists():
-            logger.warning(f"[{i+1}/{len(target_techniques)}] Plan for {technique_id} not found at '{file_path}'. Skipping.")
-            missing_count += 1
-            continue
-
-        # Load existing plan
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                existing_plan = json.load(f)
-            if not isinstance(existing_plan, list):
-                logger.error(f"Plan at '{file_path}' is not a list. Skipping.")
+    if num_workers <= 1:
+        logger.info("Running in single-core mode.")
+        for job in jobs:
+            res = _worker_refine_one(job)
+            status = res.get("status")
+            if status == "ok":
+                refined_count += 1
+            elif status == "skip":
                 skipped_count += 1
-                continue
-        except Exception as e:
-            logger.error(f"Failed to read/parse plan at '{file_path}': {e}. Skipping.")
-            skipped_count += 1
-            continue
-
-        # Skip rules
-        plan_last_updated_max, plan_version_max = compute_plan_metadata(existing_plan)
-
-        if skip_if_updated_after:
-            try:
-                cutoff_dt = parse_date(skip_if_updated_after)
-                plan_dt = parse_date(plan_last_updated_max) if plan_last_updated_max else None
-                if cutoff_dt and plan_dt and plan_dt > cutoff_dt:
-                    logger.info(f"Skipping {technique_id} due to last_updated {plan_last_updated_max} > cutoff {skip_if_updated_after}")
-                    skipped_count += 1
-                    continue
-            except Exception:
-                # If parse fails, ignore skip rule
-                pass
-
-        if skip_if_version_gt and plan_version_max:
-            try:
-                if compare_versions(plan_version_max, str(skip_if_version_gt)) > 0:
-                    logger.info(f"Skipping {technique_id} due to version {plan_version_max} > {skip_if_version_gt}")
-                    skipped_count += 1
-                    continue
-            except Exception:
-                pass
-
-        logger.info(f"[{i+1}/{len(target_techniques)}] Refining {full_key} ...")
-
-        # Prompt assembly
-        technique = full_key
-        tactic = tech_data.get("tactic", "")
-        description = tech_data.get("description", "")
-        detection = tech_data.get("detection", "")
-        matrix_banner = f"Matrix: MITRE ATT&CK for {tech_data.get('matrix','').upper()}"
-
-        # We ask the model to REFINE the existing JSON; keep schema identical; return ONLY JSON.
-        refine_block = (
-            f"{BASE_PROMPT}\n\n"
-            f"You are given an EXISTING analytic plan to refine. Keep the JSON schema identical and retain "
-            f"the top-level array-of-objects structure. Improve clarity, specificity, and operational utility, "
-            f"but do not remove required fields.\n\n"
-            f"Technique: {technique}\n"
-            f"{matrix_banner}\n"
-            f"Tactic(s): {tactic}\n\n"
-            f"Description: {description}\n\n"
-            f"Detection: {detection}\n\n"
-            f"Existing plan JSON:\n```json\n{json.dumps(existing_plan, indent=2)}\n```\n\n"
-        )
-
-        if refine_guidance:
-            refine_block += f"REFINEMENT GUIDANCE (apply carefully):\n{refine_guidance}\n\n"
-
-        refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
-
-        # Model call
-        try:
-            raw = refine_with_llm(
-                prompt=refine_block,
-                model=model,
-                ask_sage_client=ask_sage_client,
-                max_retries=max_retries,
-                retry_delay=retry_delay,
-            )
-        except Exception as e:
-            logger.error(f"Model call failed for {technique_id}: {e}")
-            failed_count += 1
-            continue
-
-        # Extract and parse JSON
-        json_str = extract_json(raw)
-        if not json_str:
-            logger.error(f"Could not extract JSON for {technique_id}. Skipping write.")
-            failed_count += 1
-            continue
-
-        try:
-            refined_plan = json.loads(json_str)
-            if not isinstance(refined_plan, list):
-                logger.error(f"Refined content for {technique_id} is not a list. Skipping write.")
-                failed_count += 1
-                continue
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse refined JSON for {technique_id}: {e}.")
-            failed_count += 1
-            continue
-
-        # Apply metadata updates: last_updated = today; version = incremented
-        # Compute baseline metadata from existing plan
-        _, base_version_max = compute_plan_metadata(existing_plan)
-        new_version = increment_version(base_version_max or "1.0")
-
-        # Attempt to preserve earliest date_created and contributor union from existing plan
-        existing_dates = [ir.get("date_created") for ir in existing_plan if ir.get("date_created")]
-        min_created = min(existing_dates) if existing_dates else None
-        contrib_union = []
-        seen = set()
-        for ir in existing_plan:
-            for c in ir.get("contributors", []) or []:
-                if c not in seen:
-                    seen.add(c)
-                    contrib_union.append(c)
-        if not contrib_union:
-            contrib_union = ["Zachary Szewczyk"]
-
-        for ir in refined_plan:
-            ir["last_updated"] = today_iso
-            ir["version"] = new_version
-            if "date_created" not in ir and min_created:
-                ir["date_created"] = min_created
-            # Ensure contributors exists and includes union
-            if "contributors" not in ir or not isinstance(ir["contributors"], list) or not ir["contributors"]:
-                ir["contributors"] = contrib_union
+            elif status == "missing":
+                missing_count += 1
             else:
-                # union with contrib_union
-                existing_c = set(ir["contributors"])
-                for c in contrib_union:
-                    if c not in existing_c:
-                        ir["contributors"].append(c)
-
-        # Backup then write
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            if make_backup:
-                backup_path = backups_dir / f"{technique_id}_{run_ts}.json"
+                failed_count += 1
+            logger.info(f"{res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+    else:
+        max_cpu = os.cpu_count() or 1
+        workers = max(1, min(num_workers, max_cpu))
+        logger.info(f"Running in multi-core mode with {workers} workers.")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            future_map = {ex.submit(_worker_refine_one, jb): jb for jb in jobs}
+            for fut in as_completed(future_map):
                 try:
-                    with open(backup_path, "w", encoding="utf-8") as bf:
-                        json.dump(existing_plan, bf, indent=2)
-                except Exception as be:
-                    logger.warning(f"Failed to write backup for {technique_id}: {be}")
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(refined_plan, f, indent=2)
-            logger.info(f"Successfully refined and saved plan to '{file_path}'.")
-            refined_count += 1
-        except IOError as e:
-            logger.error(f"Failed to write refined file for {technique_id}: {e}")
-            failed_count += 1
+                    res = fut.result()
+                except Exception as e:
+                    logger.error(f"Worker crashed: {e}")
+                    failed_count += 1
+                    continue
+                status = res.get("status")
+                if status == "ok":
+                    refined_count += 1
+                elif status == "skip":
+                    skipped_count += 1
+                elif status == "missing":
+                    missing_count += 1
+                else:
+                    failed_count += 1
+                logger.info(f"{res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
 
     logger.info(f"Refinement complete. Refined: {refined_count} | Skipped: {skipped_count} | Missing: {missing_count} | Failed: {failed_count}")
     logger.info("Script finished successfully.")
