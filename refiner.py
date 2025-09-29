@@ -197,7 +197,11 @@ def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str
     return dt_iso, max_ver
 
 def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
-                    max_retries: int = 3, retry_delay: int = 1) -> str:
+                    max_retries: int = 3, retry_delay: int = 1) -> Dict[str, str]:
+    """
+    Returns a dict: {"text": <response>, "endpoint": "gemini"|"asksage", "model_used": <model_name>}
+    Adds detailed logging: pre-attempt, fallback, and completion indicators.
+    """
     if not prompt or not isinstance(prompt, str):
         raise ValueError("Prompt must be a non-empty string")
     if not model or not isinstance(model, str):
@@ -208,8 +212,10 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
         try:
             api_key = os.environ.get("GEMINI_API_KEY")
             if not api_key:
+                logger.warning("GEMINI_API_KEY not found in environment variables for Gemini. Moving to fallback.")
                 raise ValueError("GEMINI_API_KEY environment variable is not set")
 
+            logger.info(f"[LLM] Attempt {attempt+1}/{max_retries}: using endpoint=gemini model={model}")
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=model,
@@ -218,19 +224,24 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
             )
 
             if response and hasattr(response, "text") and response.text:
-                return response.text
+                logger.info(f"[LLM] Gemini success with model={model}")
+                return {"text": response.text, "endpoint": "gemini", "model_used": model}
 
+            logger.warning("[LLM] Gemini returned empty/invalid text; considering fallback")
             raise ValueError("Invalid response format from Gemini")
 
-        except (errors.ClientError, errors.APIError) as e:
+        except (errors.ClientError, errors.APIError, ValueError) as e:
             error_message = str(e)
             error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
+            # If clearly rate/quota limited, break to fallback
             if (error_code == 429 or
                 "429" in error_message or
                 "RESOURCE_EXHAUSTED" in error_message or
                 "quota" in error_message.lower() or
                 "rate" in error_message.lower()):
+                logger.error(f"[LLM] Gemini rate/quota issue: {error_message}. Falling back to AskSage.")
                 break
+            # else backoff
             retry_after = retry_delay * (2 ** attempt)
             m = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
             if m:
@@ -239,11 +250,15 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
                 except Exception:
                     pass
             if attempt < max_retries - 1:
+                logger.warning(f"[LLM] Gemini error: {error_message}. Retrying in {retry_after:.1f}s ...")
                 time.sleep(retry_after)
                 continue
+            logger.warning(f"[LLM] Gemini attempts exhausted. Falling back to AskSage.")
             break
 
     # Fallback: AskSage (Gemini-through-AskSage model)
+    fallback_model = "google-gemini-2.5-pro"
+    logger.info(f"[LLM] Using endpoint=AskSage model={fallback_model}")
     response = ask_sage_client.query(
         prompt,
         persona="default",
@@ -251,12 +266,13 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
         limit_references=0,
         temperature=0.7,
         live=0,
-        model="google-gemini-2.5-pro",
+        model=fallback_model,
         system_prompt=None,
     )
     if not response or not isinstance(response, dict) or not response.get("message"):
-        raise Exception("Both primary and backup models failed or returned empty content.")
-    return response["message"]
+        raise Exception("[LLM] Both primary and backup models failed or returned empty content.")
+    logger.info(f"[LLM] AskSage success with model={fallback_model}")
+    return {"text": response["message"], "endpoint": "asksage", "model_used": fallback_model}
 
 # ---------------------------
 # Worker (picklable)
@@ -265,6 +281,10 @@ def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
 def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     Worker process function: refine a single technique plan. Returns a summary dict.
+    Logs:
+      - Skip reasons
+      - Pre-processing endpoint/model
+      - Post-processing completion with endpoint/model
     """
     # Light, per-process prep
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -304,10 +324,12 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             technique_id = full_key.split(" - ")[0].strip()
         except Exception:
+            logger.warning(f"[{full_key}] SKIP: unable to parse technique_id from key.")
             return {"technique": full_key, "status": "fail", "reason": "parse_id"}
 
         file_path = output_dir / f"{technique_id}.json"
         if not file_path.exists():
+            logger.info(f"[{technique_id}] SKIP: plan file missing at '{file_path}'.")
             return {"technique": technique_id, "status": "missing"}
 
         # Load existing plan
@@ -315,8 +337,10 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             with open(file_path, "r", encoding="utf-8") as f:
                 existing_plan = json.load(f)
             if not isinstance(existing_plan, list):
+                logger.info(f"[{technique_id}] SKIP: plan JSON is not a list.")
                 return {"technique": technique_id, "status": "skip", "reason": "not_list"}
         except Exception as e:
+            logger.info(f"[{technique_id}] SKIP: read/parse error: {e}")
             return {"technique": technique_id, "status": "skip", "reason": f"read_error: {e}"}
 
         # Skip rules
@@ -326,10 +350,12 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             cutoff_dt = parse_date(job["skip_if_updated_after"])
             plan_dt = parse_date(plan_last_updated_max) if plan_last_updated_max else None
             if cutoff_dt and plan_dt and plan_dt > cutoff_dt:
+                logger.info(f"[{technique_id}] SKIP: last_updated {plan_last_updated_max} > cutoff {job['skip_if_updated_after']}.")
                 return {"technique": technique_id, "status": "skip", "reason": "updated_after_cutoff"}
 
         if job.get("skip_if_version_gt") and plan_version_max:
             if compare_versions(plan_version_max, str(job["skip_if_version_gt"])) > 0:
+                logger.info(f"[{technique_id}] SKIP: version {plan_version_max} > {job['skip_if_version_gt']}.")
                 return {"technique": technique_id, "status": "skip", "reason": "version_gt"}
 
         # Build prompt
@@ -351,8 +377,11 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             refine_block += f"REFINEMENT GUIDANCE (apply carefully):\n{refine_guidance}\n\n"
         refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
 
+        # Pre-processing log (we intend to use Gemini; fallback will be logged by runner)
+        logger.info(f"[{technique_id}] START: about to process with endpoint=gemini model={job['model']}")
+
         # LLM call
-        raw = refine_with_llm(
+        llm_res = refine_with_llm(
             prompt=refine_block,
             model=job["model"],
             ask_sage_client=ask_sage_client,
@@ -360,16 +389,23 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             retry_delay=job["retry_delay"],
         )
 
+        # If fallback occurred, make it explicit at technique level too
+        if llm_res["endpoint"] != "gemini":
+            logger.info(f"[{technique_id}] INFO: fell back to endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+
         # Extract & parse
-        json_str = extract_json(raw)
+        json_str = extract_json(llm_res["text"])
         if not json_str:
+            logger.error(f"[{technique_id}] FAIL: could not extract JSON from model output.")
             return {"technique": technique_id, "status": "fail", "reason": "no_json"}
 
         try:
             refined_plan = json.loads(json_str)
             if not isinstance(refined_plan, list):
+                logger.error(f"[{technique_id}] FAIL: refined JSON is not a list.")
                 return {"technique": technique_id, "status": "fail", "reason": "not_list_refined"}
         except json.JSONDecodeError as e:
+            logger.error(f"[{technique_id}] FAIL: JSON decode error: {e}")
             return {"technique": technique_id, "status": "fail", "reason": f"json_error: {e}"}
 
         # Update metadata
@@ -415,11 +451,14 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(refined_plan, f, indent=2)
         except Exception as e:
+            logger.error(f"[{technique_id}] FAIL: write error: {e}")
             return {"technique": technique_id, "status": "fail", "reason": f"write_error: {e}"}
 
-        return {"technique": technique_id, "status": "ok"}
+        logger.info(f"[{technique_id}] DONE: processing complete with endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+        return {"technique": technique_id, "status": "ok", "endpoint": llm_res["endpoint"], "model_used": llm_res["model_used"]}
 
     except Exception as e:
+        logger.error(f"[{job.get('full_key','unknown')}] FAIL: unexpected error: {e}")
         return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
 
 # ---------------------------
@@ -539,6 +578,7 @@ def main():
                 missing_count += 1
             else:
                 failed_count += 1
+            # Consolidated per-technique summary line (still useful):
             logger.info(f"{res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
     else:
         max_cpu = os.cpu_count() or 1
