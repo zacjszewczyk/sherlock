@@ -36,4 +36,4 @@ pull:
 	@git -c http.sslverify=false pull gitlab master
 
 digest:
-	@gitingest . --exclude-pattern "notebooks/*,techniques/*,logs/*,enterprise-attack.json,mobile-attack.json,ics-attack.json,environment.yml,conda-bootstrap.sh,README.md,LICENSE.md,makefile"
+	@gitingest . --exclude-pattern "notebooks/*,techniques/*,logs/*,backups/*,asom_test_*,enterprise-attack.json,mobile-attack.json,ics-attack.json,environment.yml,conda-bootstrap.sh,README.md,LICENSE.md,makefile"
