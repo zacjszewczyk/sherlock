@@ -224,85 +224,106 @@ def _core_tag() -> str:
     except Exception:
         return f"pid={pid}"
 
-def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
-                    max_retries: int = 3, retry_delay: int = 1) -> Dict[str, str]:
+def refine_with_llm(
+    prompt: str,
+    provider_pref: Optional[str],
+    model: Optional[str],
+    ask_sage_client: AskSageClient,
+    max_retries: int = 3,
+    retry_delay: int = 1,
+    gemini_primary_model: Optional[str] = None,  # for auto mode fallback to legacy `model` key
+) -> Dict[str, str]:
     """
-    Returns a dict: {"text": <response>, "endpoint": "gemini"|"asksage", "model_used": <model_name>}
-    Adds detailed logging: pre-attempt, fallback, and completion indicators, with core/worker tag.
+    Returns: {"text": <response>, "endpoint": "gemini"|"asksage", "model_used": <model_name>}
+
+    Behavior:
+      - If provider_pref in {"gemini","asksage"} AND model provided: use ONLY that provider+model.
+      - Else: AUTO mode = try Gemini (gemini_primary_model or model) then AskSage fallback.
     """
     if not prompt or not isinstance(prompt, str):
         raise ValueError("Prompt must be a non-empty string")
-    if not model or not isinstance(model, str):
-        raise ValueError("Model must be a non-empty string")
 
     tag = _core_tag()
 
-    # Primary: Gemini
+    def _call_gemini(gem_model: str) -> Dict[str, str]:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set")
+        logger.info(f"[LLM] [{tag}] Gemini call model={gem_model}")
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=gem_model,
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+            config=types.GenerateContentConfig(temperature=0.7),
+        )
+        if not resp or not getattr(resp, "text", None):
+            raise ValueError("Invalid/empty response from Gemini")
+        return {"text": resp.text, "endpoint": "gemini", "model_used": gem_model}
+
+    def _call_asksage(as_model: str) -> Dict[str, str]:
+        logger.info(f"[LLM] [{tag}] AskSage call model={as_model}")
+        resp = ask_sage_client.query(
+            prompt,
+            persona="default",
+            dataset="none",
+            limit_references=0,
+            temperature=0.7,
+            live=0,
+            model=as_model,
+            system_prompt=None,
+        )
+        if not resp or not isinstance(resp, dict) or not resp.get("message"):
+            raise ValueError("Invalid/empty response from AskSage")
+        return {"text": resp["message"], "endpoint": "asksage", "model_used": as_model}
+
+    # ------------ Forced mode (provider+model both set) ------------
+    if provider_pref in {"gemini", "asksage"} and model:
+        logger.info(f"[LLM] [{tag}] Forced LLM mode: provider={provider_pref} model={model}")
+        if provider_pref == "gemini":
+            return _call_gemini(model)
+        else:
+            return _call_asksage(model)
+
+    # ------------ AUTO mode (back-compat) ------------
+    # Primary: Gemini with gemini_primary_model (legacy `model`) or provided model if set
+    primary_gemini_model = gemini_primary_model or (model if model else "gemini-2.5-pro")
+    logger.info(f"[LLM] [{tag}] AUTO mode: try Gemini primary={primary_gemini_model}, fallback=AskSage")
+
+    # Try Gemini with exponential backoff on retriable cases
     for attempt in range(max_retries):
         try:
-            api_key = os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning(f"[LLM] [{tag}] GEMINI_API_KEY not found in environment for Gemini. Moving to fallback.")
-                raise ValueError("GEMINI_API_KEY environment variable is not set")
-
-            logger.info(f"[LLM] [{tag}] Attempt {attempt+1}/{max_retries}: endpoint=gemini model={model}")
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=model,
-                contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
-                config=types.GenerateContentConfig(temperature=0.7),
-            )
-
-            if response and hasattr(response, "text") and response.text:
-                logger.info(f"[LLM] [{tag}] Gemini success model={model}")
-                return {"text": response.text, "endpoint": "gemini", "model_used": model}
-
-            logger.warning(f"[LLM] [{tag}] Gemini returned empty/invalid text; considering fallback")
-            raise ValueError("Invalid response format from Gemini")
-
+            return _call_gemini(primary_gemini_model)
         except (errors.ClientError, errors.APIError, ValueError) as e:
-            error_message = str(e)
-            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
-            # If clearly rate/quota limited, break to fallback
-            if (error_code == 429 or
-                "429" in error_message or
-                "RESOURCE_EXHAUSTED" in error_message or
-                "quota" in error_message.lower() or
-                "rate" in error_message.lower()):
-                logger.error(f"[LLM] [{tag}] Gemini rate/quota issue: {error_message}. Falling back to AskSage.")
+            msg = str(e)
+            code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
+            retriable = (
+                code == 429 or
+                "429" in msg or
+                "RESOURCE_EXHAUSTED" in msg or
+                "quota" in msg.lower() or
+                "rate" in msg.lower()
+            )
+            if retriable:
+                logger.error(f"[LLM] [{tag}] Gemini rate/quota: {msg}. Breaking to AskSage fallback.")
                 break
-            # else backoff
-            retry_after = retry_delay * (2 ** attempt)
-            m = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
+            # backoff
+            delay = retry_delay * (2 ** attempt)
+            m = re.search(r'retry in (\d+(?:\.\d+)?)', msg.lower())
             if m:
                 try:
-                    retry_after = min(float(m.group(1)) + 1, 120)
+                    delay = min(float(m.group(1)) + 1, 120)
                 except Exception:
                     pass
             if attempt < max_retries - 1:
-                logger.warning(f"[LLM] [{tag}] Gemini error: {error_message}. Retrying in {retry_after:.1f}s ...")
-                time.sleep(retry_after)
-                continue
-            logger.warning(f"[LLM] [{tag}] Gemini attempts exhausted. Falling back to AskSage.")
-            break
+                logger.warning(f"[LLM] [{tag}] Gemini error: {msg}. Retrying in {delay:.1f}s ...")
+                time.sleep(delay)
+            else:
+                logger.warning(f"[LLM] [{tag}] Gemini attempts exhausted; switching to AskSage fallback.")
 
-    # Fallback: AskSage (Gemini-through-AskSage model)
+    # AskSage fallback (use a sensible default if none given)
     fallback_model = "google-gemini-2.5-pro"
-    logger.info(f"[LLM] [{tag}] Using endpoint=AskSage model={fallback_model}")
-    response = ask_sage_client.query(
-        prompt,
-        persona="default",
-        dataset="none",
-        limit_references=0,
-        temperature=0.7,
-        live=0,
-        model=fallback_model,
-        system_prompt=None,
-    )
-    if not response or not isinstance(response, dict) or not response.get("message"):
-        raise Exception(f"[LLM] [{tag}] Both primary and backup models failed or returned empty content.")
-    logger.info(f"[LLM] [{tag}] AskSage success model={fallback_model}")
-    return {"text": response["message"], "endpoint": "asksage", "model_used": fallback_model}
+    logger.info(f"[LLM] [{tag}] Fallback AskSage model={fallback_model}")
+    return _call_asksage(fallback_model)
 
 # ---------------------------
 # Worker (picklable)
@@ -409,17 +430,24 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             refine_block += f"REFINEMENT GUIDANCE (apply carefully):\n{refine_guidance}\n\n"
         refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
 
-        # Pre-processing log: we intend Gemini; any fallback is logged by the LLM runner and echoed here
-        logger.info(f"[{technique_id}] [{tag}] START: about to process with endpoint=gemini model={job['model']}")
+        prov = (job.get("llm_provider") or "auto").lower()
+        # Prefer llm_model if set; otherwise legacy `model` in auto mode
+        mdl = job.get("llm_model")
+        base_model = mdl or job.get("model")  # used by auto/Gemini-primary
+
+        logger.info(f"[{technique_id}] [{tag}] START: provider={prov} model={mdl or base_model}")
 
         # LLM call
         llm_res = refine_with_llm(
             prompt=refine_block,
-            model=job["model"],
+            provider_pref=prov,
+            model=mdl,
             ask_sage_client=ask_sage_client,
             max_retries=job["max_retries"],
             retry_delay=job["retry_delay"],
+            gemini_primary_model=base_model,  # legacy primary in AUTO mode
         )
+
 
         # If fallback occurred, make it explicit at technique level too
         if llm_res["endpoint"] != "gemini":
@@ -541,6 +569,8 @@ def main():
     max_retries = int(config.get("max_retries", 3))
     retry_delay = int(config.get("retry_delay", 1))
     num_cores = config.get("num_cores", 0)
+    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
+    llm_model = config.get("llm_model")  # may be None
 
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
@@ -571,7 +601,6 @@ def main():
             "output_dirs_map": output_dirs_map,
             "default_output_dir": str(default_output_dir),
             "refine_guidance": refine_guidance,
-            "model": model,
             "max_retries": max_retries,
             "retry_delay": retry_delay,
             "skip_if_updated_after": skip_if_updated_after,
@@ -583,6 +612,9 @@ def main():
             "sage_email": sage_email,
             "sage_api_key": sage_api_key,
             "gemini_api_key": gemini_api_key,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "model": model, # keep existing for back-compat in auto mode:
         })
 
     # --- 4. Execute (single-core or multi-core) ---
