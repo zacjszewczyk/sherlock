@@ -134,144 +134,226 @@ def build_asom(
     return all_results
 
 
-def format_asom(asom_input_list: List[dict], joiner: str = "; ") -> pd.DataFrame:
-    table_rows = []
-    ir_index = 0
+ORDINAL_LABELS = ["First action", "Second action", "Third action"]
 
-    if not isinstance(asom_input_list, list):
-        raise TypeError("Expected asom_input_list to be a list.")
+def _distinct_preserve_order(xs: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-    for ir_obj in asom_input_list:
-        if not isinstance(ir_obj, dict):
-            logger.warning(f"Skipping non-dict IR object: {ir_obj}")
+def _normalize_actions_no_pad(action_field: Any, *, context: str) -> List[str]:
+    """
+    Return up to three DISTINCT actions, preserving order. Do NOT pad with blanks.
+    """
+    if isinstance(action_field, list):
+        actions = [str(a).strip() for a in action_field if a is not None and str(a).strip() != ""]
+        actions = _distinct_preserve_order(actions)
+        if len(actions) > 3:
+            logger.warning(f"{context}: 'action' had {len(actions)} entries; truncating to 3.")
+            actions = actions[:3]
+        return actions
+    elif isinstance(action_field, str):
+        s = action_field.strip()
+        return [s] if s else []
+    elif action_field is None:
+        return []
+    else:
+        logger.warning(f"{context}: 'action' not a list/string; skipping.")
+        return []
+
+def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Flatten nested ASOM (with 'action' as a list) into one row per ACTION (1..3).
+    No blank padding; an evidence with 1 or 2 actions produces 1 or 2 rows respectively.
+
+    Columns:
+      - CCIR Index
+      - CCIR
+      - Tactic ID
+      - Tactic Name
+      - Indicator Index   (TEMP, will be re-numbered later)
+      - Indicator
+      - Technique ID
+      - Technique Name
+      - Evidence Index    (TEMP, will be re-numbered later)
+      - Evidence Description
+      - Data Sources
+      - Data Platforms
+      - NAI
+      - Action Label
+      - Action
+    """
+    rows: List[Dict[str, Any]] = []
+
+    if not isinstance(raw_asom, list):
+        logger.error("format_asom: expected a list at the top level; returning empty frame.")
+        return pd.DataFrame(columns=[
+            "CCIR Index","CCIR","Tactic ID","Tactic Name","Indicator Index","Indicator",
+            "Technique ID","Technique Name","Evidence Index","Evidence Description",
+            "Data Sources","Data Platforms","NAI","Action Label","Action"
+        ])
+
+    for ccir_idx, ccir_obj in enumerate(raw_asom, start=1):
+        ccir = str(ccir_obj.get("information_requirement", "")).strip()
+        tactic_id = str(ccir_obj.get("tactic_id", "")).strip()
+        tactic_name = str(ccir_obj.get("tactic_name", "")).strip()
+
+        indicators = ccir_obj.get("indicators", []) or []
+        if not isinstance(indicators, list):
+            logger.warning(f"CCIR {ccir_idx}: 'indicators' not a list; skipping.")
             continue
 
-        required_ir_keys = {"information_requirement", "tactic_id", "tactic_name", "indicators"}
-        if not required_ir_keys.issubset(ir_obj.keys()):
-            logger.warning(f"IR object missing required keys: {ir_obj.keys()}")
-            continue
+        for ind_temp_idx, ind in enumerate(indicators, start=1):
+            # Schema shows: technique_id + name at indicator level
+            tech_id = str(ind.get("technique_id", "")).strip()
+            indicator_name = str(ind.get("name", "")).strip()
+            tech_name = str(ind.get("name", "")).strip()  # If you have a separate technique name, swap here
 
-        indicators = ir_obj.get("indicators", [])
-        if not indicators:
-            logger.info(f"IR '{ir_obj.get('information_requirement')}' has no indicators; skipping.")
-            continue
-
-        ir_index += 1
-        tactic_id = ir_obj.get("tactic_id", "")
-        tactic_name = ir_obj.get("tactic_name", "")
-        ir_text = ir_obj.get("information_requirement", "")
-        information_requirement = f"{ir_text} ({tactic_id} - {tactic_name})"
-
-        tech_sub_index = 0
-        for indicator in indicators:
-            technique_id = indicator.get("technique_id", "")
-            technique_name = indicator.get("name", "")
-            evidence_list = indicator.get("evidence", [])
-            tech_sub_index += 1
-            indicator_index_str = f"{ir_index}.{tech_sub_index}"
-
-            if not evidence_list:
-                logger.info(f"Indicator '{technique_id} - {technique_name}' has no evidence entries.")
+            evidence_list = ind.get("evidence", []) or []
+            if not isinstance(evidence_list, list):
+                logger.warning(f"CCIR {ccir_idx} Indicator {ind_temp_idx}: 'evidence' not a list; skipping.")
                 continue
 
-            evidence_sub_index = 0
-            for evidence in evidence_list:
-                evidence_sub_index += 1
-                evidence_index_str = f"{indicator_index_str}.{evidence_sub_index}"
+            for ev_temp_idx, ev in enumerate(evidence_list, start=1):
+                description = str(ev.get("description", "")).strip()
 
-                row = {
-                    "CCIR Index": ir_index,
-                    "CCIR": information_requirement,
-                    "Tactic ID": tactic_id,
-                    "Tactic Name": tactic_name,
-                    "Indicator Index": indicator_index_str,
-                    "Indicator": f"{technique_id} - {technique_name}",
-                    "Technique ID": technique_id,
-                    "Technique Name": technique_name,
-                    "Evidence Index": evidence_index_str,
-                    "Evidence Description": evidence.get("description", ""),
-                    "Data Sources": joiner.join(evidence.get("data_sources", [])),
-                    "Data Platforms": joiner.join(evidence.get("data_platforms", [])),
-                    "NAI": evidence.get("nai", ""),
-                    "Action": evidence.get("action", ""),
-                }
-                table_rows.append(row)
+                data_sources = ev.get("data_sources", []) or []
+                if not isinstance(data_sources, list):
+                    data_sources = [str(data_sources)]
+                data_sources_str = "; ".join([str(s) for s in data_sources])
 
-    df = pd.DataFrame(table_rows)
-    column_order = [
-        "CCIR Index", "CCIR", "Tactic ID", "Tactic Name", "Indicator Index",
-        "Indicator", "Technique ID", "Technique Name", "Evidence Index",
-        "Evidence Description", "Data Sources", "Data Platforms", "NAI", "Action"
-    ]
-    for col in column_order:
-        if col not in df.columns:
-            df[col] = pd.NA
+                data_platforms = ev.get("data_platforms", []) or []
+                if not isinstance(data_platforms, list):
+                    data_platforms = [str(data_platforms)]
+                data_platforms_str = "; ".join([str(p) for p in data_platforms])
+
+                nai = str(ev.get("nai", "")).strip()
+
+                actions = _normalize_actions_no_pad(
+                    ev.get("action"),
+                    context=f"CCIR {ccir_idx}, IND {ind_temp_idx}, EVID {ev_temp_idx}"
+                )
+
+                # If no actions, still emit a single row so the evidence is not lost (Action columns blank)
+                if not actions:
+                    rows.append({
+                        "CCIR Index": ccir_idx,
+                        "CCIR": ccir,
+                        "Tactic ID": tactic_id,
+                        "Tactic Name": tactic_name,
+                        "Indicator Index": ind_temp_idx,   # temp
+                        "Indicator": indicator_name,
+                        "Technique ID": tech_id,
+                        "Technique Name": tech_name,
+                        "Evidence Index": ev_temp_idx,     # temp
+                        "Evidence Description": description,
+                        "Data Sources": data_sources_str,
+                        "Data Platforms": data_platforms_str,
+                        "NAI": nai,
+                        "Action Index": 1,
+                        "Action": "",
+                    })
+                else:
+                    for a_i, a_text in enumerate(actions, start=1):
+                        rows.append({
+                            "CCIR Index": ccir_idx,
+                            "CCIR": ccir,
+                            "Tactic ID": tactic_id,
+                            "Tactic Name": tactic_name,
+                            "Indicator Index": ind_temp_idx,   # temp; renumbered later
+                            "Indicator": indicator_name,
+                            "Technique ID": tech_id,
+                            "Technique Name": tech_name,
+                            "Evidence Index": ev_temp_idx,     # temp; renumbered later
+                            "Evidence Description": description,
+                            "Data Sources": data_sources_str,
+                            "Data Platforms": data_platforms_str,
+                            "NAI": nai,
+                            "Action Index": a_i,               # <— integer index, 1..N
+                            "Action": a_text,
+                        })
+
+    df = pd.DataFrame(rows, columns=[
+        "CCIR Index","CCIR","Tactic ID","Tactic Name",
+        "Indicator Index","Indicator","Technique ID","Technique Name",
+        "Evidence Index","Evidence Description","Data Sources","Data Platforms","NAI",
+        "Action Index","Action"   # <— updated
+    ])
+    return df
+
+def renumber_formatted_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sorts rows and re-numbers:
+      - Indicator Index: 1..N within each (CCIR Index, Tactic ID, Tactic Name) for each distinct (Indicator, Technique ID, Technique Name) triplet in order of first appearance.
+      - Evidence Index:  1..M within each (CCIR Index, Tactic ID, Tactic Name, Indicator Index) for each distinct (Evidence Description, Data Sources, Data Platforms, NAI).
+
+    Ensures contiguity so merges work across consecutive rows.
+    """
+    if df.empty:
+        return df
+
+    # Re-number Indicator Index
+    def renumber_indicator(group: pd.DataFrame) -> pd.Series:
+        # Key per indicator within the tactic
+        keys = list(zip(group["Indicator"], group["Technique ID"], group["Technique Name"]))
+        key_to_num = {}
+        next_id = 1
+        mapped = []
+        for k in keys:
+            if k not in key_to_num:
+                key_to_num[k] = next_id
+                next_id += 1
+            mapped.append(key_to_num[k])
+        return pd.Series(mapped, index=group.index)
+
+    # Re-number Evidence Index within each Indicator Index block
+    def renumber_evidence(group: pd.DataFrame) -> pd.Series:
+        keys = list(zip(group["Evidence Description"], group["Data Sources"], group["Data Platforms"], group["NAI"]))
+        key_to_num = {}
+        next_id = 1
+        mapped = []
+        for k in keys:
+            if k not in key_to_num:
+                key_to_num[k] = next_id
+                next_id += 1
+            mapped.append(key_to_num[k])
+        return pd.Series(mapped, index=group.index)
     
-    if not df.empty:
-        df = df.sort_values(by=["CCIR Index", "Indicator Index", "Evidence Index"], ignore_index=True)
-
-    return df[column_order]
-
-def renumber_formatted_df(formatted_df: pd.DataFrame, d3_tactic_id: str = "D3-D") -> pd.DataFrame:
-    if formatted_df.empty:
-        return formatted_df
-        
-    df = formatted_df.copy()
-
-    df["_tactic_primary_key"] = (df["Tactic ID"] != d3_tactic_id).astype(int)
-    df["_orig_row"] = range(len(df))
-    df["_CCIR_norm"] = df["CCIR"].apply(lambda s: re.sub(r"\s+", " ", s).strip())
-
-    df.sort_values(
-        by=["_tactic_primary_key", "Tactic ID", "_CCIR_norm", "Indicator", "Evidence Description", "_orig_row"],
-        kind="stable",
-        inplace=True
+    # initial deterministic sort (stable)
+    df = df.sort_values(
+        by=[
+            "CCIR Index", "Tactic ID", "Tactic Name",
+            "Indicator", "Technique ID", "Technique Name",
+            "Evidence Description", "Data Sources", "Data Platforms", "NAI", "Action Index"
+        ],
+        kind="mergesort"
+    ).reset_index(drop=True)
+    
+    # Re-number Indicator Index (silence FutureWarning with include_groups=False)
+    df["Indicator Index"] = (
+        df.groupby(["CCIR Index","Tactic ID","Tactic Name"], sort=False)
+          .apply(renumber_indicator, include_groups=False)
+          .reset_index(level=[0,1,2], drop=True)
     )
-
-    ccir_index_map = {}
-    next_ccir_idx = 0
-    new_ccir_indices = []
-    for ccir_norm in df["_CCIR_norm"]:
-        if ccir_norm not in ccir_index_map:
-            next_ccir_idx += 1
-            ccir_index_map[ccir_norm] = next_ccir_idx
-        new_ccir_indices.append(ccir_index_map[ccir_norm])
-    df["CCIR Index"] = new_ccir_indices
-
-    indicator_index_map = {}
-    ccir_indicator_counters = {}
-    new_indicator_indices = []
-    for ccir_norm, ccir_idx, indicator in zip(df["_CCIR_norm"], df["CCIR Index"], df["Indicator"]):
-        key = (ccir_norm, indicator)
-        if key not in indicator_index_map:
-            ccir_indicator_counters.setdefault(ccir_norm, 0)
-            ccir_indicator_counters[ccir_norm] += 1
-            indicator_index_map[key] = ccir_indicator_counters[ccir_norm]
-        sub_idx = indicator_index_map[key]
-        new_indicator_indices.append(f"{ccir_idx}.{sub_idx}")
-    df["Indicator Index"] = new_indicator_indices
     
-    indicator_sub_lookup = {key: sub for key, sub in indicator_index_map.items()}
-
-    evidence_index_map = {}
-    evidence_counters = {}
-    new_evidence_indices = []
-    for ccir_norm, indicator, evidence_desc in zip(df["_CCIR_norm"], df["Indicator"], df["Evidence Description"]):
-        parent_key = (ccir_norm, indicator)
-        evidence_key = (ccir_norm, indicator, evidence_desc)
-        if evidence_key not in evidence_index_map:
-            evidence_counters.setdefault(parent_key, 0)
-            evidence_counters[parent_key] += 1
-            evidence_index_map[evidence_key] = evidence_counters[parent_key]
-        
-        ccir_idx = ccir_index_map[ccir_norm]
-        indicator_sub_idx = indicator_sub_lookup[parent_key]
-        evidence_sub_idx = evidence_index_map[evidence_key]
-        new_evidence_indices.append(f"{ccir_idx}.{indicator_sub_idx}.{evidence_sub_idx}")
-    df["Evidence Index"] = new_evidence_indices
-
-    df.sort_values(by=["CCIR Index", "Indicator Index", "Evidence Index"], kind="stable", inplace=True)
-    df.drop(columns=["_tactic_primary_key", "_orig_row", "_CCIR_norm"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # Re-number Evidence Index inside each Indicator Index
+    df["Evidence Index"] = (
+        df.groupby(["CCIR Index","Tactic ID","Tactic Name","Indicator Index"], sort=False)
+          .apply(renumber_evidence, include_groups=False)
+          .reset_index(level=[0,1,2,3], drop=True)
+    )
+    
+    # Final contiguous sort
+    df = df.sort_values(
+        by=[
+            "CCIR Index", "Tactic ID", "Tactic Name",
+            "Indicator Index", "Evidence Index", "Action Index"
+        ],
+        kind="mergesort"
+    ).reset_index(drop=True)
 
     return df

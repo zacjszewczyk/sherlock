@@ -2,10 +2,12 @@ Directory structure:
 └── watson/
     ├── AskSage.ipynb
     ├── generator.py
+    ├── refiner.py
     ├── watson.py
     ├── config/
     │   ├── asom.yml
-    │   └── generator.yml
+    │   ├── generator.yml
+    │   └── refine.yml
     └── src/
         ├── attack_retriever.py
         ├── colorlog.py
@@ -42,11 +44,13 @@ import os
 import re
 import requests
 import urllib3
+import time  # Added for retry delays
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
 from google import genai
 from google.genai import types
+from google.genai import errors  # Added for proper exception handling
 import yaml
 
 logger.info("Importing project-specific modules.")
@@ -71,9 +75,9 @@ I need you to generate an analytic plan. The analytic plan consists of the follo
 
 6. Named Areas of Interest (NAIs): These are areas where data that will satisfy a specific information requirement can be collected. For the IR above, NAIs could include 'Our organization's internet gateway', 'Authentication servers', 'Servers hosting sensitive data', and 'Endpoint devices of high-value targets'.
 
-7.  Actions: These are high-level instructions that guide the analysts' search for evidence. For the evidence associated with the indicator 'T1078 - Valid Accounts' and the associated PIR 'Has the adversary gained initial access? (TA0001 - Initial Access)', an action could be: 'For each successful login (Windows Event ID 4624), enrich with geolocation data from the source IP (Zeek conn.log). Establish a multi-faceted baseline for each user account including typical login times, source countries/ISPs, and devices used. Use a scoring system where deviations from the baseline (e.g., rare country, login at 3 AM, new device) add to a risk score. A high cumulative risk score, identified using statistical models or descriptive statistics (e.g., multiple metrics exceeding 2 standard deviations from the norm), indicates a likely compromised account.' For the evidence associated wit hthe indicator 'D3-NTA' and the associated FFIR 'What data is available for threat detection and modeling? (D3-D - Detect)', an acount could be: 'Inventory available network log sources (e.g., networking appliances, Zeek, PCAP). For each source, perform a time series analysis to visualize data volume over at least the last 30 days to identify collection gaps or anomalies. Use descriptive statistics to summarize key fields like protocol distribution in Zeek conn.log and the frequency of top requested domains in dns.log to establish a cursory understanding of network activity. Compare across data sources to validate collection consistency and identify individual sensor blind spots.' Focus mostly on simple detections, but also look for opportunities to incorporate basic data science techniques here, such as percentiles, entropy scores, statistics, and other, similar methods.
+7.  Actions: These are high-level instructions that guide the analysts' search for evidence. For the evidence associated with the indicator 'T1078 - Valid Accounts' and the associated PIR 'Has the adversary gained initial access? (TA0001 - Initial Access)', an action could be: 'For each successful login (Windows Event ID 4624), enrich with geolocation data from the source IP (Zeek conn.log). Establish a multi-faceted baseline for each user account including typical login times, source countries/ISPs, and devices used. Use a scoring system where deviations from the baseline (e.g., rare country, login at 3 AM, new device) add to a risk score. A high cumulative risk score, identified using statistical models or descriptive statistics (e.g., multiple metrics exceeding 2 standard deviations from the norm), indicates a likely compromised account.' For the evidence associated with the indicator 'D3-NTA' and the associated FFIR 'What data is available for threat detection and modeling? (D3-D - Detect)', an action could be: 'Inventory available network log sources (e.g., networking appliances, Zeek, PCAP). For each source, perform a time series analysis to visualize data volume over at least the last 30 days to identify collection gaps or anomalies. Use descriptive statistics to summarize key fields like protocol distribution in Zeek conn.log and the frequency of top requested domains in dns.log to establish a cursory understanding of network activity. Compare across data sources to validate collection consistency and identify individual sensor blind spots.' Focus mostly on simple detections, but also look for opportunities to incorporate basic data science techniques here, such as percentiles, entropy scores, statistics, and other, similar methods. Generally speaking, you should have one symbolic logic (such as an IOC match), one statistical method (such as a percentile threshold), and machine learning application (such as classification or time series analysis) action.
 
-Based on these definitions, please generate a detailed analytic plan in plain, unstyled text in the JSON format below. Provide specific and relevant examples for each component within this format.
+Based on these definitions, please refine an existing analytic plan in plain, unstyled text in the JSON format below. Provide specific and relevant examples for each component within this format.
 
 [
   {
@@ -95,7 +99,11 @@ Based on these definitions, please generate a detailed analytic plan in plain, u
               "TBD"
             ],
             "nai": "Insert site-specific NAI here",
-            "action": "Describe the action here"
+            "action": [
+              "Describe the symbolic logic action here, such as an IOC match",
+              "Describe one statistical acton, such as a percentile threshold",
+              "Describe one machine learning action, such as classification, regression, time series analysis, clustering, etc."
+            ]
           }
         ]
       }
@@ -189,63 +197,41 @@ def generate_analytic_plan(prompt, model, ask_sage_client, max_retries=3, retry_
                 logger.warning("Response received but no text content found")
                 raise ValueError("Invalid response format from Gemini")
                 
-        except exceptions.ResourceExhausted as e:
-            # Handle 429 Too Many Requests specifically
-            logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            
-            if attempt < max_retries - 1:
-                # Exponential backoff
-                wait_time = retry_delay * (2 ** attempt)
-                logger.info(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-                continue
-            else:
-                # All retries exhausted, fall back to backup model
-                logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
-                break
-                
-        except exceptions.GoogleAPIError as e:
-            # Handle other Google API errors
+        except (errors.ClientError, errors.APIError) as e:
+            # Handle Google API errors including rate limiting
             error_message = str(e)
+            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
             
-            # Check for rate limiting in error message
-            if "429" in error_message or "quota" in error_message.lower() or "rate" in error_message.lower():
-                logger.warning(f"Rate limit detected in error message: {error_message}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.info(f"Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.info("Falling back to AskSage backup model")
-                    break
-            else:
-                # For non-rate-limit errors, log and re-raise
+            # Check for rate limiting (429 status code or quota-related messages)
+            if (error_code == 429 or 
+                "429" in error_message or 
+                "RESOURCE_EXHAUSTED" in error_message or
+                "quota" in error_message.lower() or 
+                "rate" in error_message.lower()):
                 logger.error(f"Google API error: {error_message}")
-                raise
+                logger.info("Attempting to use AskSage backup model due to API error")
+                break
+            else:
+                logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {error_message}")
                 
-        except Exception as e:
-            # Handle any other unexpected errors
-            error_message = str(e)
-            
-            # Check if it's a rate limit error in disguise
-            if "429" in error_message or "Too Many Requests" in error_message:
-                logger.warning(f"Rate limit detected in general exception: {error_message}")
+                # Try to extract retry delay from error message
+                retry_after = retry_delay * (2 ** attempt)  # Default exponential backoff
+                
+                # Look for specific retry delay in error message
+                import re
+                retry_match = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
+                if retry_match:
+                    suggested_delay = float(retry_match.group(1))
+                    retry_after = min(suggested_delay + 1, 120)  # Cap at 2 minutes
+                    logger.info(f"Using suggested retry delay: {retry_after} seconds")
                 
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt)
-                    logger.info(f"Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
+                    logger.info(f"Waiting {retry_after} seconds before retry...")
+                    time.sleep(retry_after)
                     continue
                 else:
-                    logger.info("Falling back to AskSage backup model")
+                    logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
                     break
-            else:
-                # For non-rate-limit errors, log the error
-                logger.error(f"Unexpected error with Gemini: {error_message}")
-                # Attempt fallback instead of failing completely
-                break
     
     # Fallback to AskSage backup model
     try:
@@ -408,7 +394,11 @@ def main():
         )
         
         # This is where you would call your actual AI model
-        plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+        try:
+            plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+        except Exception as e:
+            logger.error(f"Failed to generate plan for {full_key}: {str(e)}")
+            continue
 
         # --- Extract JSON from the raw text blob ---
         json_str = None
@@ -463,6 +453,657 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+================================================
+FILE: refiner.py
+================================================
+#!/usr/bin/env python3
+import logging
+import sys
+from pathlib import Path
+
+# Add project root to path to allow src imports
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from src.colorlog import make_console_handler
+
+# Module-level logger
+logger = logging.getLogger(__name__)
+
+logger.info("Importing built-in modules.")
+import json
+from datetime import datetime, timezone
+import os
+import re
+import requests
+import urllib3
+import time
+from typing import Any, Dict, List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
+logger.info("Importing installed modules")
+from asksageclient import AskSageClient
+from google import genai
+from google.genai import types
+from google.genai import errors
+import yaml
+
+logger.info("Importing project-specific modules.")
+from src.attack_retriever import build_technique_dictionary
+
+BASE_PROMPT = """
+I need you to refine an existing analytic plan. The analytic plan consists of the following components:
+
+1.  Information Requirements (IRs): These identify the information that the commander considers most important. For example, 'Has the adversary gained initial access? (TA0001 - Initial Access)' (PIR) or 'What data is available for threat detection and modeling? (D3-D - Detect)' (FFIR). Note that PIRs are tagged with a MITRE ATT&CK tactic, and FFIRs are tagged with a MITRE D3FEND tactic. We call these "CCIR" generally.
+
+2.  Indicators: These are positive or negative evidence of threat activity pertaining to one or more information requirements. They are observable clues related to a specific information requirement. For the IR above, indicators might include:
+    * T1078 - Valid Accounts
+    For the FFIR above, indicators might include:
+    * D3-NTA - Network Traffic Analysis
+    Note that indicators for PIRs are tagged with MITRE ATT&CK techniques, and FFIRs are tagged with MITRE D3FEND techniques.
+
+3.  Evidence: This is the concrete information that supports or refutes an indicator. It provides the 'proof' and can vary in complexity. For the indicator 'T1078 - Valid Accounts', evidence could be 'A valid account login exhibits multiple anomalous characteristics simultaneously, such as originating from a rare geographic location, using an unfamiliar device, and occurring outside of normal working hours.' For the indicator 'D3-NTA', evidence could be 'Logs generated from network activity such as network flow metadata and network traffic content'.
+
+4.  Data: This describes the precise data necessary to identify evidence. Specificity here is key (e.g., Zeek Conn logs, Sysmon event ID 4624, Active Directory security logs). For the evidence, focus your plan on the following data sources: network logs, specifically Zeek logs; host logs, specifically Windows Event IDs. Write only the data name. For example, Windows Event ID 4688, Zeek conn.log
+
+5. Data Source (Platform): Use a dummy value here of "TBD".
+
+6. Named Areas of Interest (NAIs): These are areas where data that will satisfy a specific information requirement can be collected. For the IR above, NAIs could include 'Our organization's internet gateway', 'Authentication servers', 'Servers hosting sensitive data', and 'Endpoint devices of high-value targets'.
+
+7.  Actions: These are high-level instructions that guide the analysts' search for evidence. For the evidence associated with the indicator 'T1078 - Valid Accounts' and the associated PIR 'Has the adversary gained initial access? (TA0001 - Initial Access)', an action could be: 'For each successful login (Windows Event ID 4624), enrich with geolocation data from the source IP (Zeek conn.log). Establish a multi-faceted baseline for each user account including typical login times, source countries/ISPs, and devices used. Use a scoring system where deviations from the baseline (e.g., rare country, login at 3 AM, new device) add to a risk score. A high cumulative risk score, identified using statistical models or descriptive statistics (e.g., multiple metrics exceeding 2 standard deviations from the norm), indicates a likely compromised account.' For the evidence associated with the indicator 'D3-NTA' and the associated FFIR 'What data is available for threat detection and modeling? (D3-D - Detect)', an action could be: 'Inventory available network log sources (e.g., networking appliances, Zeek, PCAP). For each source, perform a time series analysis to visualize data volume over at least the last 30 days to identify collection gaps or anomalies. Use descriptive statistics to summarize key fields like protocol distribution in Zeek conn.log and the frequency of top requested domains in dns.log to establish a cursory understanding of network activity. Compare across data sources to validate collection consistency and identify individual sensor blind spots.' Focus mostly on simple detections, but also look for opportunities to incorporate basic data science techniques here, such as percentiles, entropy scores, statistics, and other, similar methods. Generally speaking, you should have one symbolic logic (such as an IOC match), one statistical method (such as a percentile threshold), and machine learning application (such as classification or time series analysis) action.
+
+Based on these definitions, please refine an existing analytic plan in plain, unstyled text in the JSON format below. Provide specific and relevant examples for each component within this format.
+
+[
+  {
+    "information_requirement": "Insert CCIR here",
+    "tactic_id": "Insert MITRE ATT&CK or MITRE D3FEND tactic T-code here",
+    "tactic_name": "Insert the tactic name here",
+    "indicators": [
+      {
+        "technique_id": "Insert MITRE technique T-code here",
+        "name": "Insert the technique name here",
+        "evidence": [
+          {
+            "description": "Describe the evidence here",
+            "data_sources": [
+              "First data source",
+              "Second data source"
+            ],
+            "data_platforms": [
+              "TBD"
+            ],
+            "nai": "Insert site-specific NAI here",
+            "action": [
+              "Describe the symbolic logic action here, such as an IOC match",
+              "Describe one statistical acton, such as a percentile threshold",
+              "Describe one machine learning action, such as classification, regression, time series analysis, clustering, etc."
+            ]
+          }
+        ]
+      }
+    ]
+   }
+]
+
+Based on that format, improve an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
+"""
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def setup_logging() -> tuple[str, Path]:
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"refiner_{run_ts}.log"
+
+    fmt = "%(asctime)s %(levelname)-8s %(name)s :: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(make_console_handler(fmt, datefmt))
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+    root.addHandler(fh)
+    return run_ts, log_path
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        logger.critical(f"Configuration file not found at '{path}'. Exiting.")
+        raise SystemExit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            config = yaml.safe_load(f)
+            logger.info(f"Successfully loaded configuration from '{path}'.")
+            return config
+        except yaml.YAMLError as e:
+            logger.critical(f"Error parsing YAML configuration: {e}")
+            raise SystemExit(1)
+
+def parse_date(date_str: str) -> Optional[datetime]:
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def semver_tuple(v: str) -> Tuple[int, ...]:
+    if not isinstance(v, str):
+        return (0, )
+    parts = v.strip().split(".")
+    out = []
+    for p in parts[:3]:
+        try:
+            out.append(int(p))
+        except ValueError:
+            try:
+                fp = float(p)
+                out.append(int(round(fp)))
+            except Exception:
+                out.append(0)
+    return tuple(out) if out else (0, )
+
+def compare_versions(a: str, b: str) -> int:
+    ta, tb = semver_tuple(a), semver_tuple(b)
+    la, lb = len(ta), len(tb)
+    if la < lb:
+        ta = ta + (0,) * (lb - la)
+    elif lb < la:
+        tb = tb + (0,) * (la - lb)
+    return (ta > tb) - (ta < tb)
+
+def increment_version(v: str) -> str:
+    if not isinstance(v, str) or not v:
+        return "1.1"
+    parts = v.split(".")
+    nums = [int(p) if p.isdigit() else 0 for p in parts]
+    if len(nums) == 1:
+        return f"{nums[0] + 1}"
+    if len(nums) == 2:
+        return f"{nums[0]}.{nums[1] + 1}"
+    nums[2] += 1
+    return ".".join(str(x) for x in nums[:3])
+
+def extract_json(blob: str) -> Optional[str]:
+    s = blob.strip()
+    if s.startswith("[") or s.startswith("{"):
+        return s
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s)
+    if m:
+        return m.group(1).strip()
+    first_bracket = min((i for i in [s.find("["), s.find("{")] if i != -1), default=-1)
+    if first_bracket != -1:
+        last_square = s.rfind("]")
+        last_curly = s.rfind("}")
+        end_index = max(last_square, last_curly)
+        if end_index > first_bracket:
+            return s[first_bracket:end_index + 1]
+    return None
+
+def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str]]:
+    max_dt = None
+    max_ver = None
+    for ir in plan:
+        lu = parse_date(ir.get("last_updated", ""))
+        if lu and (max_dt is None or lu > max_dt):
+            max_dt = lu
+        ver = ir.get("version", "")
+        if ver and (max_ver is None or compare_versions(ver, max_ver) > 0):
+            max_ver = ver
+    dt_iso = max_dt.strftime("%Y-%m-%d") if max_dt else None
+    return dt_iso, max_ver
+
+def _core_tag() -> str:
+    """
+    Returns a string indicating which CPU core (if detectable) and process is running this code.
+    Examples:
+      'core=11 pid=12345'
+      'pid=12345 proc=ForkProcess-1'
+    """
+    pid = os.getpid()
+    # Try Linux-specific sched_getcpu()
+    core = None
+    try:
+        core = os.sched_getcpu()  # type: ignore[attr-defined]
+    except Exception:
+        core = None
+    if core is not None:
+        return f"core={core} pid={pid}"
+    # Fallback to process name
+    try:
+        proc_name = multiprocessing.current_process().name
+        return f"pid={pid} proc={proc_name}"
+    except Exception:
+        return f"pid={pid}"
+
+def refine_with_llm(prompt: str, model: str, ask_sage_client: AskSageClient,
+                    max_retries: int = 3, retry_delay: int = 1) -> Dict[str, str]:
+    """
+    Returns a dict: {"text": <response>, "endpoint": "gemini"|"asksage", "model_used": <model_name>}
+    Adds detailed logging: pre-attempt, fallback, and completion indicators, with core/worker tag.
+    """
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError("Prompt must be a non-empty string")
+    if not model or not isinstance(model, str):
+        raise ValueError("Model must be a non-empty string")
+
+    tag = _core_tag()
+
+    # Primary: Gemini
+    for attempt in range(max_retries):
+        try:
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                logger.warning(f"[LLM] [{tag}] GEMINI_API_KEY not found in environment for Gemini. Moving to fallback.")
+                raise ValueError("GEMINI_API_KEY environment variable is not set")
+
+            logger.info(f"[LLM] [{tag}] Attempt {attempt+1}/{max_retries}: endpoint=gemini model={model}")
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model,
+                contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+                config=types.GenerateContentConfig(temperature=0.7),
+            )
+
+            if response and hasattr(response, "text") and response.text:
+                logger.info(f"[LLM] [{tag}] Gemini success model={model}")
+                return {"text": response.text, "endpoint": "gemini", "model_used": model}
+
+            logger.warning(f"[LLM] [{tag}] Gemini returned empty/invalid text; considering fallback")
+            raise ValueError("Invalid response format from Gemini")
+
+        except (errors.ClientError, errors.APIError, ValueError) as e:
+            error_message = str(e)
+            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
+            # If clearly rate/quota limited, break to fallback
+            if (error_code == 429 or
+                "429" in error_message or
+                "RESOURCE_EXHAUSTED" in error_message or
+                "quota" in error_message.lower() or
+                "rate" in error_message.lower()):
+                logger.error(f"[LLM] [{tag}] Gemini rate/quota issue: {error_message}. Falling back to AskSage.")
+                break
+            # else backoff
+            retry_after = retry_delay * (2 ** attempt)
+            m = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
+            if m:
+                try:
+                    retry_after = min(float(m.group(1)) + 1, 120)
+                except Exception:
+                    pass
+            if attempt < max_retries - 1:
+                logger.warning(f"[LLM] [{tag}] Gemini error: {error_message}. Retrying in {retry_after:.1f}s ...")
+                time.sleep(retry_after)
+                continue
+            logger.warning(f"[LLM] [{tag}] Gemini attempts exhausted. Falling back to AskSage.")
+            break
+
+    # Fallback: AskSage (Gemini-through-AskSage model)
+    fallback_model = "google-gemini-2.5-pro"
+    logger.info(f"[LLM] [{tag}] Using endpoint=AskSage model={fallback_model}")
+    response = ask_sage_client.query(
+        prompt,
+        persona="default",
+        dataset="none",
+        limit_references=0,
+        temperature=0.7,
+        live=0,
+        model=fallback_model,
+        system_prompt=None,
+    )
+    if not response or not isinstance(response, dict) or not response.get("message"):
+        raise Exception(f"[LLM] [{tag}] Both primary and backup models failed or returned empty content.")
+    logger.info(f"[LLM] [{tag}] AskSage success model={fallback_model}")
+    return {"text": response["message"], "endpoint": "asksage", "model_used": fallback_model}
+
+# ---------------------------
+# Worker (picklable)
+# ---------------------------
+
+def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Worker process function: refine a single technique plan. Returns a summary dict.
+    Logs:
+      - Skip reasons
+      - Pre-processing endpoint/model (with core/worker tag)
+      - Post-processing completion with endpoint/model (with core/worker tag)
+    """
+    # Light, per-process prep
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    # Monkey-patch requests verify (in worker context)
+    old_request = requests.Session.request
+    def new_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return old_request(self, method, url, **kwargs)
+    requests.Session.request = new_request
+
+    # Ensure GEMINI key is present in worker
+    gemini_api_key = job.get("gemini_api_key")
+    if gemini_api_key:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+
+    # Build AskSage client in worker
+    ask_sage_client = AskSageClient(
+        job["sage_email"],
+        job["sage_api_key"],
+        user_base_url="https://api.genai.army.mil/user/",
+        server_base_url="https://api.genai.army.mil/server/",
+    )
+
+    tag = _core_tag()
+
+    try:
+        full_key: str = job["full_key"]
+        tech_data: Dict[str, Any] = job["tech_data"]
+
+        matrix_type = tech_data.get("matrix")
+        output_dirs_map = job["output_dirs_map"]
+        default_output_dir = Path(job["default_output_dir"])
+        if matrix_type and matrix_type in output_dirs_map:
+            output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            output_dir = default_output_dir
+
+        # Technique ID / file path
+        try:
+            technique_id = full_key.split(" - ")[0].strip()
+        except Exception:
+            logger.warning(f"[{full_key}] [{tag}] SKIP: unable to parse technique_id from key.")
+            return {"technique": full_key, "status": "fail", "reason": "parse_id"}
+
+        file_path = output_dir / f"{technique_id}.json"
+        if not file_path.exists():
+            logger.info(f"[{technique_id}] [{tag}] SKIP: plan file missing at '{file_path}'.")
+            return {"technique": technique_id, "status": "missing"}
+
+        # Load existing plan
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                existing_plan = json.load(f)
+            if not isinstance(existing_plan, list):
+                logger.info(f"[{technique_id}] [{tag}] SKIP: plan JSON is not a list.")
+                return {"technique": technique_id, "status": "skip", "reason": "not_list"}
+        except Exception as e:
+            logger.info(f"[{technique_id}] [{tag}] SKIP: read/parse error: {e}")
+            return {"technique": technique_id, "status": "skip", "reason": f"read_error: {e}"}
+
+        # Skip rules
+        plan_last_updated_max, plan_version_max = compute_plan_metadata(existing_plan)
+
+        if job.get("skip_if_updated_after"):
+            cutoff_dt = parse_date(job["skip_if_updated_after"])
+            plan_dt = parse_date(plan_last_updated_max) if plan_last_updated_max else None
+            if cutoff_dt and plan_dt and plan_dt > cutoff_dt:
+                logger.info(f"[{technique_id}] [{tag}] SKIP: last_updated {plan_last_updated_max} > cutoff {job['skip_if_updated_after']}.")
+                return {"technique": technique_id, "status": "skip", "reason": "updated_after_cutoff"}
+
+        if job.get("skip_if_version_gt") and plan_version_max:
+            if compare_versions(plan_version_max, str(job["skip_if_version_gt"])) > 0:
+                logger.info(f"[{technique_id}] [{tag}] SKIP: version {plan_version_max} > {job['skip_if_version_gt']}.")
+                return {"technique": technique_id, "status": "skip", "reason": "version_gt"}
+
+        # Build prompt
+        refine_guidance = (job.get("refine_guidance") or "").strip()
+        matrix_banner = f"Matrix: MITRE ATT&CK for {tech_data.get('matrix','').upper()}"
+        refine_block = (
+            f"{BASE_PROMPT}\n\n"
+            f"You are given an EXISTING analytic plan to refine. Keep the JSON schema identical and retain "
+            f"the top-level array-of-objects structure. Improve clarity, specificity, and operational utility, "
+            f"but do not remove required fields.\n\n"
+            f"Technique: {full_key}\n"
+            f"{matrix_banner}\n"
+            f"Tactic(s): {tech_data.get('tactic','')}\n\n"
+            f"Description: {tech_data.get('description','')}\n\n"
+            f"Detection: {tech_data.get('detection','')}\n\n"
+            f"Existing plan JSON:\n```json\n{json.dumps(existing_plan, indent=2)}\n```\n\n"
+        )
+        if refine_guidance:
+            refine_block += f"REFINEMENT GUIDANCE (apply carefully):\n{refine_guidance}\n\n"
+        refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
+
+        # Pre-processing log: we intend Gemini; any fallback is logged by the LLM runner and echoed here
+        logger.info(f"[{technique_id}] [{tag}] START: about to process with endpoint=gemini model={job['model']}")
+
+        # LLM call
+        llm_res = refine_with_llm(
+            prompt=refine_block,
+            model=job["model"],
+            ask_sage_client=ask_sage_client,
+            max_retries=job["max_retries"],
+            retry_delay=job["retry_delay"],
+        )
+
+        # If fallback occurred, make it explicit at technique level too
+        if llm_res["endpoint"] != "gemini":
+            logger.info(f"[{technique_id}] [{tag}] INFO: fell back to endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+
+        # Extract & parse
+        json_str = extract_json(llm_res["text"])
+        if not json_str:
+            logger.error(f"[{technique_id}] [{tag}] FAIL: could not extract JSON from model output.")
+            return {"technique": technique_id, "status": "fail", "reason": "no_json"}
+
+        try:
+            refined_plan = json.loads(json_str)
+            if not isinstance(refined_plan, list):
+                logger.error(f"[{technique_id}] [{tag}] FAIL: refined JSON is not a list.")
+                return {"technique": technique_id, "status": "fail", "reason": "not_list_refined"}
+        except json.JSONDecodeError as e:
+            logger.error(f"[{technique_id}] [{tag}] FAIL: JSON decode error: {e}")
+            return {"technique": technique_id, "status": "fail", "reason": f"json_error: {e}"}
+
+        # Update metadata
+        today_iso = job["today_iso"]
+        _, base_version_max = compute_plan_metadata(existing_plan)
+        new_version = increment_version(base_version_max or "1.0")
+
+        existing_dates = [ir.get("date_created") for ir in existing_plan if ir.get("date_created")]
+        min_created = min(existing_dates) if existing_dates else None
+        contrib_union = []
+        seen = set()
+        for ir in existing_plan:
+            for c in (ir.get("contributors") or []):
+                if c not in seen:
+                    seen.add(c)
+                    contrib_union.append(c)
+        if not contrib_union:
+            contrib_union = ["Zachary Szewczyk"]
+
+        for ir in refined_plan:
+            ir["last_updated"] = today_iso
+            ir["version"] = new_version
+            if "date_created" not in ir and min_created:
+                ir["date_created"] = min_created
+            if "contributors" not in ir or not isinstance(ir["contributors"], list) or not ir["contributors"]:
+                ir["contributors"] = contrib_union
+            else:
+                existing_c = set(ir["contributors"])
+                for c in contrib_union:
+                    if c not in existing_c:
+                        ir["contributors"].append(c)
+
+        # Backup + write
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if job["make_backup"]:
+                backups_dir = Path(job["backups_dir"])
+                backups_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backups_dir / f"{technique_id}_{job['run_ts']}.json"
+                with open(backup_path, "w", encoding="utf-8") as bf:
+                    json.dump(existing_plan, bf, indent=2)
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(refined_plan, f, indent=2)
+        except Exception as e:
+            logger.error(f"[{technique_id}] [{tag}] FAIL: write error: {e}")
+            return {"technique": technique_id, "status": "fail", "reason": f"write_error: {e}"}
+
+        logger.info(f"[{technique_id}] [{tag}] DONE: processing complete with endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+        return {"technique": technique_id, "status": "ok", "endpoint": llm_res["endpoint"], "model_used": llm_res["model_used"]}
+
+    except Exception as e:
+        logger.error(f"[{job.get('full_key','unknown')}] [{tag}] FAIL: unexpected error: {e}")
+        return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    run_ts, log_path = setup_logging()
+    logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
+
+    # --- 0. Keys ---
+    logger.info("Loading Gemini API key")
+    gemini_api_key = None
+    try:
+        with open(".GEMINI_API_KEY", "r") as fd:
+            gemini_api_key = fd.read().strip()
+            os.environ["GEMINI_API_KEY"] = gemini_api_key
+    except Exception:
+        logger.info("Failed to import Gemini API key")
+
+    logger.info("Loading Sage API key")
+    try:
+        with open("./credentials.json", "r") as file:
+            credentials = json.load(file)
+            if 'credentials' not in credentials or 'api_key' not in credentials['credentials']:
+                logger.error("Missing required keys in the credentials file.")
+                raise
+        sage_api_key = credentials['credentials']['api_key']
+        sage_email = credentials['credentials']['Ask_sage_user_info']['username']
+    except FileNotFoundError:
+        raise FileNotFoundError("Credentials file not found at ./credentials.json")
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON format in the credentials file: ./credentials.json")
+
+    # --- 1. Config ---
+    logger.info("Loading configuration")
+    config = load_config(Path("config/refine.yml"))
+
+    output_dirs_map = config.get("output_directories", {})
+    default_output_dir = Path(output_dirs_map.get("default", "techniques"))
+    matrices = config.get("matrices", ["enterprise"])
+    filter_techniques = config.get("techniques", [])
+    model = config.get("model", "gemini-2.5-flash")
+    refine_guidance = config.get("refine_guidance", "").strip()
+    skip_if_updated_after = config.get("skip_if_updated_after")
+    skip_if_version_gt = config.get("skip_if_version_gt")
+    make_backup = bool(config.get("backup", True))
+    max_retries = int(config.get("max_retries", 3))
+    retry_delay = int(config.get("retry_delay", 1))
+    num_cores = config.get("num_cores", 0)
+
+    if not output_dirs_map:
+        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
+        raise SystemExit(1)
+
+    # --- 2. Techniques ---
+    logger.info("Building technique dictionary")
+    technique_dict = build_technique_dictionary(matrices)
+
+    if filter_techniques:
+        logger.info(f"Filtering for {len(filter_techniques)} specific techniques from config.")
+        wanted = set(filter_techniques)
+        target_techniques = {k: v for k, v in technique_dict.items() if v['technique_id'] in wanted}
+    else:
+        target_techniques = technique_dict
+
+    logger.info(f"Will attempt to refine plans for up to {len(target_techniques)} techniques (existing files only).")
+
+    # --- 3. Prep jobs ---
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    backups_dir = Path("backups") / f"refiner_{run_ts}"
+
+    jobs: List[Dict[str, Any]] = []
+    for full_key, tech_data in target_techniques.items():
+        jobs.append({
+            "full_key": full_key,
+            "tech_data": tech_data,
+            "output_dirs_map": output_dirs_map,
+            "default_output_dir": str(default_output_dir),
+            "refine_guidance": refine_guidance,
+            "model": model,
+            "max_retries": max_retries,
+            "retry_delay": retry_delay,
+            "skip_if_updated_after": skip_if_updated_after,
+            "skip_if_version_gt": skip_if_version_gt,
+            "make_backup": make_backup,
+            "backups_dir": str(backups_dir),
+            "run_ts": run_ts,
+            "today_iso": today_iso,
+            "sage_email": sage_email,
+            "sage_api_key": sage_api_key,
+            "gemini_api_key": gemini_api_key,
+        })
+
+    # --- 4. Execute (single-core or multi-core) ---
+    refined_count = skipped_count = missing_count = failed_count = 0
+
+    # Normalize num_cores
+    try:
+        if num_cores is None:
+            num_workers = 1
+        else:
+            num_workers = int(num_cores)
+    except Exception:
+        num_workers = 1
+
+    main_tag = _core_tag()
+
+    if num_workers <= 1:
+        logger.info(f"[MAIN {main_tag}] Running in single-core mode.")
+        for job in jobs:
+            res = _worker_refine_one(job)
+            status = res.get("status")
+            if status == "ok":
+                refined_count += 1
+            elif status == "skip":
+                skipped_count += 1
+            elif status == "missing":
+                missing_count += 1
+            else:
+                failed_count += 1
+            # Consolidated per-technique summary line (includes main/core tag for single-core clarity)
+            logger.info(f"[MAIN {main_tag}] {res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+    else:
+        max_cpu = os.cpu_count() or 1
+        workers = max(1, min(num_workers, max_cpu))
+        logger.info(f"[MAIN {main_tag}] Running in multi-core mode with {workers} workers.")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            future_map = {ex.submit(_worker_refine_one, jb): jb for jb in jobs}
+            for fut in as_completed(future_map):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    logger.error(f"[MAIN {main_tag}] Worker crashed: {e}")
+                    failed_count += 1
+                    continue
+                status = res.get("status")
+                if status == "ok":
+                    refined_count += 1
+                elif status == "skip":
+                    skipped_count += 1
+                elif status == "missing":
+                    missing_count += 1
+                else:
+                    failed_count += 1
+                logger.info(f"[MAIN {main_tag}] {res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+
+    logger.info(f"[MAIN {main_tag}] Refinement complete. Refined: {refined_count} | Skipped: {skipped_count} | Missing: {missing_count} | Failed: {failed_count}")
+    logger.info("[MAIN] Script finished successfully.")
+
+if __name__ == "__main__":
+    main()
+
 
 
 ================================================
@@ -571,15 +1212,18 @@ def main():
     formatted_df = format_asom(raw_asom)
     logger.info("Re-sorting and re-numbering DataFrame indices...")
     final_df = renumber_formatted_df(formatted_df)
-
-    # Filter columns based on config, if specified
+    
+    # Keep an unfiltered copy for merged presentation
+    final_df_for_merge = final_df.copy()
+    
+    # Optional column filtering for the simple sheet only
     if output_columns:
-        # Validate that the requested columns exist to prevent errors
         valid_columns = [col for col in output_columns if col in final_df.columns]
         missing_columns = set(output_columns) - set(valid_columns)
         if missing_columns:
-            logger.warning(f"The following columns from 'output_columns' in config were not found and will be ignored: {list(missing_columns)}")
-        
+            logger.warning(
+                f"The following columns from 'output_columns' in config were not found and will be ignored: {list(missing_columns)}"
+            )
         if valid_columns:
             logger.info(f"Filtering output to {len(valid_columns)} columns as specified in config.")
             final_df = final_df[valid_columns]
@@ -599,7 +1243,7 @@ def main():
     # Hierarchical/Merged Excel export (for presentation)
     hier_excel_path = output_dir / f"{output_basename}_merged_{ts_suffix}.xlsx"
     logger.info(f"Exporting Excel file with merged cells to: {hier_excel_path}")
-    export_with_merged_cells(final_df, hier_excel_path, column_widths_pixels=column_widths)
+    export_with_merged_cells(final_df_for_merge, hier_excel_path, column_widths_pixels=column_widths)
     
     logger.info("Script finished successfully.")
 
@@ -737,6 +1381,59 @@ techniques:
   # - "T0882"
 
 model: "gemini-2.5-pro"
+
+
+================================================
+FILE: config/refine.yml
+================================================
+# Output directories for each matrix (align these with your existing generator.yml)
+output_directories:
+  default: techniques
+  enterprise: techniques/attack/enterprise
+  ics: techniques/attack/ics
+  mobile: techniques/attack/mobile
+
+# Which matrices to consider when resolving technique metadata via attack_retriever
+matrices:
+  - enterprise
+  # - ics
+  # - mobile
+
+# Optional: restrict to these technique IDs only (e.g., T1078, T1059, D3-NTA). Leave empty to process all found.
+techniques:
+  # - T0800
+  # - T1078
+  # - T1596
+
+# Primary model (Gemini) used for refinement
+model: gemini-2.5-pro
+
+# Guidance appended to the prompt that the model MUST apply during refinement.
+refine_guidance: |
+  * Improve evidence descriptions to be measurable and testable; avoid vague phrasing. This is the concrete information that supports or refutes an indicator.
+  * Ensure data sources list precise artifacts (e.g., "Windows Event ID 4624", "Zeek conn.log", "Zeek dns.log"). Focus on Windows and Zeek logging where possible, but you may also account for other normal logging sources.
+  * When developing actions, include at least three concrete detection methods that include, at a minimum, one symbolic logic (such as an IOC match), one statistical method (such as a percentile threshold), and machine learning application (such as classification or time series analysis) as distinct list elements in the JSON structure.
+  * Ensure every action is executable by a SOC analyst using common tools (SIEM/SQL/Zeek), stated as logical, stepwise imperatives.
+  * Add NAIs that reflect where the data actually resides for this technique/tactic across the selected matrix (enterprise/ICS/mobile), with a typical enterprise network in mind.
+  * Do not remove required fields; preserve the top-level array-of-objects JSON schema.
+  * Generally, do not remove information from the existing plan, just add to and improve it.
+  * Do not use any styling such as bold or italics in your plan.
+
+# Skip rules (optional)
+skip_if_updated_after: null   # e.g., "2025-09-01" or null to disable
+skip_if_version_gt: 2.2      # e.g., "1.2" or null to disable
+
+# File safety
+backup: true
+
+# LLM call behavior
+max_retries: 3
+retry_delay: 1
+
+# Parallelism:
+# - Set to 0, 1, or leave null to run single-core.
+# - Set to 2 or more to enable multi-core; will cap at machine CPU count.
+num_cores: 8
 
 
 ================================================
@@ -988,148 +1685,155 @@ def make_console_handler(fmt: str, datefmt: str) -> logging.Handler:
 ================================================
 FILE: src/formatting.py
 ================================================
-from pathlib import Path
-from typing import Dict, Optional
-
+# src/formatting.py
+import logging
+from typing import Dict, List, Tuple, Iterable, Optional
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
 
-def _pixels_to_width(pixels: int) -> float:
+logger = logging.getLogger(__name__)
+
+def export_simple_excel(df: pd.DataFrame, path, column_widths_pixels: Optional[Dict[str, int]] = None) -> None:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="ASOM")
+        ws = writer.sheets["ASOM"]
+        if column_widths_pixels:
+            _apply_pixel_widths(ws, list(df.columns), column_widths_pixels)
+
+def export_with_merged_cells(df: pd.DataFrame, path, column_widths_pixels: Optional[Dict[str, int]] = None) -> None:
     """
-    Approximate conversion from pixels to openpyxl's character width unit.
+    Merge hierarchy spans. If some expected columns are missing (e.g., due to filtering),
+    gracefully skip those merge levels with a warning.
     """
-    return pixels / 7.0
+    if df.empty:
+        logger.warning("export_with_merged_cells: empty DataFrame.")
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="ASOM")
+        return
 
-def export_simple_excel(df: pd.DataFrame, path: Path, column_widths_pixels: Optional[Dict[str, int]] = None):
-    """
-    Exports a DataFrame to a standard Excel file with custom formatting.
-    - Applies word wrap to all cells.
-    - Sets column widths based on pixel approximation or auto-sizing.
-    """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "ASOM"
-    cols = list(df.columns)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="ASOM")
+        ws = writer.sheets["ASOM"]
+        headers = list(df.columns)
 
-    # Styles
-    header_font = Font(bold=True)
-    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell_alignment = Alignment(vertical="top", wrap_text=True)
+        def merge_by_group(group_cols: List[str], merge_cols: List[str], level_name: str) -> None:
+            present_group_cols = [c for c in group_cols if c in df.columns]
+            present_merge_cols = [c for c in merge_cols if c in df.columns]
 
-    # Write Header
-    for c_idx, col_name in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=c_idx, value=col_name)
-        cell.font = header_font
-        cell.alignment = header_alignment
-
-    # Write Data
-    for r_idx, row in enumerate(df.itertuples(index=False), start=2):
-        for c_idx, value in enumerate(row, start=1):
-            cell = ws.cell(row=r_idx, column=c_idx, value="" if pd.isna(value) else value)
-            cell.alignment = cell_alignment
-
-    # Set column widths
-    for c_idx, col_name in enumerate(cols, start=1):
-        col_letter = get_column_letter(c_idx)
-        if column_widths_pixels and col_name in column_widths_pixels:
-            ws.column_dimensions[col_letter].width = _pixels_to_width(column_widths_pixels[col_name])
-        else:
-            max_len = df[col_name].astype(str).map(len).max()
-            max_len = max(len(col_name), max_len if pd.notna(max_len) else 0)
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
-
-    wb.save(path)
-
-
-def _compute_hierarchical_spans(df: pd.DataFrame, span_columns):
-    spans = {col: [1] * len(df) for col in span_columns}
-    parent_ranges = [(0, len(df))]
-
-    for col in span_columns:
-        col_spans = [1] * len(df)
-        new_parent_ranges = []
-        for (start, end) in parent_ranges:
-            i = start
-            while i < end:
-                val = df.iat[i, df.columns.get_loc(col)]
-                j = i + 1
-                while j < end and df.iat[j, df.columns.get_loc(col)] == val:
-                    j += 1
-                run_len = j - i
-                if run_len > 1:
-                    col_spans[i] = run_len
-                    for r in range(i + 1, j):
-                        col_spans[r] = 0
-                new_parent_ranges.append((i, j))
-                i = j
-        spans[col] = col_spans
-        parent_ranges = new_parent_ranges
-    return spans
-
-def export_with_merged_cells(df: pd.DataFrame, path: Path, column_widths_pixels: Optional[Dict[str, int]] = None):
-    # This list defines which columns are candidates for merging.
-    all_possible_span_columns = [
-        "CCIR Index", "CCIR", "Tactic ID", "Tactic Name",
-        "Indicator Index", "Indicator", "Technique ID", "Technique Name"
-    ]
-    # Filter the list to only include columns that actually exist in the DataFrame.
-    span_columns = [c for c in all_possible_span_columns if c in df.columns]
-
-    df = df.copy()
-    spans = _compute_hierarchical_spans(df, span_columns)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "ASOM"
-    cols = list(df.columns)
-
-    # Styles
-    header_font = Font(bold=True)
-    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    # This alignment will be applied to all data cells.
-    default_cell_alignment = Alignment(vertical="top", wrap_text=True)
-
-    # Write Header
-    for c_idx, col in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=c_idx, value=col)
-        cell.font = header_font
-        cell.alignment = header_alignment
-
-    # Write Data and apply default alignment
-    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
-        for c_idx, col in enumerate(cols, start=1):
-            cell = ws.cell(row=r_idx, column=c_idx, value="" if pd.isna(row[col]) else row[col])
-            cell.alignment = default_cell_alignment
-
-    # Apply Merges (the alignment is already set, so we just merge)
-    for col in span_columns:
-        c_idx = cols.index(col) + 1
-        r = 0
-        while r < len(df):
-            span_len = spans[col][r]
-            excel_row_start = r + 2
-            if span_len > 1:
-                ws.merge_cells(
-                    start_row=excel_row_start,
-                    start_column=c_idx,
-                    end_row=excel_row_start + span_len - 1,
-                    end_column=c_idx
+            missing_g = [c for c in group_cols if c not in df.columns]
+            missing_m = [c for c in merge_cols if c not in df.columns]
+            if missing_g or missing_m:
+                logger.warning(
+                    f"Merging: {level_name}: skipping missing columns "
+                    f"(group keys missing={missing_g}, merge cols missing={missing_m})."
                 )
-            r += max(span_len, 1)
-    
-    # Set column widths
-    for c_idx, col_name in enumerate(cols, start=1):
-        col_letter = get_column_letter(c_idx)
-        if column_widths_pixels and col_name in column_widths_pixels:
-            ws.column_dimensions[col_letter].width = _pixels_to_width(column_widths_pixels[col_name])
-        else:
-            max_len = df[col_name].astype(str).map(len).max()
-            max_len = max(len(col_name), max_len if pd.notna(max_len) else 0)
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
 
-    wb.save(path)
+            # If there are no group cols or no merge cols present, nothing to do.
+            if not present_group_cols or not present_merge_cols:
+                return
+
+            # Iterate contiguous spans
+            start = 0
+            prev = tuple(df.iloc[0][present_group_cols]) if len(df) > 0 else None
+
+            def flush(s: int, e: int):
+                if e <= s:
+                    return
+                top = 2 + s  # header row = 1
+                bot = 2 + e
+                for mc in present_merge_cols:
+                    c = headers.index(mc) + 1
+                    ws.merge_cells(start_row=top, start_column=c, end_row=bot, end_column=c)
+
+            for i in range(len(df)):
+                key = tuple(df.iloc[i][present_group_cols])
+                if key != prev:
+                    flush(start, i - 1)
+                    start = i
+                    prev = key
+            flush(start, len(df) - 1)
+
+        # Merge levels (expected full hierarchy)
+        merge_by_group(["CCIR Index"], ["CCIR Index", "CCIR"], "CCIR-level")
+        merge_by_group(["CCIR Index", "Tactic ID", "Tactic Name"], ["Tactic ID", "Tactic Name"], "Tactic-level")
+        merge_by_group(
+            ["CCIR Index", "Tactic ID", "Tactic Name", "Indicator Index"],
+            ["Indicator Index", "Indicator", "Technique ID", "Technique Name"],
+            "Indicator-level"
+        )
+        merge_by_group(
+            ["CCIR Index", "Tactic ID", "Tactic Name", "Indicator Index", "Evidence Index"],
+            ["Evidence Index", "Evidence Description", "Data Sources", "Data Platforms", "NAI"],
+            "Evidence-level"
+        )
+
+        if column_widths_pixels:
+            _apply_pixel_widths(ws, headers, column_widths_pixels)
+
+        # Enable wrap text for all populated cells (merged sheet only)
+        max_row = ws.max_row
+        max_col = ws.max_column
+        wrap_align = Alignment(wrap_text=True, vertical="top")
+        for r in range(1, max_row + 1):         # include header row if you want header wrapping
+            for c in range(1, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.alignment = wrap_align
+
+def _apply_pixel_widths(ws, headers: List[str], column_widths_pixels: Dict[str, int]) -> None:
+    PIXELS_PER_CHAR = 7.0
+    from openpyxl.utils import get_column_letter
+    for col_name, px in column_widths_pixels.items():
+        if col_name not in headers:
+            continue
+        col_letter = get_column_letter(headers.index(col_name) + 1)
+        ch = max(6, int(round(px / PIXELS_PER_CHAR)))
+        ws.column_dimensions[col_letter].width = ch
+
+def _col_letter(ws, col_index_1based: int) -> str:
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(col_index_1based)
+
+
+def _merge_spans(
+    ws,
+    df: pd.DataFrame,
+    group_on: List[str],
+    merge_cols: List[str],
+    headers: List[str]
+) -> None:
+    """
+    Find contiguous blocks where 'group_on' fields are identical and merge each of the 'merge_cols'
+    across the corresponding row span.
+    """
+    if any(col not in df.columns for col in group_on):
+        return
+
+    # We'll iterate contiguous spans by comparing rows with previous row
+    start = 0  # df index (0-based)
+    prev_key = tuple(df.iloc[0][group_on]) if not df.empty else None
+
+    def flush_span(s: int, e: int):
+        # Merge each column in merge_cols across Excel rows 2+s .. 2+e (header = row 1)
+        if e <= s:  # single row - no merge needed
+            return
+        top_row = 2 + s
+        bot_row = 2 + e
+        for col in merge_cols:
+            if col not in headers:
+                continue
+            c = headers.index(col) + 1
+            ws.merge_cells(start_row=top_row, start_column=c, end_row=bot_row, end_column=c)
+
+    for i in range(len(df)):
+        cur_key = tuple(df.iloc[i][group_on])
+        if cur_key != prev_key:
+            # close previous span [start, i-1]
+            flush_span(start, i - 1)
+            start = i
+            prev_key = cur_key
+    # flush last span
+    flush_span(start, len(df) - 1)
+
 
 
 ================================================
@@ -1271,145 +1975,227 @@ def build_asom(
     return all_results
 
 
-def format_asom(asom_input_list: List[dict], joiner: str = "; ") -> pd.DataFrame:
-    table_rows = []
-    ir_index = 0
+ORDINAL_LABELS = ["First action", "Second action", "Third action"]
 
-    if not isinstance(asom_input_list, list):
-        raise TypeError("Expected asom_input_list to be a list.")
+def _distinct_preserve_order(xs: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-    for ir_obj in asom_input_list:
-        if not isinstance(ir_obj, dict):
-            logger.warning(f"Skipping non-dict IR object: {ir_obj}")
+def _normalize_actions_no_pad(action_field: Any, *, context: str) -> List[str]:
+    """
+    Return up to three DISTINCT actions, preserving order. Do NOT pad with blanks.
+    """
+    if isinstance(action_field, list):
+        actions = [str(a).strip() for a in action_field if a is not None and str(a).strip() != ""]
+        actions = _distinct_preserve_order(actions)
+        if len(actions) > 3:
+            logger.warning(f"{context}: 'action' had {len(actions)} entries; truncating to 3.")
+            actions = actions[:3]
+        return actions
+    elif isinstance(action_field, str):
+        s = action_field.strip()
+        return [s] if s else []
+    elif action_field is None:
+        return []
+    else:
+        logger.warning(f"{context}: 'action' not a list/string; skipping.")
+        return []
+
+def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Flatten nested ASOM (with 'action' as a list) into one row per ACTION (1..3).
+    No blank padding; an evidence with 1 or 2 actions produces 1 or 2 rows respectively.
+
+    Columns:
+      - CCIR Index
+      - CCIR
+      - Tactic ID
+      - Tactic Name
+      - Indicator Index   (TEMP, will be re-numbered later)
+      - Indicator
+      - Technique ID
+      - Technique Name
+      - Evidence Index    (TEMP, will be re-numbered later)
+      - Evidence Description
+      - Data Sources
+      - Data Platforms
+      - NAI
+      - Action Label
+      - Action
+    """
+    rows: List[Dict[str, Any]] = []
+
+    if not isinstance(raw_asom, list):
+        logger.error("format_asom: expected a list at the top level; returning empty frame.")
+        return pd.DataFrame(columns=[
+            "CCIR Index","CCIR","Tactic ID","Tactic Name","Indicator Index","Indicator",
+            "Technique ID","Technique Name","Evidence Index","Evidence Description",
+            "Data Sources","Data Platforms","NAI","Action Label","Action"
+        ])
+
+    for ccir_idx, ccir_obj in enumerate(raw_asom, start=1):
+        ccir = str(ccir_obj.get("information_requirement", "")).strip()
+        tactic_id = str(ccir_obj.get("tactic_id", "")).strip()
+        tactic_name = str(ccir_obj.get("tactic_name", "")).strip()
+
+        indicators = ccir_obj.get("indicators", []) or []
+        if not isinstance(indicators, list):
+            logger.warning(f"CCIR {ccir_idx}: 'indicators' not a list; skipping.")
             continue
 
-        required_ir_keys = {"information_requirement", "tactic_id", "tactic_name", "indicators"}
-        if not required_ir_keys.issubset(ir_obj.keys()):
-            logger.warning(f"IR object missing required keys: {ir_obj.keys()}")
-            continue
+        for ind_temp_idx, ind in enumerate(indicators, start=1):
+            # Schema shows: technique_id + name at indicator level
+            tech_id = str(ind.get("technique_id", "")).strip()
+            indicator_name = str(ind.get("name", "")).strip()
+            tech_name = str(ind.get("name", "")).strip()  # If you have a separate technique name, swap here
 
-        indicators = ir_obj.get("indicators", [])
-        if not indicators:
-            logger.info(f"IR '{ir_obj.get('information_requirement')}' has no indicators; skipping.")
-            continue
-
-        ir_index += 1
-        tactic_id = ir_obj.get("tactic_id", "")
-        tactic_name = ir_obj.get("tactic_name", "")
-        ir_text = ir_obj.get("information_requirement", "")
-        information_requirement = f"{ir_text} ({tactic_id} - {tactic_name})"
-
-        tech_sub_index = 0
-        for indicator in indicators:
-            technique_id = indicator.get("technique_id", "")
-            technique_name = indicator.get("name", "")
-            evidence_list = indicator.get("evidence", [])
-            tech_sub_index += 1
-            indicator_index_str = f"{ir_index}.{tech_sub_index}"
-
-            if not evidence_list:
-                logger.info(f"Indicator '{technique_id} - {technique_name}' has no evidence entries.")
+            evidence_list = ind.get("evidence", []) or []
+            if not isinstance(evidence_list, list):
+                logger.warning(f"CCIR {ccir_idx} Indicator {ind_temp_idx}: 'evidence' not a list; skipping.")
                 continue
 
-            evidence_sub_index = 0
-            for evidence in evidence_list:
-                evidence_sub_index += 1
-                evidence_index_str = f"{indicator_index_str}.{evidence_sub_index}"
+            for ev_temp_idx, ev in enumerate(evidence_list, start=1):
+                description = str(ev.get("description", "")).strip()
 
-                row = {
-                    "CCIR Index": ir_index,
-                    "CCIR": information_requirement,
-                    "Tactic ID": tactic_id,
-                    "Tactic Name": tactic_name,
-                    "Indicator Index": indicator_index_str,
-                    "Indicator": f"{technique_id} - {technique_name}",
-                    "Technique ID": technique_id,
-                    "Technique Name": technique_name,
-                    "Evidence Index": evidence_index_str,
-                    "Evidence Description": evidence.get("description", ""),
-                    "Data Sources": joiner.join(evidence.get("data_sources", [])),
-                    "Data Platforms": joiner.join(evidence.get("data_platforms", [])),
-                    "NAI": evidence.get("nai", ""),
-                    "Action": evidence.get("action", ""),
-                }
-                table_rows.append(row)
+                data_sources = ev.get("data_sources", []) or []
+                if not isinstance(data_sources, list):
+                    data_sources = [str(data_sources)]
+                data_sources_str = "; ".join([str(s) for s in data_sources])
 
-    df = pd.DataFrame(table_rows)
-    column_order = [
-        "CCIR Index", "CCIR", "Tactic ID", "Tactic Name", "Indicator Index",
-        "Indicator", "Technique ID", "Technique Name", "Evidence Index",
-        "Evidence Description", "Data Sources", "Data Platforms", "NAI", "Action"
-    ]
-    for col in column_order:
-        if col not in df.columns:
-            df[col] = pd.NA
+                data_platforms = ev.get("data_platforms", []) or []
+                if not isinstance(data_platforms, list):
+                    data_platforms = [str(data_platforms)]
+                data_platforms_str = "; ".join([str(p) for p in data_platforms])
+
+                nai = str(ev.get("nai", "")).strip()
+
+                actions = _normalize_actions_no_pad(
+                    ev.get("action"),
+                    context=f"CCIR {ccir_idx}, IND {ind_temp_idx}, EVID {ev_temp_idx}"
+                )
+
+                # If no actions, still emit a single row so the evidence is not lost (Action columns blank)
+                if not actions:
+                    rows.append({
+                        "CCIR Index": ccir_idx,
+                        "CCIR": ccir,
+                        "Tactic ID": tactic_id,
+                        "Tactic Name": tactic_name,
+                        "Indicator Index": ind_temp_idx,   # temp
+                        "Indicator": indicator_name,
+                        "Technique ID": tech_id,
+                        "Technique Name": tech_name,
+                        "Evidence Index": ev_temp_idx,     # temp
+                        "Evidence Description": description,
+                        "Data Sources": data_sources_str,
+                        "Data Platforms": data_platforms_str,
+                        "NAI": nai,
+                        "Action Index": "1",
+                        "Action": "",
+                    })
+                else:
+                    for a_i, a_text in enumerate(actions, start=1):
+                        rows.append({
+                            "CCIR Index": ccir_idx,
+                            "CCIR": ccir,
+                            "Tactic ID": tactic_id,
+                            "Tactic Name": tactic_name,
+                            "Indicator Index": ind_temp_idx,   # temp; renumbered later
+                            "Indicator": indicator_name,
+                            "Technique ID": tech_id,
+                            "Technique Name": tech_name,
+                            "Evidence Index": ev_temp_idx,     # temp; renumbered later
+                            "Evidence Description": description,
+                            "Data Sources": data_sources_str,
+                            "Data Platforms": data_platforms_str,
+                            "NAI": nai,
+                            "Action Index": a_i,               # <— integer index, 1..N
+                            "Action": a_text,
+                        })
+
+    df = pd.DataFrame(rows, columns=[
+        "CCIR Index","CCIR","Tactic ID","Tactic Name",
+        "Indicator Index","Indicator","Technique ID","Technique Name",
+        "Evidence Index","Evidence Description","Data Sources","Data Platforms","NAI",
+        "Action Index","Action"   # <— updated
+    ])
+    return df
+
+def renumber_formatted_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sorts rows and re-numbers:
+      - Indicator Index: 1..N within each (CCIR Index, Tactic ID, Tactic Name) for each distinct (Indicator, Technique ID, Technique Name) triplet in order of first appearance.
+      - Evidence Index:  1..M within each (CCIR Index, Tactic ID, Tactic Name, Indicator Index) for each distinct (Evidence Description, Data Sources, Data Platforms, NAI).
+
+    Ensures contiguity so merges work across consecutive rows.
+    """
+    if df.empty:
+        return df
+
+    # Re-number Indicator Index
+    def renumber_indicator(group: pd.DataFrame) -> pd.Series:
+        # Key per indicator within the tactic
+        keys = list(zip(group["Indicator"], group["Technique ID"], group["Technique Name"]))
+        key_to_num = {}
+        next_id = 1
+        mapped = []
+        for k in keys:
+            if k not in key_to_num:
+                key_to_num[k] = next_id
+                next_id += 1
+            mapped.append(key_to_num[k])
+        return pd.Series(mapped, index=group.index)
+
+    # Re-number Evidence Index within each Indicator Index block
+    def renumber_evidence(group: pd.DataFrame) -> pd.Series:
+        keys = list(zip(group["Evidence Description"], group["Data Sources"], group["Data Platforms"], group["NAI"]))
+        key_to_num = {}
+        next_id = 1
+        mapped = []
+        for k in keys:
+            if k not in key_to_num:
+                key_to_num[k] = next_id
+                next_id += 1
+            mapped.append(key_to_num[k])
+        return pd.Series(mapped, index=group.index)
     
-    if not df.empty:
-        df = df.sort_values(by=["CCIR Index", "Indicator Index", "Evidence Index"], ignore_index=True)
-
-    return df[column_order]
-
-def renumber_formatted_df(formatted_df: pd.DataFrame, d3_tactic_id: str = "D3-D") -> pd.DataFrame:
-    if formatted_df.empty:
-        return formatted_df
-        
-    df = formatted_df.copy()
-
-    df["_tactic_primary_key"] = (df["Tactic ID"] != d3_tactic_id).astype(int)
-    df["_orig_row"] = range(len(df))
-    df["_CCIR_norm"] = df["CCIR"].apply(lambda s: re.sub(r"\s+", " ", s).strip())
-
-    df.sort_values(
-        by=["_tactic_primary_key", "Tactic ID", "_CCIR_norm", "Indicator", "Evidence Description", "_orig_row"],
-        kind="stable",
-        inplace=True
+    # initial deterministic sort (stable)
+    df = df.sort_values(
+        by=[
+            "CCIR Index", "Tactic ID", "Tactic Name",
+            "Indicator", "Technique ID", "Technique Name",
+            "Evidence Description", "Data Sources", "Data Platforms", "NAI", "Action Index"
+        ],
+        kind="mergesort"
+    ).reset_index(drop=True)
+    
+    # Re-number Indicator Index (silence FutureWarning with include_groups=False)
+    df["Indicator Index"] = (
+        df.groupby(["CCIR Index","Tactic ID","Tactic Name"], sort=False)
+          .apply(renumber_indicator, include_groups=False)
+          .reset_index(level=[0,1,2], drop=True)
     )
-
-    ccir_index_map = {}
-    next_ccir_idx = 0
-    new_ccir_indices = []
-    for ccir_norm in df["_CCIR_norm"]:
-        if ccir_norm not in ccir_index_map:
-            next_ccir_idx += 1
-            ccir_index_map[ccir_norm] = next_ccir_idx
-        new_ccir_indices.append(ccir_index_map[ccir_norm])
-    df["CCIR Index"] = new_ccir_indices
-
-    indicator_index_map = {}
-    ccir_indicator_counters = {}
-    new_indicator_indices = []
-    for ccir_norm, ccir_idx, indicator in zip(df["_CCIR_norm"], df["CCIR Index"], df["Indicator"]):
-        key = (ccir_norm, indicator)
-        if key not in indicator_index_map:
-            ccir_indicator_counters.setdefault(ccir_norm, 0)
-            ccir_indicator_counters[ccir_norm] += 1
-            indicator_index_map[key] = ccir_indicator_counters[ccir_norm]
-        sub_idx = indicator_index_map[key]
-        new_indicator_indices.append(f"{ccir_idx}.{sub_idx}")
-    df["Indicator Index"] = new_indicator_indices
     
-    indicator_sub_lookup = {key: sub for key, sub in indicator_index_map.items()}
-
-    evidence_index_map = {}
-    evidence_counters = {}
-    new_evidence_indices = []
-    for ccir_norm, indicator, evidence_desc in zip(df["_CCIR_norm"], df["Indicator"], df["Evidence Description"]):
-        parent_key = (ccir_norm, indicator)
-        evidence_key = (ccir_norm, indicator, evidence_desc)
-        if evidence_key not in evidence_index_map:
-            evidence_counters.setdefault(parent_key, 0)
-            evidence_counters[parent_key] += 1
-            evidence_index_map[evidence_key] = evidence_counters[parent_key]
-        
-        ccir_idx = ccir_index_map[ccir_norm]
-        indicator_sub_idx = indicator_sub_lookup[parent_key]
-        evidence_sub_idx = evidence_index_map[evidence_key]
-        new_evidence_indices.append(f"{ccir_idx}.{indicator_sub_idx}.{evidence_sub_idx}")
-    df["Evidence Index"] = new_evidence_indices
-
-    df.sort_values(by=["CCIR Index", "Indicator Index", "Evidence Index"], kind="stable", inplace=True)
-    df.drop(columns=["_tactic_primary_key", "_orig_row", "_CCIR_norm"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # Re-number Evidence Index inside each Indicator Index
+    df["Evidence Index"] = (
+        df.groupby(["CCIR Index","Tactic ID","Tactic Name","Indicator Index"], sort=False)
+          .apply(renumber_evidence, include_groups=False)
+          .reset_index(level=[0,1,2,3], drop=True)
+    )
+    
+    # Final contiguous sort
+    df = df.sort_values(
+        by=[
+            "CCIR Index", "Tactic ID", "Tactic Name",
+            "Indicator Index", "Evidence Index", "Action Index"
+        ],
+        kind="mergesort"
+    ).reset_index(drop=True)
 
     return df
 
