@@ -22,6 +22,7 @@ import time
 from typing import Any, Dict, List, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+import argparse
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
@@ -521,6 +522,18 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"[{job.get('full_key','unknown')}] [{tag}] FAIL: unexpected error: {e}")
         return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
 
+def _parse_cli_args() -> Path:
+    parser = argparse.ArgumentParser(
+        description="Refine existing analytic plans using LLMs."
+    )
+    parser.add_argument(
+        "-c", "--config",
+        default="config/refine.yml",
+        help="Path to refine.yml (default: config/refine.yml)"
+    )
+    args = parser.parse_args()
+    return Path(args.config).expanduser().resolve()
+        
 # ---------------------------
 # Main
 # ---------------------------
@@ -554,8 +567,10 @@ def main():
         raise ValueError("Invalid JSON format in the credentials file: ./credentials.json")
 
     # --- 1. Config ---
-    logger.info("Loading configuration")
-    config = load_config(Path("config/refine.yml"))
+    cfg_path = _parse_cli_args()
+    logger.info(f"Loading configuration from: {cfg_path}")
+    config = load_config(cfg_path)
+
 
     output_dirs_map = config.get("output_directories", {})
     default_output_dir = Path(output_dirs_map.get("default", "techniques"))
