@@ -102,34 +102,43 @@ def main():
     logger.info("Re-sorting and re-numbering DataFrame indices...")
     final_df = renumber_formatted_df(formatted_df)
 
-    # Filter columns based on config, if specified
-    if output_columns:
-        # Validate that the requested columns exist to prevent errors
-        valid_columns = [col for col in output_columns if col in final_df.columns]
-        missing_columns = set(output_columns) - set(valid_columns)
-        if missing_columns:
-            logger.warning(f"The following columns from 'output_columns' in config were not found and will be ignored: {list(missing_columns)}")
-        
-        if valid_columns:
-            logger.info(f"Filtering output to {len(valid_columns)} columns as specified in config.")
-            final_df = final_df[valid_columns]
-        else:
-            logger.warning("'output_columns' in config resulted in an empty list of valid columns. All columns will be exported.")
+    def _apply_output_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+        if not columns:
+            return df
+        # Preserve order and drop unknowns with a warning
+        present = [c for c in columns if c in df.columns]
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            logging.getLogger("main").warning(
+                f"'output_columns' includes unknown columns; ignoring: {missing}"
+            )
+        if not present:
+            logging.getLogger("main").warning(
+                "'output_columns' resolved to an empty set of valid columns. All columns will be exported."
+            )
+            return df
+        return df[present]
 
-    logger.info(f"Processing complete. Final DataFrame has {len(final_df)} rows and {len(final_df.columns)} columns.")
+    # Apply output_columns to BOTH Excel outputs
+    final_df_filtered = _apply_output_columns(final_df, output_columns)
+
+    logger.info(
+        f"Processing complete. Final DataFrame has {len(final_df_filtered)} rows and "
+        f"{len(final_df_filtered.columns)} columns (after output_columns filter)."
+    )
 
     # --- 4. Export to Excel ---
     ts_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Simple Excel export (without merged cells, for easier data parsing)
+
+    # Simple Excel export (filtered)
     simple_excel_path = output_dir / f"{output_basename}_{ts_suffix}.xlsx"
     logger.info(f"Exporting standard Excel file to: {simple_excel_path}")
-    export_simple_excel(final_df, simple_excel_path, column_widths_pixels=column_widths)
+    export_simple_excel(final_df_filtered, simple_excel_path, column_widths_pixels=column_widths)
 
-    # Hierarchical/Merged Excel export (for presentation)
+    # Hierarchical/Merged Excel export (filtered as well)
     hier_excel_path = output_dir / f"{output_basename}_merged_{ts_suffix}.xlsx"
     logger.info(f"Exporting Excel file with merged cells to: {hier_excel_path}")
-    export_with_merged_cells(final_df, hier_excel_path, column_widths_pixels=column_widths)
+    export_with_merged_cells(final_df_filtered, hier_excel_path, column_widths_pixels=column_widths)
     
     logger.info("Script finished successfully.")
 
