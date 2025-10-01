@@ -44,6 +44,22 @@ def _filter_indicators(ir_obj: dict, allowed_ids: Set[str]) -> dict:
     new_obj["indicators"] = new_indicators
     return new_obj
 
+def _append_suffix_if_missing(base: str, suffix_id: str, suffix_name: str) -> str:
+    """
+    Append ' (ID - Name)' to base if both are present and the exact suffix
+    isn't already there. Returns the possibly-modified string.
+    """
+    base = (base or "").strip()
+    sid = (suffix_id or "").strip()
+    sname = (suffix_name or "").strip()
+    if not sid or not sname:
+        return base
+    suffix = f" ({sid} - {sname})"
+    # Avoid double-appending if it's already present (anywhere in the string)
+    if suffix in base:
+        return base
+    return f"{base}{suffix}"
+
 def build_asom(
     detect_chain: Dict[str, List[str]],
     attack_chain: Dict[str, List[str]],
@@ -202,6 +218,9 @@ def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
         tactic_id = str(ccir_obj.get("tactic_id", "")).strip()
         tactic_name = str(ccir_obj.get("tactic_name", "")).strip()
 
+        # Enrich CCIR with "(TacticID - Tactic Name)" if not already present
+        ccir_display = _append_suffix_if_missing(ccir, tactic_id, tactic_name)
+        
         indicators = ccir_obj.get("indicators", []) or []
         if not isinstance(indicators, list):
             logger.warning(f"CCIR {ccir_idx}: 'indicators' not a list; skipping.")
@@ -213,6 +232,9 @@ def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
             indicator_name = str(ind.get("name", "")).strip()
             tech_name = str(ind.get("name", "")).strip()  # If you have a separate technique name, swap here
 
+            # Enrich Indicator with "(TechniqueID - Technique Name)" if not already present
+            indicator_display = _append_suffix_if_missing(indicator_name, tech_id, tech_name)
+            
             evidence_list = ind.get("evidence", []) or []
             if not isinstance(evidence_list, list):
                 logger.warning(f"CCIR {ccir_idx} Indicator {ind_temp_idx}: 'evidence' not a list; skipping.")
@@ -242,11 +264,11 @@ def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
                 if not actions:
                     rows.append({
                         "CCIR Index": ccir_idx,
-                        "CCIR": ccir,
+                        "CCIR": ccir_display,
                         "Tactic ID": tactic_id,
                         "Tactic Name": tactic_name,
                         "Indicator Index": ind_temp_idx,   # temp
-                        "Indicator": indicator_name,
+                        "Indicator": indicator_display,
                         "Technique ID": tech_id,
                         "Technique Name": tech_name,
                         "Evidence Index": ev_temp_idx,     # temp
@@ -261,11 +283,11 @@ def format_asom(raw_asom: List[Dict[str, Any]]) -> pd.DataFrame:
                     for a_i, a_text in enumerate(actions, start=1):
                         rows.append({
                             "CCIR Index": ccir_idx,
-                            "CCIR": ccir,
+                            "CCIR": ccir_display,
                             "Tactic ID": tactic_id,
                             "Tactic Name": tactic_name,
                             "Indicator Index": ind_temp_idx,   # temp; renumbered later
-                            "Indicator": indicator_name,
+                            "Indicator": indicator_display,
                             "Technique ID": tech_id,
                             "Technique Name": tech_name,
                             "Evidence Index": ev_temp_idx,     # temp; renumbered later
