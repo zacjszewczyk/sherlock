@@ -1,0 +1,251 @@
+name: T1547.007: Re-opened Applications
+id: 5a9b8e1f-1c2d-4f5a-8b9c-0d1e2f3a4b5c
+description: |
+  This playbook investigates adversary activity related to macOS persistence and privilege escalation via the "Re-opened Applications" feature. Adversaries can maintain persistence by modifying the 'com.apple.loginwindow.[UUID].plist' file, which controls which applications are re-launched at login. This can be done by a non-standard process writing to the file, or by adding a malicious application path to the 'SessionItems.CustomListItems' array within the plist, often pointing to a non-standard location like a temporary directory or an unsigned application. Furthermore, a re-opened application can be used to establish command and control (C2) beaconing. This playbook also covers how adversaries leverage this persistence mechanism for privilege escalation, where a process spawned from a re-opened application, running as a standard user, creates a child process with root privileges or writes to protected system directories to establish further persistence or modify system configurations.
+type: technique
+related:
+  - TA0003: Persistence
+  - TA0004: Privilege Escalation
+contributors:
+  - Zachary Szewczyk
+  - Ask Sage
+created: 2025-10-01
+modified: 2025-10-01
+version: 1.0
+tags: none
+questions:
+  - question: Is a process other than 'loginwindow' modifying 'Reopen windows' plist files?
+    context: |
+      The 'loginwindow' process is the legitimate macOS process responsible for managing user sessions, including saving the state of open applications for re-opening at the next login. These modifications occur on a path matching `*/Library/Preferences/ByHost/com.apple.loginwindow.*.plist`. Any other process writing to this specific file is highly anomalous and could indicate an adversary is programmatically adding a malicious application to the list of apps to be re-opened, thereby establishing persistence. Enriching alerts with process hash and parent process information is critical for immediate triage and understanding the execution chain.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - User library directories (`~/Library/Preferences/ByHost/`) on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          SEARCH file_write_events 
+          WHERE file_path MATCHES '*/Library/Preferences/ByHost/com.apple.loginwindow.*.plist' 
+          AND process_name != 'loginwindow' 
+          | RETURN timestamp, hostname, process_name, process_hash, parent_process_name
+
+  - question: Is a rare or low-prevalence process modifying 'Reopen windows' plist files across the environment?
+    context: |
+      Adversary tools and custom malware are, by nature, not widespread across an organization, unlike common software. By calculating the prevalence of any process that modifies the target plist file (i.e., the number of distinct hosts it's seen on), we can identify outliers. A process that performs this modification but appears on a very small percentage of the endpoint fleet (e.g., <1%) is a strong candidate for being malicious, as it deviates from the norm of widely distributed, legitimate software.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - User library directories (`~/Library/Preferences/ByHost/`) on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          SEARCH file_write_events 
+          WHERE file_path MATCHES '*/Library/Preferences/ByHost/com.apple.loginwindow.*.plist'
+          | CALCULATE prevalence = distinct_host_count(process_name) / total_host_count
+          | FILTER prevalence < 0.01 
+          | ALERT on process_name, host_count, total_hosts
+
+  - question: Can machine learning identify malicious modifications to 'Reopen windows' plist files based on process characteristics?
+    context: |
+      This question moves beyond simple rules to a more robust, model-based detection strategy. A Random Forest classifier can be trained on a variety of features from the process that writes to the plist file, such as its code signature status (valid, ad-hoc, unsigned), its parent process, and its recent file write activity. This allows the model to learn the complex patterns that distinguish legitimate application behavior from malicious modifications, enabling the detection of novel or evasive threats that might not be caught by static indicators.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - User library directories (`~/Library/Preferences/ByHost/`) on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          GATHER features FOR process writing to plist: [process_name, process_path, code_signature_status, parent_process_name, file_writes_last_hour]
+          | PREDICT is_malicious WITH RandomForestModel
+          | TRIGGER incident_workflow IF prediction is 'malicious'
+
+  - question: Has an application from a suspicious location or an unsigned application been added to the 'Re-opened Applications' list?
+    context: |
+      Adversaries often place malicious payloads in non-standard, user-writable directories like `/private/tmp/`, `/var/tmp/`, or `~/Downloads/` to evade detection and avoid privileged installation requirements. Furthermore, legitimate applications are almost always signed by a registered developer. This query parses the `com.apple.loginwindow.*.plist` file to check the paths of applications set to re-open. An alert should be generated if any path points to a suspicious location or if the application bundle at that path lacks a valid code signature, as these are strong indicators of a malicious persistence attempt.
+    answer_sources:
+      - File Integrity Monitoring logs
+      - osquery scheduled query results
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - File systems on all macOS endpoints, specifically targeting plist files in `~/Library/Preferences/ByHost/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          SCHEDULE or ON_MODIFICATION: PARSE 'com.apple.loginwindow.*.plist' 
+          | EXTRACT app_paths from 'SessionItems.CustomListItems'
+          | FOREACH path:
+          |   IF path STARTS WITH ('/private/tmp/', '/var/tmp/') OR path CONTAINS '~/Downloads/' OR is_application_unsigned(path)
+          |     ALERT on hostname, plist_path, suspicious_app_path
+
+  - question: Is a newly added application path in the 'Re-opened Applications' list abnormally rare within the organization?
+    context: |
+      Similar to tracking process prevalence, baselining the application paths found within 'Re-opened Applications' plists across the organization can reveal anomalies. Most legitimate applications, even if specialized, will appear on multiple systems. A path that is added to this persistence mechanism but is exceptionally rare (e.g., in the bottom 5th percentile of frequency) or unique to a single user or host is a significant outlier that warrants investigation as a potential targeted attack or custom malware.
+    answer_sources:
+      - File Integrity Monitoring logs
+      - osquery scheduled query results
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - File systems on all macOS endpoints, specifically targeting plist files in `~/Library/Preferences/ByHost/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          MAINTAIN baseline of all paths in 'Re-opened Applications' plists and their frequencies
+          | ON new path added:
+          |   CALCULATE prevalence(new_path)
+          |   IF prevalence < 5th_percentile
+          |     FLAG new_path for investigation
+
+  - question: Can unsupervised machine learning identify anomalous application paths in the 'Re-opened Applications' list?
+    context: |
+      This approach uses unsupervised learning (e.g., DBSCAN) to find outliers without pre-defined blocklists or baselines. By converting application paths into a set of features—such as path depth, presence of keywords like 'tmp' or 'cache', and whether it resides in a standard `/Applications` directory—the algorithm can group "normal" paths together. Paths that do not fit into any cluster (outliers) or form very small, distinct clusters are flagged as suspicious, as they represent structurally different and potentially malicious entries.
+    answer_sources:
+      - File Integrity Monitoring logs
+      - osquery scheduled query results
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - File systems on all macOS endpoints, specifically targeting plist files in `~/Library/Preferences/ByHost/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          EXTRACT features from application paths: [path_depth, keyword_counts, is_in_applications_dir]
+          | APPLY DBSCAN clustering algorithm
+          | ALERT on paths identified as outliers or belonging to small clusters
+
+  - question: Is a re-opened application communicating with known malicious infrastructure?
+    context: |
+      This is a high-confidence detection method that checks for post-compromise C2 activity. The query identifies processes launched at login via the re-open mechanism and correlates their network activity against threat intelligence feeds. A match on a known malicious IP address, domain, or JA3/JA3S hash (indicating a specific malicious TLS client) provides strong evidence that a persisted application is malicious and is actively communicating with an adversary's infrastructure.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - Zeek conn.log
+      - Zeek dns.log
+      - Network egress points, DNS resolvers, and process execution logs on macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          IDENTIFY processes launched at login with re-open ancestry
+          | CORRELATE process network connections (from Zeek logs) with threat intel feeds
+          | GENERATE high-severity alert ON MATCH with malicious IP, domain, or JA3/JA3S hash
+
+  - question: Is a re-opened application exhibiting anomalous network behavior, such as unusual connection patterns or DGA-like domain requests?
+    context: |
+      This query aims to detect C2 activity that does not rely on known IOCs. It works in two parts. First, it establishes a baseline of normal network behavior (connection frequency, data volume) for re-opened apps and uses z-scores to detect statistical deviations. Second, it specifically targets Domain Generation Algorithms (DGA), a common C2 technique, by calculating the Shannon entropy of requested domain names. High-entropy domains are algorithmically generated and non-sensical, making them a strong indicator of DGA activity.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - Zeek conn.log
+      - Zeek dns.log
+      - Network egress points, DNS resolvers, and process execution logs on macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          FOR each re-opened app:
+          |   BASELINE network stats (conn_freq, data_vol) AND CALCULATE z-score for new traffic
+          |   CALCULATE Shannon entropy for DNS query FQDNs
+          |   ALERT IF z-score > 3 OR entropy > 3.5
+
+  - question: Can an autoencoder model detect anomalous network sequences from re-opened applications?
+    context: |
+      This advanced technique uses an unsupervised autoencoder model to learn the normal *sequences* of network behavior for legitimate re-opened applications. The model is trained on metadata like destination ports, bytes sent, and connection duration. When the model is fed a sequence of network events from a new or running application, a high reconstruction error indicates that the sequence is anomalous and does not match the learned normal patterns. This can effectively detect novel C2 protocols or other malicious network activity.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - Zeek conn.log
+      - Zeek dns.log
+      - Network egress points, DNS resolvers, and process execution logs on macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          TRAIN autoencoder model on sequences of legitimate network connection metadata
+          | FOR new connection sequences from re-opened apps:
+          |   CALCULATE reconstruction_error from autoencoder
+          |   ALERT IF reconstruction_error > learned_threshold
+
+  - question: Did a re-opened application, running as a standard user, spawn a process with root privileges?
+    context: |
+      This query directly targets privilege escalation events originating from the re-open persistence mechanism. A standard user process (UID > 500) should not be able to create a child process with root privileges (EUID 0) without a legitimate mechanism like a `sudo` prompt. By monitoring for this specific parent-child privilege transition and tracing the parent's ancestry back to a re-opened application, we can identify a likely exploit or malicious capability in action. An allowlist for known-good escalations is crucial to minimize false positives.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_FORK
+      - Process execution and ancestry data on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          SEARCH process_creation_events
+          WHERE process_euid = 0 AND parent_process_uid > 500
+          AND parent_ancestry includes re-opened_app
+          AND parent_process_name NOT IN (sudo, other_legit_escalators)
+          | ALERT on parent_process and child_process details
+
+  - question: Has a re-opened application initiated a rare or never-before-seen privilege escalation event?
+    context: |
+      Legitimate privilege escalations within an environment are typically predictable and repetitive (e.g., a specific updater process spawning a privileged helper tool). This query involves building a baseline of all known-good parent-child process pairs where such an escalation occurs. When a new escalation event is detected from a re-opened application, it is checked against this baseline. If the specific parent-child pair is new to the environment or exceedingly rare, it is flagged as highly suspicious and likely malicious.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_FORK
+      - Process execution and ancestry data on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          BASELINE all parent-child pairs where child_euid = 0 and parent_uid > 500
+          | ON new escalation event from re-opened app:
+          |   IF parent-child_pair is not in baseline OR is rare (<0.5% of endpoints)
+          |     FLAG for investigation
+
+  - question: Can a machine learning model distinguish between malicious and benign privilege escalations originating from re-opened applications?
+    context: |
+      This proposes using a supervised machine learning model (e.g., XGBoost) to provide a more nuanced detection of malicious privilege escalations. The model would be trained on a rich set of features, including the names, paths, and code signature statuses of both the parent and child processes, as well as the command-line arguments of the child process. By learning from labeled examples of both malicious exploits and legitimate administrative actions, the model can make a more accurate and context-aware classification than a simple rule.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_FORK
+      - Process execution and ancestry data on all macOS endpoints.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          GATHER features FOR escalation event: [parent_name, parent_path, parent_sig_status, child_name, child_path, child_sig_status, child_cmd_line]
+          | PREDICT is_malicious WITH XGBoostModel
+          | ALERT IF prediction is 'malicious'
+
+  - question: Is a process originating from a re-opened application writing to protected system directories?
+    context: |
+      This query looks for post-privilege escalation actions. After an adversary gains root, a common next step is to write to protected system directories to install persistent malware (e.g., in `/Library/LaunchDaemons`), add backdoors, or modify system configurations (`/etc/sudoers.d/`). Detecting a process that originated from a re-opened app, even if it has escalated its privileges, writing to these sensitive locations is a strong indicator of compromise.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_CREATE
+      - Protected macOS system directories, including `/System/`, `/Library/LaunchDaemons/`, `/Library/LaunchAgents/`, `/Library/PrivilegedHelperTools/`, and `/usr/local/bin/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          SEARCH file_write_events
+          WHERE process_ancestry includes re-opened_app
+          AND target_directory IN (protected_system_dirs)
+          | ALERT on process_name, target_file_path
+
+  - question: Is a re-opened application writing to an unusual set of directories compared to its normal behavior?
+    context: |
+      Applications typically have a predictable pattern of file system interaction. This query involves profiling the set of directories an application normally writes to, creating a behavioral baseline. Using a metric like the Jaccard similarity index, we can compare the set of directories written to in a new session against this historical baseline. A low similarity score, especially when combined with writes to privileged directories, indicates a significant and suspicious deviation from normal behavior, suggesting the process may have been hijacked or is malicious.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_CREATE
+      - Protected macOS system directories, including `/System/`, `/Library/LaunchDaemons/`, `/Library/LaunchAgents/`, `/Library/PrivilegedHelperTools/`, and `/usr/local/bin/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          FOR each re-opened app session:
+          |   GET current_session_write_dirs
+          |   GET baseline_write_dirs from history
+          |   CALCULATE jaccard_similarity(current, baseline)
+          |   IF jaccard_similarity < 0.3 AND session includes writes to privileged_dirs
+          |     FLAG as anomalous
+
+  - question: Can a sequence-aware model (LSTM) detect anomalous file system interactions from a re-opened application?
+    context: |
+      This is a sophisticated behavioral detection that focuses on the *order* of file system operations, not just the operations themselves. A Long Short-Term Memory (LSTM) neural network can be trained on normal sequences of file interactions for common applications. If a re-opened application deviates from its learned sequence—for example, by writing a new binary to `/usr/local/bin` immediately after reading a configuration file from its Application Support directory—the model would flag this as a high-confidence anomaly, as it breaks the expected pattern of behavior.
+    answer_sources:
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_EXEC
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_WRITE
+      - macOS ESF ES_EVENT_TYPE_NOTIFY_CREATE
+      - Protected macOS system directories, including `/System/`, `/Library/LaunchDaemons/`, `/Library/LaunchAgents/`, `/Library/PrivilegedHelperTools/`, and `/usr/local/bin/`.
+    range: last 90 days
+    queries:
+      - pseudocode: |
+          TRAIN LSTM model on sequences of file system interactions for legitimate apps
+          | FOR new file interaction sequences from re-opened apps:
+          |   CALCULATE anomaly_score from LSTM model
+          |   ALERT IF anomaly_score > threshold
