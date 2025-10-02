@@ -41,6 +41,7 @@ I need you to generate an analytic playbook. The analytic playbook consists of t
 * Playbook Contributors [contributors]: A list of people who contributed to the playbook, beginning with the original author. Derive this from a comma-joined list of "contributors" from the playbook.
 * Created Date [created]: The date the playbook was initially created on. Use the date in YYYY-MM-DD format. Use 2025-10-01 for now.
 * Last Modified Date [modified]: The most recent date when the playbook was added to or modified. Use the date in YYYY-MM-DD format. Use 2025-10-01 for now.
+* Version [version]: The version of the playbook. Use 1.0 for now.
 * Tags [tags]: Additional categorization properties. For now, leave this as "none".
 * Investigative Questions [questions]: The investigative question that the play should help answer. A playbook may contain multiple questions. Each question has properties associated with it.
     * Question [question]: The investigative question written in plain but detailed language for human consumption, in the form of a question. Derive one question from each "action" element.

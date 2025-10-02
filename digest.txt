@@ -10,6 +10,7 @@ Directory structure:
         ├── attack_retriever.py
         ├── colorlog.py
         ├── formatting.py
+        ├── llm.py
         └── processing.py
 
 ================================================
@@ -31,22 +32,21 @@ logger = logging.getLogger(__name__)
 logger.info("Importing built-in modules.")
 import json
 from datetime import datetime, timezone
-import base64
 import os
 import re
 import requests
 import urllib3
 import time  # Added for retry delays
+import argparse
+from typing import Any, Dict, List, Optional
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
-from google import genai
-from google.genai import types
-from google.genai import errors  # Added for proper exception handling
 import yaml
 
 logger.info("Importing project-specific modules.")
 from src.attack_retriever import build_technique_dictionary
+from refiner import refine_with_llm  # Reuse the LLM interaction pattern
 
 BASE_PROMPT = """
 I need you to generate an analytic playbook. The analytic playbook consists of the following components in a YAML format:
@@ -59,6 +59,7 @@ I need you to generate an analytic playbook. The analytic playbook consists of t
 * Playbook Contributors [contributors]: A list of people who contributed to the playbook, beginning with the original author. Derive this from a comma-joined list of "contributors" from the playbook.
 * Created Date [created]: The date the playbook was initially created on. Use the date in YYYY-MM-DD format. Use 2025-10-01 for now.
 * Last Modified Date [modified]: The most recent date when the playbook was added to or modified. Use the date in YYYY-MM-DD format. Use 2025-10-01 for now.
+* Version [version]: The version of the playbook. Use 1.0 for now.
 * Tags [tags]: Additional categorization properties. For now, leave this as "none".
 * Investigative Questions [questions]: The investigative question that the play should help answer. A playbook may contain multiple questions. Each question has properties associated with it.
     * Question [question]: The investigative question written in plain but detailed language for human consumption, in the form of a question. Derive one question from each "action" element.
@@ -69,6 +70,10 @@ I need you to generate an analytic playbook. The analytic playbook consists of t
 
 Note that you must output a distinct "question", "context", "answer_sources", "range", and "queries" series for each distinct action in the analytic plan. Based on these definitions, please generate an analytic playbook in plain, unstyled text in the YAML format based on the analytic plan below. 
 """
+
+# ---------------------------
+# Utilities
+# ---------------------------
 
 def setup_logging() -> tuple[str, Path]:
     """Initializes console and file logging."""
@@ -107,203 +112,122 @@ def load_config(path: Path) -> dict:
             logger.critical(f"Error parsing YAML configuration: {e}")
             raise SystemExit(1)
 
-def generate_analytic_plan(prompt, model, ask_sage_client, max_retries=3, retry_delay=1):    
-    # Validate inputs
-    if not prompt or not isinstance(prompt, str):
-        raise ValueError("Prompt must be a non-empty string")
-    
-    if not model or not isinstance(model, str):
-        raise ValueError("Model must be a non-empty string")
-    
-    # Primary attempt with Gemini
-    for attempt in range(max_retries):
-        try:
-            # Initialize Gemini client with API key
-            api_key = os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning("GEMINI_API_KEY not found in environment variables")
-                raise ValueError("GEMINI_API_KEY environment variable is not set")
-            
-            client = genai.Client(api_key=api_key)
-            
-            # Generate content using Gemini
-            response = client.models.generate_content(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=prompt),
-                        ],
-                    ),
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    # max_output_tokens=2048,
-                    # top_p=0.95,
-                    # top_k=40,
-                ),
-            )
-            
-            # Validate response
-            if response and hasattr(response, 'text'):
-                logger.info(f"Successfully generated response using {model}")
-                return response.text
-            else:
-                logger.warning("Response received but no text content found")
-                raise ValueError("Invalid response format from Gemini")
-                
-        except (errors.ClientError, errors.APIError) as e:
-            # Handle Google API errors including rate limiting
-            error_message = str(e)
-            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
-            
-            # Check for rate limiting (429 status code or quota-related messages)
-            if (error_code == 429 or 
-                "429" in error_message or 
-                "RESOURCE_EXHAUSTED" in error_message or
-                "quota" in error_message.lower() or 
-                "rate" in error_message.lower()):
-                logger.error(f"Google API error: {error_message}")
-                logger.info("Attempting to use AskSage backup model due to API error")
-                break
-            else:
-                logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {error_message}")
-                
-                # Try to extract retry delay from error message
-                retry_after = retry_delay * (2 ** attempt)  # Default exponential backoff
-                
-                # Look for specific retry delay in error message
-                import re
-                retry_match = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
-                if retry_match:
-                    suggested_delay = float(retry_match.group(1))
-                    retry_after = min(suggested_delay + 1, 120)  # Cap at 2 minutes
-                    logger.info(f"Using suggested retry delay: {retry_after} seconds")
-                
-                if attempt < max_retries - 1:
-                    logger.info(f"Waiting {retry_after} seconds before retry...")
-                    time.sleep(retry_after)
-                    continue
-                else:
-                    logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
-                    break
-    
-    # Fallback to AskSage backup model
+def _parse_cli_args() -> Path:
+    ap = argparse.ArgumentParser(description="Generate analytic playbooks from Watson plans.")
+    ap.add_argument(
+        "-c", "--config",
+        default="config/generator.yml",
+        help="Path to generator.yml (default: config/generator.yml)"
+    )
+    args = ap.parse_args()
+    return Path(args.config).expanduser().resolve()
+
+def _read_json_file(path: Path) -> Optional[Any]:
     try:
-        logger.info("Using AskSage backup model: google-gemini-2.5-pro")
-        
-        # Validate ask_sage_client
-        if not ask_sage_client:
-            raise ValueError("ask_sage_client is not initialized")
-        
-        response = ask_sage_client.query(
-            prompt,
-            persona="default",
-            dataset="none",
-            limit_references=0,
-            temperature=0.7,  # Match the temperature from primary model
-            live=0,
-            model="google-gemini-2.5-pro",
-            system_prompt=None
-        )
-        
-        # Validate response structure
-        if not response or not isinstance(response, dict):
-            raise ValueError("Invalid response from AskSage API")
-        
-        if 'message' not in response:
-            logger.error(f"Response missing 'message' field: {response}")
-            raise ValueError("Response from AskSage API does not contain 'message' field")
-        
-        message = response['message']
-        
-        if not message:
-            raise ValueError("Empty message received from AskSage API")
-        
-        logger.info("Successfully generated response using AskSage backup model")
-        return message
-        
+        text = path.read_text(encoding="utf-8").strip()
+        if text.startswith("```"):
+            # Strip markdown fence if present
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
     except Exception as e:
-        logger.error(f"Backup model also failed: {str(e)}")
-        raise Exception(f"Both primary and backup models failed. Last error: {str(e)}")
+        logger.warning(f"Failed to read/parse JSON from {path}: {e}")
+        return None
+
+def _extract_yaml_blob(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    # Prefer fenced
+    m = re.search(r"```(?:yaml|yml)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Otherwise return whole thing if it looks YAML-ish
+    if ":" in s:
+        return s
+    return None
+
+def _collect_plan_files(plan_paths: Dict[str, str]) -> List[Path]:
+    files = []
+    for k, v in (plan_paths or {}).items():
+        p = Path(v)
+        if p.is_dir():
+            cand = sorted(p.glob("*.json"))
+            logger.info(f"Plan dir [{k}] {p} -> {len(cand)} file(s)")
+            files.extend(cand)
+        else:
+            logger.warning(f"Plan path [{k}] {p} is not a directory; skipping.")
+    return files
+
+def _index_attack_by_technique(technique_dict: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    out = {}
+    for full_key, meta in technique_dict.items():
+        tid = meta.get("technique_id")
+        if tid and tid not in out:
+            out[tid] = {"matrix": meta.get("matrix"), "name": meta.get("name"), "tactic": meta.get("tactic", "")}
+    return out
+
+def _first_indicator(plan_obj: Any) -> Optional[Dict[str, str]]:
+    """
+    Given a Watson plan (list of IR objects), try to extract a representative technique_id/name and tactic info.
+    """
+    if not isinstance(plan_obj, list):
+        return None
+    for ir in plan_obj:
+        inds = ir.get("indicators") if isinstance(ir, dict) else None
+        if isinstance(inds, list):
+            for ind in inds:
+                tid = (ind or {}).get("technique_id", "").strip()
+                name = (ind or {}).get("name", "").strip()
+                if tid:
+                    return {
+                        "technique_id": tid,
+                        "technique_name": name,
+                        "tactic_id": (ir or {}).get("tactic_id", "").strip(),
+                        "tactic_name": (ir or {}).get("tactic_name", "").strip(),
+                    }
+    return None
+
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
-    """Main script execution."""
-    
+    """Main script execution: read Watson plans ⇒ generate Sherlock playbooks (YAML)."""
     run_ts, log_path = setup_logging()
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
-    # --- 0. Instantiate models ---
-
+    # --- 0. Load keys for providers (same behavior as refiner.py) ---
     logger.info("Loading Gemini API key")
     try:
         with open(".GEMINI_API_KEY", "r") as fd:
             os.environ["GEMINI_API_KEY"] = fd.read().strip()
-    except:
+    except Exception:
         logger.info("Failed to import Gemini API key")
-    
+
     logger.info("Loading Sage API key")
     try:
         with open("./credentials.json", "r") as file:
             credentials = json.load(file)
-            # Validate required keys
             if 'credentials' not in credentials or 'api_key' not in credentials['credentials']:
                 logger.error("Missing required keys in the credentials file.")
                 raise
-    
-        # Extract the API key and email from the credentials
         sage_api_key = credentials['credentials']['api_key']
         sage_email = credentials['credentials']['Ask_sage_user_info']['username']
     except FileNotFoundError:
         raise FileNotFoundError(f"Credentials file not found at ./credentials.json")
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON format in the credentials file: ./credentials.json")
-    
-    # --- 1. Load Configuration ---
-    logger.info("Loading configuration")
-    config = load_config(Path("config/generator.yml"))
-    output_dirs_map = config.get("output_directories", {})
-    default_output_dir = Path(output_dirs_map.get("default", "techniques"))
-    matrices = config.get("matrices", ["enterprise"])
-    filter_techniques = config.get("techniques", [])
-    model = config.get("model", "gemini-2.5-flash")
 
-    if not output_dirs_map:
-        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
-        raise SystemExit(1)
-
-    # --- 2. Build Technique Dictionary ---
-    logger.info("Building technique dictionary")
-    technique_dict = build_technique_dictionary(matrices)
-    
-    target_techniques = {}
-    if filter_techniques:
-        logger.info(f"Filtering for {len(filter_techniques)} specific techniques from config.")
-        for full_key, tech_data in technique_dict.items():
-            if tech_data['technique_id'] in filter_techniques:
-                target_techniques[full_key] = tech_data
-    else:
-        logger.info("Processing all available techniques from selected matrices.")
-        target_techniques = technique_dict
-    
-    logger.info(f"Will generate analytic plans for {len(target_techniques)} techniques.")
-
-    # --- 3. Instantiate Sage client ---
-    logger.info("Instantiating Sage client")
-    # Disable SSL warnings
+    # Disable SSL warnings (matches refiner)
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-    # Monkey-patch requests to disable SSL verification globally
     old_request = requests.Session.request
-    
     def new_request(self, method, url, **kwargs):
         kwargs['verify'] = False
         return old_request(self, method, url, **kwargs)
-    
     requests.Session.request = new_request
 
-    # Now create your client
+    # Build AskSage client (same base URLs as refiner)
     ask_sage_client = AskSageClient(
         sage_email, 
         sage_api_key, 
@@ -311,100 +235,132 @@ def main():
         server_base_url="https://api.genai.army.mil/server/"
     )
 
-    # --- 4. Generate and Save Analytic Plans ---
-    logger.info("Generating analytic plans")
-    for i, (full_key, tech_data) in enumerate(target_techniques.items()):
-        
-        # --- Determine the correct output directory for this technique ---
-        matrix_type = tech_data.get('matrix')
-        if matrix_type and matrix_type in output_dirs_map:
-            output_dir = Path(output_dirs_map[matrix_type])
-        else:
-            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
-            output_dir = default_output_dir
+    # --- 1. Load Configuration ---
+    cfg_path = _parse_cli_args()
+    logger.info(f"Loading configuration from: {cfg_path}")
+    config = load_config(cfg_path)
 
-        # --- Extract Technique ID and check if file already exists ---
-        try:
-            technique_id = full_key.split(" - ")[0].strip()
-        except IndexError:
-            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping.")
+    plan_paths: Dict[str, str] = config.get("plan_paths", {}) or {}
+    output_dirs_map: Dict[str, str] = config.get("output_directories", {}) or {}
+    matrices = config.get("matrices", ["enterprise"])
+    filter_techniques = config.get("techniques", []) or []
+
+    # LLM behavior (mirror refiner)
+    model = config.get("model", "gemini-2.5-pro")
+    max_retries = int(config.get("max_retries", 3))
+    retry_delay = int(config.get("retry_delay", 1))
+    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
+    llm_model = config.get("llm_model")  # may be None
+    make_backup = bool(config.get("backup", True))
+    num_cores = int(config.get("num_cores", 0) or 0)  # not used here; single-core is fine
+
+    if not output_dirs_map:
+        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save playbooks.")
+        raise SystemExit(1)
+
+    # --- 2. Technique dictionary (to map technique_id ⇒ matrix) ---
+    logger.info("Building technique dictionary for ATT&CK → matrix resolution")
+    technique_dict = build_technique_dictionary(matrices)
+    tech_index = _index_attack_by_technique(technique_dict)
+
+    # --- 3. Collect Watson plan files ---
+    plan_files = _collect_plan_files(plan_paths)
+    if not plan_files:
+        logger.warning("No input plan files found in plan_paths.")
+        logger.info("Script finished.")
+        return
+
+    if filter_techniques:
+        filter_set = set(filter_techniques)
+        logger.info(f"Technique filter is active with {len(filter_set)} IDs.")
+    else:
+        filter_set = None
+
+    total = len(plan_files)
+    generated = skipped = failed = 0
+
+    for i, plan_path in enumerate(plan_files, start=1):
+        logger.info(f"[{i}/{total}] Processing plan: {plan_path}")
+
+        plan_obj = _read_json_file(plan_path)
+        if not plan_obj:
+            logger.warning(f"Skipping unreadable plan: {plan_path.name}")
+            skipped += 1
             continue
 
-        file_path = output_dir / f"{technique_id}.json"
-        if file_path.exists():
-            logger.warning(f"Plan for {technique_id} already exists at '{file_path}'. Skipping generation.")
+        ind_info = _first_indicator(plan_obj)
+        if not ind_info:
+            logger.warning(f"No indicator/technique found in plan {plan_path.name}; skipping.")
+            skipped += 1
             continue
-            
-        logger.info(f"[{i+1}/{len(target_techniques)}] Generating plan for {full_key}...")
-        
-        # Ensure the target directory exists before writing
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        tech_id = ind_info["technique_id"]
+        tech_name = ind_info["technique_name"] or tech_index.get(tech_id, {}).get("name", "")
+        tactic_id = ind_info["tactic_id"]
+        tactic_name = ind_info["tactic_name"]
+
+        if filter_set and tech_id not in filter_set:
+            logger.info(f"Technique {tech_id} not in filter list; skipping.")
+            skipped += 1
+            continue
+
+        # Determine matrix/output dir
+        matrix = tech_index.get(tech_id, {}).get("matrix", "enterprise")
+        out_dir = Path(output_dirs_map.get(matrix) or output_dirs_map.get("default", "playbooks"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{tech_id}.yml"
+        if out_path.exists():
+            logger.info(f"Playbook already exists for {tech_id} at {out_path}; skipping.")
+            skipped += 1
+            continue
+
+        # Build prompt
         prompt = (
             f"{BASE_PROMPT}\n\n"
-            f"Technique: {full_key}\n\n"
-            f"Matrix: MITRE ATT&CK for {tech_data['matrix'].upper()}\n\n"
-            f"Tactic(s): {tech_data['tactic']}\n\n"
-            f"Description: {tech_data['description']}\n\n"
-            f"Detection: {tech_data['detection']}"
+            f"Technique: {tech_id} - {tech_name}\n"
+            f"Tactic: {tactic_id} - {tactic_name}\n\n"
+            f"EXISTING ANALYTIC PLAN (JSON):\n```json\n{json.dumps(plan_obj, indent=2)}\n```\n"
+            f"Return ONLY the YAML document (no code fences, no commentary)."
         )
-        
-        # This is where you would call your actual AI model
+
         try:
-            plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+            llm_res = refine_with_llm(
+                prompt=prompt,
+                provider_pref=llm_provider,
+                model=llm_model,
+                ask_sage_client=ask_sage_client,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                gemini_primary_model=model,
+            )
         except Exception as e:
-            logger.error(f"Failed to generate plan for {full_key}: {str(e)}")
+            logger.error(f"LLM call failed for {tech_id}: {e}")
+            failed += 1
             continue
 
-        # --- Extract JSON from the raw text blob ---
-        json_str = None
-        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", plan_blob)
-        if match:
-            json_str = match.group(1).strip()
-        else:
-            start_index = -1
-            first_bracket = plan_blob.find('[')
-            first_curly = plan_blob.find('{')
-            
-            if first_bracket != -1 and first_curly != -1:
-                start_index = min(first_bracket, first_curly)
-            elif first_bracket != -1:
-                start_index = first_bracket
-            else:
-                start_index = first_curly
-
-            if start_index != -1:
-                end_index = max(plan_blob.rfind(']'), plan_blob.rfind('}'))
-                if end_index > start_index:
-                    json_str = plan_blob[start_index : end_index + 1]
-
-        if not json_str:
-            logger.error(f"Could not find a valid JSON object in the response for {full_key}. Skipping.")
+        yaml_text = _extract_yaml_blob(llm_res.get("text", ""))
+        if not yaml_text:
+            logger.error(f"Could not extract YAML for {tech_id}")
+            failed += 1
             continue
 
-        # --- Parse, add metadata, and save the file ---
+        # Optional backup of the source plan
+        if make_backup:
+            bdir = Path("backups") / f"generator_{run_ts}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / f"{tech_id}_{plan_path.name}").write_text(
+                json.dumps(plan_obj, indent=2), encoding="utf-8"
+            )
+
         try:
-            plan_data = json.loads(json_str)
-            if isinstance(plan_data, list):
-                current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                for ir_object in plan_data:
-                    ir_object["version"] = "1.0"
-                    ir_object["date_created"] = current_date_str
-                    ir_object["last_updated"] = current_date_str
-                    ir_object["contributors"] = ["Zachary Szewczyk"]
+            out_path.write_text(yaml_text, encoding="utf-8")
+            logger.info(f"Saved playbook to {out_path}")
+            generated += 1
+        except Exception as e:
+            logger.error(f"Failed to write playbook {out_path}: {e}")
+            failed += 1
 
-                try:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        json.dump(plan_data, f, indent=2)
-                    logger.info(f"Successfully saved plan for {technique_id} to '{file_path}'.")
-                except IOError as e:
-                    logger.error(f"Failed to write file for {technique_id}: {e}")
-            else:
-                logger.warning(f"Expected a list from AI for {full_key}, but got {type(plan_data)}. Skipping file write.")
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse extracted JSON for {full_key}. Error: {e}. Skipping file write.")
-            
+    logger.info(f"Generation complete. Generated: {generated} | Skipped: {skipped} | Failed: {failed}")
     logger.info("Script finished successfully.")
 
 if __name__ == "__main__":
@@ -508,6 +464,20 @@ Based on these definitions, please refine an existing analytic plan in plain, un
 Based on that format, improve an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
 """
 
+# Additional prompt for playbook refinement
+PLAYBOOK_REFINE_PROMPT = """
+You are given an existing analytic playbook in YAML. Refine it while preserving the YAML schema and improving clarity, specificity, and operational utility.
+
+Requirements:
+- Preserve the top-level keys: name, id, description, type, related, contributors, created, modified, tags, questions.
+- Keep "type" = "technique".
+- Ensure each question has: question, context, answer_sources (list), range (string), queries (list of {system, query}).
+- Keep content executable by SOC teams (SIEM/SQL/Zeek pseudo-queries are fine).
+- Avoid stylistic markup. No code fences. Return only a single YAML document.
+
+Return only the refined YAML (no commentary).
+"""
+
 # ---------------------------
 # Utilities
 # ---------------------------
@@ -605,6 +575,18 @@ def extract_json(blob: str) -> Optional[str]:
             return s[first_bracket:end_index + 1]
     return None
 
+def extract_yaml(blob: str) -> Optional[str]:
+    s = (blob or "").strip()
+    if not s:
+        return None
+    m = re.search(r"```(?:yaml|yml)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # crude heuristic
+    if ":" in s:
+        return s
+    return None
+
 def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str]]:
     max_dt = None
     max_ver = None
@@ -619,14 +601,7 @@ def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str
     return dt_iso, max_ver
 
 def _core_tag() -> str:
-    """
-    Returns a string indicating which CPU core (if detectable) and process is running this code.
-    Examples:
-      'core=11 pid=12345'
-      'pid=12345 proc=ForkProcess-1'
-    """
     pid = os.getpid()
-    # Try Linux-specific sched_getcpu()
     core = None
     try:
         core = os.sched_getcpu()  # type: ignore[attr-defined]
@@ -634,7 +609,6 @@ def _core_tag() -> str:
         core = None
     if core is not None:
         return f"core={core} pid={pid}"
-    # Fallback to process name
     try:
         proc_name = multiprocessing.current_process().name
         return f"pid={pid} proc={proc_name}"
@@ -693,7 +667,6 @@ def refine_with_llm(
             raise ValueError("Invalid/empty response from AskSage")
         return {"text": resp["message"], "endpoint": "asksage", "model_used": as_model}
 
-    # ------------ Forced mode (provider+model both set) ------------
     if provider_pref in {"gemini", "asksage"} and model:
         logger.info(f"[LLM] [{tag}] Forced LLM mode: provider={provider_pref} model={model}")
         if provider_pref == "gemini":
@@ -701,12 +674,9 @@ def refine_with_llm(
         else:
             return _call_asksage(model)
 
-    # ------------ AUTO mode (back-compat) ------------
-    # Primary: Gemini with gemini_primary_model (legacy `model`) or provided model if set
     primary_gemini_model = gemini_primary_model or (model if model else "gemini-2.5-pro")
     logger.info(f"[LLM] [{tag}] AUTO mode: try Gemini primary={primary_gemini_model}, fallback=AskSage")
 
-    # Try Gemini with exponential backoff on retriable cases
     for attempt in range(max_retries):
         try:
             return _call_gemini(primary_gemini_model)
@@ -723,7 +693,6 @@ def refine_with_llm(
             if retriable:
                 logger.error(f"[LLM] [{tag}] Gemini rate/quota: {msg}. Breaking to AskSage fallback.")
                 break
-            # backoff
             delay = retry_delay * (2 ** attempt)
             m = re.search(r'retry in (\d+(?:\.\d+)?)', msg.lower())
             if m:
@@ -737,13 +706,12 @@ def refine_with_llm(
             else:
                 logger.warning(f"[LLM] [{tag}] Gemini attempts exhausted; switching to AskSage fallback.")
 
-    # AskSage fallback (use a sensible default if none given)
     fallback_model = "google-gemini-2.5-pro"
     logger.info(f"[LLM] [{tag}] Fallback AskSage model={fallback_model}")
     return _call_asksage(fallback_model)
 
 # ---------------------------
-# Worker (picklable)
+# Worker (plans mode)
 # ---------------------------
 
 def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -754,21 +722,17 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
       - Pre-processing endpoint/model (with core/worker tag)
       - Post-processing completion with endpoint/model (with core/worker tag)
     """
-    # Light, per-process prep
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    # Monkey-patch requests verify (in worker context)
     old_request = requests.Session.request
     def new_request(self, method, url, **kwargs):
         kwargs['verify'] = False
         return old_request(self, method, url, **kwargs)
     requests.Session.request = new_request
 
-    # Ensure GEMINI key is present in worker
     gemini_api_key = job.get("gemini_api_key")
     if gemini_api_key:
         os.environ["GEMINI_API_KEY"] = gemini_api_key
 
-    # Build AskSage client in worker
     ask_sage_client = AskSageClient(
         job["sage_email"],
         job["sage_api_key"],
@@ -790,7 +754,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         else:
             output_dir = default_output_dir
 
-        # Technique ID / file path
         try:
             technique_id = full_key.split(" - ")[0].strip()
         except Exception:
@@ -802,7 +765,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"[{technique_id}] [{tag}] SKIP: plan file missing at '{file_path}'.")
             return {"technique": technique_id, "status": "missing"}
 
-        # Load existing plan
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 existing_plan = json.load(f)
@@ -813,7 +775,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"[{technique_id}] [{tag}] SKIP: read/parse error: {e}")
             return {"technique": technique_id, "status": "skip", "reason": f"read_error: {e}"}
 
-        # Skip rules
         plan_last_updated_max, plan_version_max = compute_plan_metadata(existing_plan)
 
         if job.get("skip_if_updated_after"):
@@ -828,7 +789,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"[{technique_id}] [{tag}] SKIP: version {plan_version_max} > {job['skip_if_version_gt']}.")
                 return {"technique": technique_id, "status": "skip", "reason": "version_gt"}
 
-        # Build prompt
         refine_guidance = (job.get("refine_guidance") or "").strip()
         matrix_banner = f"Matrix: MITRE ATT&CK for {tech_data.get('matrix','').upper()}"
         refine_block = (
@@ -848,13 +808,11 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
 
         prov = (job.get("llm_provider") or "auto").lower()
-        # Prefer llm_model if set; otherwise legacy `model` in auto mode
         mdl = job.get("llm_model")
-        base_model = mdl or job.get("model")  # used by auto/Gemini-primary
+        base_model = mdl or job.get("model")
 
         logger.info(f"[{technique_id}] [{tag}] START: provider={prov} model={mdl or base_model}")
 
-        # LLM call
         llm_res = refine_with_llm(
             prompt=refine_block,
             provider_pref=prov,
@@ -862,15 +820,12 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             ask_sage_client=ask_sage_client,
             max_retries=job["max_retries"],
             retry_delay=job["retry_delay"],
-            gemini_primary_model=base_model,  # legacy primary in AUTO mode
+            gemini_primary_model=base_model,
         )
 
-
-        # If fallback occurred, make it explicit at technique level too
         if llm_res["endpoint"] != "gemini":
             logger.info(f"[{technique_id}] [{tag}] INFO: fell back to endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
 
-        # Extract & parse
         json_str = extract_json(llm_res["text"])
         if not json_str:
             logger.error(f"[{technique_id}] [{tag}] FAIL: could not extract JSON from model output.")
@@ -885,7 +840,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(f"[{technique_id}] [{tag}] FAIL: JSON decode error: {e}")
             return {"technique": technique_id, "status": "fail", "reason": f"json_error: {e}"}
 
-        # Update metadata
         today_iso = job["today_iso"]
         _, base_version_max = compute_plan_metadata(existing_plan)
         new_version = increment_version(base_version_max or "1.0")
@@ -915,8 +869,8 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                     if c not in existing_c:
                         ir["contributors"].append(c)
 
-        # Backup + write
         try:
+            output_dir = Path(job["resolved_output_dir"])
             output_dir.mkdir(parents=True, exist_ok=True)
             if job["make_backup"]:
                 backups_dir = Path(job["backups_dir"])
@@ -925,6 +879,7 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 with open(backup_path, "w", encoding="utf-8") as bf:
                     json.dump(existing_plan, bf, indent=2)
 
+            file_path = Path(job["resolved_output_dir"]) / f"{technique_id}.json"
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(refined_plan, f, indent=2)
         except Exception as e:
@@ -938,18 +893,122 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"[{job.get('full_key','unknown')}] [{tag}] FAIL: unexpected error: {e}")
         return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
 
-def _parse_cli_args() -> Path:
+def _parse_cli_args() -> Tuple[Path, str]:
     parser = argparse.ArgumentParser(
-        description="Refine existing analytic plans using LLMs."
+        description="Refine existing analytic plans or analytic playbooks using LLMs."
     )
     parser.add_argument(
         "-c", "--config",
         default="config/refine.yml",
         help="Path to refine.yml (default: config/refine.yml)"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["plans", "playbooks"],
+        default=None,
+        help="Refinement mode. If omitted, uses 'mode' from config (default: plans)."
+    )
     args = parser.parse_args()
-    return Path(args.config).expanduser().resolve()
-        
+    return Path(args.config).expanduser().resolve(), (args.mode or "")
+
+# ---------------------------
+# Playbook refinement (YAML)
+# ---------------------------
+
+def _refine_one_playbook(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Refines a single playbook YAML file and writes it back.
+    """
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    old_request = requests.Session.request
+    def new_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return old_request(self, method, url, **kwargs)
+    requests.Session.request = new_request
+
+    if job.get("gemini_api_key"):
+        os.environ["GEMINI_API_KEY"] = job["gemini_api_key"]
+
+    ask_sage_client = AskSageClient(
+        job["sage_email"],
+        job["sage_api_key"],
+        user_base_url="https://api.genai.army.mil/user/",
+        server_base_url="https://api.genai.army.mil/server/",
+    )
+
+    tag = _core_tag()
+    path: Path = Path(job["file_path"])
+    try:
+        raw_yaml = path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.info(f"[{path.name}] [{tag}] SKIP: read error: {e}")
+        return {"file": str(path), "status": "skip", "reason": f"read_error: {e}"}
+
+    try:
+        pb_obj = yaml.safe_load(raw_yaml)
+        if not isinstance(pb_obj, dict) or "questions" not in pb_obj:
+            logger.info(f"[{path.name}] [{tag}] SKIP: not a playbook dict or missing 'questions'.")
+            return {"file": str(path), "status": "skip", "reason": "bad_schema"}
+    except Exception as e:
+        logger.info(f"[{path.name}] [{tag}] SKIP: parse error: {e}")
+        return {"file": str(path), "status": "skip", "reason": f"yaml_parse_error: {e}"}
+
+    refine_block = (
+        f"{PLAYBOOK_REFINE_PROMPT}\n\n"
+        f"EXISTING PLAYBOOK YAML:\n```yaml\n{raw_yaml}\n```\n\n"
+        f"Return ONLY the refined YAML (no commentary, no fences)."
+    )
+
+    prov = (job.get("llm_provider") or "auto").lower()
+    mdl = job.get("llm_model")
+    base_model = mdl or job.get("model")
+
+    logger.info(f"[{path.name}] [{tag}] START (playbook): provider={prov} model={mdl or base_model}")
+
+    llm_res = refine_with_llm(
+        prompt=refine_block,
+        provider_pref=prov,
+        model=mdl,
+        ask_sage_client=ask_sage_client,
+        max_retries=job["max_retries"],
+        retry_delay=job["retry_delay"],
+        gemini_primary_model=base_model,
+    )
+
+    ytxt = extract_yaml(llm_res.get("text", ""))
+    if not ytxt:
+        logger.error(f"[{path.name}] [{tag}] FAIL: could not extract YAML response.")
+        return {"file": str(path), "status": "fail", "reason": "no_yaml"}
+
+    # Best-effort validation
+    try:
+        refined = yaml.safe_load(ytxt)
+        if not isinstance(refined, dict) or "questions" not in refined:
+            logger.error(f"[{path.name}] [{tag}] FAIL: refined YAML not dict/has no 'questions'.")
+            return {"file": str(path), "status": "fail", "reason": "bad_refined_schema"}
+        # update modified date if present
+        today_iso = job["today_iso"]
+        refined["modified"] = today_iso
+        if "created" not in refined or not refined["created"]:
+            refined["created"] = today_iso
+        ytxt = yaml.safe_dump(refined, sort_keys=False)
+    except Exception as e:
+        logger.error(f"[{path.name}] [{tag}] FAIL: YAML validation failed: {e}")
+        return {"file": str(path), "status": "fail", "reason": f"yaml_validation: {e}"}
+
+    try:
+        backup_dir = Path(job["backups_dir"])
+        if job["make_backup"]:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            (backup_dir / f"{path.stem}_{job['run_ts']}.yml").write_text(raw_yaml, encoding="utf-8")
+        path.write_text(ytxt, encoding="utf-8")
+    except Exception as e:
+        logger.error(f"[{path.name}] [{tag}] FAIL: write error: {e}")
+        return {"file": str(path), "status": "fail", "reason": f"write_error: {e}"}
+
+    logger.info(f"[{path.name}] [{tag}] DONE (playbook): endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+    return {"file": str(path), "status": "ok", "endpoint": llm_res["endpoint"], "model_used": llm_res["model_used"]}
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -983,31 +1042,122 @@ def main():
         raise ValueError("Invalid JSON format in the credentials file: ./credentials.json")
 
     # --- 1. Config ---
-    cfg_path = _parse_cli_args()
+    cfg_path, cli_mode = _parse_cli_args()
     logger.info(f"Loading configuration from: {cfg_path}")
     config = load_config(cfg_path)
 
+    mode = (cli_mode or config.get("mode") or "plans").strip().lower()
+    logger.info(f"Refiner mode: {mode}")
 
+    # Shared knobs
+    max_retries = int(config.get("max_retries", 3))
+    retry_delay = int(config.get("retry_delay", 1))
+    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
+    llm_model = config.get("llm_model")  # may be None
+    model = config.get("model", "gemini-2.5-pro")
+    make_backup = bool(config.get("backup", True))
+    num_cores = config.get("num_cores", 0)
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    backups_dir = Path("backups") / f"refiner_{run_ts}"
+
+    if mode == "playbooks":
+        # Gather playbook files from config
+        pmap = config.get("playbook_directories", {}) or {}
+        files: List[Path] = []
+        for k, v in pmap.items():
+            d = Path(v)
+            if d.is_dir():
+                found = sorted(d.glob("*.yml"))
+                logger.info(f"Playbook dir [{k}] {d} -> {len(found)} file(s)")
+                files.extend(found)
+            else:
+                logger.warning(f"Configured playbook directory missing [{k}]: {d}")
+
+        if not files:
+            logger.warning("No playbook files found to refine.")
+            logger.info("Script finished.")
+            return
+
+        # Normalize workers
+        try:
+            if num_cores is None:
+                workers = 1
+            else:
+                workers = int(num_cores)
+        except Exception:
+            workers = 1
+        max_cpu = os.cpu_count() or 1
+        workers = max(1, min(workers, max_cpu))
+
+        jobs = []
+        for f in files:
+            jobs.append({
+                "file_path": str(f),
+                "today_iso": today_iso,
+                "run_ts": run_ts,
+                "backups_dir": str(backups_dir),
+                "make_backup": make_backup,
+                "llm_provider": llm_provider,
+                "llm_model": llm_model,
+                "model": model,
+                "max_retries": max_retries,
+                "retry_delay": retry_delay,
+                "sage_email": sage_email,
+                "sage_api_key": sage_api_key,
+                "gemini_api_key": gemini_api_key,
+            })
+
+        ok = skip = fail = 0
+        tag = _core_tag()
+        if workers <= 1:
+            logger.info(f"[MAIN {tag}] Running in single-core mode (playbooks).")
+            for jb in jobs:
+                res = _refine_one_playbook(jb)
+                st = res.get("status")
+                if st == "ok":
+                    ok += 1
+                elif st == "skip":
+                    skip += 1
+                else:
+                    fail += 1
+                logger.info(f"[MAIN {tag}] {res.get('file')}: {st}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+        else:
+            logger.info(f"[MAIN {tag}] Running in multi-core mode (playbooks) with {workers} workers.")
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_refine_one_playbook, jb): jb for jb in jobs}
+                for fut in as_completed(futs):
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        logger.error(f"[MAIN {tag}] Worker crashed: {e}")
+                        fail += 1
+                        continue
+                    st = res.get("status")
+                    if st == "ok":
+                        ok += 1
+                    elif st == "skip":
+                        skip += 1
+                    else:
+                        fail += 1
+                    logger.info(f"[MAIN {tag}] {res.get('file')}: {st}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+        logger.info(f"[MAIN {tag}] Playbook refinement done. OK: {ok} | Skip: {skip} | Fail: {fail}")
+        logger.info("[MAIN] Script finished successfully.")
+        return
+
+    # ---------------- Plans mode (existing behavior) ----------------
     output_dirs_map = config.get("output_directories", {})
     default_output_dir = Path(output_dirs_map.get("default", "techniques"))
     matrices = config.get("matrices", ["enterprise"])
     filter_techniques = config.get("techniques", [])
-    model = config.get("model", "gemini-2.5-flash")
     refine_guidance = config.get("refine_guidance", "").strip()
     skip_if_updated_after = config.get("skip_if_updated_after")
     skip_if_version_gt = config.get("skip_if_version_gt")
-    make_backup = bool(config.get("backup", True))
-    max_retries = int(config.get("max_retries", 3))
-    retry_delay = int(config.get("retry_delay", 1))
-    num_cores = config.get("num_cores", 0)
-    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
-    llm_model = config.get("llm_model")  # may be None
 
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
         raise SystemExit(1)
 
-    # --- 2. Techniques ---
     logger.info("Building technique dictionary")
     technique_dict = build_technique_dictionary(matrices)
 
@@ -1020,17 +1170,20 @@ def main():
 
     logger.info(f"Will attempt to refine plans for up to {len(target_techniques)} techniques (existing files only).")
 
-    # --- 3. Prep jobs ---
-    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    backups_dir = Path("backups") / f"refiner_{run_ts}"
-
     jobs: List[Dict[str, Any]] = []
     for full_key, tech_data in target_techniques.items():
+        matrix_type = tech_data.get("matrix")
+        if matrix_type and matrix_type in output_dirs_map:
+            resolved_output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            resolved_output_dir = default_output_dir
+
         jobs.append({
             "full_key": full_key,
             "tech_data": tech_data,
             "output_dirs_map": output_dirs_map,
             "default_output_dir": str(default_output_dir),
+            "resolved_output_dir": str(resolved_output_dir),
             "refine_guidance": refine_guidance,
             "max_retries": max_retries,
             "retry_delay": retry_delay,
@@ -1045,13 +1198,11 @@ def main():
             "gemini_api_key": gemini_api_key,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
-            "model": model, # keep existing for back-compat in auto mode:
+            "model": model,
         })
 
-    # --- 4. Execute (single-core or multi-core) ---
     refined_count = skipped_count = missing_count = failed_count = 0
 
-    # Normalize num_cores
     try:
         if num_cores is None:
             num_workers = 1
@@ -1075,7 +1226,6 @@ def main():
                 missing_count += 1
             else:
                 failed_count += 1
-            # Consolidated per-technique summary line (includes main/core tag for single-core clarity)
             logger.info(f"[MAIN {main_tag}] {res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
     else:
         max_cpu = os.cpu_count() or 1
@@ -1108,7 +1258,6 @@ if __name__ == "__main__":
     main()
 
 
-
 ================================================
 FILE: sherlock.py
 ================================================
@@ -1116,6 +1265,7 @@ FILE: sherlock.py
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Any
 
 import pandas as pd
 import yaml
@@ -1126,15 +1276,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Import local modules
 from src.colorlog import make_console_handler
-from src.formatting import export_simple_excel, export_with_merged_cells
-from src.processing import build_asom, format_asom, renumber_formatted_df
 
 def setup_logging() -> tuple[str, Path]:
     """Initializes console and file logging."""
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"{run_ts}.log"
+    log_path = logs_dir / f"sherlock_{run_ts}.log"
 
     fmt = "%(asctime)s %(levelname)-8s %(name)s :: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -1153,107 +1301,156 @@ def setup_logging() -> tuple[str, Path]:
 
     return run_ts, log_path
 
-def load_config(path: Path) -> dict:
-    """Loads and validates the YAML configuration file."""
-    logger = logging.getLogger("config")
-    if not path.exists():
-        logger.critical(f"Configuration file not found at '{path}'. Exiting.")
-        raise SystemExit(1)
-    
-    with open(path, "r", encoding="utf-8") as f:
-        try:
-            config = yaml.safe_load(f)
-            logger.info(f"Successfully loaded configuration from '{path}'.")
-            return config
-        except yaml.YAMLError as e:
-            logger.critical(f"Error parsing YAML configuration: {e}")
-            raise SystemExit(1)
+def _discover_playbooks(base_map: Dict[str, str]) -> List[Path]:
+    files: List[Path] = []
+    for k, v in (base_map or {}).items():
+        d = Path(v)
+        if d.is_dir():
+            found = sorted(d.glob("*.yml"))
+            logging.getLogger("main").info(f"Playbook dir [{k}] {d} -> {len(found)} file(s)")
+            files.extend(found)
+        else:
+            logging.getLogger("main").warning(f"Configured playbook directory missing [{k}]: {d}")
+    return files
+
+def _load_playbook(path: Path) -> Dict[str, Any] | None:
+    try:
+        txt = path.read_text(encoding="utf-8")
+        obj = yaml.safe_load(txt)
+        if isinstance(obj, dict) and "questions" in obj:
+            return obj
+        return None
+    except Exception as e:
+        logging.getLogger("main").warning(f"Failed to parse playbook {path}: {e}")
+        return None
+
+def _flatten_playbooks(files: List[Path]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for p in files:
+        obj = _load_playbook(p)
+        if not obj:
+            continue
+        name = obj.get("name", "")
+        pid = obj.get("id", "")
+        desc = obj.get("description", "")
+        ptype = obj.get("type", "")
+        created = obj.get("created", "")
+        modified = obj.get("modified", "")
+        tags = obj.get("tags", []) or []
+        tags_str = "; ".join([str(t) for t in tags])
+
+        related = obj.get("related", []) or []
+        related_str = "; ".join([str(r) for r in related])
+
+        contributors = obj.get("contributors", []) or []
+        contributors_str = "; ".join([str(c) for c in contributors])
+
+        qlist = obj.get("questions", []) or []
+        if not isinstance(qlist, list) or not qlist:
+            # still emit a row to track the playbook header
+            rows.append({
+                "Playbook Name": name,
+                "Playbook ID": pid,
+                "Type": ptype,
+                "Created": created,
+                "Modified": modified,
+                "Contributors": contributors_str,
+                "Related": related_str,
+                "Tags": tags_str,
+                "Question #": "",
+                "Question": "",
+                "Context": "",
+                "Answer Sources": "",
+                "Range": "",
+                "Queries": "",
+                "File": str(p),
+            })
+            continue
+
+        for idx, q in enumerate(qlist, start=1):
+            question = (q or {}).get("question", "")
+            context = (q or {}).get("context", "")
+            ans_sources = (q or {}).get("answer_sources", []) or []
+            ans_sources_str = "; ".join([str(s) for s in ans_sources])
+            rng = (q or {}).get("range", "")
+            queries = (q or {}).get("queries", []) or []
+            if isinstance(queries, list):
+                queries_str = "; ".join(
+                    [f"{str(d.get('system',''))}: {str(d.get('query',''))}" if isinstance(d, dict) else str(d)
+                     for d in queries]
+                )
+            else:
+                queries_str = str(queries)
+
+            rows.append({
+                "Playbook Name": name,
+                "Playbook ID": pid,
+                "Type": ptype,
+                "Created": created,
+                "Modified": modified,
+                "Contributors": contributors_str,
+                "Related": related_str,
+                "Tags": tags_str,
+                "Question #": idx,
+                "Question": question,
+                "Context": context,
+                "Answer Sources": ans_sources_str,
+                "Range": rng,
+                "Queries": queries_str,
+                "File": str(p),
+            })
+
+    cols = [
+        "Playbook Name","Playbook ID","Type","Created","Modified","Contributors",
+        "Related","Tags","Question #","Question","Context","Answer Sources","Range","Queries","File"
+    ]
+    return pd.DataFrame(rows, columns=cols)
 
 def main():
-    """Main script execution."""
+    """Aggregate and export Sherlock playbooks to Excel."""
     run_ts, log_path = setup_logging()
     logger = logging.getLogger("main")
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
-    # --- 1. Load Configuration ---
-    config = load_config(Path("config/asom.yml"))
-    detect_chain = config.get("detect_chain", {})
-    attack_chain = config.get("attack_chain", {})
-    plan_dirs_config = config.get("analytic_plan_dirs", {})
-    plan_dirs_list = [Path(p) for p in plan_dirs_config.values() if p]
-    output_dir = Path(config.get("output_dir", "."))
-    output_basename = config.get("output_basename", "asom_report")
-    column_widths = config.get("column_widths_pixels", {})
-    output_columns = config.get("output_columns", [])
-    
-    output_dir.mkdir(exist_ok=True, parents=True)
-
-    if not plan_dirs_list:
-        logger.critical("Configuration key 'analytic_plan_dirs' is empty or not found. No directories to process.")
+    # We load generator.yml to discover where playbooks are written
+    cfg_path = Path("config/generator.yml")
+    if not cfg_path.exists():
+        logger.critical("Missing config/generator.yml; cannot discover playbook directories.")
         return
 
-    if not detect_chain and not attack_chain:
-        logger.warning("Both 'detect_chain' and 'attack_chain' are empty in the config. No data to process.")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        gen_cfg = yaml.safe_load(f) or {}
+
+    playbook_dirs = gen_cfg.get("output_directories", {}) or {}
+    if not playbook_dirs:
+        logger.critical("'output_directories' is missing in config/generator.yml.")
+        return
+
+    files = _discover_playbooks(playbook_dirs)
+    if not files:
+        logger.warning("No playbooks found. Nothing to export.")
         logger.info("Script finished.")
         return
 
-    # --- 2. Build Raw ASOM Data ---
-    logger.info(f"Building ASOM from {len(plan_dirs_list)} specified analytic plan directories...")
-    raw_asom = build_asom(
-        detect_chain=detect_chain,
-        attack_chain=attack_chain,
-        directories=plan_dirs_list
-    )
-    if not raw_asom:
-        logger.warning("ASOM generation resulted in no data. Check chains and input files.")
+    df = _flatten_playbooks(files)
+    if df.empty:
+        logger.warning("Parsed 0 rows from playbooks.")
         logger.info("Script finished.")
         return
-    logger.info(f"Successfully built raw ASOM with {len(raw_asom)} information requirements.")
 
-    # --- 3. Format, Renumber, and Filter DataFrame ---
-    logger.info("Formatting ASOM data into a DataFrame...")
-    formatted_df = format_asom(raw_asom)
-    logger.info("Re-sorting and re-numbering DataFrame indices...")
-    final_df = renumber_formatted_df(formatted_df)
-
-    def _apply_output_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-        if not columns:
-            return df
-        # Preserve order and drop unknowns with a warning
-        present = [c for c in columns if c in df.columns]
-        missing = [c for c in columns if c not in df.columns]
-        if missing:
-            logging.getLogger("main").warning(
-                f"'output_columns' includes unknown columns; ignoring: {missing}"
-            )
-        if not present:
-            logging.getLogger("main").warning(
-                "'output_columns' resolved to an empty set of valid columns. All columns will be exported."
-            )
-            return df
-        return df[present]
-
-    # Apply output_columns to BOTH Excel outputs
-    final_df_filtered = _apply_output_columns(final_df, output_columns)
-
-    logger.info(
-        f"Processing complete. Final DataFrame has {len(final_df_filtered)} rows and "
-        f"{len(final_df_filtered.columns)} columns (after output_columns filter)."
-    )
-
-    # --- 4. Export to Excel ---
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
     ts_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_xlsx = out_dir / f"playbooks_{ts_suffix}.xlsx"
+    out_csv = out_dir / f"playbooks_{ts_suffix}.csv"
 
-    # Simple Excel export (filtered)
-    simple_excel_path = output_dir / f"{output_basename}_{ts_suffix}.xlsx"
-    logger.info(f"Exporting standard Excel file to: {simple_excel_path}")
-    export_simple_excel(final_df_filtered, simple_excel_path, column_widths_pixels=column_widths)
+    logger.info(f"Writing Excel: {out_xlsx}")
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Playbooks")
 
-    # Hierarchical/Merged Excel export (filtered as well)
-    hier_excel_path = output_dir / f"{output_basename}_merged_{ts_suffix}.xlsx"
-    logger.info(f"Exporting Excel file with merged cells to: {hier_excel_path}")
-    export_with_merged_cells(final_df_filtered, hier_excel_path, column_widths_pixels=column_widths)
-    
+    logger.info(f"Writing CSV: {out_csv}")
+    df.to_csv(out_csv, index=False)
+
     logger.info("Script finished successfully.")
 
 if __name__ == "__main__":
@@ -1297,7 +1494,7 @@ matrices:
 techniques:
   # - "T0817"
   # - "T0846"
-  # - "T0882"
+  - "T0882"
 
 model: "gemini-2.5-pro"
 
@@ -1333,7 +1530,12 @@ num_cores: 8
 ================================================
 FILE: config/refine.yml
 ================================================
-# Output directories for each matrix (align these with your existing generator.yml)
+# Mode: choose whether to refine Watson-style plans (JSON) or Sherlock playbooks (YAML)
+# Valid values: plans, playbooks
+mode: playbooks
+
+# ----- Plans mode (legacy Watson plan refinement) -----
+# Output directories for each matrix (align these with your existing generator for plans)
 output_directories:
   default: techniques
   enterprise: techniques/attack/enterprise
@@ -1351,28 +1553,31 @@ techniques:
   # - T0800
   # - T1078
   # - T1671
-  
-# Primary model (Gemini) used for refinement
-model: gemini-2.5-pro
 
-# Guidance appended to the prompt that the model MUST apply during refinement.
+# Guidance appended to the prompt that the model MUST apply during refinement (plans mode only).
 refine_guidance: |
-  * Improve evidence descriptions to be measurable and testable; avoid vague phrasing. This is the concrete information that supports or refutes an indicator.
-  * Ensure data sources list precise artifacts (e.g., "Windows Event ID 4624", "Zeek conn.log", "Zeek dns.log"). Focus on Windows and Zeek logging where possible, but you may also account for other normal logging sources.
-  * When developing actions, include at least three concrete detection methods that include, at a minimum, one symbolic logic (such as an IOC match), one statistical method (such as a percentile threshold), and machine learning application (such as classification or time series analysis) as distinct list elements in the JSON structure.
-  * Ensure every action is executable by a SOC analyst using common tools (SIEM/SQL/Zeek), stated as logical, stepwise imperatives.
-  * Add NAIs that reflect where the data actually resides for this technique/tactic across the selected matrix (enterprise/ICS/mobile), with a typical enterprise network in mind.
+  * Improve evidence descriptions to be measurable and testable; avoid vague phrasing.
+  * Ensure data sources list precise artifacts (e.g., "Windows Event ID 4624", "Zeek conn.log", "Zeek dns.log").
+  * Include at least one symbolic, one statistical, and one ML-oriented action where reasonable. Improve existing  
+  * Keep actions executable by SOC analysts; be explicit but concise.
   * Do not remove required fields; preserve the top-level array-of-objects JSON schema.
-  * Generally, do not remove information from the existing plan, just add to and improve it.
-  * Do not use any styling such as bold or italics in your plan.
 
-# Skip rules (optional)
+# Skip rules (plans mode only)
 skip_if_updated_after: null   # e.g., "2025-09-01" or null to disable
 skip_if_version_gt: null      # e.g., "1.2" or null to disable
+
+# ----- Playbooks mode (Sherlock) -----
+# Directories containing Sherlock playbooks to refine
+playbook_directories:
+  enterprise: playbooks/attack/enterprise
+  ics: playbooks/attack/ics
+  mobile: playbooks/attack/mobile
+  default: playbooks/misc
 
 # File safety
 backup: true
 
+# LLM provider selection
 # # Force Gemini only:
 # llm_provider: gemini
 # llm_model: gemini-2.5-pro
@@ -1384,6 +1589,9 @@ llm_model: google-gemini-2.5-pro
 # # Auto (legacy behavior):
 # llm_provider: auto
 # llm_model: null
+
+# Primary model (Gemini family) to try first in AUTO mode
+model: gemini-2.5-pro
 
 # LLM call behavior
 max_retries: 3
@@ -1792,6 +2000,81 @@ def _merge_spans(
             prev_key = cur_key
     # flush last span
     flush_span(start, len(df) - 1)
+
+
+
+================================================
+FILE: src/llm.py
+================================================
+# src/llm.py
+import logging, os, re, time
+from typing import Dict, Optional
+from google import genai
+from google.genai import types, errors
+
+logger = logging.getLogger(__name__)
+
+def refine_with_llm(
+    prompt: str,
+    ask_sage_client,
+    *,
+    provider_pref: Optional[str],
+    model: Optional[str],
+    max_retries: int = 3,
+    retry_delay: int = 1,
+    gemini_primary_model: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Shared LLM call surface. Returns:
+      {"text": <output>, "endpoint": "gemini" | "asksage", "model_used": <name>}
+    """
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError("Prompt must be a non-empty string")
+
+    def _call_gemini(gem_model: str) -> Dict[str, str]:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not set")
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=gem_model,
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+            config=types.GenerateContentConfig(temperature=0.7),
+        )
+        if not resp or not getattr(resp, "text", None):
+            raise ValueError("Invalid/empty response from Gemini")
+        return {"text": resp.text, "endpoint": "gemini", "model_used": gem_model}
+
+    def _call_asksage(as_model: str) -> Dict[str, str]:
+        resp = ask_sage_client.query(
+            prompt, persona="default", dataset="none",
+            limit_references=0, temperature=0.7, live=0,
+            model=as_model, system_prompt=None,
+        )
+        if not resp or not isinstance(resp, dict) or not resp.get("message"):
+            raise ValueError("Invalid/empty response from AskSage")
+        return {"text": resp["message"], "endpoint": "asksage", "model_used": as_model}
+
+    if provider_pref in {"gemini", "asksage"} and model:
+        return _call_gemini(model) if provider_pref == "gemini" else _call_asksage(model)
+
+    primary_gemini_model = gemini_primary_model or (model if model else "gemini-2.5-pro")
+    for attempt in range(max_retries):
+        try:
+            return _call_gemini(primary_gemini_model)
+        except (errors.ClientError, errors.APIError, ValueError) as e:
+            msg = str(e); code = getattr(e, "status_code", None)
+            retriable = code == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower() or "rate" in msg.lower()
+            if retriable:
+                break
+            delay = retry_delay * (2 ** attempt)
+            m = re.search(r'retry in (\d+(?:\.\d+)?)', msg.lower())
+            if m:
+                try: delay = min(float(m.group(1)) + 1, 120)
+                except: pass
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+    return _call_asksage("google-gemini-2.5-pro")
 
 
 
