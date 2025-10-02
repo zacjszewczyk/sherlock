@@ -14,22 +14,21 @@ logger = logging.getLogger(__name__)
 logger.info("Importing built-in modules.")
 import json
 from datetime import datetime, timezone
-import base64
 import os
 import re
 import requests
 import urllib3
 import time  # Added for retry delays
+import argparse
+from typing import Any, Dict, List, Optional
 
 logger.info("Importing installed modules")
 from asksageclient import AskSageClient
-from google import genai
-from google.genai import types
-from google.genai import errors  # Added for proper exception handling
 import yaml
 
 logger.info("Importing project-specific modules.")
 from src.attack_retriever import build_technique_dictionary
+from refiner import refine_with_llm  # Reuse the LLM interaction pattern
 
 BASE_PROMPT = """
 I need you to generate an analytic playbook. The analytic playbook consists of the following components in a YAML format:
@@ -52,6 +51,10 @@ I need you to generate an analytic playbook. The analytic playbook consists of t
 
 Note that you must output a distinct "question", "context", "answer_sources", "range", and "queries" series for each distinct action in the analytic plan. Based on these definitions, please generate an analytic playbook in plain, unstyled text in the YAML format based on the analytic plan below. 
 """
+
+# ---------------------------
+# Utilities
+# ---------------------------
 
 def setup_logging() -> tuple[str, Path]:
     """Initializes console and file logging."""
@@ -90,203 +93,122 @@ def load_config(path: Path) -> dict:
             logger.critical(f"Error parsing YAML configuration: {e}")
             raise SystemExit(1)
 
-def generate_analytic_plan(prompt, model, ask_sage_client, max_retries=3, retry_delay=1):    
-    # Validate inputs
-    if not prompt or not isinstance(prompt, str):
-        raise ValueError("Prompt must be a non-empty string")
-    
-    if not model or not isinstance(model, str):
-        raise ValueError("Model must be a non-empty string")
-    
-    # Primary attempt with Gemini
-    for attempt in range(max_retries):
-        try:
-            # Initialize Gemini client with API key
-            api_key = os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning("GEMINI_API_KEY not found in environment variables")
-                raise ValueError("GEMINI_API_KEY environment variable is not set")
-            
-            client = genai.Client(api_key=api_key)
-            
-            # Generate content using Gemini
-            response = client.models.generate_content(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=prompt),
-                        ],
-                    ),
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    # max_output_tokens=2048,
-                    # top_p=0.95,
-                    # top_k=40,
-                ),
-            )
-            
-            # Validate response
-            if response and hasattr(response, 'text'):
-                logger.info(f"Successfully generated response using {model}")
-                return response.text
-            else:
-                logger.warning("Response received but no text content found")
-                raise ValueError("Invalid response format from Gemini")
-                
-        except (errors.ClientError, errors.APIError) as e:
-            # Handle Google API errors including rate limiting
-            error_message = str(e)
-            error_code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
-            
-            # Check for rate limiting (429 status code or quota-related messages)
-            if (error_code == 429 or 
-                "429" in error_message or 
-                "RESOURCE_EXHAUSTED" in error_message or
-                "quota" in error_message.lower() or 
-                "rate" in error_message.lower()):
-                logger.error(f"Google API error: {error_message}")
-                logger.info("Attempting to use AskSage backup model due to API error")
-                break
-            else:
-                logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}): {error_message}")
-                
-                # Try to extract retry delay from error message
-                retry_after = retry_delay * (2 ** attempt)  # Default exponential backoff
-                
-                # Look for specific retry delay in error message
-                import re
-                retry_match = re.search(r'retry in (\d+(?:\.\d+)?)', error_message.lower())
-                if retry_match:
-                    suggested_delay = float(retry_match.group(1))
-                    retry_after = min(suggested_delay + 1, 120)  # Cap at 2 minutes
-                    logger.info(f"Using suggested retry delay: {retry_after} seconds")
-                
-                if attempt < max_retries - 1:
-                    logger.info(f"Waiting {retry_after} seconds before retry...")
-                    time.sleep(retry_after)
-                    continue
-                else:
-                    logger.info("All Gemini retries exhausted, falling back to AskSage backup model")
-                    break
-    
-    # Fallback to AskSage backup model
+def _parse_cli_args() -> Path:
+    ap = argparse.ArgumentParser(description="Generate analytic playbooks from Watson plans.")
+    ap.add_argument(
+        "-c", "--config",
+        default="config/generator.yml",
+        help="Path to generator.yml (default: config/generator.yml)"
+    )
+    args = ap.parse_args()
+    return Path(args.config).expanduser().resolve()
+
+def _read_json_file(path: Path) -> Optional[Any]:
     try:
-        logger.info("Using AskSage backup model: google-gemini-2.5-pro")
-        
-        # Validate ask_sage_client
-        if not ask_sage_client:
-            raise ValueError("ask_sage_client is not initialized")
-        
-        response = ask_sage_client.query(
-            prompt,
-            persona="default",
-            dataset="none",
-            limit_references=0,
-            temperature=0.7,  # Match the temperature from primary model
-            live=0,
-            model="google-gemini-2.5-pro",
-            system_prompt=None
-        )
-        
-        # Validate response structure
-        if not response or not isinstance(response, dict):
-            raise ValueError("Invalid response from AskSage API")
-        
-        if 'message' not in response:
-            logger.error(f"Response missing 'message' field: {response}")
-            raise ValueError("Response from AskSage API does not contain 'message' field")
-        
-        message = response['message']
-        
-        if not message:
-            raise ValueError("Empty message received from AskSage API")
-        
-        logger.info("Successfully generated response using AskSage backup model")
-        return message
-        
+        text = path.read_text(encoding="utf-8").strip()
+        if text.startswith("```"):
+            # Strip markdown fence if present
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
     except Exception as e:
-        logger.error(f"Backup model also failed: {str(e)}")
-        raise Exception(f"Both primary and backup models failed. Last error: {str(e)}")
+        logger.warning(f"Failed to read/parse JSON from {path}: {e}")
+        return None
+
+def _extract_yaml_blob(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    # Prefer fenced
+    m = re.search(r"```(?:yaml|yml)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Otherwise return whole thing if it looks YAML-ish
+    if ":" in s:
+        return s
+    return None
+
+def _collect_plan_files(plan_paths: Dict[str, str]) -> List[Path]:
+    files = []
+    for k, v in (plan_paths or {}).items():
+        p = Path(v)
+        if p.is_dir():
+            cand = sorted(p.glob("*.json"))
+            logger.info(f"Plan dir [{k}] {p} -> {len(cand)} file(s)")
+            files.extend(cand)
+        else:
+            logger.warning(f"Plan path [{k}] {p} is not a directory; skipping.")
+    return files
+
+def _index_attack_by_technique(technique_dict: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    out = {}
+    for full_key, meta in technique_dict.items():
+        tid = meta.get("technique_id")
+        if tid and tid not in out:
+            out[tid] = {"matrix": meta.get("matrix"), "name": meta.get("name"), "tactic": meta.get("tactic", "")}
+    return out
+
+def _first_indicator(plan_obj: Any) -> Optional[Dict[str, str]]:
+    """
+    Given a Watson plan (list of IR objects), try to extract a representative technique_id/name and tactic info.
+    """
+    if not isinstance(plan_obj, list):
+        return None
+    for ir in plan_obj:
+        inds = ir.get("indicators") if isinstance(ir, dict) else None
+        if isinstance(inds, list):
+            for ind in inds:
+                tid = (ind or {}).get("technique_id", "").strip()
+                name = (ind or {}).get("name", "").strip()
+                if tid:
+                    return {
+                        "technique_id": tid,
+                        "technique_name": name,
+                        "tactic_id": (ir or {}).get("tactic_id", "").strip(),
+                        "tactic_name": (ir or {}).get("tactic_name", "").strip(),
+                    }
+    return None
+
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
-    """Main script execution."""
-    
+    """Main script execution: read Watson plans ⇒ generate Sherlock playbooks (YAML)."""
     run_ts, log_path = setup_logging()
     logger.info(f"Run initialized at: {run_ts} | Logging to: {log_path}")
 
-    # --- 0. Instantiate models ---
-
+    # --- 0. Load keys for providers (same behavior as refiner.py) ---
     logger.info("Loading Gemini API key")
     try:
         with open(".GEMINI_API_KEY", "r") as fd:
             os.environ["GEMINI_API_KEY"] = fd.read().strip()
-    except:
+    except Exception:
         logger.info("Failed to import Gemini API key")
-    
+
     logger.info("Loading Sage API key")
     try:
         with open("./credentials.json", "r") as file:
             credentials = json.load(file)
-            # Validate required keys
             if 'credentials' not in credentials or 'api_key' not in credentials['credentials']:
                 logger.error("Missing required keys in the credentials file.")
                 raise
-    
-        # Extract the API key and email from the credentials
         sage_api_key = credentials['credentials']['api_key']
         sage_email = credentials['credentials']['Ask_sage_user_info']['username']
     except FileNotFoundError:
         raise FileNotFoundError(f"Credentials file not found at ./credentials.json")
     except json.JSONDecodeError:
         raise ValueError(f"Invalid JSON format in the credentials file: ./credentials.json")
-    
-    # --- 1. Load Configuration ---
-    logger.info("Loading configuration")
-    config = load_config(Path("config/generator.yml"))
-    output_dirs_map = config.get("output_directories", {})
-    default_output_dir = Path(output_dirs_map.get("default", "techniques"))
-    matrices = config.get("matrices", ["enterprise"])
-    filter_techniques = config.get("techniques", [])
-    model = config.get("model", "gemini-2.5-flash")
 
-    if not output_dirs_map:
-        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
-        raise SystemExit(1)
-
-    # --- 2. Build Technique Dictionary ---
-    logger.info("Building technique dictionary")
-    technique_dict = build_technique_dictionary(matrices)
-    
-    target_techniques = {}
-    if filter_techniques:
-        logger.info(f"Filtering for {len(filter_techniques)} specific techniques from config.")
-        for full_key, tech_data in technique_dict.items():
-            if tech_data['technique_id'] in filter_techniques:
-                target_techniques[full_key] = tech_data
-    else:
-        logger.info("Processing all available techniques from selected matrices.")
-        target_techniques = technique_dict
-    
-    logger.info(f"Will generate analytic plans for {len(target_techniques)} techniques.")
-
-    # --- 3. Instantiate Sage client ---
-    logger.info("Instantiating Sage client")
-    # Disable SSL warnings
+    # Disable SSL warnings (matches refiner)
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-    # Monkey-patch requests to disable SSL verification globally
     old_request = requests.Session.request
-    
     def new_request(self, method, url, **kwargs):
         kwargs['verify'] = False
         return old_request(self, method, url, **kwargs)
-    
     requests.Session.request = new_request
 
-    # Now create your client
+    # Build AskSage client (same base URLs as refiner)
     ask_sage_client = AskSageClient(
         sage_email, 
         sage_api_key, 
@@ -294,100 +216,132 @@ def main():
         server_base_url="https://api.genai.army.mil/server/"
     )
 
-    # --- 4. Generate and Save Analytic Plans ---
-    logger.info("Generating analytic plans")
-    for i, (full_key, tech_data) in enumerate(target_techniques.items()):
-        
-        # --- Determine the correct output directory for this technique ---
-        matrix_type = tech_data.get('matrix')
-        if matrix_type and matrix_type in output_dirs_map:
-            output_dir = Path(output_dirs_map[matrix_type])
-        else:
-            logger.warning(f"No output directory specified for matrix '{matrix_type}'. Using default: '{default_output_dir}'")
-            output_dir = default_output_dir
+    # --- 1. Load Configuration ---
+    cfg_path = _parse_cli_args()
+    logger.info(f"Loading configuration from: {cfg_path}")
+    config = load_config(cfg_path)
 
-        # --- Extract Technique ID and check if file already exists ---
-        try:
-            technique_id = full_key.split(" - ")[0].strip()
-        except IndexError:
-            logger.error(f"Could not parse technique ID from key '{full_key}'. Skipping.")
+    plan_paths: Dict[str, str] = config.get("plan_paths", {}) or {}
+    output_dirs_map: Dict[str, str] = config.get("output_directories", {}) or {}
+    matrices = config.get("matrices", ["enterprise"])
+    filter_techniques = config.get("techniques", []) or []
+
+    # LLM behavior (mirror refiner)
+    model = config.get("model", "gemini-2.5-pro")
+    max_retries = int(config.get("max_retries", 3))
+    retry_delay = int(config.get("retry_delay", 1))
+    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
+    llm_model = config.get("llm_model")  # may be None
+    make_backup = bool(config.get("backup", True))
+    num_cores = int(config.get("num_cores", 0) or 0)  # not used here; single-core is fine
+
+    if not output_dirs_map:
+        logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save playbooks.")
+        raise SystemExit(1)
+
+    # --- 2. Technique dictionary (to map technique_id ⇒ matrix) ---
+    logger.info("Building technique dictionary for ATT&CK → matrix resolution")
+    technique_dict = build_technique_dictionary(matrices)
+    tech_index = _index_attack_by_technique(technique_dict)
+
+    # --- 3. Collect Watson plan files ---
+    plan_files = _collect_plan_files(plan_paths)
+    if not plan_files:
+        logger.warning("No input plan files found in plan_paths.")
+        logger.info("Script finished.")
+        return
+
+    if filter_techniques:
+        filter_set = set(filter_techniques)
+        logger.info(f"Technique filter is active with {len(filter_set)} IDs.")
+    else:
+        filter_set = None
+
+    total = len(plan_files)
+    generated = skipped = failed = 0
+
+    for i, plan_path in enumerate(plan_files, start=1):
+        logger.info(f"[{i}/{total}] Processing plan: {plan_path}")
+
+        plan_obj = _read_json_file(plan_path)
+        if not plan_obj:
+            logger.warning(f"Skipping unreadable plan: {plan_path.name}")
+            skipped += 1
             continue
 
-        file_path = output_dir / f"{technique_id}.json"
-        if file_path.exists():
-            logger.warning(f"Plan for {technique_id} already exists at '{file_path}'. Skipping generation.")
+        ind_info = _first_indicator(plan_obj)
+        if not ind_info:
+            logger.warning(f"No indicator/technique found in plan {plan_path.name}; skipping.")
+            skipped += 1
             continue
-            
-        logger.info(f"[{i+1}/{len(target_techniques)}] Generating plan for {full_key}...")
-        
-        # Ensure the target directory exists before writing
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        tech_id = ind_info["technique_id"]
+        tech_name = ind_info["technique_name"] or tech_index.get(tech_id, {}).get("name", "")
+        tactic_id = ind_info["tactic_id"]
+        tactic_name = ind_info["tactic_name"]
+
+        if filter_set and tech_id not in filter_set:
+            logger.info(f"Technique {tech_id} not in filter list; skipping.")
+            skipped += 1
+            continue
+
+        # Determine matrix/output dir
+        matrix = tech_index.get(tech_id, {}).get("matrix", "enterprise")
+        out_dir = Path(output_dirs_map.get(matrix) or output_dirs_map.get("default", "playbooks"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{tech_id}.yml"
+        if out_path.exists():
+            logger.info(f"Playbook already exists for {tech_id} at {out_path}; skipping.")
+            skipped += 1
+            continue
+
+        # Build prompt
         prompt = (
             f"{BASE_PROMPT}\n\n"
-            f"Technique: {full_key}\n\n"
-            f"Matrix: MITRE ATT&CK for {tech_data['matrix'].upper()}\n\n"
-            f"Tactic(s): {tech_data['tactic']}\n\n"
-            f"Description: {tech_data['description']}\n\n"
-            f"Detection: {tech_data['detection']}"
+            f"Technique: {tech_id} - {tech_name}\n"
+            f"Tactic: {tactic_id} - {tactic_name}\n\n"
+            f"EXISTING ANALYTIC PLAN (JSON):\n```json\n{json.dumps(plan_obj, indent=2)}\n```\n"
+            f"Return ONLY the YAML document (no code fences, no commentary)."
         )
-        
-        # This is where you would call your actual AI model
+
         try:
-            plan_blob = generate_analytic_plan(prompt, model, ask_sage_client=ask_sage_client)
+            llm_res = refine_with_llm(
+                prompt=prompt,
+                provider_pref=llm_provider,
+                model=llm_model,
+                ask_sage_client=ask_sage_client,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                gemini_primary_model=model,
+            )
         except Exception as e:
-            logger.error(f"Failed to generate plan for {full_key}: {str(e)}")
+            logger.error(f"LLM call failed for {tech_id}: {e}")
+            failed += 1
             continue
 
-        # --- Extract JSON from the raw text blob ---
-        json_str = None
-        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", plan_blob)
-        if match:
-            json_str = match.group(1).strip()
-        else:
-            start_index = -1
-            first_bracket = plan_blob.find('[')
-            first_curly = plan_blob.find('{')
-            
-            if first_bracket != -1 and first_curly != -1:
-                start_index = min(first_bracket, first_curly)
-            elif first_bracket != -1:
-                start_index = first_bracket
-            else:
-                start_index = first_curly
-
-            if start_index != -1:
-                end_index = max(plan_blob.rfind(']'), plan_blob.rfind('}'))
-                if end_index > start_index:
-                    json_str = plan_blob[start_index : end_index + 1]
-
-        if not json_str:
-            logger.error(f"Could not find a valid JSON object in the response for {full_key}. Skipping.")
+        yaml_text = _extract_yaml_blob(llm_res.get("text", ""))
+        if not yaml_text:
+            logger.error(f"Could not extract YAML for {tech_id}")
+            failed += 1
             continue
 
-        # --- Parse, add metadata, and save the file ---
+        # Optional backup of the source plan
+        if make_backup:
+            bdir = Path("backups") / f"generator_{run_ts}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / f"{tech_id}_{plan_path.name}").write_text(
+                json.dumps(plan_obj, indent=2), encoding="utf-8"
+            )
+
         try:
-            plan_data = json.loads(json_str)
-            if isinstance(plan_data, list):
-                current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                for ir_object in plan_data:
-                    ir_object["version"] = "1.0"
-                    ir_object["date_created"] = current_date_str
-                    ir_object["last_updated"] = current_date_str
-                    ir_object["contributors"] = ["Zachary Szewczyk"]
+            out_path.write_text(yaml_text, encoding="utf-8")
+            logger.info(f"Saved playbook to {out_path}")
+            generated += 1
+        except Exception as e:
+            logger.error(f"Failed to write playbook {out_path}: {e}")
+            failed += 1
 
-                try:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        json.dump(plan_data, f, indent=2)
-                    logger.info(f"Successfully saved plan for {technique_id} to '{file_path}'.")
-                except IOError as e:
-                    logger.error(f"Failed to write file for {technique_id}: {e}")
-            else:
-                logger.warning(f"Expected a list from AI for {full_key}, but got {type(plan_data)}. Skipping file write.")
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse extracted JSON for {full_key}. Error: {e}. Skipping file write.")
-            
+    logger.info(f"Generation complete. Generated: {generated} | Skipped: {skipped} | Failed: {failed}")
     logger.info("Script finished successfully.")
 
 if __name__ == "__main__":

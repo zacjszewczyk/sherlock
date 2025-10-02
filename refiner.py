@@ -33,7 +33,6 @@ import yaml
 
 logger.info("Importing project-specific modules.")
 from src.attack_retriever import build_technique_dictionary
-from src.llm import refine_with_llm
 
 BASE_PROMPT = """
 I need you to refine an existing analytic plan. The analytic plan consists of the following components:
@@ -91,6 +90,20 @@ Based on these definitions, please refine an existing analytic plan in plain, un
 ]
 
 Based on that format, improve an analytic plan for the following technique. If you are given an offensive technique, a T-code, then only generate PIRs; if you are given a defensive technique, a D-code, then only generate FFIRs. Pay extremely close attention to the type of matrix the technique references (enterprise, ICS, mobile), which will have a significant impact on how you build this plan.
+"""
+
+# Additional prompt for playbook refinement
+PLAYBOOK_REFINE_PROMPT = """
+You are given an existing analytic playbook in YAML. Refine it while preserving the YAML schema and improving clarity, specificity, and operational utility.
+
+Requirements:
+- Preserve the top-level keys: name, id, description, type, related, contributors, created, modified, tags, questions.
+- Keep "type" = "technique".
+- Ensure each question has: question, context, answer_sources (list), range (string), queries (list of {system, query}).
+- Keep content executable by SOC teams (SIEM/SQL/Zeek pseudo-queries are fine).
+- Avoid stylistic markup. No code fences. Return only a single YAML document.
+
+Return only the refined YAML (no commentary).
 """
 
 # ---------------------------
@@ -190,6 +203,18 @@ def extract_json(blob: str) -> Optional[str]:
             return s[first_bracket:end_index + 1]
     return None
 
+def extract_yaml(blob: str) -> Optional[str]:
+    s = (blob or "").strip()
+    if not s:
+        return None
+    m = re.search(r"```(?:yaml|yml)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # crude heuristic
+    if ":" in s:
+        return s
+    return None
+
 def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str]]:
     max_dt = None
     max_ver = None
@@ -204,14 +229,7 @@ def compute_plan_metadata(plan: List[dict]) -> Tuple[Optional[str], Optional[str
     return dt_iso, max_ver
 
 def _core_tag() -> str:
-    """
-    Returns a string indicating which CPU core (if detectable) and process is running this code.
-    Examples:
-      'core=11 pid=12345'
-      'pid=12345 proc=ForkProcess-1'
-    """
     pid = os.getpid()
-    # Try Linux-specific sched_getcpu()
     core = None
     try:
         core = os.sched_getcpu()  # type: ignore[attr-defined]
@@ -219,15 +237,109 @@ def _core_tag() -> str:
         core = None
     if core is not None:
         return f"core={core} pid={pid}"
-    # Fallback to process name
     try:
         proc_name = multiprocessing.current_process().name
         return f"pid={pid} proc={proc_name}"
     except Exception:
         return f"pid={pid}"
 
+def refine_with_llm(
+    prompt: str,
+    provider_pref: Optional[str],
+    model: Optional[str],
+    ask_sage_client: AskSageClient,
+    max_retries: int = 3,
+    retry_delay: int = 1,
+    gemini_primary_model: Optional[str] = None,  # for auto mode fallback to legacy `model` key
+) -> Dict[str, str]:
+    """
+    Returns: {"text": <response>, "endpoint": "gemini"|"asksage", "model_used": <model_name>}
+
+    Behavior:
+      - If provider_pref in {"gemini","asksage"} AND model provided: use ONLY that provider+model.
+      - Else: AUTO mode = try Gemini (gemini_primary_model or model) then AskSage fallback.
+    """
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError("Prompt must be a non-empty string")
+
+    tag = _core_tag()
+
+    def _call_gemini(gem_model: str) -> Dict[str, str]:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set")
+        logger.info(f"[LLM] [{tag}] Gemini call model={gem_model}")
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=gem_model,
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+            config=types.GenerateContentConfig(temperature=0.7),
+        )
+        if not resp or not getattr(resp, "text", None):
+            raise ValueError("Invalid/empty response from Gemini")
+        return {"text": resp.text, "endpoint": "gemini", "model_used": gem_model}
+
+    def _call_asksage(as_model: str) -> Dict[str, str]:
+        logger.info(f"[LLM] [{tag}] AskSage call model={as_model}")
+        resp = ask_sage_client.query(
+            prompt,
+            persona="default",
+            dataset="none",
+            limit_references=0,
+            temperature=0.7,
+            live=0,
+            model=as_model,
+            system_prompt=None,
+        )
+        if not resp or not isinstance(resp, dict) or not resp.get("message"):
+            raise ValueError("Invalid/empty response from AskSage")
+        return {"text": resp["message"], "endpoint": "asksage", "model_used": as_model}
+
+    if provider_pref in {"gemini", "asksage"} and model:
+        logger.info(f"[LLM] [{tag}] Forced LLM mode: provider={provider_pref} model={model}")
+        if provider_pref == "gemini":
+            return _call_gemini(model)
+        else:
+            return _call_asksage(model)
+
+    primary_gemini_model = gemini_primary_model or (model if model else "gemini-2.5-pro")
+    logger.info(f"[LLM] [{tag}] AUTO mode: try Gemini primary={primary_gemini_model}, fallback=AskSage")
+
+    for attempt in range(max_retries):
+        try:
+            return _call_gemini(primary_gemini_model)
+        except (errors.ClientError, errors.APIError, ValueError) as e:
+            msg = str(e)
+            code = getattr(e, 'status_code', None) if hasattr(e, 'status_code') else None
+            retriable = (
+                code == 429 or
+                "429" in msg or
+                "RESOURCE_EXHAUSTED" in msg or
+                "quota" in msg.lower() or
+                "rate" in msg.lower()
+            )
+            if retriable:
+                logger.error(f"[LLM] [{tag}] Gemini rate/quota: {msg}. Breaking to AskSage fallback.")
+                break
+            delay = retry_delay * (2 ** attempt)
+            m = re.search(r'retry in (\d+(?:\.\d+)?)', msg.lower())
+            if m:
+                try:
+                    delay = min(float(m.group(1)) + 1, 120)
+                except Exception:
+                    pass
+            if attempt < max_retries - 1:
+                logger.warning(f"[LLM] [{tag}] Gemini error: {msg}. Retrying in {delay:.1f}s ...")
+                time.sleep(delay)
+            else:
+                logger.warning(f"[LLM] [{tag}] Gemini attempts exhausted; switching to AskSage fallback.")
+
+    fallback_model = "google-gemini-2.5-pro"
+    logger.info(f"[LLM] [{tag}] Fallback AskSage model={fallback_model}")
+    return _call_asksage(fallback_model)
+
 # ---------------------------
-# Worker (picklable)
+# Worker (plans mode)
 # ---------------------------
 
 def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,21 +350,17 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
       - Pre-processing endpoint/model (with core/worker tag)
       - Post-processing completion with endpoint/model (with core/worker tag)
     """
-    # Light, per-process prep
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    # Monkey-patch requests verify (in worker context)
     old_request = requests.Session.request
     def new_request(self, method, url, **kwargs):
         kwargs['verify'] = False
         return old_request(self, method, url, **kwargs)
     requests.Session.request = new_request
 
-    # Ensure GEMINI key is present in worker
     gemini_api_key = job.get("gemini_api_key")
     if gemini_api_key:
         os.environ["GEMINI_API_KEY"] = gemini_api_key
 
-    # Build AskSage client in worker
     ask_sage_client = AskSageClient(
         job["sage_email"],
         job["sage_api_key"],
@@ -274,7 +382,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         else:
             output_dir = default_output_dir
 
-        # Technique ID / file path
         try:
             technique_id = full_key.split(" - ")[0].strip()
         except Exception:
@@ -286,7 +393,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"[{technique_id}] [{tag}] SKIP: plan file missing at '{file_path}'.")
             return {"technique": technique_id, "status": "missing"}
 
-        # Load existing plan
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 existing_plan = json.load(f)
@@ -297,7 +403,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"[{technique_id}] [{tag}] SKIP: read/parse error: {e}")
             return {"technique": technique_id, "status": "skip", "reason": f"read_error: {e}"}
 
-        # Skip rules
         plan_last_updated_max, plan_version_max = compute_plan_metadata(existing_plan)
 
         if job.get("skip_if_updated_after"):
@@ -312,7 +417,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"[{technique_id}] [{tag}] SKIP: version {plan_version_max} > {job['skip_if_version_gt']}.")
                 return {"technique": technique_id, "status": "skip", "reason": "version_gt"}
 
-        # Build prompt
         refine_guidance = (job.get("refine_guidance") or "").strip()
         matrix_banner = f"Matrix: MITRE ATT&CK for {tech_data.get('matrix','').upper()}"
         refine_block = (
@@ -332,13 +436,11 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         refine_block += "Return ONLY the refined JSON array (no commentary, no markdown, no code fences)."
 
         prov = (job.get("llm_provider") or "auto").lower()
-        # Prefer llm_model if set; otherwise legacy `model` in auto mode
         mdl = job.get("llm_model")
-        base_model = mdl or job.get("model")  # used by auto/Gemini-primary
+        base_model = mdl or job.get("model")
 
         logger.info(f"[{technique_id}] [{tag}] START: provider={prov} model={mdl or base_model}")
 
-        # LLM call
         llm_res = refine_with_llm(
             prompt=refine_block,
             provider_pref=prov,
@@ -346,15 +448,12 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             ask_sage_client=ask_sage_client,
             max_retries=job["max_retries"],
             retry_delay=job["retry_delay"],
-            gemini_primary_model=base_model,  # legacy primary in AUTO mode
+            gemini_primary_model=base_model,
         )
 
-
-        # If fallback occurred, make it explicit at technique level too
         if llm_res["endpoint"] != "gemini":
             logger.info(f"[{technique_id}] [{tag}] INFO: fell back to endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
 
-        # Extract & parse
         json_str = extract_json(llm_res["text"])
         if not json_str:
             logger.error(f"[{technique_id}] [{tag}] FAIL: could not extract JSON from model output.")
@@ -369,7 +468,6 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error(f"[{technique_id}] [{tag}] FAIL: JSON decode error: {e}")
             return {"technique": technique_id, "status": "fail", "reason": f"json_error: {e}"}
 
-        # Update metadata
         today_iso = job["today_iso"]
         _, base_version_max = compute_plan_metadata(existing_plan)
         new_version = increment_version(base_version_max or "1.0")
@@ -399,8 +497,8 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                     if c not in existing_c:
                         ir["contributors"].append(c)
 
-        # Backup + write
         try:
+            output_dir = Path(job["resolved_output_dir"])
             output_dir.mkdir(parents=True, exist_ok=True)
             if job["make_backup"]:
                 backups_dir = Path(job["backups_dir"])
@@ -409,6 +507,7 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 with open(backup_path, "w", encoding="utf-8") as bf:
                     json.dump(existing_plan, bf, indent=2)
 
+            file_path = Path(job["resolved_output_dir"]) / f"{technique_id}.json"
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(refined_plan, f, indent=2)
         except Exception as e:
@@ -422,18 +521,122 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"[{job.get('full_key','unknown')}] [{tag}] FAIL: unexpected error: {e}")
         return {"technique": job.get("full_key", "unknown"), "status": "fail", "reason": f"unexpected: {e}"}
 
-def _parse_cli_args() -> Path:
+def _parse_cli_args() -> Tuple[Path, str]:
     parser = argparse.ArgumentParser(
-        description="Refine existing analytic plans using LLMs."
+        description="Refine existing analytic plans or analytic playbooks using LLMs."
     )
     parser.add_argument(
         "-c", "--config",
         default="config/refine.yml",
         help="Path to refine.yml (default: config/refine.yml)"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["plans", "playbooks"],
+        default=None,
+        help="Refinement mode. If omitted, uses 'mode' from config (default: plans)."
+    )
     args = parser.parse_args()
-    return Path(args.config).expanduser().resolve()
-        
+    return Path(args.config).expanduser().resolve(), (args.mode or "")
+
+# ---------------------------
+# Playbook refinement (YAML)
+# ---------------------------
+
+def _refine_one_playbook(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Refines a single playbook YAML file and writes it back.
+    """
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    old_request = requests.Session.request
+    def new_request(self, method, url, **kwargs):
+        kwargs['verify'] = False
+        return old_request(self, method, url, **kwargs)
+    requests.Session.request = new_request
+
+    if job.get("gemini_api_key"):
+        os.environ["GEMINI_API_KEY"] = job["gemini_api_key"]
+
+    ask_sage_client = AskSageClient(
+        job["sage_email"],
+        job["sage_api_key"],
+        user_base_url="https://api.genai.army.mil/user/",
+        server_base_url="https://api.genai.army.mil/server/",
+    )
+
+    tag = _core_tag()
+    path: Path = Path(job["file_path"])
+    try:
+        raw_yaml = path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.info(f"[{path.name}] [{tag}] SKIP: read error: {e}")
+        return {"file": str(path), "status": "skip", "reason": f"read_error: {e}"}
+
+    try:
+        pb_obj = yaml.safe_load(raw_yaml)
+        if not isinstance(pb_obj, dict) or "questions" not in pb_obj:
+            logger.info(f"[{path.name}] [{tag}] SKIP: not a playbook dict or missing 'questions'.")
+            return {"file": str(path), "status": "skip", "reason": "bad_schema"}
+    except Exception as e:
+        logger.info(f"[{path.name}] [{tag}] SKIP: parse error: {e}")
+        return {"file": str(path), "status": "skip", "reason": f"yaml_parse_error: {e}"}
+
+    refine_block = (
+        f"{PLAYBOOK_REFINE_PROMPT}\n\n"
+        f"EXISTING PLAYBOOK YAML:\n```yaml\n{raw_yaml}\n```\n\n"
+        f"Return ONLY the refined YAML (no commentary, no fences)."
+    )
+
+    prov = (job.get("llm_provider") or "auto").lower()
+    mdl = job.get("llm_model")
+    base_model = mdl or job.get("model")
+
+    logger.info(f"[{path.name}] [{tag}] START (playbook): provider={prov} model={mdl or base_model}")
+
+    llm_res = refine_with_llm(
+        prompt=refine_block,
+        provider_pref=prov,
+        model=mdl,
+        ask_sage_client=ask_sage_client,
+        max_retries=job["max_retries"],
+        retry_delay=job["retry_delay"],
+        gemini_primary_model=base_model,
+    )
+
+    ytxt = extract_yaml(llm_res.get("text", ""))
+    if not ytxt:
+        logger.error(f"[{path.name}] [{tag}] FAIL: could not extract YAML response.")
+        return {"file": str(path), "status": "fail", "reason": "no_yaml"}
+
+    # Best-effort validation
+    try:
+        refined = yaml.safe_load(ytxt)
+        if not isinstance(refined, dict) or "questions" not in refined:
+            logger.error(f"[{path.name}] [{tag}] FAIL: refined YAML not dict/has no 'questions'.")
+            return {"file": str(path), "status": "fail", "reason": "bad_refined_schema"}
+        # update modified date if present
+        today_iso = job["today_iso"]
+        refined["modified"] = today_iso
+        if "created" not in refined or not refined["created"]:
+            refined["created"] = today_iso
+        ytxt = yaml.safe_dump(refined, sort_keys=False)
+    except Exception as e:
+        logger.error(f"[{path.name}] [{tag}] FAIL: YAML validation failed: {e}")
+        return {"file": str(path), "status": "fail", "reason": f"yaml_validation: {e}"}
+
+    try:
+        backup_dir = Path(job["backups_dir"])
+        if job["make_backup"]:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            (backup_dir / f"{path.stem}_{job['run_ts']}.yml").write_text(raw_yaml, encoding="utf-8")
+        path.write_text(ytxt, encoding="utf-8")
+    except Exception as e:
+        logger.error(f"[{path.name}] [{tag}] FAIL: write error: {e}")
+        return {"file": str(path), "status": "fail", "reason": f"write_error: {e}"}
+
+    logger.info(f"[{path.name}] [{tag}] DONE (playbook): endpoint={llm_res['endpoint']} model={llm_res['model_used']}")
+    return {"file": str(path), "status": "ok", "endpoint": llm_res["endpoint"], "model_used": llm_res["model_used"]}
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -467,31 +670,122 @@ def main():
         raise ValueError("Invalid JSON format in the credentials file: ./credentials.json")
 
     # --- 1. Config ---
-    cfg_path = _parse_cli_args()
+    cfg_path, cli_mode = _parse_cli_args()
     logger.info(f"Loading configuration from: {cfg_path}")
     config = load_config(cfg_path)
 
+    mode = (cli_mode or config.get("mode") or "plans").strip().lower()
+    logger.info(f"Refiner mode: {mode}")
 
+    # Shared knobs
+    max_retries = int(config.get("max_retries", 3))
+    retry_delay = int(config.get("retry_delay", 1))
+    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
+    llm_model = config.get("llm_model")  # may be None
+    model = config.get("model", "gemini-2.5-pro")
+    make_backup = bool(config.get("backup", True))
+    num_cores = config.get("num_cores", 0)
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    backups_dir = Path("backups") / f"refiner_{run_ts}"
+
+    if mode == "playbooks":
+        # Gather playbook files from config
+        pmap = config.get("playbook_directories", {}) or {}
+        files: List[Path] = []
+        for k, v in pmap.items():
+            d = Path(v)
+            if d.is_dir():
+                found = sorted(d.glob("*.yml"))
+                logger.info(f"Playbook dir [{k}] {d} -> {len(found)} file(s)")
+                files.extend(found)
+            else:
+                logger.warning(f"Configured playbook directory missing [{k}]: {d}")
+
+        if not files:
+            logger.warning("No playbook files found to refine.")
+            logger.info("Script finished.")
+            return
+
+        # Normalize workers
+        try:
+            if num_cores is None:
+                workers = 1
+            else:
+                workers = int(num_cores)
+        except Exception:
+            workers = 1
+        max_cpu = os.cpu_count() or 1
+        workers = max(1, min(workers, max_cpu))
+
+        jobs = []
+        for f in files:
+            jobs.append({
+                "file_path": str(f),
+                "today_iso": today_iso,
+                "run_ts": run_ts,
+                "backups_dir": str(backups_dir),
+                "make_backup": make_backup,
+                "llm_provider": llm_provider,
+                "llm_model": llm_model,
+                "model": model,
+                "max_retries": max_retries,
+                "retry_delay": retry_delay,
+                "sage_email": sage_email,
+                "sage_api_key": sage_api_key,
+                "gemini_api_key": gemini_api_key,
+            })
+
+        ok = skip = fail = 0
+        tag = _core_tag()
+        if workers <= 1:
+            logger.info(f"[MAIN {tag}] Running in single-core mode (playbooks).")
+            for jb in jobs:
+                res = _refine_one_playbook(jb)
+                st = res.get("status")
+                if st == "ok":
+                    ok += 1
+                elif st == "skip":
+                    skip += 1
+                else:
+                    fail += 1
+                logger.info(f"[MAIN {tag}] {res.get('file')}: {st}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+        else:
+            logger.info(f"[MAIN {tag}] Running in multi-core mode (playbooks) with {workers} workers.")
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_refine_one_playbook, jb): jb for jb in jobs}
+                for fut in as_completed(futs):
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        logger.error(f"[MAIN {tag}] Worker crashed: {e}")
+                        fail += 1
+                        continue
+                    st = res.get("status")
+                    if st == "ok":
+                        ok += 1
+                    elif st == "skip":
+                        skip += 1
+                    else:
+                        fail += 1
+                    logger.info(f"[MAIN {tag}] {res.get('file')}: {st}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
+        logger.info(f"[MAIN {tag}] Playbook refinement done. OK: {ok} | Skip: {skip} | Fail: {fail}")
+        logger.info("[MAIN] Script finished successfully.")
+        return
+
+    # ---------------- Plans mode (existing behavior) ----------------
     output_dirs_map = config.get("output_directories", {})
     default_output_dir = Path(output_dirs_map.get("default", "techniques"))
     matrices = config.get("matrices", ["enterprise"])
     filter_techniques = config.get("techniques", [])
-    model = config.get("model", "gemini-2.5-flash")
     refine_guidance = config.get("refine_guidance", "").strip()
     skip_if_updated_after = config.get("skip_if_updated_after")
     skip_if_version_gt = config.get("skip_if_version_gt")
-    make_backup = bool(config.get("backup", True))
-    max_retries = int(config.get("max_retries", 3))
-    retry_delay = int(config.get("retry_delay", 1))
-    num_cores = config.get("num_cores", 0)
-    llm_provider = (config.get("llm_provider") or "auto").strip().lower()
-    llm_model = config.get("llm_model")  # may be None
 
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save files.")
         raise SystemExit(1)
 
-    # --- 2. Techniques ---
     logger.info("Building technique dictionary")
     technique_dict = build_technique_dictionary(matrices)
 
@@ -504,17 +798,20 @@ def main():
 
     logger.info(f"Will attempt to refine plans for up to {len(target_techniques)} techniques (existing files only).")
 
-    # --- 3. Prep jobs ---
-    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    backups_dir = Path("backups") / f"refiner_{run_ts}"
-
     jobs: List[Dict[str, Any]] = []
     for full_key, tech_data in target_techniques.items():
+        matrix_type = tech_data.get("matrix")
+        if matrix_type and matrix_type in output_dirs_map:
+            resolved_output_dir = Path(output_dirs_map[matrix_type])
+        else:
+            resolved_output_dir = default_output_dir
+
         jobs.append({
             "full_key": full_key,
             "tech_data": tech_data,
             "output_dirs_map": output_dirs_map,
             "default_output_dir": str(default_output_dir),
+            "resolved_output_dir": str(resolved_output_dir),
             "refine_guidance": refine_guidance,
             "max_retries": max_retries,
             "retry_delay": retry_delay,
@@ -529,13 +826,11 @@ def main():
             "gemini_api_key": gemini_api_key,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
-            "model": model, # keep existing for back-compat in auto mode:
+            "model": model,
         })
 
-    # --- 4. Execute (single-core or multi-core) ---
     refined_count = skipped_count = missing_count = failed_count = 0
 
-    # Normalize num_cores
     try:
         if num_cores is None:
             num_workers = 1
@@ -559,7 +854,6 @@ def main():
                 missing_count += 1
             else:
                 failed_count += 1
-            # Consolidated per-technique summary line (includes main/core tag for single-core clarity)
             logger.info(f"[MAIN {main_tag}] {res.get('technique')}: {status}" + (f" ({res.get('reason')})" if res.get('reason') else ""))
     else:
         max_cpu = os.cpu_count() or 1
