@@ -20,7 +20,7 @@ import requests
 import urllib3
 import time  # Added for retry delays
 import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
@@ -131,9 +131,16 @@ def _extract_yaml_blob(text: str) -> Optional[str]:
         return s
     return None
 
-def _collect_plan_files(plan_paths: Dict[str, str]) -> List[Path]:
+def _collect_plan_files(plan_paths: Dict[str, str], allowed_keys: Set[str]) -> List[Path]:
+    """
+    Enumerate JSON plan files ONLY from plan_paths whose key is in allowed_keys (matrices).
+    This ensures generation respects the selected matrices (e.g., just 'ics').
+    """
     files = []
     for k, v in (plan_paths or {}).items():
+        if k not in allowed_keys:
+            logger.info(f"Skipping plan path [{k}] not in selected matrices {sorted(allowed_keys)}")
+            continue
         p = Path(v)
         if p.is_dir():
             cand = sorted(p.glob("*.json"))
@@ -367,10 +374,16 @@ def main():
     technique_dict = build_technique_dictionary(matrices)
     tech_index = _index_attack_by_technique(technique_dict)
 
-    # --- 3. Collect Watson plan files ---
-    plan_files = _collect_plan_files(plan_paths)
+    # --- 3. Collect Watson plan files (respect selected matrices ONLY) ---
+    selected_keys = set(matrices)
+    if not selected_keys:
+        logger.warning("No matrices selected in config; nothing to process.")
+        logger.info("Script finished.")
+        return
+
+    plan_files = _collect_plan_files(plan_paths, selected_keys)
     if not plan_files:
-        logger.warning("No input plan files found in plan_paths.")
+        logger.warning(f"No input plan files found in plan_paths for matrices: {sorted(selected_keys)}")
         logger.info("Script finished.")
         return
 
