@@ -192,6 +192,11 @@ def _core_tag() -> str:
     except Exception:
         return f"pid={pid}"
 
+class _DummyAskSage:
+    """Minimal stub so refine_with_llm can be called if AskSage is unavailable and we force Gemini."""
+    def query(self, *args, **kwargs):
+        raise RuntimeError("AskSage is unavailable in this run.")
+
 # ---------------------------
 # Worker
 # ---------------------------
@@ -208,15 +213,24 @@ def _worker_generate_one(job: Dict[str, Any]) -> Dict[str, Any]:
         return old_request(self, method, url, **kwargs)
     requests.Session.request = new_request
 
+    # Only set Gemini key if provided (do not error if missing; main decides effective provider)
     if job.get("gemini_api_key"):
         os.environ["GEMINI_API_KEY"] = job["gemini_api_key"]
 
-    ask_sage_client = AskSageClient(
-        job["sage_email"],
-        job["sage_api_key"],
-        user_base_url="https://api.genai.army.mil/user/",
-        server_base_url="https://api.genai.army.mil/server/",
-    )
+    # Build AskSage client only if available/effective provider may use it
+    ask_sage_client = _DummyAskSage()
+    if job.get("asksage_available"):
+        try:
+            ask_sage_client = AskSageClient(
+                job["sage_email"],
+                job["sage_api_key"],
+                user_base_url="https://api.genai.army.mil/user/",
+                server_base_url="https://api.genai.army.mil/server/",
+            )
+        except Exception as e:
+            # If AskSage unexpectedly fails in the worker, force Gemini for this job (if possible)
+            logger.warning(f"[WORKER] AskSage client init failed, will force Gemini if possible: {e}")
+            job["llm_provider_effective"] = "gemini"
 
     tag = _core_tag()
     plan_path = Path(job["plan_path"])
@@ -258,17 +272,21 @@ def _worker_generate_one(job: Dict[str, Any]) -> Dict[str, Any]:
         f"Return ONLY the YAML document (no code fences, no commentary)."
     )
 
-    logger.info(f"[{tech_id}] [{tag}] START: provider={job['llm_provider']} model={job.get('llm_model') or job.get('model')} -> {out_path}")
+    provider = job.get("llm_provider_effective") or job.get("llm_provider") or "auto"
+    model = job.get("llm_model_effective") or job.get("llm_model")
+    base_model = job.get("model")
+
+    logger.info(f"[{tech_id}] [{tag}] START: provider={provider} model={model or base_model} -> {out_path}")
 
     try:
         llm_res = refine_with_llm(
             prompt=prompt,
             ask_sage_client=ask_sage_client,
-            provider_pref=job["llm_provider"],
-            model=job.get("llm_model"),
+            provider_pref=provider,
+            model=model,
             max_retries=job["max_retries"],
             retry_delay=job["retry_delay"],
-            gemini_primary_model=job.get("model"),
+            gemini_primary_model=base_model,
         )
     except Exception as e:
         return {"file": str(plan_path), "technique": tech_id, "status": "fail", "reason": f"llm_error: {e}"}
@@ -317,12 +335,14 @@ def main():
         logger.info("Failed to import Gemini API key")
 
     logger.info("Loading Sage API key")
+    sage_email = None
+    sage_api_key = None
     try:
         with open("./credentials.json", "r") as file:
             credentials = json.load(file)
             if 'credentials' not in credentials or 'api_key' not in credentials['credentials']:
                 logger.error("Missing required keys in the credentials file.")
-                raise
+                raise RuntimeError("Bad credentials schema")
         sage_api_key = credentials['credentials']['api_key']
         sage_email = credentials['credentials']['Ask_sage_user_info']['username']
     except FileNotFoundError:
@@ -337,14 +357,6 @@ def main():
         kwargs['verify'] = False
         return old_request(self, method, url, **kwargs)
     requests.Session.request = new_request
-
-    # Build AskSage client (kept for early validation, though workers rebuild it)
-    ask_sage_client = AskSageClient(
-        sage_email, 
-        sage_api_key, 
-        user_base_url="https://api.genai.army.mil/user/", 
-        server_base_url="https://api.genai.army.mil/server/"
-    )
 
     # --- 1. Load Configuration ---
     cfg_path = _parse_cli_args()
@@ -368,6 +380,41 @@ def main():
     if not output_dirs_map:
         logger.critical("Configuration key 'output_directories' is missing or empty. Cannot determine where to save playbooks.")
         raise SystemExit(1)
+
+    # --- Determine provider availability & effective provider ---
+    asksage_available = False
+    if llm_provider in {"asksage", "auto"}:
+        try:
+            # Probing AskSage reachability quickly (HEAD or simple init). We'll rely on worker init otherwise.
+            # Create a lightweight client and ping a harmless path (handled by init).
+            _ = AskSageClient(
+                sage_email,
+                sage_api_key,
+                user_base_url="https://api.genai.army.mil/user/",
+                server_base_url="https://api.genai.army.mil/server/",
+            )
+            asksage_available = True
+            logger.info("AskSage appears reachable.")
+        except Exception as e:
+            logger.warning(f"AskSage is not reachable: {e}")
+
+    gemini_available = bool(os.environ.get("GEMINI_API_KEY"))
+
+    # Decide the effective provider/model if AskSage is down
+    llm_provider_effective = llm_provider
+    llm_model_effective = llm_model
+
+    if not asksage_available:
+        if llm_provider in {"asksage", "auto"}:
+            if gemini_available:
+                llm_provider_effective = "gemini"
+                # Prefer explicit llm_model if set; otherwise use 'model' (primary Gemini model)
+                llm_model_effective = llm_model or model
+                logger.warning("AskSage unavailable. Falling back to Gemini for this run.")
+            else:
+                logger.critical("AskSage unavailable and Gemini not configured. Exiting.")
+                raise SystemExit(2)
+        # if llm_provider == "gemini", nothing to do; we'll stay on Gemini.
 
     # --- 2. Technique dictionary (to map technique_id ⇒ matrix) ---
     logger.info("Building technique dictionary for ATT&CK → matrix resolution")
@@ -399,16 +446,19 @@ def main():
             "output_dirs_map": output_dirs_map,
             "tech_index": tech_index,
             "filter_set": filter_set,
-            "llm_provider": llm_provider,
-            "llm_model": llm_model,
-            "model": model,
+            "llm_provider": llm_provider,                 # original (for logging/debug)
+            "llm_model": llm_model,                       # original
+            "llm_provider_effective": llm_provider_effective,
+            "llm_model_effective": llm_model_effective,
+            "model": model,                                # primary Gemini model (auto mode)
             "max_retries": max_retries,
             "retry_delay": retry_delay,
             "make_backup": make_backup,
             "backups_dir": str(backups_dir),
             "sage_email": sage_email,
             "sage_api_key": sage_api_key,
-            "gemini_api_key": gemini_api_key,
+            "gemini_api_key": os.environ.get("GEMINI_API_KEY"),
+            "asksage_available": asksage_available,        # hint to worker
         })
 
     # --- 5. Execute (single-core or multi-core) ---
