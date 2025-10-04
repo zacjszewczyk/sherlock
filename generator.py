@@ -471,8 +471,9 @@ def main():
         num_workers = 1
 
     max_cpu = os.cpu_count() or 1
-    workers = max(1, min(num_workers, max_cpu))
+    workers = max(1, num_workers if num_workers > 0 else max_cpu)
     tag = _core_tag()
+    logger.info(f"[MAIN {tag}] Parallelism: requested={num_workers}, cpu_count={max_cpu}, using workers={workers}")
 
     ok = skip = fail = 0
     if workers <= 1:
