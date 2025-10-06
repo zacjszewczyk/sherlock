@@ -1,0 +1,334 @@
+name: 'T1573.001: Symmetric Cryptography'
+id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+description: |
+  This playbook helps investigate whether an adversary is communicating with command and control infrastructure using symmetric cryptography. It focuses on detecting indicators such as network connections to known C2 infrastructure, process creation from non-standard directories followed by network activity, outbound traffic on standard ports that doesn't conform to the expected protocol and has high entropy, periodic 'heartbeat' network patterns, and processes not on an allowlist exhibiting multiple suspicious network behaviors simultaneously.
+type: 'technique'
+related:
+  - 'TA0011: Command and Control'
+contributors:
+  - 'Zachary Szewczyk'
+created: '2025-10-01'
+modified: '2025-10-01'
+version: 1.0
+tags: 'none'
+questions:
+  - question: 'Is there network traffic to IPs or domains known to be malicious C2 infrastructure?'
+    context: |
+      This question seeks to identify direct communication with known command and control servers. By ingesting a threat intelligence feed of C2 infrastructure, we can create a rule to join Zeek conn.log destination IPs and Zeek dns.log queried domains against this feed. A match provides a high-confidence indicator of a potential compromise.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Zeek dns.log'
+      - 'Threat Intelligence Feed'
+      - 'Network Egress Points'
+      - 'DNS Resolvers'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          JOIN (
+            SELECT dest_ip FROM zeek_conn_log
+            UNION
+            SELECT queried_domain FROM zeek_dns_log
+          ) AS network_activity
+          ON network_activity.destination = threat_intel_feed.indicator
+          WHERE threat_intel_feed.tag = 'C2'
+          RETURN network_activity.destination, threat_intel_feed.indicator
+  - question: 'Are any known-bad C2 domains being queried by an unusually small number of internal hosts?'
+    context: |
+      This question aims to find stealthy C2 communications. Adversaries often use dedicated infrastructure for a limited number of targets. By calculating the number of unique internal hosts querying each domain from a CTI feed, we can identify domains contacted by very few hosts (e.g., below the 5th percentile). These rare communications to known-bad domains are highly suspicious and warrant escalation.
+    answer_sources:
+      - 'Zeek dns.log'
+      - 'Threat Intelligence Feed'
+      - 'DNS Resolvers'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Step 1: Count hosts per domain
+          domain_counts = SELECT domain, COUNT(DISTINCT source_host) AS host_count
+                          FROM zeek_dns_log
+                          WHERE domain IN (SELECT indicator FROM threat_intel_feed WHERE tag = 'C2')
+                          GROUP BY domain
+
+          // Step 2: Find the 5th percentile threshold
+          percentile_threshold = CALCULATE_PERCENTILE(domain_counts.host_count, 5)
+
+          // Step 3: Find rare domains
+          SELECT domain, host_count
+          FROM domain_counts
+          WHERE host_count <= percentile_threshold
+  - question: 'Can we predict if new, unseen IP addresses are malicious C2 infrastructure based on connection characteristics?'
+    context: |
+      This question uses machine learning to proactively identify potential C2 servers not yet on threat intelligence feeds. A supervised classification model (like Random Forest) is trained on labeled historical data (Zeek connection logs and CTI feeds). Features like destination port, protocol, and bytes transferred help the model learn the patterns of malicious C2 traffic. Applying this model to new connections allows for the prediction of maliciousness, alerting when the probability score is high.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Historical Threat Intelligence Data'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Training Phase
+          features = SELECT dest_port, protocol, bytes_sent, bytes_received FROM zeek_conn_log
+          labels = SELECT is_malicious FROM historical_cti_data
+          model = TRAIN RandomForestClassifier(features, labels)
+
+          // Prediction Phase
+          new_features = SELECT dest_port, protocol, bytes_sent, bytes_received FROM new_zeek_conn_log
+          predictions = model.PREDICT_PROBA(new_features)
+          ALERT WHERE predictions.probability > 0.85
+  - question: 'Has a known malicious process or a process from a suspicious location initiated an outbound network connection?'
+    context: |
+      This question looks for malware execution that leads to C2 communication. By monitoring process creation events (Windows Event ID 4688), we can check if the process hash is on a blocklist or if it originates from a temporary or user-writable directory. Correlating this with an outbound network connection from the same host within a short time frame (e.g., 5 minutes) strongly indicates malicious activity.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'Malicious Hash Feed'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Domain Controllers'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          suspicious_procs = SELECT host, timestamp, process_hash, process_path
+                             FROM win_event_4688
+                             WHERE process_hash IN (malicious_hashes) OR process_path MATCHES '.*\\Temp\\.*'
+
+          outbound_conns = SELECT host, timestamp FROM zeek_conn_log
+
+          JOIN suspicious_procs, outbound_conns
+          ON suspicious_procs.host = outbound_conns.host
+          WHERE outbound_conns.timestamp BETWEEN suspicious_procs.timestamp AND suspicious_procs.timestamp + 5_minutes
+  - question: 'Is a process executing from a rare file path and then making a network connection?'
+    context: |
+      This question seeks to identify anomalous process behavior that might indicate malware attempting to hide. By baselining common process execution paths, we can calculate the rarity of any new process execution. An execution from an extremely rare path (e.g., below the 1st percentile) that is immediately followed by an outbound network connection is a significant anomaly that should be investigated.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Domain Controllers'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Step 1: Baseline execution paths
+          path_frequencies = CALCULATE_FREQUENCY(win_event_4688.process_path)
+          rarity_threshold = CALCULATE_PERCENTILE(path_frequencies, 1)
+
+          // Step 2: Find rare executions and correlate with network connections
+          rare_procs = SELECT host, timestamp, process_path
+                       FROM win_event_4688
+                       WHERE FREQUENCY(process_path) < rarity_threshold
+          // JOIN logic with network logs is then applied
+  - question: 'Can we detect malicious processes based on their command-line arguments before they establish persistent C2?'
+    context: |
+      This question focuses on detecting obfuscated or suspicious process execution through its command-line arguments. An anomaly detection model (like Isolation Forest) can be trained on features derived from command lines, such as length, character entropy (randomness), and the presence of encoded strings. Processes that receive a high anomaly score and also initiate network traffic are strong candidates for being malicious.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Domain Controllers'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Training Phase
+          features = EXTRACT_FEATURES(win_event_4688.command_line) // e.g., length, entropy
+          model = TRAIN IsolationForest(features)
+
+          // Prediction Phase
+          new_features = EXTRACT_FEATURES(new_win_event_4688.command_line)
+          anomaly_scores = model.PREDICT(new_features)
+
+          // Correlate high scores with network activity
+          ALERT WHERE anomaly_scores > threshold AND process initiated network connection
+  - question: 'Is there non-TLS traffic occurring over a standard TLS port like 443?'
+    context: |
+      This question aims to find C2 traffic masquerading as legitimate encrypted traffic. Adversaries often use standard ports like 443 to bypass firewall rules. A symbolic rule can be created to identify any connection logged by Zeek on port 443 that does not have a corresponding entry in the ssl.log. This mismatch indicates that the traffic is not valid TLS, a common tactic for custom encrypted C2 channels.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Zeek ssl.log'
+      - 'Network Egress Points'
+      - 'Internal Network Segments'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          SELECT c.*
+          FROM zeek_conn_log c
+          LEFT JOIN zeek_ssl_log s ON c.uid = s.uid
+          WHERE c.dest_port = 443 AND s.uid IS NULL
+  - question: 'Is there network traffic on any given port with unusually high payload entropy?'
+    context: |
+      This question helps detect encrypted or packed data where it is not expected. By establishing a baseline of normal payload entropy for each destination port over a 30-day window, we can then alert on any new connection whose entropy exceeds the 95th percentile. This is particularly powerful when combined with the protocol-mismatch rule, as it suggests the traffic is not only non-standard but also likely encrypted.
+    answer_sources:
+      - 'Zeek files.log'
+      - 'Zeek conn.log'
+      - 'Network Egress Points'
+      - 'Internal Network Segments'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Step 1: Calculate baseline entropy per port
+          entropy_thresholds = SELECT dest_port, PERCENTILE(entropy, 95) AS threshold
+                               FROM zeek_files_log
+                               GROUP BY dest_port
+
+          // Step 2: Find connections exceeding the threshold
+          SELECT *
+          FROM zeek_files_log f
+          JOIN entropy_thresholds t ON f.dest_port = t.dest_port
+          WHERE f.entropy > t.threshold
+  - question: 'Can we predict and detect anomalous spikes in payload entropy for high-traffic ports?'
+    context: |
+      This question applies time-series forecasting to detect subtle anomalies in high-volume traffic. For busy ports like 80 and 443, a simple percentile might be too noisy. A model like ARIMA can learn the normal daily and weekly patterns of payload entropy. It can then forecast the expected entropy for a given time. An alert is generated when the observed entropy significantly deviates (e.g., more than 3 standard deviations) from the forecast, indicating a statistical anomaly that could be custom encrypted C2 traffic.
+    answer_sources:
+      - 'Zeek files.log'
+      - 'Zeek conn.log'
+      - 'Network Egress Points'
+      - 'Internal Network Segments'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Training Phase (per port)
+          timeseries_data = SELECT timestamp, entropy FROM zeek_files_log WHERE dest_port = 443
+          model = TRAIN ARIMA(timeseries_data)
+
+          // Prediction Phase
+          forecast = model.FORECAST(next_time_period)
+          observed_entropy = GET_CURRENT_ENTROPY(dest_port=443)
+
+          ALERT WHERE ABS(observed_entropy - forecast.value) > 3 * forecast.std_dev
+  - question: "Is any internal host communicating with an external destination in a periodic, repeating 'heartbeat' pattern?"
+    context: |
+      This question aims to detect the classic C2 beaconing behavior. Malware often 'phones home' at regular intervals to check for new commands. A symbolic rule can analyze connection timestamps and data sizes for each source-destination pair. An alert is triggered if a host makes a series of connections (e.g., more than 5) to the same destination at regular intervals (e.g., every 5 minutes) with a consistent payload size, indicating a likely automated C2 channel.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          GROUP connections by source_ip, dest_ip
+          FOR each group:
+            CALCULATE time_delta between consecutive connections
+            CALCULATE size_delta between consecutive connections
+            IF count > 5 AND STDEV(time_delta) < threshold AND STDEV(size_delta) < threshold:
+              ALERT "Beaconing detected"
+  - question: 'Are there any network connections with a highly unusual ratio of data sent versus data received for that port?'
+    context: |
+      This question identifies anomalous data transfer patterns. For most protocols and ports, there is a typical ratio of sent vs. received bytes. By establishing a statistical baseline for this ratio on a per-port basis, we can flag connections that deviate significantly (e.g., by more than 3 standard deviations). This could indicate C2 activity, such as a small check-in packet followed by a large command download, or a large data exfiltration upload with a small acknowledgement.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Step 1: Calculate baseline ratio stats per port
+          port_baselines = SELECT dest_port, AVG(sent_bytes / received_bytes) AS mean_ratio, STDEV(sent_bytes / received_bytes) AS stdev_ratio
+                           FROM zeek_conn_log
+                           GROUP BY dest_port
+
+          // Step 2: Find connections with anomalous ratios
+          SELECT *
+          FROM zeek_conn_log c
+          JOIN port_baselines b ON c.dest_port = b.dest_port
+          WHERE ABS((c.sent_bytes / c.received_bytes) - b.mean_ratio) > 3 * b.stdev_ratio
+  - question: 'Can we use time-series analysis to automatically detect repeating signals indicative of C2 beaconing?'
+    context: |
+      This question applies a more advanced mathematical approach to beacon detection. For each source-destination pair, the timestamps of their connections can be treated as a time series. An autocorrelation function measures how correlated the series is with a delayed copy of itself. A high autocorrelation score indicates a strong, repeating, periodic signal (a beacon). This method can find beaconing even when the intervals are not perfectly fixed, and is especially useful for flagging activity to low-reputation destinations.
+    answer_sources:
+      - 'Zeek conn.log'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          GROUP connections by source_ip, dest_ip
+          FOR each group:
+            timestamps = GET_TIMESTAMPS(connections)
+            autocorrelation_score = AUTOCORRELATE(timestamps)
+            IF autocorrelation_score > threshold:
+              ALERT "Periodic signal detected via autocorrelation"
+  - question: 'Is an unapproved process making a suspicious network connection, such as non-TLS traffic on port 443?'
+    context: |
+      This question combines process and network validation to find high-fidelity threats. It correlates two distinct symbolic alerts: one for a process execution whose hash is not on a software allowlist, and another for a network connection that shows signs of protocol mismatch (e.g., non-TLS on port 443). When both events originate from the same host in a close time window, it's a strong indicator of unauthorized software performing C2 communications.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'Zeek ssl.log'
+      - 'Software Allowlist'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          unapproved_procs = SELECT host, timestamp
+                             FROM win_event_4688
+                             WHERE process_hash NOT IN (software_allowlist)
+
+          protocol_mismatch = SELECT host, timestamp
+                              FROM non_tls_on_443_alert_log
+
+          JOIN unapproved_procs, protocol_mismatch
+          ON unapproved_procs.host = protocol_mismatch.host
+          WHERE ABS(unapproved_procs.timestamp - protocol_mismatch.timestamp) < 5_minutes
+  - question: 'Can we create a composite risk score to identify processes exhibiting multiple suspicious behaviors at once?'
+    context: |
+      This question moves beyond single indicators to a holistic risk assessment. Instead of separate alerts, a composite score is calculated for each network-connected process. Points are awarded for various statistically anomalous attributes: executing from a rare path, high network traffic entropy, exhibiting beaconing behavior, or having an anomalous data transfer ratio. If a process's cumulative score surpasses a threshold (e.g., 3), it is flagged for investigation as a multi-faceted threat.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'Zeek files.log'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          FOR each process with network activity:
+            score = 0
+            IF path_rarity < 5th_percentile: score += 1
+            IF network_entropy > 95th_percentile: score += 1
+            IF is_beaconing: score += 2
+            IF data_ratio_stdev > 3: score += 1
+
+            IF score > 3:
+              ALERT "High risk score process detected"
+  - question: 'Can we use unsupervised machine learning to find outlier processes based on a combination of process and network features?'
+    context: |
+      This question uses clustering to find 'unknown unknowns'. An unsupervised algorithm like DBSCAN can group processes based on a wide set of features, including both process data (path rarity) and network data (entropy, beaconing stability, data ratio). Normal activity will form large, dense clusters. Malicious processes, exhibiting a unique combination of these behaviors, will be flagged as outliers or small, distant clusters, identifying them as multi-faceted behavioral anomalies that require investigation.
+    answer_sources:
+      - 'Windows Event ID 4688'
+      - 'Zeek conn.log'
+      - 'Zeek ssl.log'
+      - 'Zeek files.log'
+      - 'User Workstations'
+      - 'Critical Application Servers'
+      - 'Network Egress Points'
+    range: 'last 90 days'
+    queries:
+      - technology: 'pseudocode'
+        query: |
+          // Feature Engineering
+          features = COMBINE(
+            process_path_rarity,
+            network_entropy,
+            beaconing_interval_stdev,
+            data_ratio
+          )
+
+          // Clustering
+          model = TRAIN DBSCAN(features)
+          clusters = model.FIT_PREDICT(features)
+
+          ALERT WHERE cluster_label = -1 // DBSCAN outlier label
