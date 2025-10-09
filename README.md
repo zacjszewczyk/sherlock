@@ -16,6 +16,8 @@ LLM-assisted generation, refinement, and export of analytic playbooks based on a
 
 ## Description
 
+This project solves the problem of inconsistent investigations by generating step-by-step analyst playbooks. These playbooks translate high-level guidance from WATSON, and incorporate concrete detections from LESTRADE, into actionable, repeatable procedures, detailing queries to run, data sources to check, and decision trees for escalation. The deliverable is a library of comprehensive hunting and response guides that ensure analysts across the enterprise can act with rigor and consistency. SHERLOCK links strategy to execution.
+
 Sherlock converts structured analytic plans (the from the `Watson` project) into operational playbooks (YAML), then optionally refines those playbooks and aggregates them for dissemination. It supports multiple MITRE ATT&CK matrices (enterprise, ICS, mobile), multi-core processing, run-safe backups, and dual LLM backends (AskSage and Gemini) with automatic/failsafe selection.
 
 ## Dependencies
