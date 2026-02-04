@@ -4,9 +4,9 @@ import logging
 import sys
 from pathlib import Path
 # Add project root to path to allow src imports
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.colorlog import make_console_handler
+from sherlock.src.colorlog import make_console_handler
 
 # Define a module-level logger to be accessible by all functions
 logger = logging.getLogger(__name__)
@@ -29,8 +29,8 @@ from asksageclient import AskSageClient
 import yaml
 
 logger.info("Importing project-specific modules.")
-from src.attack_retriever import build_technique_dictionary
-from src.llm import refine_with_llm  # shared LLM interface
+from sherlock.src.attack_retriever import build_technique_dictionary
+from sherlock.src.llm import refine_with_llm  # shared LLM interface
 
 BASE_PROMPT = """
 I need you to generate an analytic playbook. The analytic playbook consists of the following components in a YAML format:

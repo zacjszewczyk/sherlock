@@ -9,10 +9,10 @@ import yaml
 
 # Add project root to path to allow src imports
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Import local modules
-from src.colorlog import make_console_handler
+from sherlock.src.colorlog import make_console_handler
 
 def setup_logging() -> tuple[str, Path]:
     """Initializes console and file logging."""

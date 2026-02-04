@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 
 # Add project root to path to allow src imports
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.colorlog import make_console_handler
+from sherlock.src.colorlog import make_console_handler
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ from google.genai import errors
 import yaml
 
 logger.info("Importing project-specific modules.")
-from src.attack_retriever import build_technique_dictionary
+from sherlock.src.attack_retriever import build_technique_dictionary
 
 BASE_PROMPT = """
 I need you to refine an existing analytic plan. The analytic plan consists of the following components:
