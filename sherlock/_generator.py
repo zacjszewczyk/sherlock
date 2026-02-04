@@ -25,7 +25,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
 logger.info("Importing installed modules")
-from asksageclient import AskSageClient
+try:
+    from asksageclient import AskSageClient
+    ASKSAGE_AVAILABLE = True
+except ImportError:
+    ASKSAGE_AVAILABLE = False
+    AskSageClient = None
+    logger.warning("asksageclient not available - AskSage functionality will be disabled")
 import yaml
 
 logger.info("Importing project-specific modules.")
@@ -219,7 +225,7 @@ def _worker_generate_one(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # Build AskSage client only if available/effective provider may use it
     ask_sage_client = _DummyAskSage()
-    if job.get("asksage_available"):
+    if job.get("asksage_available") and ASKSAGE_AVAILABLE:
         try:
             ask_sage_client = AskSageClient(
                 job["sage_email"],
@@ -383,7 +389,7 @@ def main():
 
     # --- Determine provider availability & effective provider ---
     asksage_available = False
-    if llm_provider in {"asksage", "auto"}:
+    if llm_provider in {"asksage", "auto"} and ASKSAGE_AVAILABLE:
         try:
             # Probing AskSage reachability quickly (HEAD or simple init). We'll rely on worker init otherwise.
             # Create a lightweight client and ping a harmless path (handled by init).

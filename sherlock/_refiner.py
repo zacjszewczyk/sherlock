@@ -25,7 +25,13 @@ import multiprocessing
 import argparse
 
 logger.info("Importing installed modules")
-from asksageclient import AskSageClient
+try:
+    from asksageclient import AskSageClient
+    ASKSAGE_AVAILABLE = True
+except ImportError:
+    ASKSAGE_AVAILABLE = False
+    AskSageClient = None
+    logger.warning("asksageclient not available - AskSage functionality will be disabled")
 from google import genai
 from google.genai import types
 from google.genai import errors
@@ -361,12 +367,18 @@ def _worker_refine_one(job: Dict[str, Any]) -> Dict[str, Any]:
     if gemini_api_key:
         os.environ["GEMINI_API_KEY"] = gemini_api_key
 
-    ask_sage_client = AskSageClient(
-        job["sage_email"],
-        job["sage_api_key"],
-        user_base_url="https://api.genai.army.mil/user/",
-        server_base_url="https://api.genai.army.mil/server/",
-    )
+    ask_sage_client = None
+    if ASKSAGE_AVAILABLE:
+        try:
+            ask_sage_client = AskSageClient(
+                job["sage_email"],
+                job["sage_api_key"],
+                user_base_url="https://api.genai.army.mil/user/",
+                server_base_url="https://api.genai.army.mil/server/",
+            )
+        except Exception as e:
+            logger.warning(f"[WORKER] Failed to initialize AskSage: {e}")
+            ask_sage_client = None
 
     tag = _core_tag()
 
@@ -557,12 +569,18 @@ def _refine_one_playbook(job: Dict[str, Any]) -> Dict[str, Any]:
     if job.get("gemini_api_key"):
         os.environ["GEMINI_API_KEY"] = job["gemini_api_key"]
 
-    ask_sage_client = AskSageClient(
-        job["sage_email"],
-        job["sage_api_key"],
-        user_base_url="https://api.genai.army.mil/user/",
-        server_base_url="https://api.genai.army.mil/server/",
-    )
+    ask_sage_client = None
+    if ASKSAGE_AVAILABLE:
+        try:
+            ask_sage_client = AskSageClient(
+                job["sage_email"],
+                job["sage_api_key"],
+                user_base_url="https://api.genai.army.mil/user/",
+                server_base_url="https://api.genai.army.mil/server/",
+            )
+        except Exception as e:
+            logger.warning(f"[WORKER] Failed to initialize AskSage: {e}")
+            ask_sage_client = None
 
     tag = _core_tag()
     path: Path = Path(job["file_path"])
