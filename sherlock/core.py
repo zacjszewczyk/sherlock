@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -367,8 +368,11 @@ def generate_playbooks_for_techniques(
         }]
         
         # Write minimal plan to temp file
-        temp_plan_path = Path(f"/tmp/sherlock_temp_{tech_id}.json")
+        temp_fd, temp_plan_path_str = tempfile.mkstemp(suffix=f"_{tech_id}.json", prefix="sherlock_temp_")
+        temp_plan_path = Path(temp_plan_path_str)
         try:
+            # Close the file descriptor as we'll write with Path
+            os.close(temp_fd)
             temp_plan_path.write_text(json.dumps(minimal_plan, indent=2), encoding="utf-8")
             
             # Generate playbook
