@@ -4,13 +4,6 @@
 
 List of Enterprise ATT&CK techniques that have been fully processed:
 
-T1567.001
-T1553.003
-T1053.json
-T1055.001
-T1055.002
-T1195.003
-
 #### In Progress
 
 List of Enterprise ATT&CK techniques that currently being processed in this batch. Note: pay attention to which agent is handling which batch!
@@ -21,7 +14,7 @@ List of Enterprise ATT&CK techniques that currently being processed in this batc
 
 List of Enterprise ATT&CK techniques that currently being processed in this batch specifically by Agent #1:
 
-(no active Agent #1 tasks right now)
+T1071.004
 
 ---
 
