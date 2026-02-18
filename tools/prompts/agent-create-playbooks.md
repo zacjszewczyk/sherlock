@@ -120,7 +120,7 @@ Analysis playbooks consists of the following components in a YAML format. These 
         * Queries [queries]: Search queries analysts can use to gather evidence data to answer the question. Specify the search technology and the query. For now, output short pseudocode based on the approach described in the action.
 ```
 
-Note that you must output a distinct “question”, “context”, “answer_sources”, “range”, and “queries” series for each distinct action in the analytic plan.
+Note that you must output a distinct “question”, “context”, “answer_sources”, “range”, and “queries” series for each distinct action in the analytic plan. Your "question" and "context" should be a more helpful, verbose, and explanatory version of the "action" from the analysis plan, designed to help guide an analyst to investigate what may be a high-level abstraction in the brief analysis plan. The playbooks should provide very granular, actionable guidance to analysts.
 
 ## Instructions
 
