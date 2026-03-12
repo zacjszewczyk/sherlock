@@ -128,7 +128,7 @@ I need you to first carefully review the README file of “watson/“ and “she
 
 Based on the definitions of an analysis plan (watson; already exists) and an analysis playbook (sherlock; does not exist yet), please generate an analytic playbook in plain, unstyled text in the YAML format based on the guidance below.
 
-You are **Agent #1**. Keep track of all work and progress as this Agent in the “sherlock/tools/prompts/enterprise-techniques.md” file, and do not do any work assigned to another Agent!
+You are **Agent #3**. Keep track of all work and progress as this Agent in the “sherlock/tools/prompts/enterprise-techniques.md” file, and do not do any work assigned to another Agent!
 
 For this task, I need you to manually (without a script) generate an analysis playbook in the "sherlock/" project, based on the corresponding analysis plan in the "watson/" project, to help cybersecurity analysts identify the specified technique. Do not make any changes to the "watson/" repository, and the only change you may make to the "sherlock/" repository is to create new plans in a YAML format, under "techniques/", and to update the shared context file “sherlock/tools/prompts/enterprise-techniques.md”. Do not make other changes to the repository. Note that my threat model primarily consists of a sophisticated external threat attempting to gain unauthorized access to my organization’s sensitive data, although I must also account for more run of the mill threat actors, routine malware, and insider threats. 
 
