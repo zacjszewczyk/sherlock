@@ -5,6 +5,9 @@
 List of Enterprise ATT&CK techniques that have been fully processed:
 
 T1071.004
+T1078
+T1190
+T1059.001
 T1071.001
 T1133
 
