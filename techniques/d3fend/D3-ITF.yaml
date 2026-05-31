@@ -1,0 +1,345 @@
+name: 'D3-ITF: Inbound Traffic Filtering'
+id: 53f3299d-e273-48e1-85d0-000bb26dc067
+description: Assess how effectively inbound traffic filtering controls isolate critical assets and protected
+  enclaves from untrusted external networks. This playbook helps an analyst investigate boundary connection-state
+  evidence to confirm whether ingress controls actually blocked traffic, surface successful sessions from
+  known-bad sources, detect reachability to prohibited services, and reconcile host-level Windows Filtering
+  Platform outcomes against expected boundary policy. It combines deterministic firewall/ruleset verification
+  (default-deny allow-lists, reachability and config-diff analysis, rule-shadowing detection, enclave
+  isolation invariants), statistical baselining (allow-to-deny ratio drift, rejection-volume collapse
+  as a control-failure signal, and inbound protocol-tunneling profiling), and machine-learning anomaly/classification
+  layers to identify when inbound filtering has gaps, has been weakened by a rule change, or has silently
+  failed.
+type: technique
+related:
+- tactic_id: D3-IS
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there established inbound sessions originating from IP addresses on our threat-intelligence
+    deny lists, and did the boundary or host-level filtering actually block them or allow them to complete?
+  context: Within the Isolate tactic, inbound filtering is supposed to drop traffic from known-bad sources
+    at the network edge. By matching inbound source IPs in Zeek conn.log against threat-intel deny lists
+    and inspecting conn_state/history, the analyst distinguishes a blocked attempt (S0/REJ/RSTO) from
+    an established, data-bearing session (SF, S1, history with ShAdDa data flags). Correlating with Windows
+    Event ID 5156 (allowed) versus 5157 (blocked) reveals cases where the host's Windows Filtering Platform
+    contradicted the expected boundary policy. A positive result -- an established session from a denied
+    indicator -- means an ingress control failed or was bypassed and the asset may be compromised; a negative
+    result (only blocked attempts) confirms the control worked.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'load conn.log
+
+      | where id.orig_h in threat_intel_deny_list
+
+      | where conn_state in ("SF","S1") OR history matches /Sh.*A.*D.*[a-z]/
+
+      | project ts, id.orig_h, id.resp_h, id.resp_p, conn_state, history, orig_bytes, resp_bytes
+
+      | alert "Established inbound session from denied indicator"'
+  - technology: SIEM/Rule pseudocode
+    query: 'source=wfp (EventID=5156 OR EventID=5157)
+
+      | lookup threat_intel_deny on SourceAddress
+
+      | eval allowed=if(EventID=5156,1,0)
+
+      | where deny_listed=true AND allowed=1
+
+      | table _time, SourceAddress, DestAddress, DestPort, EventID, ProcessName
+
+      | alert "Host WFP allowed traffic from denied source (boundary policy contradiction)"'
+- question: Is inbound traffic from untrusted zones reaching forbidden or sensitive services (e.g., SSH
+    22, RDP 3389, SMB 445, SNMP 161, databases) on protected enclaves despite a default-deny policy?
+  context: Isolation depends on a default-deny allow-list of permitted inbound destination/port tuples
+    per enclave (per NIST SP 800-41 Rev. 1). This question hunts for any inbound flow from an untrusted
+    zone that lands on a service not on that allow-list, especially management protocols and databases
+    that should never be externally reachable. Reachability modeling (Header Space Analysis) confirms
+    the path is actually permitted end-to-end rather than a stray, dropped packet. The analyst should
+    enrich alerts with asset owner, service criticality, source zone, and conn_state. A positive finding
+    indicates a hole in inbound filtering exposing high-value services -- a prime target for an external
+    actor seeking unauthorized access.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'load conn.log
+
+      | where src_zone == "untrusted"
+
+      | where id.resp_p in (22,3389,445,161,1433,3306,5432)
+
+      | join allow_list on (id.resp_h, id.resp_p) type=anti  // not explicitly permitted
+
+      | where conn_state in ("SF","S1")
+
+      | project ts, id.orig_h, id.resp_h, id.resp_p, conn_state, asset_owner, criticality
+
+      | alert "Untrusted-zone inbound reached prohibited service"'
+  - technology: SIEM/Rule pseudocode
+    query: 'source=firewall_syslog action=allow direction=inbound src_zone=untrusted
+
+      | lookup permitted_tuples dest_ip dest_port OUTPUT permitted
+
+      | where isnull(permitted) AND dest_port IN (22,3389,445,161,1433,3306,5432)
+
+      | table _time, src_ip, dest_ip, dest_port, enclave, criticality
+
+      | alert "Prohibited inbound service exposure"'
+- question: After each firewall/router rule or configuration commit, has a previously isolated destination/port
+    tuple become reachable from an untrusted source, violating the intended inbound deny policy?
+  context: Within the Isolate tactic, configuration changes are the most common way isolation invariants
+    get broken. This question rechecks the deny invariants protecting each enclave on every rule/config
+    commit (real-time, in the style of VeriFlow) and runs offline config-diff analysis (Batfish) to flag
+    commits that make an intended-deny tuple reachable, before or after deployment. The analyst compares
+    the pre- and post-change reachability sets for each protected enclave. A positive result -- a formerly
+    unreachable, isolated tuple now reachable from untrusted space -- flags a dangerous or unauthorized
+    change that must be rolled back or justified, even if no malicious traffic has yet been observed.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Batfish/pseudocode
+    query: "snapshot_before = load_config(commit=prev)\nsnapshot_after  = load_config(commit=current)\n\
+      for enclave in protected_enclaves:\n  r_before = reachability(src=untrusted_zone, dst=enclave.deny_tuples,\
+      \ snapshot_before)\n  r_after  = reachability(src=untrusted_zone, dst=enclave.deny_tuples, snapshot_after)\n\
+      \  new = r_after - r_before\n  if new not empty: alert(\"Isolation invariant broken\", enclave,\
+      \ new)"
+  - technology: SIEM/Rule pseudocode
+    query: 'source=netdevice_config_audit event=commit
+
+      | run invariant_check(deny_invariants)
+
+      | where invariant_status="violated"
+
+      | table _time, device, commit_id, author, violated_tuple, src_zone
+
+      | alert "Rule change exposed previously isolated tuple"'
+- question: Does the active firewall ruleset contain anomalies -- shadowing, generalization, correlation,
+    or redundancy -- such as a broad allow inserted above a deny that silently weakens inbound filtering,
+    and does every rule change map to an approved request?
+  context: Effective isolation requires a coherent ruleset. Parsing the active ruleset and applying the
+    rule-relation model (shadowing, generalization, correlation, redundancy) from 'Detecting and Resolving
+    Firewall Policy Anomalies' deterministically flags structural weaknesses -- most importantly a broad
+    allow placed above a more specific deny, or reorderings that quietly open ingress paths. The analyst
+    also cross-checks each rule change against an approved change request (NIST SP 800-41 Rev. 1) to catch
+    unauthorized modifications. A positive result indicates the policy as written does not enforce intended
+    isolation, regardless of current traffic, and may reflect misconfiguration or deliberate tampering.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ruleset = parse_active_ruleset()\nfor (ri, rj) in ordered_pairs(ruleset):\n  rel = relation(ri,\
+      \ rj)   // shadow|generalization|correlation|redundancy\n  if rel==\"shadow\" AND rj.action==\"\
+      deny\" AND ri.action==\"allow\":\n    flag(ri, rj, \"broad allow shadows deny\")\nfor change in\
+      \ rule_change_log:\n  if change.id not in approved_change_requests: flag(change, \"unapproved\"\
+      )\n| alert on flagged"
+  - technology: Batfish/pseudocode
+    query: 'load_config(current)
+
+      | detectFirewallRuleAnomalies()  // shadowed, unreachable, redundant rules
+
+      | where anomaly_type in ("shadowed","unreachable","correlated")
+
+      | table device, rule_index, anomaly_type, allow_rule, deny_rule'
+- question: For each critical asset and destination port, has the daily ratio of allowed-versus-denied
+    inbound connections drifted beyond its 30-day baseline, indicating filtering is letting through traffic
+    it previously blocked?
+  context: This statistical method computes daily allow-vs-deny ratios (volume + state) per critical asset
+    and destination port and compares them to a 30-day baseline, escalating when the ratio exceeds the
+    95th percentile or shows an abrupt step change, using CUSUM/Bayesian online change-point detection.
+    Site-specific thresholds are derived from labeled boundary traffic. A rising allow ratio means inbound
+    filtering is permitting more than it used to -- possibly from a weakened rule, an exception that was
+    never removed, or an attacker who found an open path. The analyst correlates any change point with
+    rule-change events to find the cause.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=firewall_syslog direction=inbound
+
+      | bin _time span=1d
+
+      | stats count(eval(action="allow")) as allows, count(eval(action="deny")) as denies by asset, dest_port,
+      _time
+
+      | eval ratio=allows/(denies+1)
+
+      | join baseline_30d on asset,dest_port
+
+      | where ratio > p95_ratio OR changepoint(ratio)==true
+
+      | alert "Allow-to-deny ratio drift"'
+  - technology: Python/pseudocode
+    query: "series = daily_ratio(asset, port)\ncp = bayesian_online_changepoint(series)\nif cp.detected\
+      \ and series[-1] > percentile(baseline,95):\n    alert(asset, port, series[-1], cp.location)"
+- question: Has the hourly volume of rejected/blocked inbound attempts (REJ/S0 in conn.log, Event ID 5157
+    in WFP) dropped in a sustained way that is inconsistent with external threat pressure, suggesting
+    a sensor or control has failed?
+  context: A quiet boundary is not necessarily a safe one. This method builds hourly baselines for rejected/blocked
+    inbound attempts and applies CUSUM or EWMA to detect sustained drops. Crucially, a collapse in deny/REJ
+    counts is treated as a distinct failure signal -- not as 'things are calm' -- and is investigated
+    as sensor failure, a disabled control, a logging gap, or an unlogged bypass. The analyst checks whether
+    the drop coincides with a config change, a logging pipeline outage, or device reboot. A positive result
+    (sustained deny-count collapse) means the isolation control may no longer be enforcing or reporting,
+    leaving the enclave silently exposed.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=(zeek_conn OR wfp)
+
+      | eval blocked=if(conn_state in ("REJ","S0") OR EventID=5157,1,0)
+
+      | bin _time span=1h | stats sum(blocked) as denies by device, _time
+
+      | apply EWMA(denies, alpha=0.3) as ewma
+
+      | where denies < ewma - k*stdev OR cusum_down(denies)==true
+
+      | alert "Rejection-volume degradation (possible control failure)"'
+  - technology: Python/pseudocode
+    query: "hourly = block_counts_per_hour(device)\nstat, alarm = cusum(hourly, target=baseline_mean,\
+      \ k, h)\nif alarm and trend(hourly)==\"down\":\n    alert(\"deny count collapse -> investigate sensor/control\
+      \ failure\", device)"
+- question: On common bypass ports (53/80/443), do inbound sessions show byte counts, orig/resp byte ratios,
+    durations, or payload byte-frequency distributions that deviate from each service's normal profile,
+    indicating tunneled or encapsulated unauthorized traffic?
+  context: Attackers often smuggle unauthorized traffic through ports that inbound filters leave open
+    (DNS 53, HTTP 80, HTTPS 443). This statistical method profiles per-service byte counts, orig/resp
+    byte ratios, and duration, flagging outliers beyond the per-service 99th percentile. It is augmented
+    with payload byte-frequency profiling (per-host/port/length 1-grams with Mahalanobis distance, a la
+    PAYL) and multi-model request profiles (length, character-distribution chi-square, structure, a la
+    Kruegel and Vigna). A positive result -- a '443' session whose byte ratio or payload distribution
+    looks nothing like TLS -- suggests protocol tunneling that bypassed content-blind inbound filtering,
+    a known weakness called out in the D3FEND knowledge base.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'load conn.log
+
+      | where id.resp_p in (53,80,443) AND direction=="inbound"
+
+      | eval ratio=orig_bytes/(resp_bytes+1)
+
+      | stats p99(duration), p99(orig_bytes), p99(ratio) by id.resp_p as baseline
+
+      | where duration>p99_dur OR ratio>p99_ratio OR orig_bytes>p99_bytes
+
+      | alert "Anomalous inbound session on bypass port (possible tunneling)"'
+  - technology: Python/pseudocode
+    query: "for sess in inbound_sessions(port in [53,80,443]):\n    v = bytefreq_1gram(sess.payload, length_bin=sess.len)\n\
+      \    d = mahalanobis(v, model[port][sess.len])\n    chi = char_distribution_chisq(sess.payload)\n\
+      \    if d > thresh or chi > thresh:\n        alert(\"payload deviates from service profile\", sess)"
+- question: Does an unsupervised anomaly model over inbound traffic features (volume, frequency, source
+    diversity, port spread, geo profile, failed-connection ratio) flag inbound flows that deviate from
+    learned-benign behavior, and which features drive the anomaly?
+  context: As a parallel layer above deterministic rules, an unsupervised model (online autoencoder ensemble
+    like Kitsune, or train-on-benign one-class models -- Isolation Forest / OCSVM / deep autoencoder at
+    a 99th-percentile score threshold) learns normal inbound behavior and surfaces deviations the static
+    rules miss. Features include inbound volume (bytes/pkts), frequency (conn/min), source diversity,
+    port spread, geo profile, and failed-connection ratio. To stay actionable, the alert must surface
+    the top-3 contributing features (e.g., distinct-source count, blocked-port hits, byte ratio) via LIME/xNIDS.
+    The analyst treats high anomaly scores as leads to corroborate with the deterministic findings; this
+    catches novel scan/exploit/tunneling against the boundary that signatures would miss.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Python/pseudocode
+    query: "X = inbound_features(window=5min)  # bytes,pkts,conn_rate,src_div,port_spread,geo,fail_ratio\n\
+      model = train_on_benign(IsolationForest|OCSVM|autoencoder)\nscore = model.anomaly_score(X)\nif score\
+      \ > p99_threshold:\n    top3 = explain(model, X, method=\"LIME\")\n    alert(\"inbound anomaly\"\
+      , score, top3)"
+  - technology: SIEM/Stats pseudocode
+    query: 'source=zeek_conn direction=inbound
+
+      | bin _time span=5m
+
+      | stats sum(orig_bytes) bytes, count conns, dc(id.orig_h) src_div, dc(id.resp_p) port_spread, avg(failed)
+      fail_ratio by enclave,_time
+
+      | apply anomaly_model OUTPUT score, top_features
+
+      | where score > p99
+
+      | alert "Modeled inbound policy anomaly"'
+- question: Where labeled boundary traffic exists, can a supervised flow classifier separate sanctioned
+    inbound flows from scan/exploit/tunneling patterns, and what ranked feature contributions justify
+    each verdict for triage?
+  context: When labeled boundary traffic is available, a supervised classifier (with feature-importance
+    output, per Kasongo and Sun) distinguishes sanctioned inbound flows from scan, exploit, and tunneling
+    patterns, with features and thresholds derived from established NIDS datasets. Within the Isolate
+    tactic this directly answers whether observed inbound flows are authorized given policy, and the ranked
+    feature contributions reported with each verdict let the analyst quickly validate or dismiss the call.
+    A flow classified as scan/exploit/tunneling against a protected enclave indicates inbound filtering
+    allowed traffic it should have isolated; the explanation guides remediation (which rule, which port,
+    which source).
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Firewall syslog
+  - 'NAI: Internet gateways, network firewalls, and DMZ ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Python/pseudocode
+    query: "clf = train_supervised(labeled_boundary_flows, model=XGBoost|RandomForest)\nfor flow in inbound_flows:\n\
+      \    label, proba = clf.predict(flow.features)\n    if label in (\"scan\",\"exploit\",\"tunnel\"\
+      ) and proba>0.8:\n        alert(flow, label, proba, clf.feature_importance(flow))"
+  - technology: SIEM/Rule pseudocode
+    query: 'source=zeek_conn direction=inbound
+
+      | apply flow_classifier OUTPUT verdict, confidence, ranked_features
+
+      | where verdict!="sanctioned" AND confidence>0.8
+
+      | table _time, id.orig_h, id.resp_h, id.resp_p, verdict, confidence, ranked_features
+
+      | alert "Unauthorized inbound flow classified"'
