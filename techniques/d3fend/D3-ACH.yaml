@@ -1,0 +1,411 @@
+name: 'D3-ACH: Application Configuration Hardening'
+id: 75c7cda8-3d7e-4df2-b91e-61212fc6ac44
+description: 'This playbook helps an analyst investigate weaknesses in application and host configuration
+  hardening (D3FEND D3-ACH: Application Configuration Hardening) by hunting for configurations that deviate
+  from established security baselines. It focuses on three classes of evidence: (1) applications or services
+  communicating over deprecated/insecure protocols such as SMBv1 (the EternalBlue/WannaCry vector, lacking
+  pre-auth integrity and secure dialect negotiation); (2) servers accepting weak or obsolete TLS/SSL versions
+  or cipher suites (SSLv2/SSLv3, TLS 1.0/1.1, RC4, DES/3DES, EXPORT/<1024-bit DH) that are downgradable
+  and decryptable; and (3) managed assets that drift from their secure baseline (DISA STIG / CIS Benchmark)
+  at the registry, daemon-flag, or config-file level. For each it provides deterministic deny-list detections,
+  statistical baselining/anomaly methods, and ML clustering to surface non-hardened cohorts and configuration
+  drift so a SOC analyst can prioritize remediation by asset sensitivity and confirm that hardening is
+  actually enforced.'
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any hosts generating Windows Event ID 3000 in the Microsoft-Windows-SMBServer/Audit log,
+    indicating an SMBv1 connection attempt against a server that should have SMBv1 disabled?
+  context: 'Event ID 3000 is Microsoft''s first-party, host-based SMB1 access-auditing signal (enable
+    it with `Set-SmbServerConfiguration -AuditSmb1Access $true`). Because SMBv1 lacks pre-auth integrity
+    and secure dialect negotiation and is the vector behind EternalBlue/WannaCry, any such event is a
+    direct indication that a client negotiated or attempted SMBv1 against the server. In the context of
+    the Harden tactic this is a high-priority configuration-hardening violation: it tells you either a
+    legacy/misconfigured client is still using SMBv1 or that hardening was never applied to the server.
+    A positive result means SMBv1 is live on the asset and must be remediated; a clean result across audited
+    servers supports that SMBv1 is removed.'
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert when (channel == ''Microsoft-Windows-SMBServer/Audit'' AND EventID == 3000)
+
+      | enrich src_host from asset_inventory
+
+      | set severity = high, tag = ''SMBv1_hardening_violation'''
+- question: Which network sessions negotiated SMB dialect 1.0 (SMBv1), and which source/destination assets
+    are responsible?
+  context: Parsing Zeek smb.log and smb_mapping.log for any session whose negotiated dialect is 1.0 gives
+    a network-level, vendor-agnostic view of SMBv1 usage that complements host audit logs. Cross-referencing
+    the source and destination IPs against the asset inventory pinpoints legacy systems or misconfigured
+    services still requiring SMBv1 for compatibility. For the Harden tactic, every SMBv1 session to an
+    internal asset is a hardening violation; prioritize sessions terminating on Domain Controllers, file
+    servers, and application servers. A match identifies concrete endpoints to reconfigure; no matches
+    over the window corroborates that SMBv1 is no longer negotiated on the wire.
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FOR each rec IN (smb.log + smb_mapping.log):\n  IF rec.dialect == '1.0' OR rec.native_lm CONTAINS\
+      \ 'SMB 1':\n    EMIT alert(src=rec.id.orig_h, dst=rec.id.resp_h, dialect=rec.dialect)\n    JOIN\
+      \ asset_inventory ON dst -> note asset_sensitivity"
+- question: Which hosts are the top SMBv1 talkers, and how does each host's fraction of SMBv1 versus SMBv2/3
+    sessions compare to its own 30-day baseline?
+  context: Aggregating Zeek smb.log by source IP and SMB dialect lets you compute volume (SMBv1 byte/session
+    counts) and the per-host fraction of SMBv1 versus SMBv2/3 across the fleet, applying the enumerate-and-aggregate
+    methodology used for weak-config populations. Ranking the top SMBv1 talkers, weighted by destination
+    asset sensitivity, produces an actionable remediation report. Derive the alert threshold from your
+    own baseline (e.g., any host with >0 successful SMBv1 sessions in a 24h window where the 30-day baseline
+    is 0). For the Harden tactic this turns scattered SMBv1 events into a prioritized worklist and exposes
+    newly introduced non-hardened devices.
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days; compare 24h windows against a 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM smb.log EARLIEST=-24h
+
+      | stats count AS sessions, sum(bytes) AS vol BY id.orig_h, dialect
+
+      | eval smbv1_frac = sessions(dialect=''1.0'') / total_sessions
+
+      | join baseline_30d ON id.orig_h
+
+      | where smbv1_frac > 0 AND baseline_smbv1_sessions == 0
+
+      | sort -vol, -dst_sensitivity'
+- question: Has any host shown a sudden statistical shift toward SMBv1 usage, suggesting a downgrade attack
+    or a newly introduced non-hardened device?
+  context: For each host, compute a 30-day baseline of SMB dialect usage (v1 vs v2/v3) as frequency (sessions/hour)
+    and apply a z-score, flagging |z|>3, to catch an abrupt increase in SMBv1. A sudden shift toward SMBv1
+    can indicate an attacker forcing a protocol downgrade or a freshly deployed device that bypassed hardening.
+    For traffic with strong business-hour/seasonal structure, replace the static z-score with Seasonal-Hybrid
+    ESD to avoid weekday/weekend false positives. In the Harden context, this behavioral profiling catches
+    regressions that point-in-time scans miss; a flagged host warrants immediate investigation of why
+    SMBv1 reappeared.
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days; 30-day rolling baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM smb.log
+
+      | timechart span=1h count BY id.orig_h, dialect
+
+      | eval rate_v1 = sessions(dialect=''1.0'')/hour
+
+      | stats mean(rate_v1) AS mu, stdev(rate_v1) AS sd OVER last_30d BY host
+
+      | eval z = (rate_v1 - mu)/sd
+
+      | where abs(z) > 3   // or Seasonal-Hybrid ESD for business-hour traffic'
+- question: Is the rate of failed or blocked SMBv1 negotiation attempts rising, confirming hardening is
+    enforced and revealing clients still trying to use SMBv1?
+  context: 'Profiling the State of SMB negotiations as a distinct signal means tracking per-host counts
+    of failed/blocked SMBv1 negotiate attempts — Event ID 3000 where access is denied after SMB1 removal,
+    or Zeek SMB sessions reset during dialect negotiation. A rising failure rate is good news for the
+    Harden tactic: it confirms SMBv1 enforcement is working while simultaneously surfacing the specific
+    clients still attempting SMBv1 that need reconfiguration. Pair this with the SMBv1 success detections:
+    rising failures with zero successes means hardening holds; failures alongside renewed successes means
+    a gap remains.'
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '// EventID 3000 with access denied OR Zeek smb session reset during negotiate
+
+      FROM (winlog WHERE EventID==3000 AND result==''denied'') + (smb.log WHERE state==''reset'' AND phase==''negotiate'')
+
+      | timechart span=1d count BY host
+
+      | compare to prior window -> flag rising failure rate AND list attempting clients'
+- question: Do any clusters of hosts share a legacy SMB profile (high SMBv1 fraction, many legacy peers,
+    off-hours volume) that marks them as a cohort of non-hardened devices?
+  context: Build per-host feature vectors of SMB dialect proportions, session volume, and peer counts
+    from Zeek smb.log and cluster them (K-Means/DBSCAN) to surface cohorts of non-hardened devices that
+    share a legacy profile — for example an old gold image or a forgotten subnet. Investigate clusters
+    that deviate from the enterprise standard, and require every alert to emit the top-3 contributing
+    features (e.g., SMBv1 fraction, distinct legacy peers, off-hours session volume) so analysts understand
+    why a host clustered as legacy. For the Harden tactic this finds systemic, shared misconfiguration
+    rather than one-off events, enabling fleet-wide remediation.
+  answer_sources:
+  - Windows Event ID 3000
+  - Zeek smb.log
+  - Zeek smb_mapping.log
+  - 'NAI: Domain Controllers, File Servers, Application Servers, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features[host] = {smbv1_frac, total_sessions, distinct_peers, offhours_session_vol, legacy_peer_count}\n\
+      model = DBSCAN(features) // or KMeans(k)\nFOR each cluster deviating from enterprise_standard:\n\
+      \  EMIT alert(members, top3_features_by_SHAP)"
+- question: Did any successful TLS handshake negotiate a weak or obsolete cipher suite (RC4, DES, 3DES,
+    NULL, or EXPORT-grade) to an internal asset?
+  context: 'Query Zeek ssl.log for connections whose negotiated `cipher` matches a deny-list of weak/obsolete
+    suites (RC4, DES, 3DES, NULL, EXPORT-grade) and alert only on the State of a successful handshake
+    (established=T), since these are demonstrably downgradable and breakable (Logjam, DROWN). For the
+    Harden tactic, any successful weak-cipher session to an internal asset is a configuration-hardening
+    violation: the data in that session is effectively decryptable by a capable adversary. A match identifies
+    a server (and client) that must be reconfigured to modern cipher suites; correlate the server IP with
+    the asset inventory to scope impact.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM ssl.log
+
+      | where established == T AND cipher IN denylist(RC4*, *DES*, *3DES*, *NULL*, *EXPORT*)
+
+      | enrich server from asset_inventory
+
+      | EMIT alert(client=id.orig_h, server=id.resp_h, cipher, ''weak_cipher_success'')'
+- question: Did any successful TLS handshake use a deprecated protocol version (SSLv2, SSLv3, TLS 1.0,
+    or TLS 1.1)?
+  context: Monitor the Zeek ssl.log `version` field for any successful handshake using SSLv2, SSLv3, TLS
+    1.0, or TLS 1.1. SSLv3's CBC mode is broken by POODLE and SSLv2 enables cross-protocol decryption
+    via DROWN, so these versions represent insecure, non-hardened configurations. Filter against a maintained
+    exception list and alert on new or unauthorized usage. For the Harden tactic this confirms whether
+    servers still accept obsolete protocol versions; a positive result is a remediation item, and a tracked
+    decline of such sessions evidences progress toward a hardened TLS posture.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM ssl.log
+
+      | where established == T AND version IN (''SSLv2'',''SSLv3'',''TLSv10'',''TLSv11'')
+
+      | where server NOT IN exception_list
+
+      | EMIT alert(server=id.resp_h, version, ''deprecated_tls_version'')'
+- question: Are there signs of a TLS downgrade dance — ClientHellos offering TLS_FALLBACK_SCSV (0x5600)
+    or servers emitting inappropriate_fallback alerts — followed by weak negotiation?
+  context: Detect the downgrade dance itself by flagging ClientHellos that offer TLS_FALLBACK_SCSV (cipher
+    value 0x5600) or servers emitting an inappropriate_fallback alert — the standardized markers (RFC
+    7507) that a connection was downgraded below the highest mutually supported version. Correlate these
+    markers with a subsequent weak-version or weak-cipher negotiation to distinguish benign client retries
+    from an active downgrade attack. In the Harden context, downgrade activity can defeat otherwise-modern
+    configurations, so confirming a downgrade that lands on a weak parameter elevates the finding from
+    a misconfiguration to a possible active attack.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days; correlate fallback markers with negotiation in same/adjacent sessions
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM ssl.log\n| where client_ciphers CONTAINS 0x5600 (TLS_FALLBACK_SCSV)\n     OR alert_desc\
+      \ == 'inappropriate_fallback'\n| join next_handshake ON (client,server) within 5m\n| where next.version\
+      \ weak OR next.cipher weak\n| EMIT alert('active_downgrade_suspected')"
+- question: For each TLS server, what fraction of daily sessions use non-hardened versions/ciphers, and
+    which servers exceed the compliance threshold?
+  context: For each server IP in Zeek ssl.log, compute the daily distribution (volume and ratio) of TLS
+    versions and cipher suites, then flag servers where the fraction of non-hardened sessions exceeds
+    a tuned threshold — start at 10% and then derive a per-server baseline from 30 days of data. Track
+    remediation on a compliance dashboard, mirroring the distribution/outlier methodology of large-scale
+    TLS measurement studies. For the Harden tactic this provides a quantitative, per-server hardening
+    scorecard so leadership can prioritize the worst offenders and verify that weak-session fractions
+    trend toward zero over time.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days; per-server 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM ssl.log EARLIEST=-1d
+
+      | stats count AS total, count(eval(weak)) AS weak BY id.resp_h
+
+      | eval weak_frac = weak/total
+
+      | join baseline_30d ON server
+
+      | where weak_frac > max(0.10, baseline_threshold)
+
+      | output compliance_dashboard'
+- question: Has any server shown an anomalous spike in weak-cipher/weak-version connection volume indicating
+    configuration drift, a regression after deploy, or a targeted downgrade?
+  context: Build a per-server time series of daily weak-cipher/weak-version connection volume and apply
+    Seasonal-Hybrid ESD to detect spikes. A spike can indicate server-side configuration drift, a regression
+    introduced by a deployment, or a targeted downgrade campaign. Baseline against the documented secular
+    decline of SSLv3/RC4/export usage so a rising trend reads as drift rather than normal background.
+    For the Harden tactic this catches the moment a previously hardened server starts accepting weak parameters
+    again — often immediately after a change — enabling rapid rollback and root-cause analysis.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days; daily time series with seasonal modeling
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM ssl.log
+
+      | timechart span=1d count(eval(weak_cipher OR weak_version)) AS weak_vol BY id.resp_h
+
+      | apply SeasonalHybridESD(weak_vol) per server
+
+      | flag positive_anomalies AS config_drift_or_downgrade'
+- question: What is each server's TLS handshake_failure / no-shared-cipher rate, and do spikes indicate
+    enforced hardening or an active downgrade attempt?
+  context: Profile the State of handshakes as a distinct signal by tracking per-server handshake_failure
+    and no-shared-cipher rates from Zeek ssl.log. A spike in failures right after enforcing modern ciphers
+    confirms hardening is working and identifies legacy clients that need updates. However, a spike in
+    failures paired with renewed weak-cipher successes indicates an active downgrade attempt where an
+    adversary is probing for an acceptable weak parameter. For the Harden tactic this dual-purpose signal
+    both validates remediation and detects attacks against it; interpret it alongside the weak-cipher/weak-version
+    success detections.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM ssl.log
+
+      | stats count AS total, count(eval(alert_desc IN (''handshake_failure'',''no_shared_cipher'')))
+      AS fails BY id.resp_h
+
+      | eval fail_rate = fails/total
+
+      | timechart fail_rate BY server
+
+      | flag spikes; correlate with weak_cipher_success -> distinguish hardening vs active downgrade'
+- question: Which client/server identities consistently negotiate weak TLS parameters, and can they be
+    clustered by JA3/JA4 fingerprint into insecure cohorts for client-side hardening?
+  context: Cluster client and server identities by their offered/negotiated cipher suites and TLS versions,
+    using JA3/JA4 fingerprints emitted in Zeek ssl.log as compact features. This identifies insecure cohorts
+    — groups of endpoints that consistently negotiate weak parameters — so client-side hardening can be
+    prioritized at the cohort level (e.g., an outdated library or appliance firmware shared across many
+    hosts). Each alert should surface the top-3 drivers (weak-cipher fraction, deprecated-version fraction,
+    fingerprint rarity) for explainability. For the Harden tactic this moves remediation upstream from
+    individual sessions to the software/agent responsible for weak negotiation.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features[id] = {weak_cipher_frac, deprecated_version_frac, ja3, ja4, fingerprint_rarity}\n\
+      model = cluster(features)\nFOR each insecure_cohort:\n  EMIT alert(members, top3_drivers_by_SHAP)"
+- question: Where TLS 1.3/ECH hides handshake fields, do flow-based features reveal unusual or downgraded/misconfigured
+    sessions that deny-lists cannot see?
+  context: Where TLS 1.3 or Encrypted Client Hello (ECH) encrypts handshake fields, deny-lists on version/cipher
+    go blind, so layer a self-supervised anomaly model over Zeek-derived flow features (record sizes,
+    timing, byte ratios, JA4) to flag unusual sessions — including downgraded or misconfigured negotiations
+    — without large labeled datasets. Run this in parallel with the deterministic deny-lists, never replacing
+    them. For the Harden tactic this preserves visibility into non-hardened or anomalous encrypted sessions
+    as the environment modernizes, ensuring that hardening verification keeps working even when the handshake
+    itself is opaque.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - 'NAI: Web Servers, Application Servers, Internet Gateway, Internal Certificate Authorities'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features[flow] = {record_sizes, iat_timing, byte_ratios, ja4}
+
+      model = self_supervised_autoencoder(flows)   // trained on benign
+
+      score = reconstruction_error(flow)
+
+      IF score > tau: EMIT alert(''anomalous_encrypted_session'')  // runs alongside denylists'
+- question: Which assets fail any rule when evaluated against their applicable STIG/CIS hardening baseline
+    using machine-readable SCAP content?
+  context: Evaluate each asset against machine-readable hardening content — XCCDF checklists plus OVAL
+    checks for the applicable DISA STIG or CIS Benchmark — and alert on any rule that returns fail. This
+    is the deterministic, auditable floor for measuring configuration deviation per NIST SP 800-126. Keep
+    concrete pass/fail rule IDs and required values rather than fuzzy scoring so every finding is traceable
+    to a specific control and remediation. For the Harden tactic this directly answers which critical
+    applications deviate from established security baselines; each failing rule ID is a precise, actionable
+    hardening gap on a named asset.
+  answer_sources:
+  - OpenSCAP/SCAP scan results (XCCDF/OVAL)
+  - Windows Registry (Sysmon Event ID 12/13)
+  - Configuration files / Auditd
+  - 'NAI: All managed servers, endpoints, and applications subject to a hardening baseline'
+  range: Last 90 days; per scan cadence
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR each asset:\n  results = oscap eval --profile <STIG/CIS> xccdf+oval\n  FOR each rule WHERE\
+      \ result == 'fail':\n    EMIT alert(asset, rule_id, expected_value, actual_value, severity)"
+- question: Has any host's count of failed baseline checks increased over time, indicating configuration
+    drift away from the hardened state?
+  context: Track the count of failed baseline checks per host over time and the frequency of new failures;
+    alert when a host's failed-check count increases beyond a tuned delta (e.g., any new high-severity
+    STIG failure, or z-score>3 on daily failed-check counts). Apply Seasonal-Hybrid ESD to scan-cadence
+    series to suppress predictable maintenance-window noise. For the Harden tactic, an increase in failed
+    checks is configuration drift — a host that was hardened slipping back out of compliance, often due
+    to an update, manual change, or rogue process. A flagged host should be investigated for what changed
+    and when, then re-hardened.
+  answer_sources:
+  - OpenSCAP/SCAP scan results (XCCDF/OVAL)
+  - Windows Registry (Sysmon Event ID 12/13)
+  - Configuration files / Auditd
+  - 'NAI: All managed servers, endpoints, and applications subject to a hardening baseline'
+  range: Last 90 days; daily failed-check time series
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM scap_results
+
+      | stats count(eval(result==''fail'')) AS fails BY host, scan_date
+
+      | eval delta = fails - prev_fails
+
+      | where new_high_severity_fail OR zscore(daily_fails) > 3
+
+      | apply SeasonalHybridESD to scan_cadence to suppress maintenance noise'
+- question: Do groups of hosts share the same set of failed baseline controls, revealing a common non-hardened
+    profile such as an unpatched gold image?
+  context: 'Represent each host as a binary vector of passed/failed baseline controls and cluster them
+    to discover cohorts sharing the same non-hardened profile — for instance an unpatched gold image,
+    a misconfigured deployment template, or a configuration-management gap. Emit the top-3 failing controls
+    driving each cluster assignment so remediation is actionable rather than a bare anomaly score. For
+    the Harden tactic this elevates investigation from per-host findings to systemic root causes: fixing
+    the shared template or image remediates the entire cohort at once, which is far more efficient than
+    chasing individual failures.'
+  answer_sources:
+  - OpenSCAP/SCAP scan results (XCCDF/OVAL)
+  - Windows Registry (Sysmon Event ID 12/13)
+  - Configuration files / Auditd
+  - 'NAI: All managed servers, endpoints, and applications subject to a hardening baseline'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "vector[host] = [pass/fail for each control_id]\nmodel = cluster(vectors)\nFOR each cohort\
+      \ sharing non-hardened profile:\n  EMIT alert(members, top3_failing_controls_by_SHAP)"
