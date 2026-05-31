@@ -1,0 +1,377 @@
+name: 'T1547.015: Login Items'
+id: 5ddb4002-a5c5-440d-a2ce-7c4682de9dfa
+description: 'Investigate adversary abuse of macOS Login Items (T1547.015) for persistence (TA0003) and
+  privilege escalation (TA0004). Adversaries add login items via the Background Task Management framework
+  (writing `~/Library/Application Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm`),
+  via AppleScript that tells ''System Events'' to `make login item`, or via the Service Management framework
+  (`SMLoginItemSetEnabled`/`SMAppService.register`) which installs a helper in an app bundle''s `Contents/Library/LoginItems`.
+  This playbook helps an analyst hunt for: suspicious BTM launch-item-add and backgrounditems.btm modifications;
+  osascript-driven login item creation; low-prevalence, unsigned, or ad-hoc-signed registrants and helpers
+  whose bundle id mismatches the parent app; login-spawned processes (children of launchd/loginwindow)
+  that beacon to low-reputation or newly-registered C2; credential-prompting via `AuthorizationExecuteWithPrivileges`
+  or `osascript ... with administrator privileges` from masqueraded/typosquatted apps; and writes to system-wide
+  persistence directories by non-root, non-installer processes. Detection methods span deterministic rules,
+  statistical prevalence/anomaly scoring, and machine-learning provenance and parent-child models.'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a macOS host record a Background Task Management launch-item-add event, a create/modify
+    of `backgrounditems.btm`, or an `osascript` invocation that tells 'System Events' to `make login item`,
+    where the registered target executable is unsigned/ad-hoc-signed or lives in an unusual location such
+    as `/tmp`, `~/Downloads`, or `/Users/Shared`?
+  context: This is the core persistence signal for T1547.015. On macOS 13+ Endpoint Security emits `ES_EVENT_TYPE_NOTIFY_BTM_LAUNCH_ITEM_ADD`
+    when a login item is registered; older or scripted paths instead show file create/modify of `~/Library/Application
+    Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm` or an `osascript` process whose
+    arguments contain `tell application "System Events"` and `make login item`. Legitimate login items
+    are usually signed apps registering themselves; an adversary instead points a login item at a malicious
+    binary in a world-writable or download directory or one that is unsigned/ad-hoc-signed. Deterministically
+    alert on these events, enrich with the target path and SHA256, and IOC-match. Maintain KnockKnock/DumpBTM
+    allowlist snapshots as the benign denominator so known-good login items are suppressed. A positive
+    result is a new persistence mechanism that survives logout/reboot.
+  answer_sources:
+  - macOS ESF BTM launch-item events
+  - macOS ESF file create/modify events
+  - macOS Unified Log (osascript/process execution)
+  - 'NAI: User Library directories (`~/Library/Application Support/com.apple.backgroundtaskmanagementagent`)
+    and app-bundle `Contents/Library/LoginItems/` directories on all macOS endpoints, plus process/AppleEvent
+    telemetry.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (esf_btm, esf_file, unifiedlog)\n  | where event_type=\"BTM_LAUNCH_ITEM_ADD\"\n\
+      \     OR (file_op IN (\"create\",\"modify\") AND path ENDSWITH \"backgrounditems.btm\")\n     OR\
+      \ (process=\"osascript\" AND args MATCHES \"System Events\" AND args MATCHES \"make login item\"\
+      )\n  | where target_signing IN (\"unsigned\",\"adhoc\")\n     OR target_path MATCHES \"^(/tmp|/Users/Shared|/Users/[^/]+/Downloads)/\"\
+      \n     OR target_sha256 IN (ioc_hashes)\n  | eval benign = lookup(knockknock_allowlist, target_path,\
+      \ target_sha256)\n  | where benign=false\n  | emit alert"
+- question: Which users or hosts show an abnormally high count of `backgrounditems.btm` modifications,
+    or login-item paths/signers seen on fewer than five enterprise hosts, or a first-ever login-item writer
+    for a given host?
+  context: Adversary-added login items are statistically rare relative to a user's normal behavior. Frequency
+    analysis flags users whose `backgrounditems.btm` modification count exceeds their per-user 95th percentile,
+    indicating bursty or repeated tampering. Rarity analysis flags login-item paths or code signers observed
+    on fewer than five enterprise hosts, and treats the first-ever writer process or user for a host as
+    anomalous, because new persistence on a previously-clean host is suspicious. Derive thresholds from
+    30-day rolling baselines per dataset. This complements the deterministic rule by catching novel binaries
+    that aren't yet IOCs. A positive result narrows the hunt to the rarest, most anomalous login-item
+    changes for triage.
+  answer_sources:
+  - macOS ESF BTM launch-item events
+  - macOS ESF file create/modify events
+  - macOS Unified Log (osascript/process execution)
+  - 'NAI: User Library directories (`~/Library/Application Support/com.apple.backgroundtaskmanagementagent`)
+    and app-bundle `Contents/Library/LoginItems/` directories on all macOS endpoints, plus process/AppleEvent
+    telemetry.'
+  range: Last 90 days (30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=esf_file path ENDSWITH \"backgrounditems.btm\" file_op IN (\"create\",\"modify\")\n\
+      \  | bin _time span=1d | stats count AS mods by user, _time\n  | eventstats p95(mods) AS u_p95 by\
+      \ user\n  | where mods > u_p95\n  | join target_path, signer [ stats dc(host) AS host_prev by target_path,\
+      \ signer ]\n  | eval rare = (host_prev < 5)\n  | eval first_writer = (not seen_before(host, writer_proc))\n\
+      \  | where rare OR first_writer OR mods > u_p95\n  | emit alert"
+- question: When a new login item is added, does a parent-child / rare-causal-path model score it as anomalous
+    based on parent image, path novelty, file entropy, code-signing status, and host prevalence?
+  context: Some malicious login items evade both static rules and simple prevalence checks. An XGBoost
+    parent-child model scores new login-item additions using features such as the parent image, path novelty/depth,
+    file entropy, code-signing status, and enterprise host prevalence, and surfaces the top-3 contributing
+    features so an analyst understands why the item was flagged. Corroborate with rare causal-path scoring
+    across the provenance chain (e.g., browser/installer/osascript -> btm write -> persistent spawn),
+    which highlights uncommon execution lineages. This catches sophisticated actors whose individual artifacts
+    look benign but whose causal chain is unusual. A high score plus an unusual causal path is strong
+    evidence of malicious persistence.
+  answer_sources:
+  - macOS ESF BTM launch-item events
+  - macOS ESF file create/modify events
+  - macOS Unified Log (osascript/process execution)
+  - 'NAI: User Library directories (`~/Library/Application Support/com.apple.backgroundtaskmanagementagent`)
+    and app-bundle `Contents/Library/LoginItems/` directories on all macOS endpoints, plus process/AppleEvent
+    telemetry.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = extract(parent_image, path_novelty, path_depth, file_entropy, signing_status, host_prevalence)\n\
+      \  score = xgboost_loginitem.predict_proba(features)\n  causal = rare_path_score(chain=\"installer|browser|osascript\
+      \ -> btm_write -> spawn\")\n  if score > 0.8 OR causal > threshold:\n      emit alert with top3_features(features),\
+      \ causal_subgraph"
+- question: Was `SMLoginItemSetEnabled(true)` or `SMAppService.register` invoked by an unsigned/ad-hoc-signed
+    or low-prevalence binary, by a non-installer process, or with a helper in `Contents/Library/LoginItems`
+    whose bundle id does not match the registering app?
+  context: The Service Management framework registers login items that leverage `launchd`, are invisible
+    in System Preferences, and can only be removed by the creating app — making it attractive for stealthy
+    persistence. Legitimate use is a signed application registering its own helper bundle whose identifier
+    matches the parent app. Alert when the registrant is unsigned/ad-hoc-signed or IOC-listed, when it
+    is a low-prevalence app, when it is not a known software installer, or when the helper tool created
+    in `Contents/Library/LoginItems` has a bundle identifier mismatching the parent app. Compare against
+    the legitimate signed-bundle registration pattern. A positive result is hidden launchd-backed persistence
+    that ordinary inspection of System Preferences would miss.
+  answer_sources:
+  - macOS ESF API monitoring events
+  - macOS ESF file creation events
+  - macOS ESF process execution events
+  - 'NAI: Application bundle directories (`/Applications/*.app/`) and system-wide/user-specific LaunchAgent
+    directories (`/Library/LaunchAgents`, `~/Library/LaunchAgents`) on all macOS endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (esf_api, esf_file, esf_process)\n  | where api IN (\"SMLoginItemSetEnabled\",\"\
+      SMAppService.register\") AND api_arg=\"true\"\n  | where caller_signing IN (\"unsigned\",\"adhoc\"\
+      )\n     OR caller_sha256 IN (ioc_hashes)\n     OR caller_host_prevalence < 5\n     OR caller_is_installer=false\n\
+      \     OR (helper_path MATCHES \"Contents/Library/LoginItems/\" AND helper_bundle_id != app_bundle_id)\n\
+      \  | emit alert"
+- question: Do Service Management registration events fall outside a per-host one-class baseline of legitimate
+    registrants across signer status, path depth, helper entropy, parent image, host prevalence, and EUID?
+  context: Statistical outlier detection catches malicious registrations that don't trip the deterministic
+    rule. Maintain a per-host one-class baseline (Isolation Forest / One-Class SVM) of legitimate registrants
+    over features {signer status, path depth, helper entropy, parent image, host prevalence, EUID} and
+    flag outliers, reporting LIME top-feature attributions to explain the decision. Treat first-time registrants
+    on a host as suspect. Because legitimate registrants are repetitive (the same handful of signed apps),
+    an anomalous combination — e.g., a high-entropy helper from a never-before-seen parent at an unusual
+    path — stands out. A flagged outlier merits pivoting to the helper's subsequent execution and network
+    activity.
+  answer_sources:
+  - macOS ESF API monitoring events
+  - macOS ESF file creation events
+  - macOS ESF process execution events
+  - 'NAI: Application bundle directories (`/Applications/*.app/`) and system-wide/user-specific LaunchAgent
+    directories (`/Library/LaunchAgents`, `~/Library/LaunchAgents`) on all macOS endpoints.'
+  range: Last 90 days (per-host baseline)
+  queries:
+  - technology: ML/pseudocode
+    query: "X = registrations[signer_status, path_depth, helper_entropy, parent_image, host_prevalence,\
+      \ euid]\n  model = IsolationForest().fit(baseline_per_host)\n  outlier = model.decision_function(X)\
+      \ < cutoff\n  if outlier OR first_time_registrant(host, registrant):\n      emit alert with lime_top_features(X)"
+- question: Does node-level provenance-graph analysis of the `launchd/loginwindow -> registering-process
+    -> helper -> file/network` subgraph identify a specific anomalous node?
+  context: 'Provenance-graph anomaly detection (e.g., ThreaTrace, MAGIC) models the system as a graph
+    of processes, files, and network endpoints and learns what normal subgraphs look like. Running node-level
+    detection over the `launchd/loginwindow -> registering-process -> helper -> file/network` subgraph
+    names the specific anomalous node — for example the malicious helper or its outbound connection —
+    and lets the analyst trace its subgraph for triage. This is the deepest method for the registration
+    evidence: it captures relationships that per-event rules and per-feature scoring miss. A flagged node,
+    together with the connected subgraph, provides a ready-made incident timeline.'
+  answer_sources:
+  - macOS ESF API monitoring events
+  - macOS ESF file creation events
+  - macOS ESF process execution events
+  - 'NAI: Application bundle directories (`/Applications/*.app/`) and system-wide/user-specific LaunchAgent
+    directories (`/Library/LaunchAgents`, `~/Library/LaunchAgents`) on all macOS endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "G = build_provenance_graph(scope=\"launchd|loginwindow -> registrant -> helper -> file|net\"\
+      )\n  scores = threatrace.node_anomaly(G)\n  for n in scores where score(n) > threshold:\n      emit\
+      \ alert(node=n, subgraph=neighbors(G, n, depth=2))"
+- question: Did a process whose parent is `launchd` (PID 1) or `loginwindow`, spawned shortly after a
+    user login, connect to a low-reputation/TI-matched destination, a rare port, or a domain registered
+    within the last 30 days — or generate bursts of blocked connections or NXDOMAIN responses?
+  context: 'A login item''s payload typically executes immediately after login as a child of `launchd`
+    or `loginwindow`. Correlating these login-timed processes with Zeek conn.log/dns.log reveals command-and-control
+    behavior: connections to threat-intel-matched C2, rare ports, or newly-registered (<30-day) domains.
+    Importantly, failure-mode signals are also valuable — bursts of blocked connections or NXDOMAIN responses
+    from the same process suggest a beacon trying to reach a dead or sinkholed C2. This ties the persistence
+    mechanism to actual adversary objectives (remote control). A positive result elevates the investigation
+    from ''suspicious persistence'' to ''active C2'' and warrants containment.'
+  answer_sources:
+  - macOS ESF process/login events
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All macOS endpoints for process and login data, and network egress points (e.g., firewalls,
+    network taps) for Zeek log collection.'
+  range: Last 90 days (correlate within minutes of login events)
+  queries:
+  - technology: Zeek/pseudocode
+    query: "login_procs = esf_process where parent IN (\"launchd\",\"loginwindow\") AND start_time within\
+      \ 120s of login_event\n  | join uid, host with zeek_conn, zeek_dns\n  | where dest IN (ti_c2) OR\
+      \ dest_port IN (rare_ports)\n     OR domain_age_days < 30\n     OR conn_state IN (\"REJ\",\"S0\"\
+      ) count_burst\n     OR dns_rcode=\"NXDOMAIN\" count_burst\n  | emit alert"
+- question: Do login-spawned processes show network volume, frequency/cadence, or failure-state statistics
+    that deviate from their baseline — e.g., bytes_out >3σ, beacon-like periodicity, or elevated NXDOMAIN/404/blocked-connection
+    ratios?
+  context: 'Statistical egress profiling catches C2 that doesn''t match any IOC. Compute per-process incremental
+    flow statistics and flag: Volume (bytes_out greater than 3σ over the process baseline), Frequency
+    (connections/min, with FFT/autocorrelation to detect regular beacon cadence), and State/Failure (elevated
+    NXDOMAIN, HTTP 404, or blocked-connection ratios). Derive the sigma and cadence thresholds per dataset.
+    Beaconing malware tends to produce highly regular, low-variance timing that autocorrelation exposes
+    even when each connection looks innocuous. A positive result — particularly periodic small uploads
+    from a login-spawned process — is a hallmark of automated C2 and should be correlated with the persistence
+    evidence above.'
+  answer_sources:
+  - macOS ESF process/login events
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All macOS endpoints for process and login data, and network egress points (e.g., firewalls,
+    network taps) for Zeek log collection.'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=zeek_conn join login_procs on uid,host\n  | stats sum(bytes_out) AS vol, count AS conns,\
+      \ values(ts) AS times by proc, host, bin(_time,1h)\n  | eventstats avg(vol) AS mu, stdev(vol) AS\
+      \ sd by proc\n  | eval beacon = autocorr_peak(times)\n  | eval fail_ratio = (nxdomain+http404+blocked)/conns\n\
+      \  | where vol > mu+3*sd OR beacon=true OR fail_ratio > baseline_fail\n  | emit alert"
+- question: Does an unsupervised traffic model (autoencoder ensemble) plus a temporal provenance-graph
+    detector flag the egress of a login-spawned process across the install->execute->C2 chain?
+  context: For the stealthiest C2, score egress from login-spawned processes with an unsupervised autoencoder
+    ensemble (e.g., Kitsune) that learns normal per-host network behavior and flags beacon-like volume/jitter/timing
+    anomalies with no labels required. Corroborate with a temporal provenance-graph detector (e.g., KAIROS)
+    that reasons over the full install->execute->C2 chain so the network anomaly is tied back to the originating
+    login item. Combining a network-feature model with a provenance model reduces false positives and
+    produces an explainable kill-chain. A correlated hit across both models is high-confidence evidence
+    of an active, persistent macOS implant.
+  answer_sources:
+  - macOS ESF process/login events
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All macOS endpoints for process and login data, and network egress points (e.g., firewalls,
+    network taps) for Zeek log collection.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "net_feats = kitsune.afterimage(zeek_conn[login_procs])\n  anom = autoencoder_ensemble.rmse(net_feats)\
+      \ > threshold\n  prov = kairos.temporal_graph_score(chain=\"btm_write|register -> spawn -> c2\"\
+      )\n  if anom AND prov > threshold:\n      emit alert with reconstruction_error, prov_subgraph"
+- question: Did a process in a Login Item ancestry run `osascript` with `with administrator privileges`
+    or call `AuthorizationExecuteWithPrivileges` to display a password prompt, where the prompting app
+    is unsigned, low-prevalence, or has a typosquatted/masqueraded name such as 'Sytem Preferences'?
+  context: 'This is the privilege-escalation path for Login Items: rather than exploiting a vulnerability,
+    the adversary''s persistent login item simply asks the user for their password via a fake authorization
+    dialog. Alert when a process whose ancestry traces to a Login Item runs `osascript` with `with administrator
+    privileges` or calls the `AuthorizationExecuteWithPrivileges` API, producing a credential prompt,
+    AND the prompting app is unsigned, low-prevalence, or carries a typosquatted/masqueraded name (e.g.,
+    ''Sytem Preferences'' instead of ''System Preferences''). Legitimate privileged operations come from
+    signed system utilities and installers. A positive result indicates an attempt to phish admin credentials
+    for escalation and should trigger immediate user contact and credential reset.'
+  answer_sources:
+  - macOS ESF process execution events
+  - macOS ESF API monitoring events
+  - macOS Unified Log for authorization events
+  - 'NAI: All macOS endpoints, focusing on user-space processes and API interactions with the macOS security
+    framework.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (esf_process, esf_api, unifiedlog)\n  | where has_loginitem_ancestor(proc)=true\n\
+      \  | where (process=\"osascript\" AND args MATCHES \"with administrator privileges\")\n     OR api=\"\
+      AuthorizationExecuteWithPrivileges\"\n  | where prompt_app_signing IN (\"unsigned\",\"adhoc\")\n\
+      \     OR prompt_app_prevalence < 5\n     OR levenshtein(prompt_app_name, apple_utility_names) <=\
+      \ 2\n  | emit alert"
+- question: Are credential-prompting application display names a near-match (small Levenshtein distance)
+    to legitimate Apple/utility names, or are they first-time prompters per host or low-prevalence signers?
+  context: Masquerading drives this privilege-escalation technique, so name-similarity scoring is a strong
+    detector. Score prompting-app display names by Levenshtein distance to legitimate Apple/utility names
+    (e.g., flag 'Sytem Preferences' as a near-match to 'System Preferences') and flag near-matches; also
+    flag first-time prompters per host and low-prevalence signers, deriving the distance and prevalence
+    cutoffs from baseline. This catches typosquatted UI deception that tricks users into entering admin
+    credentials. A small edit distance combined with low prevalence is a high-confidence indicator of
+    a credential-phishing dialog, distinct from the legitimate, frequently-seen system prompts.
+  answer_sources:
+  - macOS ESF process execution events
+  - macOS ESF API monitoring events
+  - macOS Unified Log for authorization events
+  - 'NAI: All macOS endpoints, focusing on user-space processes and API interactions with the macOS security
+    framework.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=credential_prompts\n  | eval min_dist = min(levenshtein(prompt_app_name, legit_name)\
+      \ for legit_name in apple_utility_names)\n  | eval rare_signer = (signer_host_prevalence < 5)\n\
+      \  | eval first_prompter = (not seen_before(host, prompt_app))\n  | where (min_dist > 0 AND min_dist\
+      \ <= 2) OR rare_signer OR first_prompter\n  | emit alert"
+- question: Does an XGBoost parent-child classifier flag a credential prompt as suspect based on parent
+    image, path, signing status, prompt text, and concurrent network state?
+  context: A machine-learning classifier generalizes beyond fixed name lists and prevalence cutoffs. Train
+    an XGBoost parent-child classifier using features such as the parent image, the prompting binary's
+    path, its signing status, the prompt text, and the concurrent network state, and surface the top-3
+    contributing features in the alert to explain why the prompt is suspect. Concurrent network activity
+    is especially telling — a credential prompt that coincides with outbound C2 is far more likely malicious.
+    This catches novel phishing dialogs that don't typosquat a known name. A high classifier score with
+    explanatory features lets the analyst quickly judge whether the prompt is a credential-harvesting
+    escalation attempt.
+  answer_sources:
+  - macOS ESF process execution events
+  - macOS ESF API monitoring events
+  - macOS Unified Log for authorization events
+  - 'NAI: All macOS endpoints, focusing on user-space processes and API interactions with the macOS security
+    framework.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = extract(parent_image, prompt_path, signing_status, prompt_text, net_state)\n  score\
+      \ = xgboost_prompt.predict_proba(features)\n  if score > 0.8:\n      emit alert with top3_features(features)"
+- question: Was a file created or modified in a system-wide persistence directory (`/Library/LaunchAgents`,
+    `/Library/LaunchDaemons`, `/Library/StartupItems`) by a process running with a standard user's EUID
+    (≠0) that is not a whitelisted, signed installer?
+  context: Writing to system-wide LaunchAgents/LaunchDaemons/StartupItems normally requires root, so a
+    write performed by a process running with a non-root EUID is anomalous and may indicate a privilege-escalation
+    or misconfiguration that the adversary is exploiting to plant root-level persistence. Alert on file
+    create/modify (Endpoint Security) in `/Library/LaunchAgents`, `/Library/LaunchDaemons`, or `/Library/StartupItems`
+    when the acting process runs with a standard user's EUID (not 0) and is not a whitelisted, signed
+    installer. Because legitimate system-wide jobs are installed by root via signed installers, a non-root
+    writer here is highly suspect. A positive result means an unprivileged process gained write access
+    to a root-execution location — investigate how it obtained that access.
+  answer_sources:
+  - macOS ESF file creation events
+  - macOS ESF process execution events with user context
+  - 'NAI: System-wide persistence directories (`/Library/LaunchAgents`, `/Library/LaunchDaemons`, `/Library/StartupItems`)
+    on all macOS endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=esf_file file_op IN (\"create\",\"modify\")\n  | where path MATCHES \"^/Library/(LaunchAgents|LaunchDaemons|StartupItems)/\"\
+      \n  | where actor_euid != 0\n  | where actor_is_signed_installer=false AND actor NOT IN (installer_allowlist)\n\
+      \  | emit alert"
+- question: Do writes to system-wide persistence directories originate from processes, users, or signers
+    absent from the host's historical baseline, or involve login-item paths/signers seen on fewer than
+    five hosts?
+  context: Rare-path prevalence scoring catches anomalous persistence writes that aren't covered by the
+    EUID rule. Flag writes from processes, users, or signers absent from the host's historical baseline,
+    and login-item paths or signers with enterprise prevalence below five hosts, deriving the lookback
+    window per dataset. New and rare writers to root-execution directories are strong indicators of either
+    escalation or unauthorized software. This complements the deterministic non-root rule by surfacing
+    first-seen activity even when EUID is 0 (e.g., after the adversary already escalated). A flagged write
+    should be pivoted to the resulting launchd job and its execution and network behavior.
+  answer_sources:
+  - macOS ESF file creation events
+  - macOS ESF process execution events with user context
+  - 'NAI: System-wide persistence directories (`/Library/LaunchAgents`, `/Library/LaunchDaemons`, `/Library/StartupItems`)
+    on all macOS endpoints.'
+  range: Last 90 days (per-dataset lookback)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=esf_file path MATCHES \"^/Library/(LaunchAgents|LaunchDaemons|StartupItems)/\"\n  |\
+      \ eval new_writer = (not seen_before(host, writer_proc, writer_user, signer))\n  | join target_path,\
+      \ signer [ stats dc(host) AS prev by target_path, signer ]\n  | where new_writer OR prev < 5\n \
+      \ | emit alert"
+- question: Does a one-class model trained on legitimate installer writes flag a persistence-directory
+    write as an outlier, corroborated by node-level provenance anomaly detection on the writing process's
+    subgraph?
+  context: For the privilege-escalation write evidence, train a one-class model (Isolation Forest / One-Class
+    SVM) on legitimate installer writes to system-wide persistence directories and flag outliers, reporting
+    LIME top-feature attributions to explain the decision. Corroborate with node-level provenance anomaly
+    detection (e.g., ThreaTrace) on the writing process's subgraph to confirm the write sits within an
+    unusual execution lineage rather than a normal install flow. Legitimate installer writes are repetitive
+    and well-structured, so an outlier — an unusual parent, path, or signing combination writing a launch
+    job — stands out. A model hit plus an anomalous provenance subgraph is high-confidence evidence of
+    malicious root-level persistence and warrants escalation.
+  answer_sources:
+  - macOS ESF file creation events
+  - macOS ESF process execution events with user context
+  - 'NAI: System-wide persistence directories (`/Library/LaunchAgents`, `/Library/LaunchDaemons`, `/Library/StartupItems`)
+    on all macOS endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "X = persistence_writes[parent_image, path_depth, file_entropy, signer, euid, host_prevalence]\n\
+      \  model = OneClassSVM().fit(legit_installer_writes)\n  if model.predict(X) == -1:\n      sub =\
+      \ threatrace.node_anomaly(provenance_subgraph(writer_proc))\n      emit alert with lime_top_features(X),\
+      \ sub"
