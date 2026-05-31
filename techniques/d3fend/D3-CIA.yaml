@@ -1,0 +1,337 @@
+name: 'D3-CIA: Container Image Analysis'
+id: 9b67d937-063c-4f6b-a64d-f3c8c9de829a
+description: Investigate divergence between a container's runtime behavior and the expectations derived
+  from static analysis of its image, as well as policy-noncompliant images that were admitted and deployed.
+  This playbook helps an analyst determine whether container image analysis or admission controls were
+  bypassed, misconfigured, or simply missed risky components, and whether a container has been compromised
+  after deployment. It correlates runtime process and network telemetry (Windows Event ID 4688, Linux
+  exec/syscall events, Zeek conn.log) against image-derived baselines (SBOM, build manifest, provenance),
+  evaluates admitted PodSpecs and image provenance against organizational policy, and models normal syscall
+  and network behavior with statistical and machine-learning methods to surface anomalies. Use it to detect
+  images from untrusted registries, unpinned/':latest' tags, known CVEs, missing provenance, privileged/root
+  requirements, and runtime drift that signals post-deployment compromise.
+type: technique
+related:
+- tactic_id: D3-MD
+  tactic_name: Model
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any processes running inside containers matching known-bad indicators such as IOC-feed
+    hashes/names or denylisted binaries?
+  context: 'This question hunts for an unambiguous post-compromise or failed-control signal in the Model
+    tactic: if container analysis and admission controls worked, no container should ever execute a binary
+    that matches a threat-intel indicator. Correlate container-attributed Windows Event ID 4688 process
+    creation (name + hash) and Linux exec events against IOC feeds and a denylist of known-bad binaries.
+    Any match is immediate, high-confidence evidence that image analysis or admission controls failed
+    to prevent a risky component, per NIST SP 800-190 image-risk guidance. A positive result warrants
+    immediate isolation of the container host; a negative result reduces (but does not eliminate) suspicion
+    and should be paired with the baseline-divergence checks below.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      EventID=4688 OR source=linux_exec
+      | where container_id != null
+      | lookup ioc_feed on process_hash, process_name
+      | lookup denylist on process_name, process_hash
+      | where ioc_match=true OR denylist_match=true
+      | alert severity=critical
+- question: Are containers executing binaries or process lineages that are absent from the approved image
+    baseline (SBOM/build manifest allowlist)?
+  context: Under the Model tactic, the SBOM and build manifest define exactly which executables and parent-child
+    relationships should ever appear in a container of a given image. Compare observed container process
+    lineage (4688 / Linux exec) against this allowlist and flag any binary not present in the approved
+    baseline. Pair this with provenance verification (in-toto) and runtime drop-and-execute rules (Falco
+    'Drop and execute new binary in container', 'Run shell in container'). A flagged execution means a
+    binary was introduced after build, indicating the image analysis missed it, the container drifted,
+    or it was actively compromised. Tune by mapping each image version to its SBOM-derived allowlist.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source IN (EventID_4688, linux_exec)
+      | where container_id != null
+      | lookup sbom_allowlist[image_version] on process_path
+      | where in_allowlist=false
+         OR (parent_child NOT IN approved_lineage[image_version])
+      | alert reason="binary absent from image baseline"
+- question: Is any container showing a spike in failed, short-lived, or blocked network connections and
+    failed process executions?
+  context: Failure-mode telemetry is a distinct and often-earlier indicator of post-compromise activity
+    than missing allowlisted binaries. In the Model tactic, count blocked egress attempts, failed/short-lived
+    connections in Zeek conn.log (conn_state S0, REJ, RSTO), and failed process executions per container.
+    A spike in blocked outbound attempts or connection resets from a container strongly suggests beaconing,
+    C2, or lateral-movement attempts that policy is partially blocking, consistent with Falco 'Unexpected
+    outbound connection' semantics - even when no allowlisted binary is missing. Baseline per container
+    role and alert on statistically anomalous failure rates.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      conn.log
+      | where conn_state IN ("S0","REJ","RSTO")
+      | bin _time span=5m by container_id
+      | stats count as failed_conns by container_id, _time
+      | join (4688/exec failed_exec_count by container_id)
+      | where failed_conns > baseline_mean + 3*baseline_std
+      | alert reason="connection/exec failure spike"
+- question: How far has each container's observed process set diverged from the process set expected from
+    its image SBOM?
+  context: This applies a statistical measure of drift in the Model tactic. Compute a rolling Jaccard
+    similarity and rarity score between the expected (SBOM-derived) and observed process sets per image
+    version, plus a Bag-of-System-Calls change index over sliding windows (per Abed et al.). When similarity
+    drops below a tuned threshold or rare binaries/syscalls appear repeatedly, the container has materially
+    diverged from its image and merits investigation. Derive thresholds from 2-4 weeks of per-image-role
+    baseline (e.g., flag change index > mean + 3 sigma). A sustained low-similarity score is a stronger
+    signal than a single transient binary.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      per (container_id, image_version) over sliding_window:
+        observed_set = distinct(process_name, syscall)
+        expected_set = sbom_process_set[image_version]
+        jaccard = |observed ∩ expected| / |observed ∪ expected|
+        change_index = bag_of_syscalls_delta(window)
+      | where jaccard < threshold OR change_index > mean + 3*std
+      | alert reason="process-set divergence from SBOM"
+- question: Has a container's network profile (volume, frequency, connection state) drifted beyond control
+    bounds for its image role?
+  context: 'In the Model tactic, baseline three network feature families from Zeek conn.log per container
+    role: Volume (bytes_in/bytes_out distributions and ratios), Frequency (connections per minute, distinct
+    destinations), and State (blocked/failed connection rate). Raise alerts only when live behavior exceeds
+    control bounds for two or more correlated metrics, which reduces noise versus single-metric alerting.
+    Multi-metric drift - e.g., simultaneous rise in distinct destinations and outbound volume - is characteristic
+    of exfiltration or C2 from a container whose image was assumed benign.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      conn.log per (container_role) over window:
+        volume = stats(bytes_in, bytes_out, ratio)
+        frequency = conns_per_min, distinct_dest
+        state = failed_conn_rate
+      | compare to control_bounds[container_role]
+      | where count(metrics_out_of_bound) >= 2
+      | alert reason="multi-metric network drift"
+- question: Which containers show persistent high anomaly scores when their combined process and network
+    behavior is modeled with per-application autoencoders?
+  context: This is the ML floor-plus-model approach for the Model tactic. Train per-application autoencoders
+    on combined process and network frequency features for each trusted image family, routing telemetry
+    by application classification to cut false positives (per CDL). Escalate containers with persistent
+    high reconstruction error, and surface the top-3 contributing features (highest per-feature reconstruction-error
+    syscalls/destinations) in the alert text using SHAP/LIME for explainability. Keep the deterministic
+    IOC/allowlist rules as a parallel floor so detection never depends solely on a trained model. Persistent
+    (not transient) high error is the actionable signal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Linux auditd/syscalls (Falco/eBPF)
+  - 'NAI: Container host servers and their network egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      model = autoencoder_per_app[image_family]
+      features = combine(process_freq, network_freq)
+      recon_error = model.reconstruction_error(features)
+      | where recon_error > threshold for N consecutive windows
+      | enrich top3_features = shap_or_lime(recon_error)
+      | alert reason="persistent autoencoder anomaly" detail=top3_features
+- question: Were any images deployed that violate organizational policy - untrusted registry, unpinned/':latest'
+    tag, privileged/hostPath/root pods?
+  context: Central to the Model tactic, evaluate admitted PodSpecs against Rego constraints with OPA Gatekeeper
+    (deny images from untrusted registries, unpinned digests or ':latest' tags, and privileged/hostPath/root
+    pods). Alert on any Gatekeeper audit violation for already-running objects, aligning with NSA/CISA
+    Kubernetes Hardening Guidance. A violation on a running object means a noncompliant image slipped
+    past admission (controls in audit-only mode, a bypass, or a webhook gap) and is now live - a direct
+    indicator that image analysis/admission control failed. Review the offending PodSpec and the admission
+    decision trail.
+  answer_sources:
+  - Kubernetes audit logs
+  - Admission controller logs
+  - Container registry logs
+  - 'NAI: Container orchestration API server, admission webhooks, and image registries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source=gatekeeper_audit OR k8s_audit
+      | where violation=true
+         OR image_registry NOT IN trusted_registries
+         OR image_tag IN (":latest") OR image_digest=null
+         OR pod.privileged=true OR pod.hostPath=true OR pod.runAsRoot=true
+      | where object_state="running"
+      | alert reason="policy-noncompliant image admitted"
+- question: Does each deployed image's attested provenance, layer digests, and SBOM match its approved
+    build manifest?
+  context: Supply-chain integrity in the Model tactic requires verifying in-toto link metadata / signed
+    SBOM at admission. Alert when a deployed image's attested provenance, layer digests, or SBOM does
+    not match the expected build manifest (per NIST SP 800-190). A mismatch means the running image is
+    not the one that was built and approved - it may have been tampered with, rebuilt from an untrusted
+    base, or substituted in the registry. Compare attestations against the known-good build manifest store;
+    any divergence is a strong supply-chain compromise indicator.
+  answer_sources:
+  - Kubernetes audit logs
+  - Admission controller logs
+  - Container registry logs
+  - 'NAI: Container orchestration API server, admission webhooks, and image registries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source=admission_logs
+      | for each admitted image:
+          verify in_toto_link_metadata AND signed_sbom
+          compare (provenance, layer_digests, sbom) to build_manifest[image]
+      | where match=false OR attestation_missing=true
+      | alert reason="image provenance mismatch"
+- question: Are images being admitted despite open critical CVE findings, or is the admission-failure
+    rate spiking per namespace?
+  context: 'This statistical check for the Model tactic tracks Frequency and State signals from registry/admission
+    logs: count of admission denials, CVE findings per image tag, and the ratio of blocked vs. admitted
+    deployments per namespace over time. Alert when an image is admitted despite open critical-CVE findings
+    (a policy gap) or when the admission-failure rate spikes (a possible policy bypass attempt or attacker
+    probing for a misconfigured webhook). Derive thresholds from per-namespace history. A sudden change
+    in either signal indicates either a control weakening or active adversary effort to push noncompliant
+    images.'
+  answer_sources:
+  - Kubernetes audit logs
+  - Admission controller logs
+  - Container registry logs
+  - 'NAI: Container orchestration API server, admission webhooks, and image registries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source IN (registry_logs, admission_logs)
+      | per namespace over time:
+          denials = count(admission_denied)
+          cve_findings = count(critical_cve) by image_tag
+          block_ratio = blocked / (blocked + admitted)
+      | where (admitted=true AND open_critical_cve>0)
+         OR admission_failure_rate > baseline[namespace]
+      | alert reason="CVE admit or admission-failure spike"
+- question: Do container-tagged syscalls trigger any deterministic Falco runtime rules (privileged launch,
+    write below /etc, sensitive file reads, package-manager or shell execution)?
+  context: This is the hard-rule floor for the Model tactic that never depends on a trained model. Run
+    Falco Default Rules over container-tagged syscalls to catch privileged container launches, writes
+    below /etc, sensitive file reads, package-manager execution, and shell spawns. Any firing rule is
+    concrete evidence of behavior the image analysis should have precluded - for example a shell or package
+    manager running in a container that should be immutable. These deterministic detections give reliable
+    coverage even when statistical and ML models are unavailable or being retrained, and should always
+    run in parallel with them.
+  answer_sources:
+  - Linux auditd/syscalls (Falco/eBPF)
+  - Sysmon for Linux
+  - 'NAI: Container hosts running monitored workloads'
+  range: Last 90 days
+  queries:
+  - technology: Falco/pseudocode
+    query: |-
+      apply falco_default_rules to container_tagged_syscalls
+      match any of:
+        privileged_container_launch,
+        write_below_etc,
+        read_sensitive_file,
+        package_management_launched,
+        shell_spawned_in_container
+      | alert severity=high rule=<matched_rule>
+- question: Are containers producing low-probability syscall sequences relative to a learned per-image
+    language model?
+  context: In the Model tactic, build an n-gram language model of normal per-image syscall sequences using
+    Maximum Likelihood Estimation with Simple Good-Turing smoothing, and flag low-probability sequences
+    in real time (Srinivasan et al.). Complement with Markov transition models to detect and localize
+    the anomalous container in a cluster when transition likelihood falls below a learned threshold (Cavallaro
+    et al.). A low-probability sequence indicates the container is executing a syscall pattern its image
+    never normally produces - a sign of exploitation or an unmodeled component. Localization helps pinpoint
+    which replica/container in a cluster to triage first.
+  answer_sources:
+  - Linux auditd/syscalls (Falco/eBPF)
+  - Sysmon for Linux
+  - 'NAI: Container hosts running monitored workloads'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      model = ngram_MLE_GoodTuring(per_image_syscall_sequences)
+      for each live syscall_window:
+        p = model.probability(sequence)
+        t = markov_transition_likelihood(sequence)
+      | where p < prob_threshold OR t < transition_threshold
+      | alert reason="low-probability syscall sequence" container=localized
+- question: For horizontally scaled workloads, does any replica's syscall/kernel-event distribution diverge
+    from its identical peers?
+  context: This peer-comparison method for the Model tactic requires no pre-trained baseline and resists
+    concept drift. For workloads running multiple identical replicas of the same image, compare kernel-event/syscall
+    distributions across replicas and flag the replica that diverges from the consensus (ReplicaWatcher).
+    Because all replicas run the same image, a single divergent replica is highly likely to be compromised
+    or experiencing an image-analysis-missed fault, while normal image churn affects all replicas together
+    and produces no alert. This is especially powerful for catching targeted compromise of one pod in
+    a deployment.
+  answer_sources:
+  - Linux auditd/syscalls (Falco/eBPF)
+  - Sysmon for Linux
+  - 'NAI: Container hosts running monitored workloads'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      group replicas by (deployment, image_version)
+      for each group:
+        dist[r] = syscall_distribution(replica r)
+        consensus = aggregate(dist[*])
+      | where divergence(dist[r], consensus) > peer_threshold
+      | alert reason="replica diverges from peers" replica=r
+- question: Do containers exhibit contextual or novel syscall anomalies when modeled with argument/path-aware
+    explainable ML?
+  context: The ML method in the Model tactic uses Syscall Sequence Graphs that incorporate syscall arguments
+    and file-path context (CHIDS) plus self-supervised online detection that adapts to image churn (SHIL).
+    Emit the top-3 contributing syscalls/arguments per alert and benchmark feature representations (n-grams,
+    TF-IDF, embeddings) on public datasets such as LID-DS. This catches context-dependent and novel anomalies
+    that count-based methods miss - e.g., a normal syscall used with an abnormal file-path argument. Run
+    it in parallel with the deterministic Falco rules so the explainable ML augments, rather than replaces,
+    the reliable floor.
+  answer_sources:
+  - Linux auditd/syscalls (Falco/eBPF)
+  - Sysmon for Linux
+  - 'NAI: Container hosts running monitored workloads'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      graph = syscall_sequence_graph(syscalls, args, file_paths)
+      score = chids_or_shil_online_detector(graph)
+      | where score > anomaly_threshold
+      | enrich top3 = contributing_syscalls_args(score)
+      | alert reason="contextual/novel syscall anomaly" detail=top3
