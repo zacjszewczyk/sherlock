@@ -1,0 +1,465 @@
+name: 'T1048.002: Exfiltration Over Asymmetric Encrypted Non-C2 Protocol'
+id: bce4930b-bc91-4a54-a9ea-e3b21e4bebf2
+description: Investigate potential data theft conducted over an asymmetrically encrypted, non-command-and-control
+  channel (for example HTTPS/TLS/SSL) directed at a destination separate from the adversary's main C2
+  server. This playbook helps an analyst hunt for outbound encrypted connections to threat-intelligence-flagged
+  or rare destinations, TLS sessions bearing suspicious certificate attributes (self-signed, short validity,
+  low-entropy issuer/subject), upload-dominant byte ratios uncharacteristic of interactive browsing, host-to-destination
+  volumes that exceed established baselines, periodic or low-and-slow chunked transfers, and non-allowlisted
+  or dual-use processes (powershell, certutil, curl, python) that open encrypted sockets after staging
+  or compressing sensitive data. It spans network telemetry (Zeek conn/dns/ssl), endpoint process and
+  file telemetry (Windows 4688, Sysmon 1/3, auditd, osquery), and ESXi host/egress logs, combining symbolic-logic
+  rules, statistical baselining, and machine learning to surface encrypted exfiltration without requiring
+  decryption.
+type: technique
+related:
+- tactic_id: TA0010
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is any host establishing an outbound TLS/SSL connection whose destination IP, domain, SNI,
+    JA3/JA3S hash, or certificate fingerprint matches a known-malicious or exfiltration-service indicator
+    from threat intelligence?
+  context: 'This deterministic check ties encrypted egress to known-bad infrastructure or known implant
+    TLS stacks, the most defensible signal of exfiltration over a non-C2 encrypted channel. Join Zeek
+    conn.log, dns.log, and ssl.log on the connection UID and match destination IP, resolved domain, TLS
+    SNI, JA3/JA3S client/server fingerprints, and JA4X certificate fingerprints against curated threat-intel
+    lists. Prefer JA4 over JA3 because modern browser ClientHello extension randomization degrades JA3
+    reliability. A positive match is high-confidence and warrants immediate containment; a negative result
+    does not clear the host, since novel infrastructure will not be on any list. Tie to the Exfiltration
+    tactic: the adversary is moving collected data to an alternate encrypted endpoint.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Internal DNS Resolvers, Outbound Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "c = join(conn.log, dns.log, ssl.log) on uid;\nalert when c.id.resp_h in ti.ips or c.query\
+      \ in ti.domains or c.server_name in ti.sni\n  or c.ja3 in ti.ja3 or c.ja3s in ti.ja3s or c.cert_ja4x\
+      \ in ti.ja4x;\noutput src, dst, server_name, ja3, ja4x, orig_bytes, ti_source."
+- question: Are there repeated failed or blocked outbound TLS attempts from a single host to the same
+    rare or threat-intel-flagged external destination, indicating retried exfiltration even when the channel
+    is blocked?
+  context: Even when a proxy or firewall blocks exfil, the adversary's tooling often retries, leaving
+    a failure signature. Profile Zeek conn_state values (S0, REJ, RSTO), repeated TLS handshake retries,
+    and proxy-denied (403/blocked) outbound attempts per host toward rare or TI-flagged destinations.
+    Alert when a single host produces five or more failed/blocked attempts to the same external host within
+    ten minutes. A positive result reveals exfiltration intent surviving network controls; benign causes
+    include misconfigured clients, so confirm the destination's reputation and rarity. This supports the
+    Exfiltration tactic by exposing thwarted-but-persistent attempts to move data out.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Internal DNS Resolvers, Outbound Web Proxies'
+  range: Last 90 days, correlate failed attempts within a rolling 10-minute window per host-destination
+    pair.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'fails = conn.log where conn_state in [''S0'',''REJ'',''RSTO''] or proxy_status in [403,''denied''];
+
+      group by src, dst over 10m window;
+
+      alert when count(distinct attempts) >= 5 and dst in (rare_dst or ti.dst);
+
+      output src, dst, attempt_count, conn_states.'
+- question: Which outbound encrypted transfers go to destinations that almost no internal host has ever
+    contacted yet carry an unusually large outbound byte volume?
+  context: 'Exfiltration frequently targets infrastructure that is novel to the environment and pushes
+    large volumes outward. Compute, from first-party Zeek logs only, a destination-rarity score (flag
+    destinations contacted by under 1% of internal hosts) and combine it with a large-transfer score (orig_bytes
+    in the top 5th percentile of outbound transfers). Derive percentile thresholds per environment rather
+    than using fixed constants. Rare destination plus large upload is a strong statistical exfiltration
+    indicator; legitimate one-off SaaS or vendor transfers can produce false positives, so corroborate
+    with certificate and process context. Maps to Exfiltration: bulk movement of data to an unfamiliar
+    encrypted endpoint.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Internal DNS Resolvers, Outbound Web Proxies'
+  range: Last 90 days, with rarity computed across the full window and throughput percentiles refreshed
+    daily.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for dst in conn.log: rarity = internal_hosts_contacting(dst) / total_internal_hosts;
+
+      thr = percentile(orig_bytes, 95) per environment;
+
+      alert when rarity < 0.01 and orig_bytes >= thr;
+
+      output src, dst, orig_bytes, rarity_score.'
+- question: Can a supervised model trained on Zeek TLS and flow features reliably score new encrypted
+    connections as likely exfiltration, and which features drive each high-risk score?
+  context: Where simple rules miss novel tooling, a Random Forest or gradient-boosted model trained on
+    TLS+flow features — JA3/JA3S, certificate validity period, issuer/subject entropy, orig_bytes, orig:resp
+    ratio, and duration — with threat-intel labels can classify encrypted connections without decryption.
+    Score each new connection and surface the top-three SHAP-ranked contributing features (for example
+    self-signed certificate, extreme byte ratio, rare JA3) directly in the alert so analysts can triage
+    the reasoning. High scores with interpretable drivers warrant investigation; monitor for model drift
+    as legitimate TLS evolves. Supports Exfiltration by generalizing detection across diverse encrypted
+    exfil channels.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Internal DNS Resolvers, Outbound Web Proxies'
+  range: Last 90 days for scoring; retrain periodically on labeled history.
+  queries:
+  - technology: ML/pseudocode
+    query: "X = features(conn.log, ssl.log): [ja3, ja3s, cert_validity_days, issuer_entropy,\n  subject_entropy,\
+      \ orig_bytes, orig_resp_ratio, duration];\nscore = rf_model.predict_proba(X);\nalert when score\
+      \ >= threshold; output top3 = shap_rank(X), score, dst."
+- question: Are there outbound TLS sessions whose certificate is self-signed, fails validation, has a
+    validity period under 90 days, or carries low-entropy/short subject or issuer fields, while also transferring
+    more than 10 MB outbound?
+  context: Adversary-controlled TLS endpoints commonly present cheap, self-signed, or short-lived certificates
+    with thin, low-entropy naming. Alert on ssl.log entries whose validation_status indicates self-signed/validation
+    errors, whose certificate validity is under 90 days, or whose subject/issuer fields are short or low-entropy,
+    joined to conn.log on UID where orig_bytes exceeds 10 MB. These certificate anomalies are strong malicious-TLS
+    indicators and can be fingerprinted with JA4X. A match suggests data being pushed to an attacker-stood-up
+    encrypted endpoint; legitimate internal or appliance certs can trigger this, so maintain an allowlist.
+    Directly supports the Exfiltration tactic.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Endpoints initiating TLS traffic'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "s = ssl.log where validation_status != 'ok' or self_signed\n  or cert_validity_days < 90 or\
+      \ entropy(subject) < t or len(subject) < n;\nc = join(s, conn.log) on uid where orig_bytes > 10MB;\n\
+      output src, dst, subject, issuer, validity_days, orig_bytes, cert_ja4x."
+- question: After scoring TLS connections on certificate suspiciousness and outbound byte dominance, which
+    sessions exceed a robust outlier threshold with an outbound-to-inbound ratio above 10:1?
+  context: 'A single suspicious attribute may be benign; combining them statistically sharpens detection.
+    Score each TLS connection across self-signed status, low-entropy subject/issuer, short certificate
+    validity, and high orig_bytes/resp_bytes ratio. Flag connections above the 98th percentile with a
+    ratio greater than 10:1, using a MAD-based modified Z-score rather than mean+stddev so that a few
+    enormous legitimate transfers do not distort the threshold. Positive results combine a dubious certificate
+    with upload-dominant flow physics typical of exfiltration. Tie to Exfiltration: encrypted bulk egress
+    to a questionable endpoint.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Endpoints initiating TLS traffic'
+  range: Last 90 days, with MAD statistics computed over the full window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'score = w1*self_signed + w2*low_entropy_name + w3*short_validity + w4*(orig/resp);
+
+      mz = modified_zscore(score) using median and MAD;
+
+      alert when percentile(score) > 98 and orig_bytes/resp_bytes > 10;
+
+      output src, dst, score, ratio, mz.'
+- question: Does an unsupervised anomaly model trained on benign TLS baselines flag encrypted connections
+    whose certificate and volume features are outliers correlated with high outbound bytes?
+  context: An Isolation Forest or deep autoencoder trained on ssl.log/conn.log features (certificate validity
+    duration, public-key length, issuer/subject categories, orig_bytes, and byte ratio) from a known-benign
+    baseline can flag connections above the 99th-percentile anomaly score without needing labeled exfil
+    examples. Correlate the top anomalies with high outbound byte volume and surface the top contributing
+    features for triage. This catches novel encrypted exfil that evades signature and percentile rules;
+    expect periodic retraining to track baseline drift. Maps to Exfiltration by isolating statistically
+    unusual encrypted sessions moving data out.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Endpoints initiating TLS traffic'
+  range: Last 90 days for scoring; baseline established on a clean historical window.
+  queries:
+  - technology: ML/pseudocode
+    query: "X = features(ssl.log, conn.log): [validity_days, pubkey_len, issuer_cat,\n  subject_cat, orig_bytes,\
+      \ ratio];\nmodel = IsolationForest.fit(benign_baseline);\na = model.score(X); alert when percentile(a)\
+      \ > 99 and orig_bytes high;\noutput src, dst, anomaly_score, top_features."
+- question: When TLS 1.3 encrypts certificate and handshake fields and blinds certificate-based rules,
+    can version-agnostic flow features still detect encrypted exfiltration?
+  context: TLS 1.3 hides the server certificate and much of the handshake, defeating certificate-attribute
+    rules. To retain coverage, score version-agnostic flow features — packet-size sequences, inter-arrival
+    times, byte ratios, and flow duration — that remain observable regardless of TLS version. A model
+    over these features can still distinguish upload-dominant automated exfil from interactive sessions.
+    Positive results indicate exfil-shaped flows even where the certificate is invisible; this is essential
+    as TLS 1.3 adoption grows. Supports the Exfiltration tactic by preserving detection against modern
+    encrypted transports.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, Endpoints initiating TLS traffic'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = flow_features(conn.log): [pkt_size_seq, inter_arrival, byte_ratio, duration];
+
+      score = flow_model.predict(X);  # version-agnostic, no cert dependency
+
+      alert when score >= threshold; output src, dst, score, byte_ratio.'
+- question: Is any host sending more than 500 MB of outbound data over an encrypted session to a destination
+    that is not on the sanctioned cloud/backup allowlist?
+  context: A simple, high-signal volumetric rule catches blatant bulk exfiltration. Filter Zeek conn.log
+    for outbound encrypted sessions with orig_bytes over 500 MB, exclude sanctioned cloud and backup services
+    on an explicit allowlist, and alert on what remains. A positive result is an unsanctioned large encrypted
+    upload that demands explanation; the allowlist controls false positives from legitimate backups and
+    SaaS. This directly serves the Exfiltration tactic by flagging large encrypted data movement to non-approved
+    endpoints.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, High-Value Asset Servers, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "alert = conn.log where encrypted and orig_bytes > 500MB\n  and dst not in allowlist(cloud_backup_services);\n\
+      output src, dst, service, orig_bytes."
+- question: Does the daily outbound encrypted volume for a host-to-destination pair exceed its 30-day
+    baseline by a robust statistical margin, or does cumulative volume to one destination cross an information-theoretic
+    bound indicating low-and-slow exfil?
+  context: Baseline daily orig_bytes for each host-destination pair over 30 days and alert when a value
+    exceeds a MAD-based modified Z-score of 3.5, which is more outlier-resistant than mean+3σ. Additionally,
+    sum the information sent to a single destination across the window and alert when it exceeds an information-theoretic
+    bound, catching chunked low-and-slow exfiltration that never trips a single-day threshold. A positive
+    result is a host moving abnormally much data to one endpoint relative to its own history. Maps to
+    Exfiltration by detecting both burst and slow-drip data theft.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, High-Value Asset Servers, User Workstations'
+  range: Last 90 days, with a rolling 30-day per-pair baseline and cumulative tracking across the window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per (src,dst) daily orig_bytes over 30d;
+
+      mz = modified_zscore(today_bytes, median, MAD);
+
+      alert when mz > 3.5 or cumulative_bytes(src,dst) > info_theoretic_bound;
+
+      output src, dst, today_bytes, mz, cumulative_bytes.'
+- question: Are there fixed-cadence, similar-sized encrypted uploads to a single destination that indicate
+    scheduled, automated exfiltration?
+  context: Automated exfil agents often beacon out data on a regular schedule, producing periodic similar-sized
+    transfers. Detect this with FFT/periodicity analysis and inter-arrival coefficient-of-variation scoring
+    over TLS uploads to each destination, isolating machine-driven cadence from bursty interactive traffic
+    while suppressing known benign periodic services (updates, telemetry). A strong periodicity score
+    with consistent payload sizes points to scheduled exfiltration; tune to exclude sanctioned recurring
+    jobs. Supports the Exfiltration tactic by revealing rhythmic, programmatic data movement.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, High-Value Asset Servers, User Workstations'
+  range: Last 90 days, requiring enough observations per destination to assess periodicity reliably.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = upload_events(src,dst) timestamps and sizes;
+
+      period = fft_dominant_period(series); cv = stddev(inter_arrival)/mean(inter_arrival);
+
+      alert when period strong and cv < t and size_variance low and dst not in benign_periodic;
+
+      output src, dst, period, cv, sample_sizes.'
+- question: Does a host's actual daily outbound encrypted volume exceed its forecasted confidence interval,
+    or do its transfer timing/volume state transitions match irregular chunked exfiltration?
+  context: Forecast each host's daily outbound volume with ARIMA or Prophet and alert when the actual
+    value exceeds the 95% confidence interval, catching deviations from learned seasonal patterns. Complement
+    this with a Continuous-Time Hidden Markov Model of outbound timing/volume state transitions to catch
+    high-jitter, irregular chunked transfers that evade fixed-cadence detection, yielding interpretable
+    per-flow likelihoods for triage. Positive results are statistically unexpected upload behavior for
+    that host. Maps to Exfiltration by modeling both volume and temporal structure of encrypted data theft.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet Gateway/Egress Points, High-Value Asset Servers, User Workstations'
+  range: Last 90 days for model fitting; score the most recent days against the forecast.
+  queries:
+  - technology: ML/pseudocode
+    query: 'model = Prophet.fit(host_daily_outbound);
+
+      alert when actual > upper_ci(0.95);
+
+      ctHMM = fit_states(timing, volume); flag irregular high-jitter transitions;
+
+      output src, actual, forecast_ci, state_likelihood.'
+- question: Are there encrypted connections where outbound bytes exceed inbound bytes by more than 50:1
+    with over 1 MB uploaded, reflecting upload-dominant flow physics unlike interactive browsing?
+  context: Normal interactive sessions like web browsing download far more than they upload; exfiltration
+    inverts this. Alert on Zeek connections where resp_bytes is greater than zero, orig_bytes exceeds
+    1 MB, and the orig_bytes/resp_bytes ratio is greater than 50. This captures the upload-heavy signature
+    of data being pushed out. A positive result is a flow whose direction and magnitude are inconsistent
+    with the claimed application; bulk-upload services (backups, file shares) need allowlisting. Directly
+    supports the Exfiltration tactic.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet Gateway/Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "alert = conn.log where resp_bytes > 0 and orig_bytes > 1MB\n  and (orig_bytes / resp_bytes)\
+      \ > 50;\noutput src, dst, service, orig_bytes, resp_bytes, ratio."
+- question: Which encrypted connections have an outbound/inbound byte ratio above the 99th percentile
+    for their service or destination?
+  context: Rather than a fixed ratio cutoff, baseline the orig_bytes/resp_bytes ratio per service and
+    per destination and flag connections above the 99th percentile using a MAD-based modified Z-score
+    so bulk-upload services do not skew the distribution. This adapts the asymmetry detection to what
+    is normal for each service, reducing false positives while still surfacing relative upload anomalies.
+    A positive result is a connection far more upload-dominant than its peers. Maps to Exfiltration by
+    catching context-relative asymmetric data egress.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet Gateway/Egress Points'
+  range: Last 90 days, with per-service ratio baselines maintained over the window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for svc/dst: dist = ratios(orig_bytes/resp_bytes);
+
+      mz = modified_zscore(ratio, median(dist), MAD(dist));
+
+      alert when percentile(ratio) > 99; output src, dst, service, ratio, mz.'
+- question: Do clustering of encrypted flow features reveal groups of high-outbound, low-inbound, short-duration
+    connections consistent with exfiltration?
+  context: Cluster Zeek flow features — duration, orig_bytes, resp_bytes, and ratio — with DBSCAN and
+    investigate clusters characterized by high orig_bytes, low resp_bytes, and short duration. Density-based
+    clustering groups structurally similar flows and isolates exfil-shaped clusters from the dense mass
+    of normal traffic without predefined thresholds. A suspicious cluster pinpoints a population of flows
+    to triage together; legitimate bulk-upload tooling may form its own cluster, so label clusters by
+    destination. Supports the Exfiltration tactic by grouping upload-dominant flow behavior.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet Gateway/Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = conn.log features [duration, orig_bytes, resp_bytes, ratio];
+
+      labels = DBSCAN(eps, min_samples).fit(X);
+
+      flag clusters with high orig_bytes, low resp_bytes, short duration;
+
+      output cluster_id, member_flows, centroid.'
+- question: Can self-supervised contrastive learning on encrypted-flow metadata detect anomalous upload-dominant
+    TLS flows without decryption or labels, including unseen exfil tooling?
+  context: Apply self-supervised contrastive learning to encrypted-flow metadata — packet-size and inter-arrival
+    sequences and byte ratios — to learn a representation of normal traffic, then detect anomalous upload-dominant
+    TLS flows without decrypting payloads or relying on labeled exfil samples. Because it learns from
+    structure rather than signatures, it generalizes to previously unseen exfil tools and to TLS 1.3.
+    A flagged flow is structurally anomalous in its upload behavior; validate against destination and
+    process context. Maps to Exfiltration by catching novel encrypted data-theft patterns.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet Gateway/Egress Points'
+  range: Last 90 days for scoring; representation learned on a clean historical window.
+  queries:
+  - technology: ML/pseudocode
+    query: 'rep = contrastive_encoder(pkt_size_seq, inter_arrival, byte_ratio);
+
+      anomaly = distance(rep, normal_manifold);
+
+      alert when anomaly > threshold and upload_dominant;
+
+      output src, dst, anomaly_score.'
+- question: Is a non-allowlisted or dual-use process (powershell.exe, certutil.exe, curl.exe, python.exe)
+    or one running from a non-standard path initiating an outbound encrypted connection with more than
+    5 MB uploaded?
+  context: Correlate Zeek conn.log/ssl.log entries with Windows Event ID 4688 and Sysmon Event ID 1 on
+    host and time, then alert when a watchlisted or non-allowlisted process — or one executing from suspicious
+    paths like C:\Windows\Temp\* — opens an encrypted connection with orig_bytes over 5 MB. This links
+    the network exfil flow to the responsible process, which is decisive for triage and attribution. A
+    positive result is an unsanctioned binary pushing data out; legitimate admin use of these tools requires
+    allowlisting by context. Directly supports the Exfiltration tactic by binding encrypted egress to
+    its process origin.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User Workstations, Servers, Domain Controllers'
+  range: Last 90 days, joining process and network events within a few minutes on the same host.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc = process_creation (4688 or Sysmon 1) where image in watchlist\n  or path in [C:\\Windows\\\
+      Temp\\*, non_standard_dirs];\nnet = join(conn.log, ssl.log) where host=proc.host and t~proc.t and\
+      \ orig_bytes > 5MB;\nalert; output host, image, path, parent, dst, orig_bytes."
+- question: Are rare parent-child process pairs initiating outbound encrypted connections with top-percentile
+    outbound volume?
+  context: Build frequency tables of parent-child process pairs that initiate network connections, then
+    alert when a rare pair (for example winword.exe spawning powershell.exe) sends outbound encrypted
+    traffic with orig_bytes in the top 5th percentile. Rarity thresholds are derived per environment.
+    Unusual process lineage combined with heavy upload is a strong sign of malicious automation or living-off-the-land
+    exfil. A positive result pairs an anomalous ancestry with bulk egress; benign rare-but-legitimate
+    automation can occur, so review the command line. Maps to Exfiltration by spotting unexpected process
+    chains moving data out.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User Workstations, Servers, Domain Controllers'
+  range: Last 90 days, with parent-child frequency tables maintained per environment.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'pairs = freq(parent_image, child_image) initiating connections;
+
+      rare = pairs where freq < env_threshold;
+
+      alert when rare pair has outbound encrypted orig_bytes >= percentile(95);
+
+      output parent, child, host, dst, orig_bytes, pair_freq.'
+- question: Does a classifier over command-line features identify suspicious process executions that correlate
+    with high-outbound-ratio encrypted connections?
+  context: Train a logistic regression on command-line features — argument count, length, and entropy
+    — to flag suspicious executions, then correlate flagged executions with Zeek connections exhibiting
+    high outbound ratios. Surface the top contributing command-line features in the alert so analysts
+    can judge intent quickly. Obfuscated or encoded command lines that line up with upload-dominant encrypted
+    flows strongly suggest scripted exfiltration. A positive result is an anomalous command line tied
+    to data egress; tune with benign admin scripting. Supports the Exfiltration tactic by linking suspicious
+    execution to encrypted data movement.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User Workstations, Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = cmdline_features [arg_count, length, entropy];
+
+      p = logreg.predict_proba(X);
+
+      alert when p high and host has conn with high orig/resp ratio in window;
+
+      output host, command_line, p, top_features, dst.'
+- question: Can a provenance-graph model detect the causal chain of a process reading many sensitive files
+    (collection/compression) followed by an outbound TLS socket, reconstructing the collection-to-exfil
+    footprint?
+  context: Use a whole-system provenance graph autoencoder to detect the causal chain where a process
+    reads many sensitive files (collection and compression), stages them, and then opens an outbound TLS
+    socket. By modeling the full collect→stage→encrypted-send path rather than isolated events, this links
+    activities that look benign individually and reconstructs an analyst-readable footprint for triage.
+    A flagged chain is strong evidence of staged exfiltration; the provenance trail accelerates scoping
+    and response. Maps to Exfiltration by capturing the end-to-end data-theft workflow culminating in
+    encrypted egress.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User Workstations, Servers, Domain Controllers'
+  range: Last 90 days, correlating file-access, staging, and network events along provenance edges.
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = provenance_graph(process, file_access(4663/auditd open,read), net_socket);
+
+      score = graph_autoencoder.reconstruction_error(G);
+
+      alert on chain: proc reads many sensitive files -> compress -> outbound TLS;
+
+      output process, files_read, dst, chain_score, footprint.'
