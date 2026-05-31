@@ -1,0 +1,547 @@
+name: 'T1098.001: Additional Cloud Credentials'
+id: 94cad947-3e75-45da-b4c2-a60568df0e51
+description: Investigate whether an adversary has added adversary-controlled credentials to cloud accounts,
+  service principals, applications, or IAM users to maintain persistent access (TA0003) or to escalate
+  privileges (TA0004). This playbook helps an analyst hunt for the addition of access keys, SSH key pairs,
+  login profiles, x.509 certificates, service principal/application secrets, and app passwords across
+  IaaS (AWS, GCP), Identity Provider (Entra ID/Azure), and SaaS (M365, Google Workspace) environments.
+  It correlates credential-modification API calls (e.g., CreateAccessKey, ImportKeyPair, CreateLoginProfile,
+  iam.serviceAccounts.keys.create, Add-AzADAppCredential/updateApplication, app password added) with threat-intelligence
+  on source IPs, anomalous source ASNs/countries/working hours, anomalous parent-child process chains
+  on endpoints invoking cloud CLIs, impossible-travel on first use of new credentials, privilege-escalation
+  sequences (CreatePolicyVersion -> SetDefaultPolicyVersion -> CreateAccessKey), low-privilege actors
+  granting credentials to higher-privileged principals, temporary/federated identities modifying permanent
+  credentials, and rapid high-impact actions following credential additions. It combines symbolic-logic
+  detections, statistical baselining (modified Z-score, percentile, first-seen), and machine learning
+  approaches to surface both sophisticated external actors and routine abuse.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Do any cloud credential-modification events (AWS CreateAccessKey/CreateLoginProfile/ImportKeyPair,
+    Entra/Azure 'Add service principal credentials'/updateApplication, GCP iam.serviceAccounts.keys.create)
+    originate from a sourceIPAddress that appears on a threat-intelligence feed of known-malicious IPs,
+    anonymizing proxies, or Tor exit nodes?
+  context: 'For the Persistence tactic, an adversary who has added their own cloud credentials will frequently
+    do so from infrastructure that is already attributed to malicious activity or from anonymizing services
+    used to hide origin. By joining first-party cloud audit logs (AWS CloudTrail, Entra/Azure audit and
+    sign-in, GCP audit) for credential-modification events against an internal feed of known-malicious
+    IPs, anonymizing proxies, and Tor exit nodes, the analyst can deterministically flag credential additions
+    tied to bad infrastructure. A positive match is high-confidence persistence: surface the source IP,
+    ASN, acting identity, and the target principal so responders can revoke the credential and review
+    the principal''s recent activity. A negative result does not clear the event, since adversaries may
+    use clean cloud-egress IPs; pair this with the behavioral analytics below.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service Endpoints, Internet Gateway, Threat Intelligence Platform, Cloud audit log
+    aggregation platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  cloud_audit(eventName IN [CreateAccessKey, CreateLoginProfile, ImportKeyPair,\n  CreateKeyPair,\
+      \ updateApplication, \"Add service principal credentials\",\n  iam.serviceAccounts.keys.create])\n\
+      \  | join type=inner threat_intel_ip on sourceIPAddress == ti.ip\n  | where ti.category IN [malicious,\
+      \ anon_proxy, tor_exit]\n  | emit alert(sourceIPAddress, asn, actor=userIdentity.arn, target_principal,\
+      \ ti.category)"
+- question: Is any source IP or identity producing repeated failed (AccessDenied) credential-modification
+    attempts that precede a successful credential addition, or a daily failed-attempt count that is statistically
+    anomalous?
+  context: Adversaries often enumerate permissions before successfully adding credentials, generating
+    a burst of AccessDenied/failed credential-modification attempts. For the Persistence tactic, baseline
+    the per-IP and per-identity rate of failed credential-modification attempts and alert when an IP or
+    identity produces >=3 failed attempts (permission probing) followed by a successful credential add
+    within 24 hours, or when the daily failed-attempt count exceeds a modified Z-score of 3.5 (computed
+    with median/MAD from a per-tenant 90-day baseline). A positive result indicates trial-and-error access
+    establishment; the failed-then-succeeded pattern is especially indicative of an actor working out
+    which API/permission combination grants persistence.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service Endpoints, Internet Gateway, Threat Intelligence Platform, Cloud audit log
+    aggregation platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | stats count(errorCode=AccessDenied) as fails,\
+      \ count(success) as ok by sourceIPAddress, identity, bin(1d)\n  | join baseline_failrate(per_tenant,\
+      \ 90d) compute modified_z = 0.6745*(fails-median)/mad\n  | where (fails>=3 AND ok>=1 within 24h)\
+      \ OR modified_z > 3.5\n  | emit alert(sourceIPAddress, identity, fails, modified_z)"
+- question: For each identity, is a cloud credential-modification event sourced from an ASN that has never
+    been observed for that identity, or does the identity's daily credential-modification count spike
+    beyond its historical baseline?
+  context: Persistence via additional credentials is usually anomalous against an identity's normal network
+    origin and cadence. Maintain, per identity, the historical set of source ASNs used for credential
+    modifications with per-ASN counts; flag any event whose source ASN is first-seen for that identity,
+    or whose daily credential-modification count exceeds a modified Z-score of 3.5. A first-seen ASN combined
+    with a credential add strongly suggests an attacker operating from new infrastructure. Include the
+    new ASN, the identity's top-3 historical ASNs, and the z-score so the analyst can judge whether the
+    change is a legitimate relocation/VPN or adversary activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service Endpoints, Internet Gateway, Threat Intelligence Platform, Cloud audit log
+    aggregation platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | lookup identity_asn_profile by identity\n  |\
+      \ eval first_seen_asn = NOT(sourceASN in profile.seen_asns)\n  | stats count as daily by identity,\
+      \ bin(1d); modified_z = 0.6745*(daily-median)/mad\n  | where first_seen_asn OR modified_z > 3.5\n\
+      \  | emit alert(identity, sourceASN, top3_historical_asns, modified_z)"
+- question: Does a per-identity multivariate time-series forecast of credential-modification behavior
+    (frequency, source country, time-of-day) produce a residual beyond its prediction interval across
+    two or more features?
+  context: To catch subtle persistence that evades single-feature rules, train a per-identity multivariate
+    time-series/forecasting model (e.g., Prophet or LSTM) over credential-modification frequency (count/hour),
+    source country, and time-of-day. Alert when an event yields a forecast residual beyond the prediction
+    interval across >=2 features simultaneously (e.g., a frequency spike AND a new country, or off-hours
+    AND new country). Requiring multi-feature deviation reduces false positives from benign single-axis
+    changes. Report the top-3 contributing features so the analyst understands which behaviors drove the
+    anomaly and can correlate with credential additions to the same principal.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service Endpoints, Internet Gateway, Threat Intelligence Platform, Cloud audit log
+    aggregation platform'
+  range: Last 90 days; retrain weekly on trailing 90-day window
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model = forecast_per_identity(features=[cred_mod_freq_per_hr, source_country, time_of_day])\n\
+      \  for event in credential_mod_events:\n    resid = abs(event - model.predict(event.t))\n    breached\
+      \ = [f for f in features if resid[f] > model.pi[f]]\n    if len(breached) >= 2: emit alert(identity,\
+      \ top3=breached, residuals)"
+- question: Did an endpoint execute a cloud CLI (aws.exe, az.exe, gcloud.exe) or a script host running
+    credential-modification commands when the executing user is not a Cloud Admin or the host is not an
+    authorized admin workstation?
+  context: Credential additions are often launched from endpoints, sometimes via a phishing-borne payload.
+    For the Persistence tactic, alert on Windows Event ID 4688 showing creation of aws.exe/az.exe/gcloud.exe,
+    or powershell.exe/pwsh.exe whose Event ID 4104 script block contains New-AzADAppCredential, Update-MgApplication,
+    'aws iam create-access-key', or 'gcloud iam service-accounts keys create', when CreatorSubjectUserName
+    is not in the Cloud Admins group OR the Computer is not in the Admin Workstations asset group. A match
+    indicates cloud credential management from an unauthorized user/host context. Validate detection coverage
+    by running emulated credential-add techniques (e.g., Stratus Red Team).
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: Administrative Workstations, Cloud-connected Application Servers, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventID=4688 AND NewProcessName IN [aws.exe, az.exe, gcloud.exe])\n  OR (EventID=4104\
+      \ AND ScriptBlockText MATCHES\n      [New-AzADAppCredential, Update-MgApplication, \"aws iam create-access-key\"\
+      ,\n       \"gcloud iam service-accounts keys create\"])\n  | where CreatorSubjectUserName NOT IN\
+      \ cloud_admins\n          OR Computer NOT IN admin_workstations\n  | emit alert(user, host, process,\
+      \ commandline)"
+- question: On each host, is a cloud CLI being launched through a rare or anomalous parent-child process
+    chain (e.g., winword.exe or outlook.exe spawning a cloud CLI)?
+  context: Legitimate cloud administration follows predictable process lineage; malware-driven credential
+    abuse often shows aberrant lineage. For each host, baseline parent->child process chains and compute
+    each chain's frequency; flag any chain ending in a cloud CLI that occurs below the 1st percentile
+    for the host or organization (rare-event), treating an Office/communications-app parent (winword.exe/outlook.exe
+    -> CLI) as high severity because it suggests macro or phishing-driven execution. Include the observed
+    chain and its baseline frequency. A rare chain ending in a credential-modifying CLI is a strong persistence
+    signal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: Administrative Workstations, Cloud-connected Application Servers, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  proc_events(EventID=4688) | eval chain = ParentProcessName + \"->\" + NewProcessName\n\
+      \  | where NewProcessName IN [aws.exe, az.exe, gcloud.exe, powershell.exe, pwsh.exe]\n  | stats\
+      \ count by host, chain | eval pct = percentile_rank(count, by=host)\n  | where pct < 1 | eval sev\
+      \ = if(ParentProcessName IN [winword.exe, outlook.exe], \"high\", \"med\")\n  | emit alert(host,\
+      \ chain, count, sev)"
+- question: Does a supervised classifier flag a cloud-CLI/script-host execution as malicious based on
+    parent process, command-line length/entropy, keyword presence, and user/host context?
+  context: Obfuscated or anomalous credential-modification commands can be detected with ML even when
+    individual rules miss them. Train a gradient-boosted/Random Forest classifier on labeled process executions
+    (Event ID 4688/4104) using features such as parent process name, command-line length and character
+    entropy, keyword presence, user context, and host. Alert on high-confidence 'malicious' classifications
+    and surface the top-3 contributing features. This is especially useful against encoded PowerShell
+    that performs Add-AzADAppCredential or similar credential additions. A high-confidence positive warrants
+    pulling the full command line and correlating with the target cloud principal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: Administrative Workstations, Cloud-connected Application Servers, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days; retrain monthly
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  features = [parent_proc, cmdline_len, cmdline_entropy, keyword_flags, user_ctx, host]\n\
+      \  model = RandomForest.train(labeled_4688_4104)\n  for e in process_events:\n    p = model.predict_proba(features(e))\n\
+      \    if p.malicious > 0.9: emit alert(e, top3=model.explain(e))"
+- question: Is any credential-modification API call initiated by a principal that is not on the allow-list
+    of identities authorized for identity management, or by an AssumedRole/(role, action) combination
+    never seen in the baseline?
+  context: Credential management should be performed by a small, known set of principals (CI/CD pipelines,
+    IAM automation, named admins). For the Persistence tactic, maintain an allow-list of service principals/roles
+    authorized for identity management and alert when any credential-modification API call comes from
+    a principal not on this list, or from an AssumedRole/(role, action) combination never observed in
+    the baseline window. A non-allow-listed principal adding credentials is a high-fidelity persistence
+    indicator. Tune the allow-list carefully so legitimate automation does not generate noise, and treat
+    first-seen (role, action) pairs as investigation-worthy.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Provider (IdP) Systems, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | eval not_allowed = NOT(actor_principal in iam_mgmt_allowlist)\n\
+      \  | eval new_combo = NOT((actor_role, eventName) in baseline_role_action_set)\n  | where not_allowed\
+      \ OR new_combo\n  | emit alert(actor_principal, actor_role, eventName, target_principal)"
+- question: For each administrative identity, does a credential-modification event occur outside the identity's
+    normal active hours, especially combined with an anomalous event volume?
+  context: Attackers frequently operate in time zones or hours that differ from the legitimate owner of
+    a compromised admin identity. For each administrative identity, build a historical distribution of
+    credential-modification event times; flag events whose hour-of-day falls outside the 5th-95th percentile,
+    and escalate when combined with a modified-Z-score volume anomaly (|z|>3.5). Report the identity's
+    normal active hours and the observed hour. Off-hours credential additions, particularly bursts, suggest
+    persistence being established by an actor who does not follow the human owner's schedule. Benign causes
+    (travel, on-call) should be ruled out before escalation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Provider (IdP) Systems, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | lookup identity_hour_profile by identity\n \
+      \ | eval offhours = hour(event) < p5 OR hour(event) > p95\n  | stats count as vol by identity, bin(1d);\
+      \ z = 0.6745*(vol-median)/mad\n  | where offhours AND abs(z) > 3.5\n  | emit alert(identity, normal_hours=[p5,p95],\
+      \ observed_hour, z)"
+- question: Does DBSCAN clustering of credential-modification events flag an event as noise (outside dense
+    clusters) based on source ASN, time-of-day, actor role, and target principal role?
+  context: Unsupervised clustering can surface credential additions that do not fit any established behavioral
+    cluster. Apply DBSCAN to credential-modification events using features such as source ASN, time-of-day
+    (encoded cyclically), actor role, and target principal role; events labeled noise (outside dense clusters)
+    are flagged. Surface the top-3 features that placed the event outside known clusters. For the Persistence
+    tactic, a noise-labeled credential addition represents a behavior unlike any normal operational pattern,
+    e.g., an unusual actor-role/target-role pairing from a novel ASN at an odd hour. Analysts should review
+    the contributing features and confirm against legitimate change activity.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Provider (IdP) Systems, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days; recluster weekly
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  X = features(source_asn, tod_sin, tod_cos, actor_role, target_role)\n  labels = DBSCAN(eps,\
+      \ min_samples).fit_predict(X)\n  for e where labels[e] == -1:\n    emit alert(e, top3=feature_contrib_to_noise(e))"
+- question: After a credential creation event (e.g., CreateAccessKey), does the first authentication with
+    that credential originate from a location implying impossible travel (implied speed > 800 km/h) from
+    the creation location?
+  context: When an adversary creates a credential and immediately uses it from their own location, the
+    geographic jump from the creation IP to the first-use IP can be physically impossible. For each credential
+    creation event, record the timestamp and source IP geolocation; on the first use of that credential
+    (e.g., GetCallerIdentity), compute the great-circle distance to the usage IP divided by the time delta
+    and alert if the implied speed exceeds 800 km/h. Include both locations and the implied speed. For
+    Persistence, this catches a freshly minted credential being driven from attacker infrastructure shortly
+    after creation. Account for VPNs and cloud egress that can distort geolocation.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Authentication Endpoints, Internet Gateway, Geolocation IP Database'
+  range: 'Last 90 days; event-centered: pair each credential-creation with its first-use event'
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  create = cloud_audit(eventName=CreateAccessKey) | record(t_create, geo_create)\n  firstuse\
+      \ = cloud_audit(first auth with credential) | record(t_use, geo_use)\n  | eval km = great_circle(geo_create,\
+      \ geo_use); hrs = (t_use - t_create)/3600\n  | eval speed = km/hrs\n  | where speed > 800\n  | emit\
+      \ alert(geo_create, geo_use, speed)"
+- question: On first use of a newly created credential, is the source country absent from the identity's
+    180-day login-country profile, and is that country rare org-wide?
+  context: Adversaries frequently use new credentials from countries the legitimate identity never logs
+    in from. For each identity, maintain a 180-day frequency distribution of login source countries; on
+    first use of a new credential, flag if the source country is absent from the identity's profile, and
+    elevate severity if the country's org-wide login frequency is below the 1st percentile. Report the
+    identity's top-3 historical countries and the observed country. For Persistence, a brand-new credential
+    first exercised from a never-before-seen, org-rare country is a strong indicator of attacker control.
+    Distinguish genuine travel by correlating with HR/travel data and concurrent benign sessions.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Authentication Endpoints, Internet Gateway, Geolocation IP Database'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  firstuse = first auth with newly created credential\n  | lookup identity_country_profile(180d)\
+      \ by identity\n  | eval new_country = NOT(country in profile.countries)\n  | eval org_rare = org_country_freq[country]\
+      \ < p1\n  | where new_country\n  | eval sev = if(org_rare, \"high\", \"med\")\n  | emit alert(identity,\
+      \ observed_country, top3_historical_countries, sev)"
+- question: Does a per-user One-Class SVM classify the first login with a newly created credential as
+    an outlier based on source country, ASN, user agent, and time-of-day?
+  context: 'A learned per-user model captures normal login behavior more richly than fixed thresholds.
+    For each user, train a One-Class SVM on historical logins (features: source country, ASN, user agent,
+    time-of-day) and score the first login using a newly created credential; an outlier classification
+    indicates deviation from the user''s baseline. Surface the top-3 deviating features. For the Persistence
+    tactic, an outlier first-use of a new credential signals that the credential is likely being exercised
+    by someone other than the legitimate user. Investigate the deviating features and correlate with the
+    credential-creation event and any subsequent sensitive actions.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Authentication Endpoints, Internet Gateway, Geolocation IP Database'
+  range: Last 90 days; retrain per user on trailing 180-day login history
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model[user] = OneClassSVM.train(logins[user], features=[country, asn, user_agent, tod])\n\
+      \  score = model[user].decision_function(first_login_with_new_cred)\n  if score < 0 (outlier): emit\
+      \ alert(user, top3=deviating_features)"
+- question: Within a single user session and a tight time window, is there an ordered sequence of CreatePolicyVersion,
+    then SetDefaultPolicyVersion, then a credential-modification (CreateAccessKey/UpdateApplication) on
+    a principal governed by that policy?
+  context: 'This is a classic IAM privilege-escalation chain: an actor creates a permissive policy version,
+    sets it as default, then adds credentials to a principal that now inherits those permissions. Implement
+    a complex-event-processing rule that triggers when, within one user session and a 10-minute window,
+    CreatePolicyVersion is followed by SetDefaultPolicyVersion and then CreateAccessKey/UpdateApplication
+    on a principal associated with that policy. Automated escalation chains complete in minutes, so keep
+    the window tight and alert high-severity. A match is a near-unambiguous privilege-escalation-to-persistence
+    event and should trigger immediate response, including reverting the policy and revoking the new credential.'
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days; session-scoped 10-minute correlation window
+  queries:
+  - technology: SIEM/CEP pseudocode
+    query: ">-\n  PATTERN seq(A, B, C) WITHIN 10m PARTITION BY session_id\n  A: eventName=CreatePolicyVersion\n\
+      \  B: eventName=SetDefaultPolicyVersion AND policyArn=A.policyArn\n  C: eventName IN [CreateAccessKey,\
+      \ UpdateApplication] AND target governed by A.policyArn\n  => emit alert(severity=high, session_id,\
+      \ actor, policyArn, target_principal)"
+- question: Does a per-principal variable-order Markov model assign a very low probability (below the
+    1st percentile) to an API-call n-gram that contains a credential-modification call?
+  context: Privilege-escalation sequences are improbable relative to a principal's normal API usage. Model
+    per-principal API-call sequences with a variable-order Markov chain over a 5-minute session window;
+    compute the probability (and Bayesian credible interval) of each 3-gram and alert when a sequence
+    containing a credential-modification call falls below the 1st percentile of observed sequences. Report
+    the implausible n-gram. For Privilege Escalation, this flags credential additions embedded in otherwise
+    unusual call sequences that signal an actor stitching together an escalation path. A low-probability
+    n-gram should be reviewed against the principal's normal workflow before escalation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days; 5-minute session windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  model = VariableOrderMarkov.train(per_principal_api_sequences, window=5m)\n  for ngram\
+      \ in session_3grams containing credential_mod_call:\n    p = model.prob(ngram); ci = model.credible_interval(ngram)\n\
+      \    if p < percentile(all_seq_probs, 1): emit alert(principal, ngram, p, ci)"
+- question: Does an LSTM autoencoder trained on benign session API-call sequences produce high reconstruction
+    error for a session containing a credential modification?
+  context: An autoencoder learns the manifold of normal session behavior; sessions performing escalation
+    reconstruct poorly. Train an LSTM autoencoder on benign session API-call sequences; for each new session
+    compute reconstruction error and alert when a sequence containing a credential modification yields
+    high error. Surface the top-3 highest-error API steps as the explanation. For the Privilege Escalation
+    tactic, high reconstruction error on a credential-adding session indicates the action sits within
+    an abnormal behavioral sequence consistent with an escalation attempt. Use the highest-error steps
+    to pinpoint where the session diverged from normal and to scope the investigation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Cloud Audit Log Aggregation Platform'
+  range: Last 90 days; retrain monthly on benign sessions
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  ae = LSTM_Autoencoder.train(benign_session_sequences)\n  for s in sessions containing\
+      \ credential_modification:\n    err = ae.reconstruction_error(s)\n    if err > threshold: emit alert(session=s,\
+      \ top3=highest_error_steps(s))"
+- question: In any credential-modification event, is the acting principal's role privilege score lower
+    than the target principal's privilege score (a low-privilege actor adding credentials to a higher-privileged
+    principal)?
+  context: Direct privilege escalation occurs when a lower-privileged identity grants itself control of
+    a higher-privileged principal. Maintain a numerical hierarchy of IAM/RBAC roles (e.g., Global Admin=10,
+    Contributor=5, Reader=1). For every credential-modification event, compare the actor's role score
+    to the target principal's score and alert when actor_score < target_score (e.g., an Application Administrator
+    adding a credential to a higher-privileged service principal). This is a deterministic privilege-escalation
+    detection. A match should prompt immediate revocation and review of how the actor obtained the ability
+    to modify the higher-privileged principal.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Governance and Administration (IGA) Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | lookup role_score actor_role -> actor_score,\
+      \ target_role -> target_score\n  | where actor_score < target_score\n  | emit alert(actor, actor_role,\
+      \ actor_score, target_principal, target_role, target_score)"
+- question: Across historical credential modifications, does an event's actor-minus-target privilege gain
+    exceed a modified Z-score of 3.5 above the normal distribution (which should center at or below zero)?
+  context: Most credential modifications are performed by an actor of equal or higher privilege than the
+    target, so the actor-minus-target privilege difference baseline should be <=0. Across historical credential
+    modifications, compute this difference using the role hierarchy and alert on any event whose positive
+    privilege gain exceeds a modified Z-score of 3.5 above the historical distribution. Include actor
+    role, target role, and the gain. For Privilege Escalation, a statistically extreme positive privilege
+    gain identifies anomalous escalations even where a strict actor<target rule might be tuned out. Confirm
+    against approved break-glass or delegation processes before escalating.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Governance and Administration (IGA) Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  cloud_audit(credential_mod_events)\n  | eval gain = target_score - actor_score\n  |\
+      \ stats median(gain), mad(gain) over history\n  | eval z = 0.6745*(gain-median)/mad\n  | where gain\
+      \ > 0 AND z > 3.5\n  | emit alert(actor_role, target_role, gain, z)"
+- question: Does a Graph Neural Network over the IAM graph flag a credential modification as creating
+    an anomalous control edge (e.g., a low-privilege user gaining control of a high-privilege service
+    principal)?
+  context: IAM relationships form a graph, and escalation manifests as anomalous new control edges. Model
+    the IAM environment as a dynamic heterogeneous graph (principals, roles, resources, actions) and train
+    a Graph Neural Network on normal structure; alert when a credential modification creates an anomalous
+    control edge, such as a low-privilege user gaining control of a high-privilege service principal.
+    Surface the top-3 graph features (new edge, node centrality change, rare role pair). For the Privilege
+    Escalation tactic, this captures escalation paths that are only visible at the graph level, including
+    multi-hop control chains. Use the highlighted graph features to reconstruct the new attack path and
+    assess blast radius.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud IAM Service, Identity Governance and Administration (IGA) Platform'
+  range: Last 90 days; retrain on rolling graph snapshots
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  G = build_heterogeneous_iam_graph(principals, roles, resources, actions)\n  gnn = GNN.train(normal_graph_snapshots)\n\
+      \  for edge in new_control_edges_from(credential_modifications):\n    if gnn.anomaly_score(edge)\
+      \ > threshold:\n      emit alert(edge, top3=[new_edge, centrality_delta, rare_role_pair])"
+- question: Within 60 minutes of new credentials being added to a privileged identity, does that identity
+    perform a high-impact action (e.g., disabling audit logging, deleting backups, broad policy changes)?
+  context: Successful escalation is often followed quickly by impactful actions that consolidate access
+    or destroy evidence. Maintain a list of high-impact API calls (disabling audit logs such as Update-MgAuditLogConfiguration,
+    deleting backups, DeleteBucketPolicy, broad policy changes) and trigger when an identity performs
+    any listed action within 60 minutes of having new credentials added to it. For Privilege Escalation,
+    this tight temporal linkage between a credential add and a high-impact action is a strong indicator
+    that the new credential was used to wield elevated power. Treat as high severity and consider that
+    defense-evasion actions (log disabling) may already be in progress.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service, Sensitive Data Repositories (e.g., S3 Buckets, Databases), Cloud Administration
+    Endpoints'
+  range: Last 90 days; 60-minute correlation window after credential add
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  add = cloud_audit(credential_mod on identity I) at t0\n  act = cloud_audit(eventName\
+      \ in high_impact_list AND actor=I) at t1\n  | where (t1 - t0) <= 60m\n  | emit alert(severity=high,\
+      \ identity=I, credential_event=add, impact_event=act)"
+- question: After a credential modification, does a privileged identity's sensitive-API-call rate in the
+    following hour exceed the 99th percentile (or modified Z-score 3.5) of its historical hourly rate?
+  context: A sudden burst of sensitive activity right after a credential change indicates the credential
+    is being actively exploited. For each privileged identity, baseline the hourly rate of sensitive API
+    calls; after a credential modification, alert if the next hour's sensitive-call count exceeds the
+    99th percentile (or a modified Z-score of 3.5) of its historical hourly rate. Include the baseline
+    and observed counts. For Privilege Escalation, this catches the operational tempo spike that follows
+    successful escalation. Distinguish from legitimate maintenance windows by correlating with change
+    tickets and the actor's normal duties.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service, Sensitive Data Repositories (e.g., S3 Buckets, Databases), Cloud Administration
+    Endpoints'
+  range: Last 90 days; evaluate the hour following each credential modification
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  for mod in credential_modifications(identity=I) at t0:\n    cnt = count(sensitive_api_calls(I)\
+      \ in [t0, t0+1h])\n    base = hourly_sensitive_rate_history(I)\n    z = 0.6745*(cnt-median(base))/mad(base)\n\
+      \    if cnt > percentile(base,99) OR z > 3.5:\n      emit alert(I, baseline=median(base), observed=cnt,\
+      \ z)"
+- question: Following a credential modification, does a privileged identity perform a first-seen (action,
+    target_resource_type) tuple it has never executed before (e.g., a database admin suddenly modifying
+    IAM policies)?
+  context: Escalation often lets an identity act outside its normal resource domain. For each privileged
+    identity, maintain the historical set of unique (action, target_resource_type) tuples; following a
+    credential modification, flag a first-seen tuple as high risk (e.g., a database admin suddenly modifying
+    IAM policies). Report the novel tuple and the identity's typical resource types. For the Privilege
+    Escalation tactic, a credential add followed by behavior into a previously untouched resource type
+    strongly suggests the actor is exercising newly gained, broader privileges. Confirm the change is
+    not a legitimate role expansion before escalating.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Cloud IAM Service, Sensitive Data Repositories (e.g., S3 Buckets, Databases), Cloud Administration
+    Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  after credential_modification(identity=I):\n    for evt(action, target_resource_type)\
+      \ by I:\n      if (action, target_resource_type) NOT in profile[I].seen_tuples:\n        emit alert(I,\
+      \ novel_tuple=(action, target_resource_type),\n                   typical=profile[I].top_resource_types)"
+- question: Is a credential-modification action on a permanent, cloud-native IAM user or service principal
+    being performed by a temporary or federated identity (AWS AssumedRole/FederatedUser or an externally
+    federated Azure identity), or is sts:GetFederationToken being used?
+  context: Temporary/federated identities adding credentials to permanent principals is a known persistence-via-escalation
+    pattern, because the resulting credentials outlive the temporary session and any rotation of the original
+    keys. Create a high-severity alert when userIdentity.type is AssumedRole/FederatedUser (AWS) or the
+    identity originates from an external IdP (Azure) and the action is a credential modification on a
+    permanent, cloud-native IAM user or service principal. Also alert on sts:GetFederationToken usage,
+    since federated tokens persist beyond deactivation of the original keys. A match indicates an actor
+    converting transient access into durable, potentially higher-privileged access.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Identity Federation Service (e.g., ADFS), Cloud STS Endpoints, Cloud IAM Service'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  cloud_audit(eventName in credential_mod_events)\n  | where (userIdentity.type IN [AssumedRole,\
+      \ FederatedUser]\n           OR identity_from_external_idp)\n          AND target_principal.type\
+      \ == permanent_iam_user_or_sp\n  | OR eventName == \"GetFederationToken\"\n  | emit alert(severity=high,\
+      \ actor=userIdentity, target_principal, eventName)"
+- question: Is the ratio of credential-modification events to total events significantly higher for temporary/federated
+    identities than for permanent identities (indicating systemic abuse of federation)?
+  context: At a population level, federated/temporary identities abusing credential modification skews
+    the credential-mod-to-total-event ratio. Compute the baseline ratio (credential-modification events
+    / total events) for permanent vs temporary/federated identities; if the temporary-identity ratio is
+    significantly higher (Z-test, p<0.01, validated with a robust modified-Z check) it indicates systemic
+    abuse. Report both ratios. For the Privilege Escalation tactic, this fleet-wide signal complements
+    per-event rules by revealing campaigns where many federated sessions are being used to plant durable
+    credentials. A significant disparity warrants reviewing the federation trust configuration and recent
+    assumed-role activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Identity Federation Service (e.g., ADFS), Cloud STS Endpoints, Cloud IAM Service'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  r_perm = credmod_count(permanent)/total_count(permanent)\n  r_temp = credmod_count(temporary_federated)/total_count(temporary_federated)\n\
+      \  ztest = two_proportion_z(r_temp, r_perm)\n  if ztest.p < 0.01 AND modified_z_check(r_temp): emit\
+      \ alert(r_perm, r_temp, p=ztest.p)"
+- question: Does a logistic regression predict an unusually high probability (top 5%) that a temporary/federated
+    session performs a credential modification, given session_type, source_ASN, user_agent_type, and session_duration?
+  context: A learned model can rank which temporary sessions look most like abusive credential modification.
+    Train a logistic regression to predict the probability that a session performs a credential modification,
+    using features session_type (temporary/federated vs permanent), source_ASN, user_agent_type, and session_duration.
+    Alert on any temporary session performing a credential modification with predicted probability in
+    the top 5%, and surface the top-3 contributing features. For Privilege Escalation, this prioritizes
+    the federated sessions most likely to represent escalation-driven credential planting, helping analysts
+    triage volume. Review the contributing features and correlate with the target principal's privilege
+    level.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Identity Federation Service (e.g., ADFS), Cloud STS Endpoints, Cloud IAM Service'
+  range: Last 90 days; retrain monthly
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model = LogisticRegression.train(sessions,\n          features=[session_type, source_asn,\
+      \ user_agent_type, session_duration],\n          label=performs_credential_modification)\n  for\
+      \ s in temporary_sessions performing credential_modification:\n    p = model.predict_proba(s)\n\
+      \    if p in top_5_percent: emit alert(s, top3=model.coef_contrib(s))"
