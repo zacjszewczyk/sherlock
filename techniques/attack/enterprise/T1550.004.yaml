@@ -1,0 +1,603 @@
+name: 'T1550.004: Use Alternate Authentication Material: Web Session Cookie'
+id: bc1dd945-4b61-4ba6-9068-7bd72c2cbc42
+description: 'This playbook helps an analyst investigate adversary use of stolen web session cookies (Pass-the-Cookie)
+  to authenticate to web applications, cloud services, and internal apps without re-authenticating, bypassing
+  MFA. It guides hunting across the full attack chain: (1) requests bearing valid session cookies arriving
+  from threat-intel/Tor/anonymizing-proxy IPs or statistically rare geolocations; (2) endpoint processes
+  that dump or read browser cookie databases (cookies.sqlite, Chrome/Edge/Firefox Network\Cookies stores),
+  including obfuscated command lines and cookie-access-then-network-callback sequences; (3) session integrity
+  violations such as User-Agent/device-fingerprint swaps mid-session, impossible-travel velocities, the
+  same session ID seen concurrently from multiple source IPs, and sessions that skip the login/SSO workflow;
+  (4) lateral-movement signals including session cookies presented from watchlisted internal IPs, from
+  non-browser tools (powershell, curl, certutil), from hosts with no corresponding interactive/network
+  logon (''ghost'' sessions), and improbable user-host pairings; and (5) abuse of hijacked sessions to
+  perform privileged or peer-rare actions in sensitive management applications. Each question pairs symbolic-logic,
+  statistical, and machine-learning approaches with concrete pseudocode for SIEM and Zeek.'
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any HTTP requests or cloud sign-in/API events carrying a valid session cookie or session
+    token originating from a source IP that appears on a threat-intelligence feed, a Tor exit-node list,
+    or a known anonymizing/VPN proxy?
+  context: 'Pass-the-Cookie lets an adversary replay a stolen, already-authenticated session from infrastructure
+    they control, bypassing MFA. The deterministic floor is to extract the source IP/ASN for every cookie-bearing
+    request (Zeek http.log + conn.log) or every session-token-bound cloud event (CloudTrail/Okta/M365)
+    and match it against curated malicious-IP, Tor, and anonymizer lists. A positive match on a valid
+    live session is high-fidelity evidence of session theft and lateral movement into corporate apps.
+    Reinforce with state/failure profiling: count HTTP 401/403 and cloud ''login denied''/errorCode results
+    from the same IP over the prior 24h — a burst of low-byte failures followed by a single success on
+    a valid cookie indicates token replay after probing.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - AWS:CloudTrail
+  - saas:okta System Log
+  - m365:unified
+  - 'NAI: Internet Gateway, VPN Concentrator, External Web Application Servers, Cloud Service Provider
+    Flow Logs'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  join http.log (cookie != '') with conn.log on uid\n  | derive src_ip, src_asn\n  | where\
+      \ src_ip in TI_malicious OR src_ip in tor_exit_nodes OR src_asn in anonymizer_asns\n  | enrich count(status_code\
+      \ in [401,403]) by src_ip over prior 24h\n  | alert"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (AWS:CloudTrail, okta:system, m365:unified)\n  | where session_token_used\
+      \ == true\n  | lookup src_ip against threat_intel, tor, proxy lists\n  | stats count(result='denied')\
+      \ as fails by src_ip window 24h\n  | where matched AND (success_after_fail_burst OR fails>5) ->\
+      \ alert"
+- question: For each user account, is a session being used from a source country or ASN that is first-seen
+    or statistically rare (in the rarest 1%) compared to that account's 30+ day historical baseline of
+    geolocated sign-ins and connections?
+  context: Even when a replay IP is not yet on any blocklist, a stolen cookie is frequently used from
+    geolocations the legitimate user never visits. Baseline each account's source countries and ASNs over
+    >=30 days from geolocated conn.log/sign-in data and compute a first-seen/rarity score. Trigger when
+    a session's country or ASN is first-seen or in the 99th rarity percentile for that user. Add volume/frequency
+    features (bytes-per-session, requests/min) and surface the top-3 contributing features (e.g., 'first-seen
+    ASN', 'country never used', 'req/min 8x baseline') so the analyst can judge whether this is travel/VPN
+    noise or genuine token theft enabling lateral movement.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - AWS:CloudTrail
+  - saas:okta System Log
+  - m365:unified
+  - 'NAI: Internet Gateway, VPN Concentrator, External Web Application Servers, Cloud Service Provider
+    Flow Logs'
+  range: Last 90 days (baseline >=30 days per account)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per user: baseline set(country), set(asn) over 30d\n  | for each new session: geolocate\
+      \ src_ip -> country, asn\n  | rarity = 1 - freq(country,asn | user)\n  | where country first_seen\
+      \ OR rarity >= 0.99\n  | emit top3 features [first_seen_asn, new_country, reqs_per_min/baseline]\n\
+      \  | alert"
+- question: Does the observed request/byte volume of any user's web session exceed the predicted upper
+    confidence band of a per-user time-series forecast, particularly during off-hours?
+  context: An attacker actively pivoting and harvesting data through a hijacked session often generates
+    request and byte volumes that diverge from the user's normal rhythm. Build a per-user time-series
+    model (Prophet/LSTM) of expected requests/hour and bytes/hour and alert when observed volume exceeds
+    the predicted upper confidence band, especially off-hours when the legitimate user is inactive. Pair
+    with rare user+geo+action population analysis and surface the influencer fields (action, source geo,
+    user-agent) so analysts understand why a session scored anomalous. A breach of the band coinciding
+    with a rare geo or unusual action strongly suggests cookie-replay-driven lateral movement.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - AWS:CloudTrail
+  - saas:okta System Log
+  - m365:unified
+  - 'NAI: Internet Gateway, VPN Concentrator, External Web Application Servers, Cloud Service Provider
+    Flow Logs'
+  range: Last 90 days (model trained on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = Prophet/LSTM per user on requests_per_hour, bytes_per_hour\n  | predict yhat_upper\
+      \ for current window\n  | where observed > yhat_upper AND hour in off_hours\n  | join population_rarity(user,\
+      \ geo, action)\n  | emit influencers [action, src_geo, user_agent] | alert"
+- question: Are any processes being created (Windows Event ID 4688) whose command lines reference known
+    cookie/credential-dumping tools or the default file paths of browser cookie databases (Chrome/Edge
+    Network\Cookies, Firefox cookies.sqlite)?
+  context: 'Before a cookie can be replayed it must be stolen from the endpoint. Scan 4688 command lines
+    for credential/cookie-dumping tool names (mimikatz.exe, lazagne.exe) and for regexes matching default
+    browser cookie-store paths (AppData\Local\Google\Chrome\User Data\*\Network\Cookies, *\Cookies.sqlite,
+    Edge/Firefox stores) — the exact artifacts targeted by cookie-stealing malware. A volume signal sharpens
+    this: count distinct cookie-store files touched per process; more than one browser profile read in
+    a single execution is strongly suspicious of bulk cookie harvesting rather than normal browser operation.
+    Positive hits identify the source endpoint and account whose sessions may now be replayable.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Endpoints, Critical Staff Workstations, Virtual Desktop Infrastructure (VDI) instances,
+    Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=WinEventID:4688\n  | where cmdline matches /(mimikatz|lazagne)\\.exe/i\n    \
+      \ OR cmdline matches /Chrome\\\\User Data\\\\.*\\\\Network\\\\Cookies|Cookies\\.sqlite|Edge\\\\\
+      .*Cookies/i\n  | stats dc(cookie_store_path) as profiles by process_guid\n  | where matched OR profiles>1\
+      \ -> alert"
+- question: Do PowerShell or cmd command lines (Event ID 4688) show abnormally high Shannon entropy together
+    with references to AppData/Local/Cookies, indicating obfuscated access to browser cookie stores?
+  context: Attackers often obfuscate or encode the commands that read cookie databases to evade name-based
+    detection. For powershell.exe/cmd.exe, compute Shannon entropy of the 4688 command-line arguments,
+    baseline entropy per-process, and alert when entropy exceeds 3 sigma AND the line references 'AppData'/'Local'/'Cookies'.
+    The combination of obfuscation and cookie-store keywords distinguishes malicious harvesting from benign
+    scripting. Track the frequency of such executions per host/hour as a secondary volume signal — repeated
+    high-entropy cookie-touching commands point to automated theft tooling on the host.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Endpoints, Critical Staff Workstations, Virtual Desktop Infrastructure (VDI) instances,
+    Domain Controllers'
+  range: Last 90 days (entropy baseline per process)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=WinEventID:4688 process IN (powershell.exe, cmd.exe)\n  | eval H = shannon_entropy(cmdline)\n\
+      \  | baseline mean,std of H per process\n  | where H > mean+3*std AND cmdline matches /AppData|Local|Cookies/i\n\
+      \  | stats count by host, bin(1h) | alert"
+- question: When a supervised model scores new process-creation events, does it classify any as likely
+    cookie-theft based on command-line length, entropy, special-character ratio, parent process, and n-gram
+    features?
+  context: Rule and entropy thresholds miss novel tooling. Train a Random Forest on labeled 4688 events
+    using command-line length, entropy, special-char ratio, parent process, and command n-grams, then
+    score new events. Mirroring the explainability approach used for cloud-log ML, emit the top-3 contributing
+    features in each alert (e.g., 'parent=winword.exe', 'path=Network\Cookies', 'entropy=4.9') so analysts
+    can quickly validate. A high model score with a suspicious parent (Office app spawning a script that
+    reads cookie stores) is strong evidence of the theft step that precedes Pass-the-Cookie lateral movement.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Endpoints, Critical Staff Workstations, Virtual Desktop Infrastructure (VDI) instances,
+    Domain Controllers'
+  range: Last 90 days (model trained on labeled history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = [cmdline_len, entropy, special_char_ratio, parent_proc, ngrams]\n  | model\
+      \ = RandomForest(labeled 4688)\n  | score new 4688 events\n  | where p(cookie_theft) > 0.8\n  |\
+      \ emit top3_features | alert"
+- question: Within a single session (same cookie/session ID), does the User-Agent string or cloud client/device
+    fingerprint change between consecutive requests?
+  context: A genuine browser does not swap its User-Agent within one cookie's lifetime, so a mid-session
+    change violates the client-binding assumption of web sessions and signals that a stolen cookie has
+    been imported into a different client. For each session identifier in http.log, alert when the User-Agent
+    (or cloud device fingerprint) changes between consecutive requests on the same cookie. This is a direct,
+    low-false-positive indicator of session hijacking enabling lateral movement; a positive result means
+    the same authenticated session is being driven from two different clients.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4634
+  - 'NAI: Internet Gateway, User Endpoints, Authentication Logs from Domain Controllers, Web Proxies'
+  range: Last 90 days (correlate within each session lifetime)
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  stream http.log ordered by ts, group by session_cookie\n  | track prev_user_agent per\
+      \ session\n  | where user_agent != prev_user_agent AND prev_user_agent != ''\n  | alert 'UA switch\
+      \ mid-session'"
+- question: For any session, do consecutive geolocated requests imply an impossible-travel velocity (e.g.,
+    > ~600 mph) or a User-Agent set that diverges sharply (Jaccard distance > 0.5) from the user's baseline?
+  context: Compute the geodesic distance and elapsed time between consecutive geolocated requests within
+    a session; a required velocity above ~600 mph is physically impossible and indicates the cookie is
+    in use from two locations at once. Maintain a per-user User-Agent set and flag agents with Jaccard
+    distance > 0.5 from the baseline. Report the two endpoints, elapsed time, and implied speed in the
+    alert. Impossible travel on a single authenticated session is a hallmark of cookie replay; combined
+    with a divergent User-Agent it is high-confidence session hijacking driving lateral movement.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4634
+  - 'NAI: Internet Gateway, User Endpoints, Authentication Logs from Domain Controllers, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per session: order events by ts\n  | speed = geodist(geo[i-1],geo[i]) / (ts[i]-ts[i-1])\n\
+      \  | where speed > 600 mph\n  | ua_div = jaccard(session_ua_set, baseline_ua_set[user])\n  | where\
+      \ speed>600 OR ua_div>0.5\n  | emit endpoints, elapsed, implied_speed | alert"
+- question: When session features (source IP/ASN, User-Agent, inter-request timing, bytes, accessed resources)
+    are clustered, do any sessions fall into sparse/noise clusters rather than the dense clusters formed
+    by legitimate activity?
+  context: Legitimate user sessions share consistent feature patterns and form dense clusters, whereas
+    a replayed-cookie session typically differs across multiple dimensions and lands in noise or sparse
+    clusters. Cluster session features with DBSCAN and treat noise-labeled sessions as candidates for
+    hijacking. Combine with population rarity scoring and list the top-3 deviating features for triage
+    (e.g., 'ASN never seen', 'timing 10x faster', 'resource set disjoint'). This unsupervised approach
+    catches replay that evades single-feature rules and helps confirm lateral movement via stolen sessions.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4634
+  - 'NAI: Internet Gateway, User Endpoints, Authentication Logs from Domain Controllers, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  vectorize sessions [src_asn, user_agent, mean_inter_req, bytes, resource_set]\n  | DBSCAN(eps,\
+      \ min_samples)\n  | where cluster_label == -1 (noise)\n  | join population_rarity\n  | emit top3_deviating_features\
+      \ | alert"
+- question: Is a process that touched a browser cookie file (Event ID 4688) followed within ~60 seconds
+    by a DNS query from the same host to a watchlisted, low-reputation, or newly-registered domain?
+  context: 'The classic exfiltrate-then-replay chain has malware read a cookie store and then immediately
+    beacon out to attacker infrastructure. Trigger when a process touch of a browser cookie file (4688)
+    is followed within 60s by a DNS query (dns.log) from the same host to a watchlisted/low-reputation
+    or newly-registered domain. Add failure profiling: also alert on a spike of NXDOMAIN responses in
+    the same window, which can indicate DGA or exfil staging. A positive sequence ties local cookie theft
+    to outbound exfiltration, identifying both the compromised host and the adversary''s domain.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User Endpoints, DNS Servers, Internet Gateway'
+  range: Last 90 days (60s correlation window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  A = 4688 where cmdline matches cookie_store_path on host H\n  | B = dns.log query from\
+      \ host H within 60s after A\n  | where B.domain in low_reputation OR newly_registered\n  | side:\
+      \ count(dns rcode=NXDOMAIN by H window 60s) spike\n  | alert sequence(A->B)"
+- question: After a suspicious cookie-file access on a host, are there new outbound network or DNS destinations
+    in the 99th rarity percentile (first-seen) for that host, and what byte volume was uploaded to them?
+  context: 'Per host, baseline destination IPs and domains over time; after a suspicious cookie-file access,
+    alert on new conn.log/dns.log destinations in the 99th rarity percentile (first-seen). Include uploaded
+    byte counts (orig_bytes) to the rare destination: cookie databases themselves are small, but the surrounding
+    exfil burst is detectable and helps gauge scope. A first-seen destination contacted moments after
+    cookie access, with a measurable upload, indicates the stolen session material is being sent to adversary
+    infrastructure for replay.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User Endpoints, DNS Servers, Internet Gateway'
+  range: Last 90 days (baseline per host)
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  per host: baseline set(dest_domain/ip)\n  | window after cookie_access event\n  | where\
+      \ dest first_seen OR rarity>=0.99\n  | stats sum(orig_bytes) as uploaded by host, dest\n  | alert"
+- question: Does a sequence model of combined host+network events flag anomalous chains such as 'powershell.exe
+    reads cookie -> DNS to dynamic-DNS domain -> long-lived TCP' that deviate from learned benign chains?
+  context: Model host and network event streams with a sequence model (HMM or an LSTM log-sequence approach
+    like DeepLog) and learn normal chains such as 'chrome.exe reads cookie -> chrome.exe web request'.
+    Flag anomalous chains — for example 'powershell.exe reads cookie -> DNS to dynamic-DNS domain -> long-lived
+    TCP'. Surface the offending event subsequence in the alert. Sequence modeling captures the ordering
+    and actor relationships that point-rules miss, distinguishing legitimate browser cookie use from scripted
+    theft-and-exfil that precedes Pass-the-Cookie lateral movement.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User Endpoints, DNS Servers, Internet Gateway'
+  range: Last 90 days (model on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  build event sequences per host [proc_cookie_read, dns_query, tcp_conn]\n  | model =\
+      \ DeepLog LSTM / HMM on benign chains\n  | where observed_chain not in topK predicted next-events\n\
+      \  | emit offending_subsequence | alert"
+- question: Does a new (source IP + User-Agent) session access internal application pages without any
+    preceding request to a defined authentication-workflow URL (login page, SSO callback, token endpoint)?
+  context: A legitimate session is preceded by traffic to an authentication workflow; a stolen cookie
+    replayed into a fresh client jumps straight to application pages with no login. Enumerate authentication-workflow
+    URLs (/login, /sso/callback, token endpoints) and alert when a new (source IP + User-Agent) session
+    reaches internal app pages without a preceding log for any auth URL. This direct-to-deep-link pattern
+    reflects the missing client-binding of session integrity and is a strong replay signal. A positive
+    result means a session was presented to the app without ever authenticating from that client.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Web Application Servers, Load Balancers, Reverse Proxies'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  define AUTH_URLS = [/login, /sso/callback, /oauth/token]\n  | per (src_ip,user_agent)\
+      \ session in http.log\n  | where first_request.uri not in AUTH_URLS\n     AND no prior request to\
+      \ AUTH_URLS for this session\n  | alert 'session skipped login workflow'"
+- question: Per application, do any sessions begin on an uncommon, high-entropy deep-link URL rather than
+    typical landing pages (/home, /dashboard), and how frequently does each user start sessions this way?
+  context: Compute the rarity/entropy of the first-visited URL per session per app; sessions beginning
+    on an uncommon deep link rather than common landing pages are anomalous. Track the count of such sessions
+    per user/hour to separate one-off bookmarks (low frequency) from automated replay (high frequency).
+    A user repeatedly starting authenticated sessions on rare deep links — without traversing normal entry
+    pages — is consistent with cookie replay by tooling that targets specific endpoints, supporting the
+    lateral-movement hypothesis.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Web Application Servers, Load Balancers, Reverse Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per app: freq distribution of first_url across sessions\n  | rarity = 1 - freq(first_url)\n\
+      \  | where first_url not in [/home,/dashboard] AND rarity high\n  | stats count by user, bin(1h)\
+      \ as starts_per_hour\n  | where starts_per_hour high -> alert"
+- question: Using a variable-order Markov chain of valid page transitions, do any sessions begin in a
+    non-start state with no valid transition from a legitimate start state?
+  context: Learn valid page-transition probabilities with a variable-order Markov chain per application;
+    a session that starts in a non-start state, with no valid transition from any start state, is a high-confidence
+    replay because real users navigate through legitimate entry points. Emit the implausible transition
+    and its probability in the alert. This models the entire navigation flow rather than a single URL,
+    so it robustly separates genuine user journeys from sessions injected mid-flow via a stolen cookie.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Web Application Servers, Load Balancers, Reverse Proxies'
+  range: Last 90 days (model on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = variable_order_markov(page_transitions per app)\n  | for each session: evaluate\
+      \ P(start_state) and first transition\n  | where start_state not reachable from any valid start\n\
+      \     OR P(transition) ~ 0\n  | emit implausible_transition, prob | alert"
+- question: Does any internal source IP currently on a dynamic watchlist (flagged by EDR/C2 detections
+    or recent malware alerts) establish a new authenticated web session bearing a session cookie to an
+    internal application?
+  context: Correlating prior-compromise context with session reuse exposes lateral movement. Maintain
+    a dynamic watchlist of internal IPs flagged by EDR/C2 detections and alert when such an IP appears
+    as the source in conn.log for a connection whose http.log request carries a session cookie. An already-suspicious
+    host now presenting an authenticated session to an internal app strongly suggests the attacker has
+    stolen a cookie and is pivoting deeper. A positive result links a known-bad endpoint to a specific
+    application and account.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Segments, Server Subnets, Data Center Core Switches, Internal Web Servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  watchlist = internal_ips flagged by EDR/C2 (dynamic)\n  | join http.log(cookie!='')\
+      \ with conn.log on uid\n  | where src_ip in watchlist\n  | alert 'session reuse from compromised\
+      \ host'"
+- question: Are any internal source hosts contacting an unusually large number of distinct internal web
+    servers (out-degree above the 95th percentile for their role)?
+  context: 'Build a daily source-host -> web-server graph from conn.log/http.log and compute out-degree
+    (unique servers contacted) per host. Investigate hosts above the 95th percentile for their role, which
+    is an unauthorized-pivot indicator: a workstation that suddenly fans out to many internal web apps
+    is behaving like an attacker enumerating reachable services with stolen sessions. Report the host,
+    its out-degree, and the role baseline. This rarity-of-fan-out scoring catches lateral movement even
+    when each individual connection looks authenticated.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Segments, Server Subnets, Data Center Core Switches, Internal Web Servers'
+  range: Last 90 days (daily graph)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  daily graph: edges src_host -> web_server from conn/http\n  | out_degree = dc(web_server)\
+      \ by src_host\n  | baseline per role percentile\n  | where out_degree > p95(role)\n  | emit host,\
+      \ out_degree, role_baseline | alert"
+- question: Does community detection on internal host-to-web-server traffic reveal connections that bridge
+    normally separate communities (e.g., a user workstation reaching an administrative application cluster)?
+  context: Apply Louvain community detection (or heterogeneous graph embeddings) to host-to-web-server
+    communications and flag connections that bridge distinct communities — for example a standard workstation
+    reaching an admin app cluster it normally never touches. Report the source/destination communities
+    and the bridging edge. Such bridging edges are characteristic of lateral movement, where a foothold
+    in one segment is leveraged with stolen sessions to reach higher-value systems. This graph view surfaces
+    pivots that per-host thresholds would miss.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Segments, Server Subnets, Data Center Core Switches, Internal Web Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = graph(host <-> web_server) from conn/http\n  | communities = louvain(G)  # or GNN\
+      \ embeddings\n  | for each edge: where community(src) != community(dst)\n     AND edge_rare\n  |\
+      \ emit src_community, dst_community, bridging_edge | alert"
+- question: Are session-cookie-bearing HTTP requests to internal web applications correlated (within ~5
+    seconds on the source host) with non-browser processes such as powershell.exe, curl.exe, certutil.exe,
+    or bitsadmin.exe?
+  context: Browser session cookies presented by non-browser tooling violate client binding and indicate
+    scripted session replay. Correlate http.log cookie requests with 4688 process creation on the source
+    host within 5s and alert if the initiating process is a non-browser tool (powershell.exe, curl.exe,
+    certutil.exe, bitsadmin.exe) or absent from the approved-browser allowlist. A positive result means
+    an authenticated session is being driven programmatically rather than by a real user in a browser
+    — a strong Pass-the-Cookie lateral-movement signal that also names the offending process and host.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Servers hosting internal web applications, Domain Controllers'
+  range: Last 90 days (5s correlation window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  A = http.log(cookie!='') to internal app from host H at T\n  | B = 4688 on host H within\
+      \ +/-5s of T\n  | where B.process in [powershell.exe,curl.exe,certutil.exe,bitsadmin.exe]\n    \
+      \ OR B.process not in approved_browser_allowlist\n  | alert"
+- question: Do any parent-child process pairs that initiate outbound traffic to internal web services
+    occur with extreme rarity (< 0.01% of observed pairs), such as winword.exe -> powershell.exe -> internal
+    web request?
+  context: 'Build a frequency distribution of parent-child process pairs that initiate outbound traffic
+    to internal web services and score pairs occurring less than 0.01% of the time as highly suspicious.
+    A chain like winword.exe -> powershell.exe -> internal web request is a textbook initial-access-to-lateral-movement
+    pattern: a document spawns a script that replays a stolen session. Reporting the rare lineage and
+    its historical frequency gives analysts immediate context to confirm whether the web access is attacker-driven.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Servers hosting internal web applications, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  pairs = (parent_proc, child_proc) that emit internal web traffic\n  | freq = count(pair)\
+      \ / total\n  | where freq < 0.0001\n  | emit lineage, freq | alert"
+- question: Does a trained classifier, using process/parent and HTTP features (User-Agent, destination
+    port, bytes), separate legitimate automation from script-based session replay, and which sessions
+    does it flag?
+  context: Train a classifier on 4688 (process, parent) and http.log (User-Agent, destination port, bytes)
+    features to distinguish sanctioned automation from script-based session replay, with rare user+action
+    population analysis for context. Surface the top-3 features in each alert (e.g., 'process=curl.exe',
+    'UA=python-requests', 'no prior cookie use'). Because some legitimate jobs also use non-browser clients,
+    the classifier reduces false positives versus a blanket process blocklist while still catching adversarial
+    replay that drives lateral movement through internal apps.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Servers hosting internal web applications, Domain Controllers'
+  range: Last 90 days (model trained on labeled history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = [process, parent, user_agent, dest_port, bytes, prior_cookie_use]\n  | model\
+      \ = classifier(legit_automation vs replay)\n  | score sessions; where p(replay) > 0.8\n  | emit\
+      \ top3_features | alert"
+- question: Is a single session identifier (session cookie value) observed in requests from two or more
+    distinct internal source IPs within the session's timeout window?
+  context: A session ID is meant to be held by one client; seeing it from two source IPs at once is a
+    direct breach of session integrity and a clear sign the cookie was copied and replayed. For each session
+    ID in http.log, cache the first source IP with a TTL equal to the session timeout (e.g., 30 min);
+    if the same session ID arrives from a different source IP while cached, alert on concurrent reuse.
+    This multi-IP token reuse is a documented adversary behavior; a positive result identifies both the
+    original and the replaying host.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Core, Application Server Load Balancers, East-West Traffic Mirrors'
+  range: Last 90 days (session-timeout correlation window, e.g. 30 min)
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  cache[session_id] = first_src_ip with TTL = session_timeout (30m)\n  | for each http.log\
+      \ request:\n      if session_id in cache AND src_ip != cache[session_id]:\n         alert 'concurrent\
+      \ session reuse from multiple IPs'"
+- question: Does the number of distinct internal source IPs used by a user in a day exceed 3 sigma above
+    that user's historical mean, indicating session hopping across hosts?
+  context: Per user, baseline the number of distinct internal source IPs used per day and alert when the
+    daily count exceeds 3 sigma above their mean. A sudden jump in source IPs indicates session hopping
+    across hosts — consistent with an attacker reusing a stolen session from multiple footholds. Combine
+    with impossible-travel checks when those source IPs geolocate far apart. Reporting the user's baseline
+    versus today's count helps analysts separate legitimate roaming from token reuse driving lateral movement.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Core, Application Server Load Balancers, East-West Traffic Mirrors'
+  range: Last 90 days (per-user daily baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per user/day: n_ips = dc(src_ip)\n  | baseline mean,std over 30d\n  | where n_ips >\
+      \ mean + 3*std\n  | optional: join impossible_travel(src_ips)\n  | emit baseline, today_count |\
+      \ alert"
+- question: Does a per-user state machine of application activity show an illogical state jump (e.g.,
+    reaching a settings/admin page without traversing the dashboard) coinciding with a source-IP change?
+  context: Track user activity as a state machine; an illogical state jump — such as landing on a settings
+    or admin page without traversing the expected dashboard — that coincides with a source-IP change is
+    a strong anomaly. Detect it with sequence models (DeepLog) or a variable-order Markov approach and
+    report the violating transition together with the IP change. When a session abruptly performs an out-of-order
+    privileged action from a new IP, it strongly suggests the cookie was hijacked mid-flow and is now
+    being driven by an attacker performing lateral movement.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internal Network Core, Application Server Load Balancers, East-West Traffic Mirrors'
+  range: Last 90 days (model on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = state_machine / DeepLog of user app states\n  | where transition P ~ 0 (illogical\
+      \ jump)\n     AND src_ip changed at same step\n  | emit violating_transition, ip_change | alert"
+- question: Is there an authenticated internal web request from a source host where the corresponding
+    user has no interactive (Type 2), remote interactive (Type 10), or network (Type 3) logon (Event ID
+    4624) within the recent window?
+  context: If a user is authenticated to a web app from a host but never logged on to that host, the session
+    is a 'ghost' — strong evidence the cookie was replayed from somewhere the user is not present. For
+    each authenticated internal web request (http.log), require a corresponding Windows Event ID 4624
+    (Logon Type 2/10/3) for that user on the source host within 24h; if absent, alert. This new-edge lateral-movement
+    signal catches replay even when the source IP is internal and otherwise unremarkable, pinpointing
+    the host and account in question.
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Member Servers, User Endpoints, Internal Web Servers'
+  range: Last 90 days (24h logon-correlation window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  for each http.log authenticated request (user U, host H):\n    L = 4624 where user=U\
+      \ AND host=H AND logon_type in (2,3,10) within 24h\n    if L is empty -> alert 'ghost session (no\
+      \ logon on source host)'"
+- question: For each web request, how rare is the user-host pair relative to the historical baseline of
+    which users log on to that server, and which near-zero-probability pairs appear?
+  context: Per server, baseline which users log on (from 4624 history); for each web request compute a
+    rarity score for the user-host pair and alert on pairs with near-zero historical probability. Include
+    the user's historical logon count on that host in the alert so analysts can gauge confidence. A user
+    authenticating to an app from a server they have essentially never used is a classic lateral-movement
+    edge; with stolen sessions, the attacker reaches services from unexpected hosts, and rarity scoring
+    surfaces exactly those improbable user-host combinations.
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Member Servers, User Endpoints, Internal Web Servers'
+  range: Last 90 days (per-server baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per server: baseline P(user logs on) from 4624\n  | for each web request: rarity = 1\
+      \ - P(user|host)\n  | where rarity ~ 1 (near-zero history)\n  | emit user_host_logon_count | alert"
+- question: Does a graph model of historical user-host logons flag any web session as originating from
+    a host that is a highly improbable source for that user?
+  context: Train a bipartite user-host logon graph on historical 4624 data (or heterogeneous identity-graph
+    embeddings) and flag a web session from a host the model deems a highly improbable source for that
+    user. Output the improbable edge and its score. The graph captures multi-hop and structural relationships
+    that simple pairwise rarity misses, making it effective at spotting attacker pivots where a stolen
+    session is presented from a host with no plausible connection to the user — a key indicator of Pass-the-Cookie
+    lateral movement.
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Member Servers, User Endpoints, Internal Web Servers'
+  range: Last 90 days (model on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = bipartite(user <-> host) from 4624 history\n  | embeddings / link-prediction model\n\
+      \  | for each web session: score edge(user, source_host)\n  | where score < improbable_threshold\n\
+      \  | emit improbable_edge, score | alert"
+- question: Does any user outside the authorized admin group invoke privileged actions (defined by URL/API
+    patterns such as /api/v1/delete_vm or /admin/export_all_users) in a sensitive internal application
+    or cloud service?
+  context: Once a session is hijacked, attackers use it to perform high-impact actions. Define privileged
+    actions via URL/API patterns (/api/v1/delete_vm, /admin/export_all_users) and alert when a user outside
+    the authorized admin group invokes them across http.log/CloudTrail/Okta. Pair with prebuilt cloud
+    rules and least-privilege expectations, and profile failed/denied privileged calls (403/AccessDenied)
+    as a distinct probing signal. A non-admin account performing admin operations through a web session
+    is strong evidence of a hijacked session being used for impactful lateral movement.
+  answer_sources:
+  - Zeek http.log
+  - saas:okta System Log
+  - AWS:CloudTrail
+  - 'NAI: Administrative Network Segment, Servers hosting critical management tools, Core Switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  PRIV = [/api/v1/delete_vm, /admin/export_all_users, ...]\n  | source IN (http.log, CloudTrail,\
+      \ okta)\n  | where action matches PRIV AND user not in admin_group\n  | side: profile result in\
+      \ (403, AccessDenied) as probing\n  | alert"
+- question: Within a sensitive management application, do any users access URLs/API endpoints that are
+    statistically rare (99.9th percentile) for that user or their peer group (Help Desk, Developers)?
+  context: Per user and per peer group, profile accessed URLs/API endpoints with TF-IDF and first-seen
+    scoring and flag actions in the 99.9th rarity percentile for that user/group. Emit the rare action
+    and the peer-group baseline frequency. An account in a hijacked session frequently performs operations
+    that no one in its role normally does; peer-group profiling catches this even when the individual
+    user has limited history, surfacing the abuse of stolen sessions to take rare, sensitive actions in
+    critical tools.
+  answer_sources:
+  - Zeek http.log
+  - saas:okta System Log
+  - AWS:CloudTrail
+  - 'NAI: Administrative Network Segment, Servers hosting critical management tools, Core Switches'
+  range: Last 90 days (per-user and per-peer-group baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  per user and per peer_group: TF-IDF profile of url/api endpoints\n  | rarity = first_seen\
+      \ / 1 - freq(action | user/group)\n  | where rarity >= 0.999\n  | emit rare_action, peer_baseline_freq\
+      \ | alert"
+- question: Does a sequence autoencoder (or LSTM log-sequence model) of normal in-app action sequences
+    produce high reconstruction error for any session, indicating a hijacked admin session?
+  context: Train a seq2seq autoencoder (or an LSTM log-sequence model like DeepLog) on normal action sequences
+    within the application; high reconstruction error flags a session whose action flow does not match
+    learned legitimate behavior, characteristic of a hijacked admin session. Combine with variable-order
+    Markov plausibility and surface the lowest-likelihood actions in the alert. Modeling whole sequences
+    rather than individual actions catches subtle, ordered misuse of a stolen session that single-event
+    rules and even rarity scoring can miss.
+  answer_sources:
+  - Zeek http.log
+  - saas:okta System Log
+  - AWS:CloudTrail
+  - 'NAI: Administrative Network Segment, Servers hosting critical management tools, Core Switches'
+  range: Last 90 days (model on trailing history)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = seq2seq_autoencoder / DeepLog on normal action sequences per app\n  | recon_error\
+      \ = ||seq - decode(encode(seq))||\n  | where recon_error > threshold\n  | join markov_plausibility\n\
+      \  | emit lowest_likelihood_actions | alert"
