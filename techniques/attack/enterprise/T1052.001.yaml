@@ -1,0 +1,449 @@
+name: 'T1052.001: Exfiltration over USB'
+id: 6cd1cef5-2739-47a5-b91c-b400e9e91e9a
+description: Investigate potential exfiltration of data over a USB-connected physical device (MITRE ATT&CK
+  T1052.001). This playbook helps an analyst determine whether an adversary, insider, or commodity malware
+  staged and copied sensitive data to removable media as a final exfiltration point or to hop between
+  otherwise disconnected (e.g., air-gapped) systems. It correlates USB mass-storage device connection
+  events with subsequent process execution from removable paths, recursive copy and archival activity
+  targeting sensitive internal locations, abnormally high volumes or counts of files written to removable
+  drives, off-hours or service-account writes, and known-malicious tool execution from removable media.
+  It pairs deterministic floors (device-control denies, malicious hashes, volume/count thresholds, stateful
+  connect->archive->bulk-write chains) with statistical baselines (per-user/host write-volume baselines,
+  change-point detection, activity-hour histograms) and machine-learning approaches (supervised classifiers,
+  sequence/graph models, and unsupervised anomaly scoring with feature attribution) across Windows, Linux,
+  and macOS endpoints.
+type: technique
+related:
+- tactic_id: TA0010
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process execute from a removable-drive path whose executable hash matches a known-malicious
+    data-staging or exfiltration tool, or was an execution from removable media explicitly blocked by
+    device-control, AppLocker, or Gatekeeper?
+  context: 'This is the deterministic floor for USB exfiltration: an adversary or insider often runs their
+    staging/exfil tooling directly from the USB device itself. Join process-creation events (Windows Event
+    ID 4688 / Sysmon EID 1, Linux auditd execve, macOS osquery process_events) with a curated threat-intel
+    hash feed and alert when the image path resides on a removable drive (Windows E:-Z:\, Linux /media/
+    or /run/media/, macOS /Volumes/) AND the SHA256 matches a known staging/exfil tool. A positive match
+    is high-fidelity and warrants immediate response; tune the hash feed rather than removing the rule.
+    Separately, device-control deny events and AppLocker/Gatekeeper execution blocks originating from
+    removable media are a failure-mode signal that an actor attempted but was prevented from running tooling
+    off USB - treat these as high-priority leads in the context of the Exfiltration tactic, where the
+    goal is to move data off the host.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, particularly those with sensitive data access or used
+    by privileged accounts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'process_creation
+
+      | where image_path matches /^[E-Z]:\\/ or image_path startswith "/media/" or image_path startswith
+      "/run/media/" or image_path startswith "/Volumes/"
+
+      | join kind=inner threatintel_hashes on sha256
+
+      | emit ALERT severity=high
+
+
+      // failure-mode (separate high-priority rule)
+
+      device_control_or_applocker_or_gatekeeper
+
+      | where action in ("deny","block") and source_path is_removable
+
+      | emit ALERT severity=high'
+- question: Among processes launched from removable media, are any exhibiting abnormally high Shannon
+    entropy in their process name or command line (above the enterprise 95th percentile) suggesting obfuscation
+    or packing?
+  context: Adversaries frequently rename or pack tooling carried on USB to evade signature detection.
+    For every process launched from removable media, compute the Shannon entropy of the process name and
+    full command line, build an enterprise baseline over 30 days, and flag values above the 95th percentile
+    as possible obfuscation/packing. To avoid alerting purely on naming style, pair entropy with volume
+    (image size) and frequency (executions/min from the device). A high-entropy, high-frequency executable
+    running off a freshly mounted USB is a strong staging indicator under the Exfiltration tactic. Derive
+    the percentile from your own data and raise it if false positives are high; a negative result (entropy
+    within baseline) lowers but does not eliminate suspicion.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, particularly those with sensitive data access or used
+    by privileged accounts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'process_creation
+
+      | where image_path is_removable
+
+      | extend name_entropy = shannon(process_name), cmd_entropy = shannon(command_line)
+
+      | summarize p95_name = percentile(name_entropy,95), p95_cmd = percentile(cmd_entropy,95) by enterprise
+      // 30d baseline
+
+      | join recent on enterprise
+
+      | where name_entropy > p95_name or cmd_entropy > p95_cmd
+
+      | extend img_size, exec_per_min
+
+      | emit ALERT'
+- question: When scored by a supervised classifier trained on known-malicious versus benign software,
+    do any processes launched from USB receive a high maliciousness score, and what are the top contributing
+    features?
+  context: Train a supervised classifier (Random Forest / Gradient Boosting) on process features - parent
+    process, user context, command-line length and entropy, image size, sensitive-keyword presence, and
+    a removable-path flag - using labels from known malware versus benign software. Score every process
+    launched from USB and require the alert to surface the top-3 contributing features rather than a bare
+    score, so an analyst can validate the reasoning. This catches novel tooling that lacks a known hash.
+    Within the Exfiltration tactic, a high-scoring removable-media process whose attribution highlights
+    sensitive keywords or unusual parentage is a priority lead; explainability lets the analyst quickly
+    confirm or dismiss it and provides feedback to retrain the model.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, particularly those with sensitive data access or used
+    by privileged accounts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = RandomForest/GBM trained on {parent_proc, user_ctx, cmdline_len, cmd_entropy, image_size,
+      sensitive_kw, removable_flag} labels={malware,benign}
+
+      score = model.predict_proba(process where removable_flag=1)
+
+      | where score >= threshold
+
+      | extend top3 = feature_attribution(model, process)[:3]
+
+      | emit ALERT with top3'
+- question: Was a native copy utility (robocopy, xcopy, PowerShell Copy-Item, cp -r, rsync, tar) executed
+    with recursive flags to copy data from a sensitive internal source to a removable-media destination?
+  context: 'Living-off-the-land copy utilities are the most common means of bulk-moving files to USB.
+    Monitor process creation (Windows Event ID 4688) for robocopy.exe, xcopy.exe, powershell.exe (Copy-Item),
+    and on Linux/macOS cp -r, rsync, and tar, applying regex that matches a sensitive source (C:\Users,
+    \\fileserver\, /home, mounted shares) AND a removable destination (E:-Z:\, /media/, /Volumes/) combined
+    with recursive flags (/E, /S, -Recurse, -r). This is a deterministic rule: maintain it and tune the
+    source/destination lists. A match strongly suggests staged collection for exfiltration over USB; absence
+    of a recursive flag or a non-removable destination reduces but does not eliminate concern, since attackers
+    may copy in stages.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Endpoints with access to network shares, document management systems, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'process_creation
+
+      | where process_name in~ ("robocopy.exe","xcopy.exe","powershell.exe","cp","rsync","tar")
+
+      | where command_line matches /(C:\\Users|\\\\fileserver\\|\/home|\/mnt|\/srv)/   // sensitive source
+
+      | where command_line matches /([E-Z]:\\|\/media\/|\/Volumes\/)/                      // removable
+      dest
+
+      | where command_line matches /(\/E|\/S|-Recurse|-r|-a)/                                 // recursive
+
+      | emit ALERT'
+- question: Does a user's copy-utility activity (frequency, argument count, recursive-flag rate, bytes
+    copied) to removable media deviate more than three standard deviations from their own baseline or
+    far exceed their peer group?
+  context: Build a per-user baseline of copy-utility usage capturing frequency (invocations/day), argument
+    count, recursive-flag rate, and bytes copied. Raise a risk score when a command deviates more than
+    three standard deviations from the user's baseline AND the destination is removable media, and add
+    peer-group comparison so a user copying far more than departmental peers is flagged even if their
+    own history is short. In the Exfiltration context, a normally light copy-utility user suddenly running
+    large recursive copies to USB is a meaningful behavioral shift. Derive thresholds from your own telemetry;
+    combine with the deterministic rule above to prioritize confirmed sensitive->removable copies.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Endpoints with access to network shares, document management systems, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'copy_events // robocopy/xcopy/Copy-Item/cp/rsync/tar
+
+      | summarize per_user_mean,per_user_std of {freq,argc,recursive_rate,bytes} over 90d
+
+      | join recent on user
+
+      | extend z = (value - per_user_mean)/per_user_std
+
+      | where z > 3 and destination is_removable
+
+      | extend peer_ratio = bytes / peer_group_median(bytes)
+
+      | where z > 3 or peer_ratio > N
+
+      | emit RISK_SCORE'
+- question: Does the sequence of commands or processes in a user session deviate from learned benign command
+    sequences in a way consistent with reconnaissance-then-copy-to-USB behavior?
+  context: Model per-session command/process sequences with an LSTM log-key predictor trained on benign
+    sequences only, and flag sessions whose next event falls outside the top-g predictions - for example
+    whoami -> dir \\sensitive\share -> robocopy \\sensitive\share E:\ - surfacing the deviating step for
+    triage. This captures the recon-then-stage pattern that precedes USB exfiltration even when individual
+    commands are benign in isolation. Under the Exfiltration tactic, an out-of-distribution step that
+    pivots from internal enumeration to a removable-media copy is a strong investigative lead; the model
+    points the analyst to the exact anomalous command for fast validation.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Endpoints with access to network shares, document management systems, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = LSTM_logkey.train(benign_session_sequences)\nfor session in recent_sessions:\n  for\
+      \ step in session:\n    if step not in model.topg(prev_context):\n      flag(step)\n| where flagged_step\
+      \ involves removable_dest\n| emit ALERT with deviating_step"
+- question: Did a single user write more than 1 GB or more than 1000 files to a removable-drive path within
+    15 minutes, or generate a burst of access-denied write attempts to a removable device?
+  context: With file-system object-access auditing (SACL) enabled (Windows Event ID 4663, Linux auditd
+    open/write on USB mounts, macOS fs_usage), alert when a single user writes more than 1 GB OR more
+    than 1000 files to a removable-drive path within 15 minutes. This deterministic volume/count floor
+    catches obvious bulk exfiltration regardless of tooling. Also count failed/denied writes (Event ID
+    4656 with access-denied / 0xC0000022) to the device as a distinct failure-mode signal of attempted-but-blocked
+    exfiltration, which can reveal an actor probing device-control restrictions. Keep these floors and
+    tune the thresholds per environment; this directly addresses the Exfiltration tactic's goal of moving
+    large data volumes off-host.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: Workstations of users in departments handling PII, PHI, or intellectual property (e.g., HR,
+    Finance, R&D).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'file_access // 4663 / auditd write / fs_usage
+
+      | where object_path is_removable and access in ("write","WriteData")
+
+      | summarize bytes=sum(size), files=dcount(object_path) by user, host, bin(15m)
+
+      | where bytes > 1GB or files > 1000
+
+      | emit ALERT severity=high
+
+
+      // failure-mode
+
+      file_access_denied // 4656 access-denied / 0xC0000022
+
+      | where object_path is_removable
+
+      | summarize denies=count() by user,host,bin(15m) | where denies > N | emit ALERT'
+- question: When measured against a rolling 30-day per-user/host baseline of removable-media write volume,
+    does current activity exceed the 99th percentile or show an abrupt sustained change-point?
+  context: Build a rolling 30-day per-user/host baseline of hourly bytes and file-count written to removable
+    media and alert above the 99th percentile. In parallel, run change-point detection (CUSUM, Bayesian
+    online CPD, or PELT) on the write-volume time series to catch abrupt sustained bursts while modeling
+    seasonality such as end-of-month reporting. This statistical layer catches slower or stealthier exfiltration
+    that stays under the deterministic 1 GB/15-minute floor but is clearly abnormal for that entity. Within
+    the Exfiltration tactic, a confirmed change-point coinciding with a 99th-percentile spike in USB writes
+    is a high-value lead; derive all thresholds from your own data to keep false positives manageable.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: Workstations of users in departments handling PII, PHI, or intellectual property (e.g., HR,
+    Finance, R&D).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'usb_writes
+
+      | summarize hourly_bytes,hourly_files by user,host,bin(1h) over 30d  // rolling baseline
+
+      | extend p99 = percentile(hourly_bytes,99) by user,host
+
+      | where current_hour_bytes > p99
+
+      | union changepoint(CUSUM|BOCPD|PELT, series=usb_write_volume[user,host], seasonality=true)
+
+      | emit ALERT'
+- question: Do per-write-session feature vectors for removable-media activity score as anomalies under
+    Isolation Forest or an autoencoder, and which features drive the anomaly?
+  context: Score per-write-session feature vectors - total bytes, file count, write rate, off-hours flag,
+    account type, and an archive-before-write flag - with Isolation Forest / Extended Isolation Forest,
+    or an autoencoder thresholded at the 99th-percentile reconstruction error. Cluster the per-feature
+    reconstruction error to report the top-3 contributing features in the alert so analysts understand
+    why a session is anomalous. This unsupervised approach catches multivariate combinations (e.g., moderate
+    volume but off-hours, service account, with prior archiving) that single thresholds miss. For the
+    Exfiltration tactic, an anomalous USB write-session whose attribution highlights off-hours staging
+    by an unusual account is a strong lead worth immediate triage.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: Workstations of users in departments handling PII, PHI, or intellectual property (e.g., HR,
+    Finance, R&D).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = features(usb_write_sessions){total_bytes,file_count,write_rate,off_hours,account_type,archive_before_write}
+
+      model = IsolationForest | ExtendedIF | Autoencoder
+
+      score = model.anomaly(X)
+
+      | where score > p99   // or recon_error > p99
+
+      | extend top3 = per_feature_error(model,X)[:3]
+
+      | emit ALERT with top3'
+- question: On a single host within 10 minutes, did a USB mass-storage device connect, then an archiver
+    process launch, then more than 100 file-write events occur to the new drive - the classic staging-and-exfiltration
+    chain?
+  context: 'Trigger a stateful rule when, for one host within 10 minutes: (1) a USB mass-storage connect
+    occurs (Kernel-PnP Event ID 400, Linux udev block-device add, macOS volume mount), then (2) an archiver
+    process launches (7z.exe, winrar.exe, tar, zip) seen in 4688/EID 1, then (3) more than 100 file-write
+    events (4663) hit the new drive letter or mount. This stateful correlation captures the full collect-compress-copy
+    chain that characterizes deliberate USB exfiltration, especially in air-gapped or high-security zones
+    where USB is the primary data-movement vector. Keep the count and time-window thresholds and tune
+    them to the environment; a complete chain is a high-confidence Exfiltration indicator warranting immediate
+    response.'
+  answer_sources:
+  - Microsoft-Windows-Kernel-PnP/Configuration Event ID 400
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: All enterprise endpoints, with a focus on air-gapped or high-security zone systems where USB
+    is a primary vector for data movement.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "stateful per host, window=10m:\n  S1 = usb_connect (KernelPnP 400 | udev add | macos volume\
+      \ mount)\n  S2 = process_creation where image in~ (\"7z.exe\",\"winrar.exe\",\"tar\",\"zip\",\"\
+      rar\")\n  S3 = file_access(4663) writes to new_drive count > 100\n  if S1 -> S2 -> S3 within 10m:\
+      \ emit ALERT severity=high"
+- question: Given a user's historical behavior, how improbable is it that they created an archive within
+    15 minutes of connecting a USB device, and is the observed staging event below a p<0.01 likelihood?
+  context: For each user, estimate the historical probability of creating an archive (.zip/.7z/.tar) within
+    15 minutes of a USB connect, then alert when an observed occurrence has very low probability (p <
+    0.01) against that user's prior behavior, indicating anomalous staging. This probabilistic method
+    personalizes the connect-then-archive signal so that users who routinely archive to USB do not generate
+    noise, while a first-time or rare staging action stands out. Within the Exfiltration tactic, a low-probability
+    staging event is a meaningful behavioral anomaly; baseline from labeled USB connect/copy telemetry
+    and combine with the stateful chain rule to prioritize.
+  answer_sources:
+  - Microsoft-Windows-Kernel-PnP/Configuration Event ID 400
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: All enterprise endpoints, with a focus on air-gapped or high-security zone systems where USB
+    is a primary vector for data movement.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each user: p_stage = P(archive_within_15m | usb_connect)  // from history
+
+      observe recent usb_connect events
+
+      | where archive_within_15m == true and p_stage < 0.01
+
+      | emit ALERT'
+- question: Does the connect->archive->write event chain (or its user-host-process-device graph) deviate
+    from learned benign staging patterns when modeled by a sequence or graph neural network?
+  context: Represent the connect->archive->write chain as an event sequence (LSTM next-event prediction)
+    or as a user-host-process-device behavioral graph (GNN), and flag chains that deviate from learned
+    benign patterns, surfacing the contributing nodes or steps for analyst review. This captures variations
+    of the staging-exfil pattern that fixed thresholds miss - unusual process orderings, atypical device/account
+    combinations, or rare host-process edges. For the Exfiltration tactic, a deviating chain with explainable
+    contributing nodes lets an analyst quickly judge whether a USB staging sequence is malicious; train
+    on benign chains and use attribution to focus triage.
+  answer_sources:
+  - Microsoft-Windows-Kernel-PnP/Configuration Event ID 400
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: All enterprise endpoints, with a focus on air-gapped or high-security zone systems where USB
+    is a primary vector for data movement.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq_model = LSTM_nextevent.train(benign_chains)  // or GNN on user-host-proc-device graph
+
+      score = model.deviation(observed_chain)
+
+      | where score > threshold
+
+      | extend contributing = top_nodes_or_steps(model, observed_chain)
+
+      | emit ALERT with contributing'
+- question: Were file writes to removable media performed by a designated service (non-interactive) account,
+    or by a standard user outside their established business hours (e.g., 22:00-06:00)?
+  context: 'Raise a high-priority alert on any removable-media file write (4663) or process creation (4688)
+    where the account is a designated service account (e.g., a member of a ''Service Accounts'' AD group)
+    - which should essentially never write to USB - or where a standard user performs the write outside
+    business hours such as 22:00-06:00 local. Correlate with logon/logoff (4624/4634) on the same Logon
+    ID to establish session context and interactivity. This deterministic rule targets two strong exfiltration
+    tells: misuse of service-account credentials and stealthy off-hours data movement. Within the Exfiltration
+    tactic, either condition combined with a removable destination is a priority lead, particularly on
+    servers, domain controllers, and privileged-user workstations.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - 'NAI: All servers (especially Domain Controllers, database servers) and workstations of privileged
+    users (e.g., Domain Admins, developers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "usb_write = file_access(4663) where object_path is_removable, write\n  union process_creation(4688)\
+      \ on removable target\n| join logon(4624)/logoff(4634) on logon_id\n| where account in ServiceAccountsGroup\n\
+      \   or (account_type==\"standard\" and hour(time) in 22..23 or 0..6)\n| emit ALERT severity=high"
+- question: When does a USB write occur relative to a user's historical activity-hour histogram, and is
+    it in a time window below their 5th-percentile activity level?
+  context: From 90 days of logon/logoff (4624/4634) build a per-user histogram of activity by hour-of-day
+    and day-of-week, then alert when a USB write occurs in a window below the 5th percentile of that user's
+    historical activity. Combine with change-point detection to confirm a genuine shift in working pattern
+    rather than incidental noise. This statistical refinement of the off-hours signal adapts to each user's
+    true schedule (e.g., legitimate night-shift staff), reducing false positives while still surfacing
+    anomalous timing. For the Exfiltration tactic, a USB write at a personally unusual hour - confirmed
+    by a change-point - is a credible indicator of covert data movement.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - 'NAI: All servers (especially Domain Controllers, database servers) and workstations of privileged
+    users (e.g., Domain Admins, developers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'hist = activity_by_hour_dow(user) from logon/logoff 90d
+
+      activity_pct = hist.percentile_of(usb_write.hour, usb_write.dow)
+
+      | where activity_pct < 5
+
+      | union changepoint(series=user_activity_hours)
+
+      | emit ALERT'
+- question: Do USB-write events cluster as outliers (or tiny isolated clusters) when scored on account
+    type, hour, day-of-week, bytes, file count, and host, and which features drive each outlier?
+  context: Cluster and score USB-write events on features including account type, hour, day-of-week, bytes,
+    file count, and host using Isolation Forest / DBSCAN, then investigate outliers and tiny isolated
+    clusters. Have the detector report the top-3 features driving each outlier score so analysts can triage
+    efficiently. This unsupervised method catches abnormal context combinations - e.g., a privileged account
+    writing many files at an odd hour on an atypical host - that rule-based off-hours/service-account
+    logic may not enumerate. For the Exfiltration tactic, isolated outlier USB-write events with clear
+    feature attribution (account type + hour + volume) are strong leads; feed confirmed findings back
+    to refine baselines and tuning.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - 'NAI: All servers (especially Domain Controllers, database servers) and workstations of privileged
+    users (e.g., Domain Admins, developers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = features(usb_write_events){account_type,hour,dow,bytes,file_count,host}
+
+      model = IsolationForest | DBSCAN
+
+      outliers = model.fit_predict(X)
+
+      | where is_outlier or in_tiny_cluster
+
+      | extend top3 = feature_attribution(model,X)[:3]
+
+      | emit ALERT with top3'
