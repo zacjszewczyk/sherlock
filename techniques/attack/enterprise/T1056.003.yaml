@@ -1,0 +1,473 @@
+name: 'T1056.003: Web Portal Capture'
+id: 1e06b1a8-52a8-448c-95a7-3f9c98fc4b70
+description: 'This playbook helps an analyst investigate Web Portal Capture (T1056.003), in which an adversary
+  installs code on externally facing portals such as a VPN, OWA, SSO, or SharePoint login page to capture
+  and exfiltrate the credentials of users who authenticate to the service. It supports two missions: determining
+  whether the adversary has accessed credentials via web portal capture (Credential Access) and whether
+  the adversary is collecting data via web portal capture (Collection). Investigative threads include
+  detecting unauthorized modifications to login-facing files (login.aspx, index.html, login.js, .php)
+  against a known-good hash manifest, spotting injected <script src> / <form action> tags pointing to
+  non-allowlisted external domains, identifying credential-like outbound HTTP/S requests and rare-destination/beaconing
+  exfil from DMZ portal servers, correlating unauthorized file-writing processes with rare outbound callbacks,
+  catching web-server parents spawning shells or recon tools, finding credential-staging writes to non-log
+  file extensions or hidden files, and correlating sensitive config/SAM reads with temp/staging writes.
+  Each thread layers deterministic symbolic-logic rules, robust statistical baselining (median/MAD modified
+  Z-score, beaconing/FFT analysis), and explainable machine-learning detectors (One-Class SVM, Isolation
+  Forest, autoencoders, sequence and graph models) so a SOC analyst can move from a high-fidelity floor
+  to anomaly-driven hunting.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any login-facing portal file deviated from its known-good SHA256 manifest, and does the
+    change introduce a <script src> or <form action> pointing to a non-allowlisted external domain or
+    contain dangerous functions (eval, base64_decode, XMLHttpRequest, fetch)?
+  context: Deterministic floor for credential harvesting via portal tampering (Credential Access). Keep
+    a known-good SHA256 manifest of every login file and alert on ANY hash deviation on Windows Event
+    ID 4663 / Sysmon Event ID 11. On change, parse and extract domains from script src and form action
+    attributes; alert on any not on the internal allowlist or present on threat intel. Run YARA / dangerous-function
+    rules on the changed file. A positive result (hash change + external domain) is a near-certain credential-capture
+    compromise.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Externally-facing web servers hosting login portals (VPN, OWA, SharePoint)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on file_modify(path in login_file_set) where sha256(path)!=baseline[path]:\n  d = extract_domains(<script\
+      \ src>,<form action>) from file(path)\n  if any(x not in allowlist or x in threat_intel for x in\
+      \ d)\n     or yara_match(file(path), {eval,base64_decode,document.forms,XMLHttpRequest,fetch}):\n\
+      \    alert(host,path,d)"
+- question: For each newly introduced external domain in a login-page modification, does its risk score
+    (domain age < 30 days, popularity in the bottom 10th percentile, Shannon entropy of the label > 3.5)
+    exceed your locally derived cutoff using a median/MAD modified Z-score (|z| > 3.5)?
+  context: Statistical triage that ranks injected domains by how suspicious they look without being fooled
+    by benign CDN rotations. Compute a weighted risk score from domain age, popularity, and label entropy;
+    use median/MAD modified Z-score (cutoff |z|>3.5) rather than mean/stdev so periodic CDN changes do
+    not distort the baseline, and derive the cutoff from your own 90-day domain distribution. The alert
+    must list the top-3 contributing factors (age, popularity, entropy) so an analyst can judge it quickly
+    in the Credential Access context.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Externally-facing web servers hosting login portals (VPN, OWA, SharePoint)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for d in new_external_domains(login_page_mods):\n  score = w1*(age(d)<30) + w2*(popularity_pct(d)<10)\
+      \ + w3*(shannon(label(d))>3.5)\n  z = (score - median(hist))/(1.4826*MAD(hist))\n  if z>3.5: alert(d,\
+      \ top3_factors=[age,popularity,entropy])"
+- question: Does a login-page modification (Windows Event ID 4663) fall outside the forecasted maintenance
+    window predicted from its historical cadence, and what process (Windows Event ID 4688) performed the
+    off-cycle edit?
+  context: Legitimate login-page edits follow a predictable maintenance cadence; an edit outside that
+    rhythm is suspicious. Model the historical modification cadence with online ARIMA/SARIMA and alert
+    when a modification's forecast residual exceeds adaptive confidence bounds. Correlate the alert with
+    the responsible process via Windows Event ID 4688, and surface the forecast interval, observed time,
+    and parent process as the top contributing features. An off-cycle edit by a non-deployment process
+    strongly suggests adversary credential-capture staging.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Externally-facing web servers hosting login portals (VPN, OWA, SharePoint)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "model = SARIMA(login_page_mod_times_per_host)\nfor mod in 4663_login_page_mods:\n  if mod.time\
+      \ outside model.predict_interval(mod.time):\n    proc = join 4688 on host,time\n    alert(host,\
+      \ mod.time, forecast_interval, proc.parent_image)"
+- question: Is a portal server (id.orig_h) sending an outbound HTTP/S request to an external, non-allowlisted
+    destination whose URI or POST body matches credential key-value patterns (username=, password=, user=,
+    pass=, token=, credential=)?
+  context: Direct detection of credentials leaving the DMZ (Credential Access). On Zeek http.log where
+    id.orig_h is a portal server and id.resp_h is external, alert when uri/post_body matches /(user(name)?|pass(word)?|token|cred(ential)?)=[^&]+/i
+    to a non-allowlisted destination. Record orig_bytes (Volume) and HTTP status (State); repeated 4xx/blocked
+    POSTs to the same external host are a distinct failure-mode signal of a broken exfil channel and still
+    indicate attempted credential theft.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points for the DMZ hosting the web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "http.log | where id.orig_h in portal_servers and id.resp_h not in allowlist\n  and (uri =~\
+      \ /(user(name)?|pass(word)?|token|cred(ential)?)=[^&]+/i\n       or post_body =~ same)\n| stats\
+      \ sum(orig_bytes), count by id.resp_h, status_code\n| alert; flag repeated 4xx to same host as broken-channel"
+- question: Has a portal server connected to an external destination IP/ASN/country below the 5th percentile
+    of its 90-day historical frequency, with orig_bytes deviating > 3.5 modified-Z from the per-port baseline,
+    or with elevated destination-name entropy/NXDOMAIN rate?
+  context: Rare-destination plus volume anomaly hunting for credential exfil. Per portal server keep a
+    90-day rolling baseline of outbound destination IPs/ASNs/countries and per-destination orig_bytes
+    from Zeek conn.log. Alert on connections to rare destinations (below 5th percentile frequency) whose
+    orig_bytes deviates >3.5 modified-Z from the server's per-port baseline. Score destination-name entropy
+    and unique-query counts to surface high-information channels, and track NXDOMAIN rate (dns.log) as
+    a separate failure signal of a half-built exfil channel.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points for the DMZ hosting the web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = freq_and_bytes(conn.log, portal_server, 90d)\nfor c in conn.log[portal_server]:\n\
+      \  if freq_pct(c.dest)<5 and modZ(c.orig_bytes, baseline[c.dest_port])>3.5:\n    alert(c.dest, entropy(dest_name),\
+      \ nxdomain_rate(c.dest))"
+- question: Does a portal server's outbound connection register as an outlier to a One-Class SVM / Isolation
+    Forest trained on legitimate conn.log flows (id.resp_p, duration, orig_bytes, resp_bytes, proto, byte
+    ratio), and is that outlier also an HTTP/S flow with credential-like URI patterns?
+  context: Machine-learning safety net for novel exfil channels that evade signatures. Train a One-Class
+    SVM (preferred for robustness under noisy/poisoned baselines) or Isolation Forest on legitimate outbound
+    conn.log flows and flag outliers, using LIME-style attribution to surface the top-3 contributing features
+    in the alert. Alternatively use an online autoencoder ensemble (Kitsune) whose per-feature reconstruction
+    error names contributors. Escalate when the outlier flow also carries credential-like URI patterns,
+    indicating active credential exfiltration.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points for the DMZ hosting the web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = OneClassSVM(fit=legit_conn[id.resp_p,duration,orig_bytes,resp_bytes,proto,byte_ratio])\n\
+      for c in conn.log[portal_server]:\n  if model.predict(c)==outlier:\n    feats = lime_top3(model,c)\n\
+      \    if http_credential_pattern(c): escalate\n    alert(c, feats)"
+- question: Did a non-allowlisted process (Windows Event ID 4688) modify a login-page file (Windows Event
+    ID 4663) and then, within 5 minutes, generate an outbound connection (Zeek conn.log) from the same
+    host to an external IP unseen in the last 30 days?
+  context: Stateful kill-chain correlation that ties unauthorized tampering to its callback (Credential
+    Access). On Windows Event ID 4663 for a login-page file, check the writing process (Event ID 4688)
+    against an allowlist of authorized deployment processes (e.g., deployscript.ps1); if not allowlisted,
+    watch Zeek conn.log for an outbound connection from that host within 5 minutes to an external IP unseen
+    in 30 days, and alert on the full chain. Combine with web-server-parent-spawns-shell / writes-to-webroot
+    Sigma patterns to catch interactive tampering. Preserve the explicit 5-minute / 30-day thresholds.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Web portal application servers and their associated host-based monitoring agents'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on 4663(file in login_file_set):\n  proc = 4688 writer; if proc.image in deploy_allowlist:\
+      \ pass\n  else watch conn.log[same_host] for 5min:\n    if dest_ip not seen in 30d and external:\
+      \ alert(chain: proc, file, dest_ip)"
+- question: Does the command line of the process (Windows Event ID 4688) that modified a login page show
+    Shannon entropy above the 99th percentile (MAD modified-Z > 3.5) of the legitimate-deployment baseline,
+    correlated with a subsequent rare outbound connection?
+  context: Obfuscated command lines betray adversary tooling masquerading as deployment activity. For
+    each Event ID 4688 process that modifies a login page, compute Shannon entropy of the command line
+    and alert when it exceeds the 99th percentile (robustly, MAD modified-Z > 3.5) of the legitimate-deployment
+    baseline, indicating obfuscation, then correlate with a subsequent rare outbound connection. Record
+    process count/min (Frequency) and exit status (State). High-entropy command lines plus a rare callback
+    strengthen the credential-capture hypothesis.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Web portal application servers and their associated host-based monitoring agents'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for p in 4688 where p modifies login_page:\n  e = shannon(p.command_line)\n  if modZ(e, deploy_cmd_baseline)>3.5:\n\
+      \    if rare_outbound(p.host within window): alert(p, e)"
+- question: Does the observed process/file/network sequence on a portal server (e.g., w3wp.exe -> file_write_login_page
+    -> connection_to_rare_IP) score as low-probability against a sequence model trained on legitimate
+    update workflows?
+  context: Sequence modeling catches tampering that each individual step would not. Train an HMM or LSTM
+    autoencoder on legitimate update sequences (trusted_process_starts -> file_write_login_page -> connection_to_update_server)
+    and alert on low-probability observed sequences such as w3wp.exe -> file_write_login_page -> connection_to_rare_IP.
+    The alert must surface the three most anomalous transitions/features, not just the score, so the analyst
+    can confirm a Credential Access tampering chain.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Web portal application servers and their associated host-based monitoring agents'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = LSTM_AE(fit=legit_update_sequences)\nfor seq in host_event_sequences(portal_server):\n\
+      \  if model.prob(seq) < threshold:\n    alert(seq, top3_anomalous_transitions(model,seq))"
+- question: Has a portal server completed a successful connection (conn_state=SF) to an off-allowlist
+    destination country or ASN in GeoIP/ASN-enriched Zeek conn.log, and how many failed/reset states (S0,
+    REJ, RSTO) target the same destinations?
+  context: Geo/ASN allowlisting is a high-signal way to catch exfil to unexpected infrastructure (Credential
+    Access). Maintain a per-portal allowlist of destination countries/ASNs and alert on any successful
+    connection (conn_state=SF) to an off-allowlist country/ASN. Separately count failed/reset states (S0,
+    REJ, RSTO) to the same destinations as a distinct failure-mode signal of probing or a broken callback.
+    A successful off-allowlist connection from a portal server is a leading credential-exfil indicator.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network sensor data at the DMZ egress point'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "conn.log + geoip/asn | where id.orig_h in portal_servers\n  and (resp_cc not in allowlist_cc\
+      \ or resp_asn not in allowlist_asn)\n| where conn_state=='SF' -> alert\n| where conn_state in (S0,REJ,RSTO)\
+      \ -> count as failure_signal"
+- question: Within any 1-hour window, does a portal server's orig_bytes drop below the 50th percentile
+    while connection count rises > 3 standard deviations (small-payload high-frequency exfil), or does
+    the std-dev of inter-connection delta collapse into fixed-interval beaconing confirmed by FFT/autocorrelation?
+  context: Detects both low-and-slow exfil and C2 beaconing from compromised portals. Per portal server
+    build an hourly Zeek conn.log profile (95th-percentile orig_bytes, mean inter-connection delta). Alert
+    when orig_bytes drops below the 50th percentile while connection count rises >3 standard deviations,
+    or when the std-dev of inter-connection delta collapses (fixed-interval beaconing) confirmed by FFT/autocorrelation
+    of timestamps. Use MAD modified-Z to keep thresholds robust. Both patterns are consistent with credential
+    capture being trickled out or a captured store being polled.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network sensor data at the DMZ egress point'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'profile = hourly(conn.log, portal_server): p95(orig_bytes), mean(delta)
+
+      if orig_bytes<p50 and count>mean+3*std: alert(small_payload_high_freq)
+
+      if std(inter_conn_delta)->0 and fft_peak(timestamps): alert(beaconing)'
+- question: Does per-minute outbound volume per portal server show a residual spike unexplained by trend/seasonality
+    (online ARIMA/STL + peak-finding), and does it correlate with a novel connection cluster (DBSCAN on
+    duration, orig_bytes, id.resp_p)?
+  context: Time-series residual analysis surfaces exfil bursts hidden inside normal traffic seasonality.
+    Apply online ARIMA / STL decomposition to per-minute outbound volume per server and run peak-finding
+    on the residual to detect spikes unexplained by trend/seasonality. Correlate spikes with new connection
+    clusters (DBSCAN on duration, orig_bytes, id.resp_p) and emit the top-3 contributing features (residual
+    magnitude, cluster novelty, destination rarity) in the alert. A correlated residual spike plus novel
+    cluster is a strong credential-exfil signal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network sensor data at the DMZ egress point'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "resid = STL(per_minute_outbound[portal_server]).residual\nfor spike in peaks(resid):\n  cl\
+      \ = DBSCAN(conn.log[duration,orig_bytes,id.resp_p])\n  if spike aligns with novel_cluster:\n   \
+      \ alert(top3=[residual_mag, cluster_novelty, dest_rarity])"
+- question: Has a new or modified file in a web root or temp directory produced a SHA256 that deviates
+    from the known-good manifest, matches a threat-intel hash, or triggers YARA rules tuned for webshell/credential-harvest
+    logic (e.g., passthru($_POST['cmd']))?
+  context: Deterministic floor for the Collection mission. For each new/modified file in web root or temp
+    dirs (Sysmon Event ID 11 / Windows Event IDs 4663/4688), compute SHA256, compare against the known-good
+    baseline manifest and threat-intel, and run YARA rules tuned for webshell/credential-harvest logic.
+    Alert on any hash/manifest deviation or YARA hit. A positive result means an adversary has staged
+    code capable of capturing and collecting credentials on the portal.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems of externally-facing web servers, particularly web root and temporary directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on new_or_modified(path in [wwwroot, /var/www/html, temp]):\n  h = sha256(path)\n  if h !=\
+      \ baseline[path] or h in threat_intel\n     or yara_match(path, webshell_credharvest):\n    alert(host,\
+      \ path, h)"
+- question: Does a new portal file's Shannon entropy exceed its per-extension (.js/.html/.aspx/.php) baseline
+    by a robust MAD modified-Z > 3.5, signaling obfuscation?
+  context: Obfuscated/packed payloads have abnormally high entropy. Baseline per-extension (.js/.html/.aspx/.php)
+    Shannon entropy served by portal handlers; on a new file compute entropy and alert when it exceeds
+    the type-specific baseline by a robust MAD modified-Z > 3.5, which resists occasional minified bundles.
+    A high-entropy outlier among portal files is a strong indicator of a hidden credential-collection
+    payload in the Collection context.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems of externally-facing web servers, particularly web root and temporary directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for f in new_portal_files:\n  e = shannon(f.bytes)\n  if modZ(e, entropy_baseline[f.ext])\
+      \ > 3.5:\n    alert(f.path, e, f.ext)"
+- question: Does a multi-language source-code classifier (PHP/JSP/ASP/ASPX), augmented with CodeBERT embeddings
+    and simplified-AST deep learning, score a new/modified portal file above a calibrated webshell confidence
+    (e.g., 0.90)?
+  context: ML classification catches novel/obfuscated webshells that signatures miss. Score new/modified
+    portal files with a multi-language source-code classifier and alert above a calibrated confidence
+    (e.g., 0.90); augment with CodeBERT semantic embeddings and simplified-AST deep learning for obfuscation
+    robustness. Surface the top-3 features (suspicious function counts, high-entropy strings, AST anomaly)
+    in the alert so the analyst can confirm a credential-collection capability.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems of externally-facing web servers, particularly web root and temporary directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = webshell_classifier(php,jsp,asp,aspx) + codebert + ast_dl\nfor f in new_portal_files:\n\
+      \  p = model.score(f)\n  if p>=0.90: alert(f, top3=[susp_func_count, high_entropy_strings, ast_anomaly])"
+- question: Did a web-server process (w3wp.exe, httpd, nginx) spawn a command interpreter, scripting engine,
+    or recon utility (cmd.exe, powershell.exe, bash, python, whoami, net.exe) per Windows Event ID 4688
+    / Sysmon Event ID 1?
+  context: Web services almost never spawn shells; when they do it is a hallmark of webshell-driven hands-on
+    activity supporting Collection. Trigger when process creation (Windows Event ID 4688 / Sysmon Event
+    ID 1) shows a web-server parent spawning an interpreter/recon tool, using analyst-validated Sigma
+    baselines. A positive result indicates interactive access through the portal that often precedes or
+    accompanies credential collection.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Process execution logs on web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on 4688/Sysmon1 where parent_image in (w3wp.exe,httpd,nginx)\n  and child_image in (cmd.exe,powershell.exe,cscript.exe,bash,python.exe,whoami.exe,net.exe):\n\
+      \    alert(host, parent_image, child_image, command_line)"
+- question: Does an observed parent-child process pair on a web server (e.g., w3wp.exe -> powershell.exe)
+    fall in the bottom 1st percentile of the 30-day rolling frequency table, using robust MAD scoring?
+  context: Frequency baselining surfaces rare-but-real spawns while suppressing benign maintenance noise.
+    Build 30-day rolling frequency tables of parent-child pairs per web server and alert when an observed
+    pair falls in the bottom 1st percentile (e.g., w3wp.exe -> powershell.exe), using robust MAD scoring.
+    Track spawn count/min (Frequency) and child exit status (State). A rare web-parent spawn is a strong
+    lead for Collection-stage hands-on activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Process execution logs on web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "table = freq(parent_child_pairs, web_server, 30d)\nfor pair in observed:\n  if pct_rank(pair,\
+      \ table) < 1 (MAD-robust):\n    alert(pair, spawn_rate, child_exit_status)"
+- question: Do vectorized Event ID 4688 command lines (TF-IDF or embeddings) score as outliers/malicious
+    to a classifier or one-class detector, and what are the top contributing tokens?
+  context: Command-line ML flags novel malicious invocations on portal servers. Vectorize Event ID 4688
+    command lines (TF-IDF or embeddings) and score with a classifier / one-class outlier detector, surfacing
+    the top contributing tokens in the alert; prefer robust unsupervised models for novel commands. Outlier
+    command lines on a web server support the Collection hypothesis of attacker tooling gathering data/credentials.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Process execution logs on web portal servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "X = tfidf(4688.command_line)\nmodel = OneClassSVM(fit=legit_cmdlines)\nfor c in X:\n  if model.predict(c)==outlier:\n\
+      \    alert(c, top_tokens(model,c))"
+- question: Is a web-server process writing text content (Windows Event ID 4663) to a non-log extension
+    (.jpg, .png, .css, .ico) or a hidden file (.config.php) in image/document directories, a classic credential-capture
+    staging pattern?
+  context: Captured credentials are often appended to innocuous-looking files to hide them. Alert when
+    Windows Event ID 4663 shows a web-server process writing text content to a non-log extension or a
+    hidden file in image/document dirs. This is a classic credential-capture staging pattern documented
+    in real VPN-portal keylogging cases and is a high-confidence Collection indicator.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek http.log
+  - 'NAI: File system audit logs for web server directories, including temporary, image, and document
+    root folders'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on 4663 where process in web_server_set\n  and target_ext in (.jpg,.png,.css,.ico) or target_name\
+      \ like '.*'\n  and dir in (images, docroot)\n  and content_is_text:\n    alert(host, process, target)"
+- question: Does a candidate file's size growth/inter-write interval cross-correlate (coefficient > 0.7)
+    with inbound login POST counts from Zeek http.log, indicating each login submission appends a captured
+    credential?
+  context: If a staging file grows in lockstep with login submissions, it is almost certainly a credential
+    log. Build a time series of each candidate file's size growth and inter-write interval (Volume/Frequency)
+    and cross-correlate with inbound login POST counts from Zeek http.log; alert on correlation coefficient
+    > 0.7, and profile failed-login (4xx) POSTs separately. Strong correlation confirms active credential
+    Collection tied to user logins.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek http.log
+  - 'NAI: File system audit logs for web server directories, including temporary, image, and document
+    root folders'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'growth = timeseries(file_size, inter_write_interval)
+
+      posts = count(http.log POST to login_page per bin)
+
+      if pearson(growth, posts) > 0.7: alert(file, corr)
+
+      profile 4xx login POSTs separately'
+- question: When file-write events are clustered with DBSCAN (vectorized path, process, write frequency,
+    extension, content-type), do any fall into the noise cluster, indicating anomalous credential logging?
+  context: Density clustering isolates write behavior that does not fit any normal pattern. Apply DBSCAN
+    to file-write events (vectorized path, process, write frequency, extension, content-type) and investigate
+    noise-cluster writes as anomalous credential logging; report the defining features of each anomalous
+    point. Noise-cluster writes on a portal server are strong leads for Collection-stage credential staging.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek http.log
+  - 'NAI: File system audit logs for web server directories, including temporary, image, and document
+    root folders'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "X = vectorize(file_writes[path,process,write_freq,ext,content_type])\nlabels = DBSCAN(X)\n\
+      for w where label==noise:\n  alert(w, defining_features(w))"
+- question: Did a web-server process read a SACL-protected sensitive file (web.config, SAM hive, .env)
+    per Windows Event ID 4656/4663 and then write to a world-writable/temp directory within 60 seconds,
+    indicating credential/config staging?
+  context: Reading secrets then dropping them to temp is a textbook collection-and-stage sequence. Alert
+    when a web-server process issues a read (Event ID 4656/4663) on a SACL-protected sensitive file and
+    writes to a world-writable/temp dir within 60 seconds. Preserve the 60-second deterministic window.
+    A positive result indicates the adversary is collecting credentials/config for later exfiltration.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - 'NAI: System-level audit logs on web servers, with SACLs configured for sensitive configuration files
+    and registry hives'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on 4656/4663 read where process in web_server_set\n  and target in (web.config, SAM_hive,\
+      \ .env):\n  watch 60s for same_process write to (temp, world_writable):\n    alert(host, process,\
+      \ read_target, write_target)"
+- question: Does a web process's directory transition (e.g., web root -> System32 -> temp) fall below
+    the 1st percentile of a Markov-chain model built from Windows Event ID 4663, and how many access-denied
+    reads accompany it?
+  context: Markov modeling of directory transitions flags unusual file-access paths. Build Markov-chain
+    models of directory transitions for web processes from Event ID 4663 and alert on transitions below
+    the 1st percentile (e.g., web root -> System32 -> temp). Track read failure/access-denied counts (State)
+    as a distinct signal. Low-probability transitions indicate a process roaming the filesystem to collect
+    sensitive data.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - 'NAI: System-level audit logs on web servers, with SACLs configured for sensitive configuration files
+    and registry hives'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "M = markov(dir_transitions(web_proc, 4663))\nfor t in observed_transitions:\n  if M.prob(t)\
+      \ < 1st_percentile:\n    alert(t, access_denied_count)"
+- question: Does a process-file access graph show a new anomalous edge (e.g., sensitive file -> temp staging)
+    flagged by a graph/representation-anomaly detector?
+  context: Graph anomaly detection captures abnormal process-file relationships that point-based methods
+    miss. Train a graph/representation-anomaly detector on normal process-file access graphs and flag
+    new edges (sensitive file -> temp staging) as anomalous, surfacing the contributing nodes/edges; use
+    robust, explainable outlier scoring. New sensitive-to-temp edges are strong Collection-stage credential-staging
+    indicators.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - 'NAI: System-level audit logs on web servers, with SACLs configured for sensitive configuration files
+    and registry hives'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "G = build_graph(process_file_access, 4663)\nmodel = graph_anomaly(fit=normal_graphs)\nfor\
+      \ edge in new_edges(G):\n  if model.score(edge)==anomalous:\n    alert(edge, contributing_nodes)"
