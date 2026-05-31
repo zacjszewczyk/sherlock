@@ -1,0 +1,714 @@
+name: 'T1659: Content Injection'
+id: fcffc5cd-44a9-4545-b3b6-443c4322783a
+description: 'Investigate suspected adversary Content Injection (T1659), where a threat actor positioned
+  in-the-middle or on-the-side of online client-server communications (often via a compromised upstream
+  channel such as an ISP, as documented in ESET''s MoustachedBouncer reporting) injects malicious content
+  into otherwise legitimate network traffic. This playbook helps an analyst pursue two missions: (1) confirming
+  initial access via injected payloads -- malicious executables transferred over unencrypted protocols,
+  browsers spawning interpreters that execute cache/temp drops, rapid download-to-process-to-network chains,
+  and TLS/HTTP anomalies (issuer changes, SNI/Host mismatches, response-length deviations) that betray
+  in-line tampering; and (2) confirming command-and-control conducted over injected/relayed channels --
+  C2 signatures in HTTP content, domain-fronting/relay mismatches, static non-browser request profiles,
+  periodic beaconing, and encoded DNS/HTTP exfiltration. Each question pairs symbolic-logic, statistical,
+  and machine-learning detection methods against endpoint (Windows 4688, Sysmon, auditd, macOS unified
+  logs) and network (Zeek, NSM/flow, PCAP) evidence so a SOC analyst can triage, scope, and corroborate
+  content-injection activity end to end.'
+type: technique
+related:
+- tactic_id: TA0001
+  tactic_name: Initial Access
+- tactic_id: TA0011
+  tactic_name: Command and Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any file transferred over an unencrypted protocol (HTTP or FTP) from an external host
+    have an MD5/SHA1 hash that matches a known-malicious indicator in a threat-intelligence feed?
+  context: Injected payloads delivered over compromised or unencrypted upstream channels are the canonical
+    T1659 initial-access vector (see ESET MoustachedBouncer). Because HTTP/FTP traffic is unencrypted
+    and modifiable in transit, an adversary in-the-middle can swap or append a malicious binary into a
+    legitimate download stream. Join the file hash extracted by Zeek files.log against curated malicious
+    feeds whenever the carrying connection is HTTP or FTP and the conn_uid maps to an external IP. A positive
+    hit is high-confidence evidence of a malicious file entering the environment; pivot on the conn_uid
+    to identify the receiving host, the originating server, and whether the file was executed.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway, External-facing Web Proxies, ISP Demarcation Point, Cloud Access Security
+    Brokers (CASBs)'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        files.log where source in ("HTTP","FTP")
+        | join conn.log on conn_uids where resp_h is external
+        | lookup md5, sha1 in threat_intel_feed
+        | where match==true | emit conn_uid, tx_host, server_ip, matched_indicator
+- question: Did any file extracted from an HTTP/FTP transfer exhibit high byte-entropy (>7.2) that is
+    inconsistent with its declared MIME type, or was a high-entropy executable fetched from a rarely contacted
+    host?
+  context: Content injected over unencrypted channels is frequently packed or encrypted to evade signatures,
+    yielding byte-entropy above ~7.2 (Lyda and Hamrock). When an object declared as text/script carries
+    near-random bytes, or when a packed executable arrives from a host the enterprise seldom contacts,
+    the declared type and the actual content disagree -- a strong tampering/injection signal. Compute
+    the Shannon byte-entropy of each extracted object over HTTP/FTP and alert on the entropy/MIME mismatch.
+    A positive result warrants extracting and detonating the object; a negative result lowers but does
+    not eliminate suspicion (plaintext droppers exist).
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway, External-facing Web Proxies, ISP Demarcation Point, Cloud Access Security
+    Brokers (CASBs)'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        files.log where source in ("HTTP","FTP")
+        | compute entropy = byte_entropy(extracted_object)
+        | where (entropy > 7.2 and mime_type in ("text/*","application/javascript"))
+           or (is_executable and source_host_rarity < p01)
+        | emit fuid, mime_type, entropy, server_ip
+- question: Which files transferred over HTTP/FTP have a 30-day fleet prevalence below the 1st percentile,
+    indicating an extremely rare object consistent with targeted injection?
+  context: Injected malware is, by design, rare across an enterprise fleet -- it is delivered to a small
+    number of targets rather than broadly cached and reused. Measure the 30-day prevalence of each file
+    hash observed in Zeek files.log and flag hashes seen on very few hosts (below the 1st percentile).
+    Rarity alone is not malicious (e.g., a unique installer), so combine with protocol, source reputation,
+    and entropy before escalating. A rare hash arriving over HTTP from an unusual server toward a single
+    workstation is a high-priority injection lead.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway, External-facing Web Proxies, ISP Demarcation Point, Cloud Access Security
+    Brokers (CASBs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_files earliest=-30d
+        | stats dc(host) as fleet_count by sha1, mime_type, source
+        | eventstats perc1(fleet_count) as p01
+        | where fleet_count <= p01 and source in ("HTTP","FTP")
+- question: On connections delivering executables, does the transferred-byte volume deviate more than
+    3 standard deviations from that URL's 30-day mean, or is there an elevated rate of failed/partial
+    transfers (truncated objects, 4xx/5xx, RST) suggesting an injection race?
+  context: On-the-side injection works by racing a forged response to the client ahead of the legitimate
+    server, which often leaves an abnormal response size and a tell-tale increase in truncated, partial,
+    or reset transfers (the real server's late response collides with the injected one). Per source-host
+    and per server, baseline both transferred-byte volume and the failed/partial-transfer ratio. Flag
+    executables whose response size deviates >3 sigma from that URL's 30-day mean, and treat an elevated
+    transfer-error rate as a distinct injection/race indicator. Correlate spikes with the specific URL
+    and client to confirm.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway, External-facing Web Proxies, ISP Demarcation Point, Cloud Access Security
+    Brokers (CASBs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_conn OR index=zeek_http earliest=-30d
+        | stats avg(resp_bytes) as mu, stdev(resp_bytes) as sd,
+                count(eval(status>=400 OR conn_state="RSTR")) as errs, count as tot by url, server_ip
+        | eval err_rate=errs/tot
+        | where is_executable and (resp_bytes > mu+3*sd or err_rate > baseline_err_rate)
+- question: Does a supervised file-reputation classifier (e.g., XGBoost over MIME type, size, source protocol,
+    byte-entropy, and domain reputation) score any downloaded file above 0.9, and what features drove
+    that score?
+  context: Single heuristics miss injected payloads that individually look benign but are collectively
+    suspicious. A supervised model trained on Zeek files/http features (MIME type, size, protocol, byte-entropy,
+    domain reputation) can combine weak signals into a calibrated maliciousness score. Flag files scoring
+    above 0.9 and emit the top-3 contributing features (e.g., entropy, rare source IP, protocol=HTTP)
+    so the analyst can validate the model's reasoning rather than trust a black box. High scores driven
+    by HTTP delivery plus high entropy plus poor domain reputation strongly indicate an injected payload;
+    investigate the receiving host for execution.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway, External-facing Web Proxies, ISP Demarcation Point, Cloud Access Security
+    Brokers (CASBs)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        features = [mime_type, size, protocol, byte_entropy, domain_reputation]
+        score = xgboost_model.predict_proba(features)
+        if score > 0.9: alert(fuid, score, top3_shap_features)
+- question: Did a web browser process (chrome.exe, msedge.exe, firefox.exe) spawn a scripting/command
+    interpreter (cmd.exe, powershell.exe, wscript.exe, mshta.exe) whose command line references a browser
+    cache, temporary-internet-files, or download path?
+  context: 'The host-side footprint of an injected payload is a download-then-execute chain: the browser
+    writes the injected content to its cache or downloads folder, then a scripting engine runs it. Per
+    ESET''s MoustachedBouncer analysis, this browser-parent -> interpreter-child pattern with a cache/temp
+    path on the child command line is a strong indicator of injected payload delivery. Alert on Windows
+    Event ID 4688 where the parent image is a browser and the child is an interpreter referencing those
+    paths. Legitimate cases exist (extensions, updaters), so verify the referenced file, its origin, and
+    any follow-on network activity.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI) Environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        EventCode=4688
+        ParentImage IN (chrome.exe,msedge.exe,firefox.exe)
+        AND NewProcessName IN (cmd.exe,powershell.exe,wscript.exe,cscript.exe,mshta.exe)
+        AND CommandLine MATCHES "(?i)(Temporary Internet|\\Cache\\|\\Temp\\|\\Downloads\\)"
+- question: How frequently has each browser parent / interpreter child process pair occurred historically
+    on a given host, and is the observed spawn below the 5th percentile or entirely new?
+  context: A browser legitimately spawning a scripting engine is uncommon on most endpoints, so rarity
+    is discriminating. Track the historical frequency of browser parent-child pairs per host and alert
+    when a browser-spawned scripting event falls below the 5th percentile or has never been seen before;
+    also count such spawns per minute as a burst signal. A newly observed browser->powershell relationship
+    on a workstation that normally never exhibits it is a high-value lead consistent with injected-payload
+    execution. Tune per host role (developer machines and VDI golden images differ).
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI) Environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        EventCode=4688 ParentImage IN (chrome.exe,msedge.exe,firefox.exe)
+        | stats count by host, ParentImage, NewProcessName
+        | eventstats perc5(count) as p5 by host
+        | where count <= p5 OR isnull(prior_seen)
+- question: Does an Isolation Forest model over process-lineage features (parent name, child name, command-line
+    length/entropy, path tokens) flag any browser-parented execution as a strong anomaly?
+  context: Some injected execution chains evade fixed allow/deny lists by using uncommon interpreters
+    or obfuscated command lines. An Isolation Forest trained on browser-parent process features (parent/child
+    image, command-line length and entropy, path tokens) isolates rare, structurally-unusual spawns without
+    predefined rules. Flag high anomaly scores and surface the top-3 contributing features in the alert
+    (per the explainability practice in Nadler et al.) so analysts can see whether, e.g., an abnormally
+    long high-entropy command line referencing a cache path drove the score. Validate flagged events against
+    the file written by the browser and downstream network connections.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI) Environments'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = features(parent_image, child_image, cmdline_len, cmdline_entropy, path_tokens)
+        for browser-parented 4688 events:
+          s = IsolationForest.decision_function(X)
+          if s < threshold: alert(pid, anomaly=s, top3_features)
+- question: Within a 60-second window on a single host, did a browser-driven file download lead to a new
+    process created from that file, which then connected outbound to a domain not contacted by that host
+    in the prior 30 days?
+  context: This temporal chain -- download, execute, call a never-before-seen destination within ~60 seconds
+    -- captures the injected-payload-to-C2 pivot described in MoustachedBouncer. Correlate Zeek files.log
+    downloads with Windows Event ID 4688 process creations (matching the downloaded file name) and subsequent
+    Zeek conn.log connections, alerting when the outbound destination is unseen for that host in 30 days.
+    A complete chain is strong, multi-source evidence of initial access plus immediate callout; partial
+    chains (download+execute, or execute+new-domain) still merit triage. Pivot to identify the destination,
+    the payload, and lateral spread.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days; correlate events within a 60-second window per host
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        files.log(download, fname) THEN
+        4688(NewProcessName ~ fname) within 60s on same host THEN
+        conn.log(outbound dest) within 60s
+        WHERE dest NOT IN seen_destinations(host, last_30d)
+        | emit host, fname, dest
+- question: Across hosts, which download-type -> process -> destination 3-event sequences fall into the
+    lowest 1st percentile of historical frequency, and did the new-destination connection succeed or fail?
+  context: Modeling the full 3-event sequence (what was downloaded -> what ran -> where it connected)
+    and ranking by historical frequency surfaces rare multi-stage behaviors that no single-event rule
+    would catch. Flag sequences in the lowest 1st percentile, and track whether the new-destination connection
+    succeeded or failed as a distinct state signal -- failed callouts can indicate a sinkholed or not-yet-live
+    C2, while successful ones indicate established communication. A rare sequence ending in a successful
+    connection to a new domain is a high-priority injection/initial-access indicator.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        build seq = (download_type, process, destination) per host
+        | stats count by seq | eventstats perc1(count) as p1
+        | where count <= p1
+        | eval conn_state = success|fail | emit seq, conn_state
+- question: Does a sequence model (HMM/LSTM) over download->process->network chains assign a low likelihood
+    to any observed real-time chain, and which transition is the least probable?
+  context: Injected-payload chains often have irregular multi-stage timing that distinguishes them from
+    benign software behavior, similar to beacon chains studied by Gupta et al. Train an HMM or LSTM on
+    normal download->process->network sequences and flag real-time chains with low overall likelihood,
+    emitting the lowest-probability transition as the explanation (e.g., 'process X immediately connecting
+    to first-seen domain Y'). This catches novel chains that exact-match rules miss. Corroborate low-likelihood
+    chains with file reputation and destination intelligence before escalating.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek http.log
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        seq = [download_event, process_event, network_event]
+        ll = hmm_lstm_model.log_likelihood(seq)
+        if ll < threshold:
+          alert(host, ll, min_prob_transition)
+- question: For a watched domain, did a later TLS connection present a certificate issuer or subject different
+    from the first observed value, or a validation status of self-signed / unable-to-get-local-issuer?
+  context: In-line MITM injection commonly substitutes the TLS certificate, so the issuer or subject for
+    a given domain changes from what was first observed, or validation fails (self-signed, unable_to_get_local_issuer).
+    Cache the first-seen issuer/subject per watched domain from Zeek ssl.log and alert when a later connection
+    deviates -- a classic interception signature. Legitimate certificate rotation and CDN multi-CA issuance
+    cause benign changes, so weight unexpected issuers, self-signed certs, and validation failures more
+    heavily and corroborate with response-length or JA4X anomalies. This is a direct indicator of an adversary-in-the-middle
+    injecting content.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Internal DNS Servers, Web Proxies, Network TAPs at key aggregation points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        first_seen[domain] = (issuer, subject)  // memento cache
+        ssl.log: if domain in first_seen and
+           (issuer != first_seen.issuer or subject != first_seen.subject
+            or validation_status in ("self-signed","unable_to_get_local_issuer")):
+           alert(domain, old=first_seen, new=(issuer,subject,validation_status))
+- question: In any TLS/HTTP session, does the outer SNI name a high-reputation CDN front while the decrypted/proxied
+    Host header or subsequent CONNECT target differs, or does a rare inner host ride a common front?
+  context: 'Domain fronting and relayed-channel evasion (Fifield et al.) hide injected/relayed traffic
+    behind a high-reputation front: the TLS SNI advertises a trusted CDN, but the real Host header or
+    CONNECT target points elsewhere, or an unusual inner host hides behind a popular front. Alert when
+    the outer SNI and the inner Host/CONNECT target disagree, or when a rare inner host rides a common
+    front. This is the canonical injected/relayed-channel signal and is difficult to achieve legitimately.
+    Pivot on the inner host''s reputation and the client population using the same front.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Internal DNS Servers, Web Proxies, Network TAPs at key aggregation points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        join ssl.log(sni) with http.log(host) / CONNECT(target) on conn_uid
+        | where sni is high_reputation_front
+           and (host != sni or connect_target != sni or inner_host_rarity < p01)
+        | emit conn_uid, sni, host, connect_target
+- question: Do the JA3/JA4+ ClientHello fingerprints or the JA4X server-certificate fingerprints match
+    known implant/relay fingerprints, or show certificate anomalies inconsistent with the expected issuer?
+  context: TLS fingerprints capture client and certificate characteristics that survive encryption. Compute
+    JA3/JA4+ from the Zeek ssl.log ClientHello and JA4X from the served certificate, then alert on matches
+    to known implant or relay fingerprints, or on JA4X certificate anomalies that don't fit the expected
+    issuer for that domain. A known-bad fingerprint indicates a specific tool or relay; a JA4X anomaly
+    indicates the served certificate's structure is inconsistent with the legitimate CA -- both point
+    to an injected or man-in-the-middle channel. Maintain and update fingerprint allow/deny lists to control
+    false positives.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Internal DNS Servers, Web Proxies, Network TAPs at key aggregation points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        ja3/ja4 = fingerprint(ssl.log ClientHello)
+        ja4x = fingerprint(served_certificate)
+        if ja3/ja4 in known_implant_relay_set
+           or ja4x inconsistent_with expected_issuer(domain):
+           alert(conn_uid, ja3, ja4, ja4x)
+- question: For a given URL, does the HTTP response body length (resp_body_len) deviate by more than 3
+    standard deviations from its 30-day baseline, and is the per-domain TLS validation-failure rate elevated?
+  context: Injected content changes the size of HTTP responses. Maintain a 30-day moving average and standard
+    deviation of resp_body_len per URL in Zeek http.log and flag deviations greater than 3 sigma, which
+    indicate content was added or altered in transit. Simultaneously track the per-domain TLS validation-failure
+    rate as a distinct state signal -- a spike in validation failures alongside abnormal response sizes
+    strengthens the MITM hypothesis. Confirm by comparing the suspect response content and certificate
+    chain against a known-good baseline; benign causes include legitimate page updates and A/B content.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Internal DNS Servers, Web Proxies, Network TAPs at key aggregation points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_http earliest=-30d
+        | stats avg(resp_body_len) as mu, stdev(resp_body_len) as sd by url
+        | join domain [search zeek_ssl | stats count(eval(validation!="ok")) as vf, count as t by domain | eval vf_rate=vf/t]
+        | where resp_body_len > mu+3*sd or vf_rate > baseline
+- question: Does change-point detection (CUSUM/PELT/BOCPD) over a high-value domain's TLS-issuer and response-length
+    time series reveal an abrupt switch consistent with MITM/content injection?
+  context: Gradual drift differs from the abrupt change an interception introduces. Run change-point detection
+    (CUSUM, PELT, or Bayesian Online Change-Point Detection) on the TLS-issuer and response-length sequences
+    for high-value domains and flag sudden switches (Aminikhanghahi and Cook), reporting the changed attribute
+    with its pre/post values. An abrupt issuer change or a step-change in response size at a specific
+    timestamp pinpoints when injection likely began, which is invaluable for scoping. Correlate the change
+    point with other anomalies (validation failures, SNI/Host mismatch) and with the set of clients affected
+    after that time.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Internal DNS Servers, Web Proxies, Network TAPs at key aggregation points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        series = timeseries(issuer, resp_body_len) per high_value_domain
+        cps = changepoint_detect(series, method=PELT|CUSUM|BOCPD)
+        for cp in cps: alert(domain, attribute, pre_value, post_value, ts=cp)
+- question: Does outbound HTTP traffic to legitimate high-reputation domains (CDNs, cloud providers) contain
+    request URIs, headers, or POST bodies matching known C2-framework signatures?
+  context: Adversaries tunnel C2 through trusted domains so traffic blends in, but the request content
+    often still matches known framework patterns. Run Suricata/YARA-style signatures over Zeek http.log
+    request content (URIs, headers, POST bodies) and alert on matches even when the destination is high-reputation.
+    A signature hit toward a CDN or cloud front is strong evidence of C2 tunneling via an injected/relayed
+    channel. Confirm by examining the full session, the destination's role for that host, and beacon-like
+    timing; update signatures as frameworks evolve.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, DNS Resolvers, Cloud Service Gateways, Web Application Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        http.log | run suricata/yara C2_signatures over (uri, headers, post_body)
+        | where match==true and dest in high_reputation_domains
+        | emit conn_uid, host, matched_rule
+- question: Are there requests to high-reputation CDN/cloud fronts whose inner Host header (or TLS-decrypted
+    target) differs from the SNI, or where a rare inner host hides behind a common front?
+  context: 'This is the C2 expression of domain fronting / relay mismatch (Fifield et al.): the connection
+    is fronted by a trusted CDN, but the actual destination differs. Flag requests where the inner Host
+    or decrypted target disagrees with the SNI, or where an uncommon inner host rides a popular front.
+    For command-and-control this evasion lets implants reach attacker infrastructure while appearing to
+    talk to a benign provider. Pivot on the inner host, its reputation, and which internal hosts use the
+    same front to scope the campaign.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, DNS Resolvers, Cloud Service Gateways, Web Application Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        join ssl.log(sni) http.log(host) on conn_uid
+        | where sni in high_reputation_fronts
+           and (host != sni or inner_host_global_prevalence < p01)
+        | emit conn_uid, sni, host
+- question: Which JA3/JA4 TLS fingerprints are globally rare (below the 1st percentile) yet used by multiple
+    internal hosts toward the same destination?
+  context: Bespoke implants present unusual TLS fingerprints. Build a global prevalence heatmap of JA3/JA4
+    hashes from Zeek ssl.log and flag hashes that are globally rare (<1st percentile) but observed from
+    multiple internal hosts toward a single destination -- a pattern indicating a shared, uncommon client
+    (likely the same implant) communicating with common C2 infrastructure. A rare fingerprint on one host
+    may be a niche app; the same rare fingerprint on several hosts to one external destination is a strong
+    C2 signal. Pivot to enumerate all hosts sharing the fingerprint and the destination.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, DNS Resolvers, Cloud Service Gateways, Web Application Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_ssl
+        | stats dc(src_ip) as host_count, values(dest) as dests by ja3
+        | eventstats perc1(global_prevalence(ja3)) as p1
+        | where global_prevalence(ja3) <= p1 and host_count >= 2
+- question: Does a supervised classifier over request features (URI length, parameter count, entropy,
+    keywords, JA3 rarity) assign a high C2 probability to any session, and which features drove it?
+  context: Individually weak indicators (slightly long URI, unusual parameter count, elevated entropy,
+    rare JA3) combine into a reliable C2 signal. Train a Logistic Regression or XGBoost classifier on
+    these features and alert when the C2 probability is high, surfacing the top-3 contributing features
+    (Nadler et al.) so the analyst can validate the verdict. High-probability sessions toward high-reputation
+    fronts are prime C2-tunneling candidates. Corroborate with beacon timing and signature matches before
+    escalating, and feed confirmed cases back into the training set.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, DNS Resolvers, Cloud Service Gateways, Web Application Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        features = [uri_len, param_count, uri_entropy, keyword_hits, ja3_rarity]
+        p = c2_classifier.predict_proba(features)
+        if p > threshold: alert(conn_uid, p, top3_features)
+- question: Is a host repeatedly contacting a domain with a fixed, non-browser User-Agent string -- one
+    matching known malware strings, empty payloads, or non-browser HTTP libraries from non-server subnets?
+  context: Automated C2 clients frequently use a static, non-browser User-Agent that differs from the
+    host's normal browser traffic. Alert on Zeek http.log sessions to a domain where the User-Agent matches
+    known malware strings, is empty, or identifies a scripting/HTTP library (curl, python-requests, etc.)
+    originating from a workstation subnet (not a legitimate server). A consistent non-browser UA hammering
+    one domain from an end-user host is a classic structured-C2 signature. Verify there is no legitimate
+    agent on the host and examine request timing and URIs.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Web Proxies, Network Egress Points, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        http.log | where user_agent in known_malware_UAs
+           or user_agent=="" or user_agent ~ "(curl|wget|python-requests|libwww|Go-http)"
+        | where src_subnet in workstation_subnets
+        | stats count by src_ip, host, user_agent
+- question: Do the URI query parameters in repeated requests to a domain show Shannon entropy consistently
+    above 4.0 or below 1.5 versus that domain's baseline, and do n-gram/Zipfian bigram scores indicate
+    non-human structure?
+  context: C2 channels encode commands/data into URI parameters, producing either very high entropy (encrypted/encoded
+    payloads) or very low entropy (fixed tokens) relative to normal human-driven traffic. Compute Shannon
+    entropy of URI query parameters per source/destination over 1-hour windows and flag pairs that consistently
+    exceed 4.0 or fall below 1.5 versus the domain baseline; complement with n-gram and Zipfian bigram
+    scoring (Dusi et al.) to distinguish machine-generated strings from natural language. Persistent entropy
+    anomalies on a repeated source-destination pair indicate automated, structured communication consistent
+    with C2.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Web Proxies, Network Egress Points, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_http | bin _time span=1h
+        | eval H=shannon_entropy(uri_query), ng=ngram_zipf_score(uri_query)
+        | stats avg(H) as Havg, avg(ng) as ngavg by src_ip, host, _time
+        | where Havg>4.0 OR Havg<1.5 OR ngavg < natural_lang_threshold
+- question: For a static-User-Agent channel, is the per source-destination 404/4xx and TLS-handshake-failure
+    rate anomalous, suggesting probing or fallback-URI behavior?
+  context: 'Beyond a static UA, C2 implants often probe multiple URIs or fail over between endpoints,
+    generating an abnormal 404/4xx and TLS-handshake-failure rate. Baseline the per source-destination
+    error rate and flag channels where a static-UA conversation also produces anomalous failures -- a
+    distinct injection/C2 indicator that captures dead-drop rotation and resilient-C2 fallback. Combine
+    with entropy and UA checks: a non-browser UA that hits one domain with a burst of 404s before a 200
+    is highly suspicious. Investigate the failed URIs for staging or kill-switch patterns.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Web Proxies, Network Egress Points, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_http OR index=zeek_ssl
+        | stats count(eval(status>=400)) as e4xx,
+                count(eval(ssl_handshake=="failed")) as hs_fail, count as tot by src_ip, host
+        | eval fail_rate=(e4xx+hs_fail)/tot
+        | where fail_rate > baseline_fail_rate AND user_agent in static_non_browser
+- question: 'Does DBSCAN clustering of HTTP requests (features: User-Agent, URI length, parameter count,
+    method) produce small outlier clusters, and for encrypted sessions do version-agnostic flow features
+    isolate the same anomalies?'
+  context: Benign HTTP requests form dense clusters; automated C2 traffic typically falls into small,
+    distinct outlier clusters. Cluster requests with DBSCAN over User-Agent, URI length, parameter count,
+    and method, then investigate small outlier clusters and report their distinguishing features. For
+    TLS-encrypted sessions where URIs aren't visible, substitute version-agnostic flow features (Novo
+    et al.) to achieve the same separation. A tight outlier cluster of requests sharing an unusual UA
+    and URI structure toward one domain is a strong C2 lead. Pivot on every member of the cluster to scope
+    affected hosts.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Web Proxies, Network Egress Points, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = features(user_agent, uri_len, param_count, method)  # or flow features for TLS
+        labels = DBSCAN(eps, min_samples).fit_predict(X)
+        for c in small_clusters(labels): alert(cluster=c, distinguishing_features)
+- question: Does any source-destination pair show >=10 connections within one hour where orig_bytes/resp_bytes
+    stay within 10% across the window -- the consistent-size heartbeat of automated C2?
+  context: Automated C2 beacons produce many connections of nearly identical size. Alert when Zeek conn.log
+    shows >=10 connections from one source to one destination within an hour and the orig_bytes/resp_bytes
+    stay within 10% across the window. Consistent transfer sizes betray a scripted check-in rather than
+    human browsing, whose payload sizes vary widely. This rule is a fast first-pass beacon detector; corroborate
+    with inter-arrival regularity and destination reputation, and exclude known software heartbeats (monitoring
+    agents, telemetry) via an allow-list.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, VPN Concentrators, User Workstations, Firewall logs'
+  range: Last 90 days; evaluate in rolling 1-hour windows
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        index=zeek_conn | bin _time span=1h
+        | stats count as conns, stdev(orig_bytes) as so, avg(orig_bytes) as mo,
+                stdev(resp_bytes) as sr, avg(resp_bytes) as mr by src_ip, dest, _time
+        | where conns>=10 AND so/mo<0.10 AND sr/mr<0.10
+- question: Which source-destination streams show low inter-arrival jitter (low coefficient of variation,
+    low MAD, low Bowley skewness) combined with persistent, long-running activity indicative of beaconing?
+  context: Periodicity is the hallmark of beaconing. Compute per source-destination inter-arrival regularity
+    using coefficient of variation, median absolute deviation, and Bowley skewness (as in RITA), and flag
+    streams with low CV/stddev and persistent long-running activity. Low jitter over a long duration distinguishes
+    machine timers from bursty human activity. Confirm with size consistency and destination intelligence;
+    remember that some legitimate services beacon (NTP, update checks), so maintain an allow-list and
+    weight rare/low-reputation destinations.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, VPN Concentrators, User Workstations, Firewall logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_conn | sort _time | streamstats range(_time) as iat by src_ip,dest
+        | stats avg(iat) as mu, stdev(iat) as sd, count as n, range(_time) as span by src_ip,dest
+        | eval cv=sd/mu | where cv<0.1 AND n>=20 AND span>long_duration
+- question: Does frequency-domain analysis (FFT/periodicity extraction with whitelist suppression) of
+    connection timestamps reveal a dominant periodic peak indicative of beaconing at enterprise scale?
+  context: Beacons with a fixed period produce a dominant peak in the frequency domain. Apply FFT or periodicity
+    extraction to per source-destination connection timestamps, suppress known-benign periodic services
+    via a whitelist, and flag streams with a strong dominant frequency (BAYWATCH, Hu et al.). This scales
+    to noisy enterprise traffic and catches beacons that size-based rules miss. A clear periodic peak
+    toward a rare or low-reputation destination is a high-confidence C2 indicator. Report the detected
+    period and destination for analyst pivoting.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, VPN Concentrators, User Workstations, Firewall logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        ts = timestamps(src,dest)
+        spectrum = FFT(binned(ts)); suppress(whitelist_periods)
+        if dominant_peak(spectrum).power > threshold:
+          alert(src, dest, period=1/peak_freq)
+- question: For beacons with deliberate jitter that defeat CV/FFT methods, do LSTM/transformer sequence
+    models or Continuous-Time HMM dwell-time models score the inter-arrival sequence as anomalous?
+  context: Sophisticated implants randomize their check-in interval (jitter) to defeat coefficient-of-variation
+    and FFT detectors. Score inter-arrival sequences with LSTM/transformer models (Gupta et al.) or Continuous-Time
+    HMM dwell-time models (NetSpectra) that learn the structure of jittered-but-non-random timing, and
+    emit the top-3 contributing interval/size features in the alert. These models flag beacons whose timing
+    is irregular yet still machine-driven. Treat low-likelihood sequences toward unusual destinations
+    as high-priority C2 leads and corroborate with content and reputation signals.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, VPN Concentrators, User Workstations, Firewall logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        seq = inter_arrival_sequence(src,dest)
+        score = lstm_or_ctHMM.anomaly_score(seq)
+        if score > threshold: alert(src, dest, score, top3_interval_size_features)
+- question: Do DNS or HTTP records contain Base64-encoded data -- especially in TXT/NULL queries or subdomains
+    longer than 50 characters -- that also violates RFC 1035 label/name length sanity checks?
+  context: Covert C2/exfil channels encode data into long DNS subdomains or HTTP fields. Apply a Base64
+    regex to Zeek dns/http logs and alert on matches, paying special attention to TXT/NULL query types
+    and subdomains over 50 characters, and enforce RFC 1035 label (<=63) and name (<=255) length sanity
+    checks. Encoded blobs in DNS queries to an adversary-controlled domain are a strong tunneling/exfil
+    indicator. Decode samples to confirm payload structure and identify the controlled domain; tune out
+    legitimate encoded services (some CDNs, DKIM, anti-spam) via allow-listing.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Servers, Web Proxies, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |2-
+        dns.log/http.log | where query/uri MATCHES base64_regex
+           and (qtype in ("TXT","NULL") or subdomain_len > 50)
+           and (label_len > 63 or name_len > 255 or subdomain_len > 50)
+        | emit src_ip, query, qtype
+- question: Which DNS queries exhibit subdomain entropy above 4.5 (versus a normal baseline of ~<3.5),
+    or an abnormal per-domain unique-query ratio/character count, indicating DGA or tunneling?
+  context: Encoded/encrypted exfil and DGA domains have high-entropy, near-random subdomains. Baseline
+    subdomain entropy (normally ~<3.5) and the per-domain unique-query ratio and character counts, then
+    flag queries exceeding 4.5 entropy (Nadler et al.) as potential DGA or DNS tunneling. A domain receiving
+    many high-entropy, unique subdomain queries from a host is a strong covert-channel indicator. Combine
+    with query volume and the Base64 check; benign high-entropy exists (some CDN/cloud hostnames), so
+    weight rare destinations and sustained patterns.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Servers, Web Proxies, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_dns | eval H=shannon_entropy(subdomain)
+        | stats avg(H) as Havg, dc(query) as uniq, count as tot by domain, src_ip
+        | eval uniq_ratio=uniq/tot
+        | where Havg>4.5 OR uniq_ratio > baseline_ratio
+- question: When domains are ranked by information content via streaming heavy-hitter analysis, which
+    surface as low-and-slow DNS exfiltration channels, and is their NXDOMAIN rate abnormally high?
+  context: Low-and-slow DNS exfiltration evades volume thresholds by trickling data, but it concentrates
+    information content in a few domains. Rank domains by information content using streaming heavy-hitter
+    analysis (Chhabra et al.), which surfaces these channels with low compute, and track per-domain NXDOMAIN
+    rate as a distinct failure-mode signal -- tunneling tools often generate many NXDOMAINs from non-existent
+    encoded labels. A domain that is a top information heavy-hitter with an elevated NXDOMAIN rate is
+    a high-priority exfil/C2 lead. Pivot to the querying hosts and decode sample labels.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Servers, Web Proxies, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        index=zeek_dns
+        | stats sum(info_content(query)) as info, count as q,
+                count(eval(rcode=="NXDOMAIN")) as nx by domain
+        | eval nx_rate=nx/q
+        | sort -info | head heavy_hitters | where nx_rate > baseline_nx
+- question: Does a character-level CNN classify any queried domain as high-confidence DGA, and does fast-flux
+    infrastructure clustering link the resolved IPs to known malicious flux networks?
+  context: Algorithmically generated domains and fast-flux infrastructure underpin resilient C2/exfil.
+    Train a character-level CNN on legitimate vs DGA domains and flag high-confidence malicious classifications,
+    then complement with fast-flux clustering (FluxBuster, Perdisci et al.) over the resolved IPs to identify
+    rapidly rotating, shared malicious infrastructure. Report the top-3 lexical features driving each
+    DGA alert so analysts can validate the lexical reasoning. A high-confidence DGA domain whose IPs cluster
+    into a flux network is strong evidence of an injected/relayed C2 channel; pivot on all hosts resolving
+    the domain and all domains in the flux cluster.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Servers, Web Proxies, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        p = charCNN_dga_model.predict(domain)
+        if p > 0.9:
+          flux = fluxbuster_cluster(resolved_ips(domain))
+          alert(domain, p, top3_lexical_features, flux_cluster)
