@@ -1,0 +1,356 @@
+name: 'D3-CA: Certificate Analysis'
+id: 5996b838-1521-4c23-9c52-78a813b42872
+description: Investigate Public Key Infrastructure (PKI) certificate usage across the enterprise to detect
+  misconfigured, spoofed, or malicious TLS certificates. This playbook helps an analyst find certificates
+  whose issuer, validity, cryptographic, or host-association properties are inconsistent with trusted
+  enterprise patterns — including self-signed and known-bad (e.g. Cobalt Strike) certificates, certificate-to-hostname
+  (CN/SAN vs SNI) and validity mismatches, Certificate Transparency mis-issuance and revocation failures,
+  anomalous JA4X/JA3 fingerprints, weak or shared public keys, and statistical/ML outliers in certificate
+  populations and trust-model drift. It combines deterministic symbolic-logic checks, statistical baselining,
+  and explainable machine-learning scoring over Zeek ssl.log/x509.log/conn.log to surface server impersonation,
+  phishing, forged certificates, and covert C2 hiding inside encrypted traffic.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there TLS certificates in active use that are self-signed (issuer == subject) or whose
+    SHA-256 fingerprint, issuer/subject DN, or serial number matches a known-malicious certificate watchlist
+    instead of an approved enterprise allow-list?
+  context: Adversaries routinely deploy self-signed certificates or reuse default tooling certificates
+    for command-and-control. A canonical example is the default Cobalt Strike beacon certificate (issuer/subject
+    'Major Cobalt Strike', serial 146473198). Querying Zeek x509.log for certificates where issuer equals
+    subject, then comparing the SHA-256 fingerprint, issuer/subject DN, and serial against curated enterprise
+    allow-lists and known-bad watchlists (including Cobalt Strike YARA signatures), deterministically
+    surfaces untrusted certificates. A match on an internet-facing or privileged internal service is high-confidence
+    evidence of malicious or misconfigured TLS and warrants immediate escalation. This directly supports
+    the Detect tactic by exposing impersonation and C2 infrastructure that hides inside encrypted traffic.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      load x509.log
+      | where certificate.issuer == certificate.subject   // self-signed
+      | eval fp = sha256(certificate.raw)
+      | where fp NOT IN enterprise_cert_allowlist
+      | where fp IN known_bad_cert_watchlist
+           OR (certificate.issuer CONTAINS "Major Cobalt Strike")
+           OR (certificate.serial == "146473198")
+      | join conn.log on uid
+      | stats count by id.resp_h, server_name, certificate.subject, fp
+      | alert priority=high
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=zeek sourcetype=x509
+      | lookup cert_allowlist sha256 OUTPUT trusted
+      | where isnull(trusted)
+      | lookup known_bad_certs sha256 serial issuer
+      | where match(issuer,"Major Cobalt Strike") OR serial="146473198" OR known_bad="true"
+      | table _time resp_host server_name issuer subject sha256 serial
+- question: Do any live TLS sessions present a certificate whose CN/SAN does not match the requested hostname
+    (SNI), or a certificate that is expired, not-yet-valid, or has a validation_status other than 'ok'?
+  context: Server impersonation and phishing infrastructure often present certificates whose subject/SAN
+    does not cover the hostname the client actually requested, while misconfiguration or trust-chain breakage
+    shows up as expired/not-yet-valid certificates or non-'ok' validation status. By correlating Zeek
+    ssl.log server_name (SNI) and the destination host with the x509.log Subject/SAN entries, and checking
+    not_valid_before/after and validation_status, an analyst performs deterministic checks that flag both
+    malicious impersonation and operationally risky misconfiguration. A mismatch on a live session is
+    a strong indicator; expired/invalid certs on critical services also degrade availability and should
+    be remediated.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      join ssl.log x509.log on cert_chain_fuids[0]==id
+      | eval host = ssl.server_name
+      | where host NOT MATCHES_ANY(certificate.subject_CN, certificate.san_dns)
+           OR ssl.validation_status != "ok"
+           OR now() < certificate.not_valid_before
+           OR now() > certificate.not_valid_after
+      | stats count by id.resp_h, host, certificate.subject_CN, certificate.san_dns, ssl.validation_status
+      | alert priority=high
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=zeek (sourcetype=ssl OR sourcetype=x509)
+      | transaction uid
+      | where NOT (san_dns LIKE server_name OR subject_cn LIKE server_name)
+           OR validation_status!="ok"
+           OR not_valid_after < now() OR not_valid_before > now()
+      | table _time resp_host server_name subject_cn san_dns validation_status not_valid_before not_valid_after
+- question: For domains we own, are there certificates appearing in Certificate Transparency logs issued
+    by an unexpected CA, certificates absent from CT logs, or certificates carrying a missing/invalid
+    SCT — and are any presented certificates already revoked per CRL/OCSP?
+  context: 'Certificate Transparency provides public, append-only logs of issued certificates. Monitoring
+    CT for owned domains surfaces mis-issuance: a certificate issued for your domain by a CA you never
+    authorized is a strong sign of fraud or compromise. Where CT is mandated, a certificate absent from
+    CT or with a missing/invalid SCT is anomalous. Independently, checking CRL/OCSP and known-abused-certificate
+    lists catches revoked-but-still-presented certificates, which research shows attackers continue to
+    abuse because revocation is slow and inconsistently enforced. Positive findings here indicate either
+    mis-issuance against your brand or continued use of certificates that should no longer be trusted.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      // CT monitoring for owned domains
+      for domain in owned_domains:
+        certs = ct_log_query(domain)
+        for c in certs:
+           if c.issuer NOT IN authorized_CAs[domain]: alert("unexpected CA mis-issuance", c)
+      // observed-cert checks
+      index=zeek sourcetype=x509
+      | where sct_present=="false" OR sct_valid=="false"
+      | append [ lookup crl_ocsp_status sha256 | where revoked="true" ]
+      | table _time resp_host server_name issuer sha256 revoked sct_valid
+  - technology: Zeek/pseudocode
+    query: |-
+      load x509.log
+      | eval ct_seen = lookup_ct(certificate.sha256)
+      | where (owned_domain(server_name) AND ct_seen.issuer NOT IN authorized_CAs)
+           OR (ct_required AND NOT valid_SCT(certificate))
+           OR ocsp_status(certificate)=="revoked"
+      | alert priority=high
+- question: When we compute JA4X (X.509 issuer/subject RDN and extension-OID structure) and JA3/JA3S handshake
+    fingerprints, do any match deny-lists or fail to match expected allow-lists for the service involved?
+  context: 'Fingerprinting the structure of a certificate (JA4X) and the TLS handshake (JA3/JA3S) lets
+    analysts cluster and recognize tooling even without decrypting traffic, because malware families and
+    frameworks tend to produce consistent fingerprints. Matching computed fingerprints against allow/deny
+    lists can surface known-bad tooling and unusual clients. However, fingerprint rarity must be treated
+    as a contributing feature, not a standalone verdict: modern browsers randomize TLS extensions, so
+    a single legitimate client can emit many JA3 hashes. A deny-list match is actionable; rarity alone
+    should feed a broader risk score rather than trigger a verdict on its own.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      load ssl.log x509.log
+      | eval ja4x = compute_ja4x(certificate)
+      | eval ja3 = ssl.ja3, ja3s = ssl.ja3s
+      | where ja4x IN ja4x_denylist OR ja3 IN ja3_denylist OR ja3s IN ja3s_denylist
+           OR (ja4x NOT IN ja4x_allowlist[service_class])
+      | stats count by id.resp_h, server_name, ja4x, ja3, ja3s
+      | note "rarity is a feature, not a verdict"
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=zeek sourcetype=ssl
+      | eval ja3=ja3, ja3s=ja3s, ja4x=ja4x
+      | lookup ja_denylist ja3 ja3s ja4x OUTPUT verdict
+      | eval rarity=1.0/cardinality(ja4x)
+      | where verdict="bad" OR rarity>0.99
+      | table _time resp_host server_name ja3 ja3s ja4x verdict rarity
+- question: Is any certificate public key on a known-weak/blacklisted-key list, or is a single public
+    key improbably shared across multiple distinct, unrelated enterprise services that should each hold
+    a unique key?
+  context: 'Weak or shared cryptographic keys are a measurable risk: research has shown that entropy failures
+    and copy/paste deployment cause distinct hosts to share the same key, and some keys are outright known-weak.
+    By hashing each certificate''s public key from x509.log and checking it against known-weak/blacklisted-key
+    lists, and by counting how many distinct hosts present the same public-key hash, an analyst can detect
+    both cryptographically weak keys and key reuse that should not occur. Observing one public-key hash
+    across more than a small threshold (e.g., >2) of unrelated hosts suggests cloning, key mismanagement,
+    or attacker-supplied infrastructure, and warrants investigation.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      load x509.log
+      | eval pkhash = sha256(certificate.public_key)
+      | where pkhash IN weak_key_blacklist
+      | union [ load x509.log | eval pkhash=sha256(certificate.public_key)
+                | stats dc(id.resp_h) as hosts by pkhash | where hosts > 2 ]
+      | table pkhash hosts server_name id.resp_h
+      | alert priority=medium
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=zeek sourcetype=x509
+      | eval pkhash=sha256(public_key)
+      | stats dc(resp_host) as host_count values(resp_host) as hosts by pkhash
+      | where host_count>2 OR [ inputlookup weak_keys | search pkhash=pkhash ]
+      | table pkhash host_count hosts
+- question: Which certificates fall outside the enterprise's expected statistical baselines for validity
+    period, issuer frequency, key size, or SAN count for their service class — for example validity under
+    30 days, sub-policy key size, SAN count beyond the 99th percentile, or issuers seen on under 1% of
+    hosts?
+  context: Benign certificates within a given service class cluster around predictable values for validity
+    period, issuer, key size, and SAN count. Building per-service-class distributions from 30-60 days
+    of local x509.log history lets an analyst flag outliers that deviate from these empirical baselines.
+    Very short validity periods, key sizes below policy, abnormally large SAN counts, or issuers that
+    appear on fewer than 1% of enterprise hosts for that service class are statistically anomalous and
+    often correspond to attacker-provisioned or misconfigured certificates. This statistical screen complements
+    deterministic rules by catching subtle deviations rather than only known-bad signatures.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 60 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=zeek sourcetype=x509 earliest=-60d
+      | eval validity_days=(not_valid_after-not_valid_before)/86400
+      | eventstats p1(validity_days) as v_lo p99(san_count) as san_hi by service_class
+      | eventstats count as issuer_freq by service_class issuer
+      | eventstats count as total by service_class
+      | where validity_days<30 OR validity_days<v_lo
+           OR key_size<policy_min_key
+           OR san_count>san_hi
+           OR (issuer_freq/total)<0.01
+      | table _time resp_host server_name issuer key_size validity_days san_count
+  - technology: Zeek/pseudocode
+    query: |-
+      baseline = build_distributions(x509.log[-60d], by=service_class,
+                     fields=[validity, issuer, key_size, san_count])
+      for c in x509.log:
+        if c.validity<30d or c.key_size<policy or c.san_count>baseline.p99
+           or baseline.issuer_freq(c.issuer)<0.01:
+              flag(c)
+- question: Are there anomalous shifts in certificate Volume, Frequency, or State — such as spikes in
+    handshake/certificate byte and SAN counts, newly observed issuers per day, distinct certificates per
+    host per day, or the rate of validation_status != ok — that exceed historical control limits per segment
+    or application?
+  context: Trust-model drift and C2 activity often manifest as statistical shifts rather than single bad
+    certificates. Tracking Volume (handshake/certificate byte counts, SAN counts), Frequency (newly observed
+    issuers per day, distinct certificates per host per day), and State (rate of validation_status !=
+    ok), then applying EWMA or 3-sigma control limits per segment/application, lets an analyst detect
+    when certificate behavior deviates from its own history. Importantly, these flow- and handshake-level
+    features survive TLS 1.3 and ECH certificate encryption, where the certificate itself may not be visible.
+    Breaches of control limits indicate emergent infrastructure changes or covert channels and should
+    trigger investigation tied to the affected segment.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=zeek (sourcetype=ssl OR sourcetype=x509)
+      | bin _time span=1d
+      | stats sum(cert_bytes) as vol dc(issuer) as new_issuers dc(sha256) as distinct_certs
+              avg(san_count) as san count(eval(validation_status!="ok")) as bad_state by segment _time
+      | streamstats window=30 mean(vol) as m_vol stdev(vol) as s_vol
+                    mean(new_issuers) as m_iss stdev(new_issuers) as s_iss by segment
+      | where vol>m_vol+3*s_vol OR new_issuers>m_iss+3*s_iss OR distinct_certs>threshold
+      | table _time segment vol new_issuers distinct_certs bad_state
+  - technology: Zeek/pseudocode
+    query: |-
+      for segment in segments:
+        ewma_vol = EWMA(daily certificate bytes & SAN counts)
+        ewma_freq = EWMA(new issuers/day, distinct certs/host/day)
+        ewma_state = EWMA(rate validation_status!=ok)
+        if any metric exceeds control_limit(segment): anomaly_alert(segment)
+- question: Are per-host or per-segment certificate validation and revocation failure rates — Zeek validation_status
+    failures, OCSP/CRL fetch failures, and revoked-but-still-presented certificates — exceeding their
+    established baselines?
+  context: Validation and revocation failures are distinct, meaningful signals that should be modeled
+    separately. Spikes in Zeek validation_status failures, OCSP/CRL fetch failures, or the appearance
+    of revoked-but-still-presented certificates can indicate broken trust chains, tampering, or deliberate
+    abuse of slow revocation. Research shows attackers exploit the gap between revocation and enforcement
+    because many clients fail open. Alerting when per-host or per-segment failure rates exceed baseline
+    helps an analyst catch both operational trust breakage and active abuse. A sustained rise in revoked-but-presented
+    certificates on a host is particularly suspicious.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=zeek (sourcetype=ssl OR sourcetype=x509)
+      | eval fail=if(validation_status!="ok",1,0)
+      | eval ocsp_fail=if(ocsp_status IN ("fetch_error","unknown"),1,0)
+      | eval revoked_used=if(ocsp_status="revoked",1,0)
+      | bin _time span=1h
+      | stats sum(fail) as vf sum(ocsp_fail) as of sum(revoked_used) as rv by resp_host segment _time
+      | streamstats window=168 mean(vf) as m stdev(vf) as s by segment
+      | where vf>m+3*s OR rv>0
+      | table _time segment resp_host vf of rv
+- question: When a supervised, explainable classifier scores newly observed certificates using cryptographic
+    and contextual features (validity period, SAN count, self-signed status, chain length, subject/issuer
+    population, key size, JA4X) plus flow metadata, which certificates receive high malicious-risk scores
+    and what top contributing features explain them?
+  context: 'A supervised classifier trained on labeled benign and malicious certificates can learn combinations
+    of cryptographic and contextual features that separate good from bad TLS — going beyond any single
+    rule. Scoring new certificates in near real time, drawing features from x509.log/ssl.log and flow
+    metadata, lets analysts triage on probability of maliciousness. Crucially, attaching the top-3 contributing
+    features (via SHAP attributions) to each alert makes the model explainable and actionable: an analyst
+    can see, for example, that a high score is driven by self-signed status, an unusual issuer population,
+    and a short validity period. This model should run alongside, never replace, the deterministic rules.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = extract(x509.log, ssl.log, conn.log,
+         [validity_period, san_count, self_signed, chain_len,
+          subject_pop, issuer_pop, key_size, ja4x, flow_meta])
+      model = load("cert_risk_classifier")
+      score, shap = model.predict_proba(features), model.explain(features)
+      if score > 0.8:
+         alert(cert, score, top3=shap.top(3))
+- question: When unsupervised outlier detection (Isolation Forest / One-Class SVM, plus a self-supervised
+    layer for encrypted environments) runs over certificate and flow features, which rare certificate
+    populations — rare issuer, atypical validity, self-signed on privileged services — are surfaced, and
+    what features make them outliers?
+  context: 'Unsupervised models excel where labels are scarce, as in encrypted traffic. Running Isolation
+    Forest or One-Class SVM over certificate and flow features flags statistically rare certificate populations:
+    rare issuers, atypical validity periods, or self-signed certificates on privileged services. For label-scarce
+    encrypted environments, a self-supervised anomaly layer over flow/handshake features (e.g., ET-SSL)
+    extends coverage where the certificate may be encrypted. Surfacing the top contributing features per
+    alert (via LIME/SHAP) keeps these detections interpretable. These models run in parallel with the
+    deterministic rules and statistical baselines and must never replace them — they widen the net for
+    novel anomalies that signatures miss.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Our organization''s internet gateway and key internal network segments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = features(x509.log, ssl.log, conn.log)
+      iforest = IsolationForest().fit(X_baseline)
+      ocsvm = OneClassSVM().fit(X_baseline)
+      scores = combine(iforest.decision_function(X), ocsvm.decision_function(X))
+      for c where scores indicate outlier:
+         alert(c, top_features=lime_explain(c))
+      # encrypted env: add self-supervised flow/handshake anomaly layer (ET-SSL)
+      # run in parallel with deterministic rules; never replace them
