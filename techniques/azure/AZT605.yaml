@@ -1,0 +1,695 @@
+name: 'AZT605: Resource Secret Reveal'
+id: d487d942-020b-4edb-91c9-d7270b312337
+description: Investigate whether an adversary has revealed Azure resource secrets to obtain reusable authentication
+  material and unauthorized access to sensitive data. This playbook helps an analyst hunt for data-plane
+  reads of Azure Key Vault secrets, keys, and certificates (including mass/automated retrieval, sensitive
+  backup/purge/delete operations, and denied-access probing); listing of Azure Storage account access
+  keys followed by rapid data-plane use; Azure Automation runbook edits, publishes, or executions that
+  surface stored credential assets in plaintext; and Resource Group deployment-history or template-export
+  access that exposes insecure deployment-time parameters. It combines deterministic symbolic-logic rules,
+  statistical baselining and time-series anomaly detection, and machine-learning behavioral, sequence,
+  and outlier models so the analyst can distinguish benign administration from deliberate credential harvesting,
+  confirm theft-then-reuse chains, and tie findings to the Credential Access tactic.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any high-impact Azure Key Vault operations such as SecretBackup, KeyBackup, SecretPurge,
+    KeyPurge, SecretDelete, KeyDelete, or VaultDelete succeeding, and can each be reconciled against an
+    approved, scheduled backup or maintenance job?
+  context: Backup operations bulk-export key and secret material in a single call, while purge and delete
+    operations can destroy or hide evidence; both are rare in healthy environments. Filter Key Vault audit
+    events to ResourceType=="VAULTS" and ResultType=="Success" for these sensitive OperationNames and
+    summarize per caller UPN/object-id, CallerIPAddress, and requestUri_s. For Credential Access, a successful
+    backup that does not align with a scheduled job indicates an adversary exporting reusable authentication
+    material; an unexpected purge/delete may be destruction of evidence. A match to a known maintenance
+    window de-prioritizes the event.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'filter KeyVaultAudit where ResourceType=="VAULTS" AND ResultType=="Success"
+
+      AND OperationName in (SecretBackup,KeyBackup,SecretPurge,KeyPurge,SecretDelete,KeyDelete,VaultDelete)
+
+      | summarize ops=count(), uris=make_set(requestUri_s) by Caller, CallerIPAddress, OperationName
+
+      | where NOT in scheduled_backup_allowlist(Caller) | alert'
+- question: Is an identity issuing a reveal operation (SecretGet, KeyGet, KeyList, SecretListVersions)
+    against a vault for the first time, and is that reveal preceded by an impossible-travel or otherwise
+    anomalous sign-in?
+  context: First-time access to vault secrets by a principal, especially right after an anomalous authentication,
+    is a classic compromised-account pattern. Compute a per-principal first-seen baseline of reveal operations
+    and of vaults touched, then correlate the first reveal with the immediately preceding Entra sign-in
+    for impossible-travel feasibility. Suppress legitimate automation via a service-principal AppId allowlist
+    (e.g., Azure Resource Graph 509e4652-da8d-478d-a730-e9d4a1996ca4, Policy Insights 8cae6e77-e04e-42ce-b5cb-50d82bce26b1).
+    A first reveal tied to impossible travel strongly suggests stolen-credential secret harvesting.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days, correlate each first-reveal with sign-ins in the preceding 24 hours.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'reveals = KeyVaultAudit where OperationName in (SecretGet,KeyGet,KeyList,SecretListVersions)
+
+      | where AppId not in automation_allowlist
+
+      | firstseen by (Principal, VaultName)
+
+      join signins on Principal where signin.time < reveal.time within 24h
+
+      | where impossible_travel(signin.prev_geo, signin.geo, signin.dt)
+
+      | alert'
+- question: Is a single caller accumulating a burst of Forbidden/denied SecretGet, KeyGet, or KeyList
+    results across one or more Key Vaults, consistent with access-policy or RBAC probing before successful
+    theft?
+  context: Denied reveal attempts are a distinct failure-rate signal that often precedes successful credential
+    theft as an adversary maps which secrets they can reach. Count distinct denied secret/key URIs per
+    caller within a sliding window and alert when the default threshold (>10 distinct denied URIs in 1h)
+    is exceeded, profiling the denied rate separately from the success rate. A denied burst followed by
+    a successful reveal is a high-confidence escalation; isolated denials may reflect misconfiguration.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days, evaluated in rolling 1-hour windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'KeyVaultAudit where ResultType in (Forbidden,Denied) AND OperationName in (SecretGet,KeyGet,KeyList)
+
+      | bin time to 1h | summarize denied_uris=dcount(requestUri_s) by Caller, bin
+
+      | where denied_uris > 10 | alert'
+- question: Which callers exceed the environment's mass-secret-retrieval thresholds, retrieving more distinct
+    secret/key URIs and total operations in a day than legitimate workloads?
+  context: Automated credential dumping enumerates many distinct secret URIs in a short window. Count
+    successful SecretGet/KeyGet/VaultGet per caller object-id over one day and alert when distinct URIs
+    exceed DistinctSecretsThreshold=10 and total operations exceed EventCountThreshold=50. Re-derive both
+    thresholds from each environment's per-principal averages and exclude allowlisted indexing AppIds.
+    Crossing both thresholds is a strong sign of bulk harvesting; tuning to local norms reduces false
+    positives from legitimate indexers.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days, aggregated per 1-day bucket.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'KeyVaultAudit where ResultType=="Success" AND OperationName in (SecretGet,KeyGet,VaultGet)
+
+      | where AppId not in indexing_allowlist
+
+      | summarize distinct_uris=dcount(requestUri_s), ops=count() by CallerObjectId, bin(time,1d)
+
+      | where distinct_uris > 10 AND ops > 50 | alert'
+- question: Do any source IPs show a statistically anomalous spike in Key Vault secret/key access relative
+    to a 14-day hourly baseline?
+  context: Volume-based time-series modeling catches stealthy ramp-ups that fixed thresholds miss. Build
+    an hourly make-series of secret/key access per CallerIPAddress over a 14-day baseline and apply series_decompose_anomalies
+    (linefit) with scorethreshold=3 and baselinethreshold=25 to ignore low-volume baselines, then join
+    anomalous hours back to raw audit records to recover caller, URIs, and user agent. Anomalous hours
+    that correlate with new principals or geographies indicate likely credential harvesting; recovering
+    the raw records lets the analyst scope what was exposed.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days using a trailing 14-day baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = KeyVaultAudit | make-series count() on time step 1h by CallerIPAddress over 14d
+
+      | series_decompose_anomalies(scorethreshold=3, baselinethreshold=25, model=linefit)
+
+      | where anomaly==1 | join raw KeyVaultAudit on CallerIPAddress, hour
+
+      | project Caller, CallerIPAddress, requestUri_s, UserAgent | alert'
+- question: Does behavioral analytics flag any caller or session as anomalous for Key Vault reveal activity
+    based on peer-group baselines, first-time actions, unusual hours, new vaults, or new IPs?
+  context: UEBA and rare-API population analysis surface behavior that is abnormal for a specific principal
+    even when raw volumes are modest. Score each caller/session with peer-group baselines and surface
+    top contributing factors (first-time action, unusual hour, unusual vault/resource, new IP) in the
+    alert text, and flag reveal operations that are rare for the principal or geography. For Credential
+    Access, a high UEBA score on a reveal-heavy session points to account compromise or insider abuse;
+    the contributing factors guide triage.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'score = UEBA_peer_baseline(KeyVaultAudit by Principal)
+
+      | features: first_time_action, unusual_hour, new_vault, new_ip, rare_api_for_geo
+
+      | where anomaly_score high | emit top_contributing_factors | alert'
+- question: Does an unsupervised outlier model identify Key Vault reveal sessions whose feature profile
+    (distinct URIs, volume, off-hours, new IP, denied ratio, management-to-data-plane latency) is an outlier
+    versus normal access?
+  context: An Isolation Forest trained on per-session features detects novel harvesting patterns without
+    predefined rules. Train on distinct secret URIs, operation volume, off-hours flag, new-IP flag, denied-operation
+    ratio, and management-to-data-plane latency, then emit the top-3 contributing features per alert via
+    LIME/SHAP and validate against labeled insider scenarios (CERT Insider Threat Test Dataset). A flagged
+    outlier session warrants manual review of exactly which secrets were revealed; explainability features
+    keep the alert actionable.
+  answer_sources:
+  - AzureDiagnostics
+  - Key Vault AuditEvent (AKVAuditLogs/KeyVaultData)
+  - AzureActivity
+  - Entra Sign-in Logs
+  - 'NAI: Key Vaults storing application secrets, signing/encryption keys, and certificates; identities
+    and managed identities with secret/key get/list permissions or access policies'
+  range: Last 90 days for scoring; train on a longer trailing window of normal sessions.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = per_session(distinct_uris, op_volume, offhours, new_ip, denied_ratio, mgmt_to_data_latency)
+
+      model = IsolationForest.fit(normal_sessions)
+
+      score = model.decision_function(features)
+
+      | where outlier | explain top3 via SHAP | alert'
+- question: Is any principal calling Microsoft.Storage/storageAccounts/listkeys/action, especially a human
+    or newly privileged identity, and is the listing followed by storage access from a different host
+    or IP?
+  context: Listing storage account keys yields reusable credentials granting broad data-plane control.
+    Alert on listkeys actions, prioritizing human identities, newly privileged principals, or callers
+    followed by storage access from a different host/IP range, and correlate with an impossible-travel
+    sign-in to confirm a compromised account. For Credential Access, a listkeys call by an unexpected
+    identity that is quickly followed by access from new infrastructure is a strong takeover signal; service
+    accounts performing routine rotation are lower risk.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity where OperationName=="Microsoft.Storage/storageAccounts/listkeys/action" AND
+      Result=="Success"
+
+      | where Caller is human OR newly_privileged(Caller)
+
+      join storage_access on Account where access.ip != activity.ip within 6h
+
+      | correlate impossible_travel(signin) | alert'
+- question: After a storage key listing, are there near-term blob or file operations from new clients,
+    anonymous-style user agents, or unapproved subnets indicating the key was immediately operationalized?
+  context: The dangerous outcome of key theft is rapid data-plane use. Correlate listkeys with subsequent
+    StorageBlobLogs/StorageFileLogs operations from new clients, anonymous-style user agents, or unapproved
+    subnets, using a per-principal first-seen pattern to flag the first listkeys by an identity. A tight
+    retrieval-then-use chain from novel infrastructure indicates active data exfiltration or takeover;
+    absence of follow-on data-plane activity suggests benign administration.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days, correlate data-plane use within 24h of each listkeys call.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'keys = AzureActivity listkeys | firstseen by Caller
+
+      join (StorageBlobLogs, StorageFileLogs) on Account within 24h
+
+      | where client is new OR user_agent anonymous OR subnet not in approved
+
+      | alert'
+- question: Are there first-time or unusually frequent storage key-list operations relative to per-account,
+    per-principal, per-IP, and time-of-day baselines?
+  context: Rarity analysis separates routine key rotation from suspicious retrieval. Baseline key-list
+    operations per account, principal, source IP, and time of day, then flag first-time key retrievals,
+    bursts across multiple accounts, or activity outside approved administration windows, applying rare-API
+    population analysis and re-deriving thresholds from per-account history. First-time or off-hours listkeys
+    across several accounts is a likely harvesting indicator; activity within established admin windows
+    is expected.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days for baselining.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = AzureActivity listkeys | per (Account,Caller,IP,hour) historical_rate
+
+      now | where firstseen(Account,Caller) OR dcount(Account) high OR hour outside admin_window
+
+      | rare_api_population_score | alert'
+- question: How quickly after retrieving a storage key does each principal first use it on the data plane,
+    and are any handoffs materially faster or broader than historical administrative workflows?
+  context: A compressed gap between key retrieval and data-plane use signals automated or adversarial
+    operationalization rather than human administration. Measure elapsed time between key retrieval and
+    first data-plane use by account and principal, and prioritize sessions whose handoff is materially
+    faster or broader than historical norms. A near-instant, wide-ranging handoff is a strong credential-capture
+    indicator; slow, narrow use matches routine maintenance.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each listkeys event: t0=key_time; t1=first_dataplane_use(Account,Caller)
+
+      latency = t1 - t0; breadth = dcount(containers/files)
+
+      | compare to historical p50/p95 per principal
+
+      | where latency << baseline OR breadth >> baseline | alert'
+- question: Does a sequence model identify suspicious chains such as role-assignment or sign-in anomaly,
+    then list-keys, then unusual blob or file operations?
+  context: Multi-stage takeovers are best caught by modeling event order rather than single events. Train
+    a multi-order Markov sequence model on management and data-plane events to identify chains like role
+    assignment/sign-in anomaly -> list keys -> unusual blob/file operations, and use a graph model (CS-GAD)
+    to rank the cross-service edges driving the score. A high-scoring chain spanning identity, management,
+    and data planes strongly indicates orchestrated credential capture; the ranked edges show the analyst
+    the pivot points.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = order_events(per Principal: signin, role_assign, listkeys, blob_ops)
+
+      model = MarkovChain.fit(normal_sequences)
+
+      | where transition_prob(seq) low | graph_rank_edges(CS-GAD) | alert'
+- question: Can a classifier determine whether a given list-keys event is benign administration or adversary
+    credential capture using account sensitivity, caller history, source novelty, denied-attempt ratio,
+    and post-retrieval data-plane behavior?
+  context: A supervised/feature-based classifier consolidates many weak signals into one decision and
+    surfaces the drivers. Use account sensitivity, caller history, source novelty, denied-attempt ratio,
+    and post-retrieval data-plane features to classify list-keys activity, surfacing the top-3 contributing
+    features per alert (UEBA) and validating against the CERT Insider Threat Test Dataset. A 'capture'
+    verdict with high-sensitivity account and novel source is high priority; a 'benign' verdict for a
+    known admin reduces noise.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [account_sensitivity, caller_history, source_novelty, denied_ratio, postuse_dataplane]
+
+      pred = classifier.predict(features)
+
+      | where pred=="credential_capture" | emit top3_features | alert'
+- question: Is any principal accumulating denied listkeys attempts or AuthorizationFailed AzureActivity
+    events, indicating permission probing before successful storage-key theft?
+  context: Denied key-management calls are a distinct failure-rate signal of reconnaissance. Track denied
+    listkeys and AuthorizationFailed AzureActivity per principal and account; a spike indicates probing
+    that precedes successful theft. A denied-attempt spike followed by a success is a high-confidence
+    escalation pattern; persistent denials without success still flag an actor attempting to reach storage
+    credentials.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - StorageBlobLogs
+  - StorageFileLogs
+  - 'NAI: Storage accounts holding sensitive data, backup repositories, and identities with storage key
+    management rights'
+  range: Last 90 days, evaluated in rolling windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'AzureActivity where (OperationName=="...listkeys/action" AND Result=="Failure") OR ActivityStatus=="AuthorizationFailed"
+
+      | summarize denied=count() by Caller, Account, bin(time,1h)
+
+      | where denied > baseline | flag (escalates if later success) | alert'
+- question: Are any Azure Automation runbook draft writes, publishes, or executions followed by job output
+    containing usernames, passwords, Get-AutomationPSCredential, ConvertFrom-SecureString, or serialization
+    patterns that surface a stored credential?
+  context: Runbooks can be modified to print or serialize credential assets that are otherwise protected.
+    Detect runbook draft writes, publishes, or executions whose JobStreams/JobLogs output contains credential
+    keywords or commands like Get-AutomationPSCredential or ConvertFrom-SecureString, or serialization
+    patterns suggesting a stored credential was surfaced. Output that reveals plaintext credentials after
+    an edit is a strong Credential Access indicator of secret exfiltration via automation; matching this
+    to an unauthorized author increases confidence.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'edits = AzureActivity runbook(draft_write|publish|start)
+
+      join JobStreams/JobLogs on JobId
+
+      | where output matches (username|password|Get-AutomationPSCredential|ConvertFrom-SecureString|serialized_cred)
+
+      | alert with Author, RunbookName, JobId'
+- question: After credential-oriented runbook output, does the exposed account sign in or perform management
+    activity from new hosts, geographies, or user agents (impossible travel) indicating theft then reuse?
+  context: Confirming reuse closes the loop from disclosure to active abuse. Correlate credential-oriented
+    runbook output with subsequent sign-ins or management activity by the exposed account from new hosts,
+    geographies, or user agents, using impossible-travel feasibility. Reuse of a just-exposed credential
+    from novel infrastructure confirms operational compromise; no follow-on activity may indicate the
+    disclosure was caught before exploitation.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days, correlate identity reuse within 7 days of disclosure.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'disclosed = runbook_output_credentials -> exposed_account
+
+      join signins/AzureActivity on exposed_account within 7d
+
+      | where new_host OR new_geo OR new_user_agent OR impossible_travel
+
+      | alert'
+- question: Do any runbook jobs deviate from per-Automation-Account baselines of output keywords, job
+    duration, edit frequency, and post-job identity activity, especially first-time secret-handling commands
+    or unusual authors?
+  context: Baselining normal automation behavior exposes anomalous credential handling. Baseline output
+    keywords, job durations, runbook edit frequency, and post-job identity activity per Automation Account,
+    then flag first-time secret-handling commands, unusual authors, or jobs whose output characteristics
+    exceed established norms. A first-time ConvertFrom-SecureString from a new author with elevated post-job
+    identity activity is suspicious; familiar maintenance jobs are expected.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days for baselining.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per AutomationAccount (output_keywords, job_duration, edit_freq, postjob_activity)
+
+      now | where firstseen(secret_command) OR unusual_author OR output_chars > p95
+
+      | alert'
+- question: Which runbooks, operators, or hybrid workers interact with automation credential assets in
+    combinations that are absent or extremely rare over the past month?
+  context: Rare access combinations highlight unauthorized credential-asset use. Track which runbooks,
+    operators, and hybrid workers normally interact with automation credential assets and prioritize combinations
+    absent or extremely rare in the past month, using per-principal first-seen baselining. A novel operator/runbook/worker
+    triad touching a credential asset is a likely harvesting indicator; established combinations are routine.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days, rarity assessed against the prior 30 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'combos = (Runbook, Operator, HybridWorker) accessing credential_asset
+
+      | firstseen / frequency over last 30d
+
+      | where combo rare_or_absent | alert'
+- question: Can a code-aware classifier distinguish credential-disclosure behavior in runbook content
+    and job streams from legitimate automation and maintenance scripts?
+  context: Legitimate automation can also touch credentials, so content-level classification is needed
+    to separate disclosure from normal use. Apply a code-aware classification model on runbook content
+    and job stream features to identify credential-disclosure behavior that differs from legitimate scripts,
+    surfacing the top contributing tokens/features per alert. A 'disclosure' verdict on a runbook that
+    writes credentials to output is high priority; the highlighted tokens speed code review.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = tokenize(runbook_content) + jobstream_features
+
+      pred = code_classifier.predict(features)
+
+      | where pred=="credential_disclosure" | emit top_tokens | alert'
+- question: Does a temporal sequence model over runbook edits, credential-oriented output, and downstream
+    identity telemetry identify sessions consistent with automation-based secret revelation and reuse?
+  context: End-to-end abuse spans editing, disclosure, and reuse, which a sequence model captures better
+    than isolated events. Train a multi-order Markov model over runbook edits, credential-oriented output,
+    and downstream identity telemetry to recognize automation-based secret revelation and reuse, corroborated
+    with UEBA peer-group anomaly scoring. A high-scoring edit->disclose->reuse sequence is a strong Credential
+    Access signal; UEBA corroboration raises confidence.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = order(per principal: runbook_edit, cred_output, downstream_signin/mgmt)
+
+      model = MarkovChain.fit(normal); score = model.score(seq)
+
+      | where score anomalous AND ueba_anomaly | alert'
+- question: Is the exposed account showing failed/errored runbook jobs or post-reveal failed sign-ins
+    followed by success, indicating credential reuse attempts?
+  context: Failure-rate signals expose reuse attempts even when the eventual success looks ordinary. Profile
+    failed/errored job runs and post-reveal failed sign-ins of the exposed account as a distinct failure-rate
+    signal; repeated failed authentications followed by success indicate credential reuse attempts. A
+    failed-then-successful auth burst by a recently exposed account is a high-confidence reuse pattern;
+    sustained failures alone still indicate attempted abuse.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Sign-in Logs
+  - 'NAI: Automation Accounts containing credential assets, hybrid workers, and subscriptions used for
+    privileged operations'
+  range: Last 90 days, evaluated in rolling windows around each disclosure.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'JobLogs where status in (Failed,Error) | per AutomationAccount
+
+      signins for exposed_account | summarize fails=count() by hour
+
+      | where fail_burst followed_by success | alert'
+- question: Is any principal performing repeated deployment-history reads or template exports across multiple
+    resource groups shortly after authentication, privilege changes, or portal access to high-value subscriptions,
+    with no recent deployment-management history?
+  context: Deployment history and template exports can expose parameter values that were not protected
+    as secure strings. Alert when a principal performs repeated deployment-history reads or exports across
+    multiple resource groups shortly after authentication, privilege changes, or portal access to high-value
+    subscriptions, prioritizing actors with no recent deployment-management history. Broad, cross-resource-group
+    reads by a non-deployer right after a privilege change strongly suggest deliberate secret hunting;
+    routine reads by an active deployer are expected.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity where OperationName matches deployments/(read|exportTemplate)
+
+      | summarize rg=dcount(ResourceGroup), reads=count() by Caller, bin(time,1h)
+
+      | where rg>1 AND Caller_has_no_recent_deploy_writes AND preceded_by(auth|priv_change|portal_hv)
+
+      | alert'
+- question: Do AzureActivity and Proxy Logs reveal rapid navigation across deployment detail pages, export
+    actions, and resource group views consistent with manual inspection of template inputs for embedded
+    secrets?
+  context: Manual secret hunting in the portal leaves a recognizable traversal fingerprint. Use AzureActivity
+    and Proxy Logs to identify rapid navigation across deployment detail pages, export actions, and resource
+    group views that suggest manual inspection of template inputs for embedded secrets. A fast click-through
+    of many deployment pages and exports without accompanying change activity indicates browsing for secrets;
+    sparse, change-linked navigation is normal operations.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'join AzureActivity(deployment reads/exports) with ProxyLogs(portal urls)
+
+      | sessionize by Caller | where rapid_sequence(deployment_detail, export, rg_view)
+
+      AND no_adjacent_deployment_writes | alert'
+- question: Which users exceed their 95th-percentile profile for the number of deployment records viewed
+    or exported, cross-subscription coverage, or off-hours export activity over a 30-day baseline?
+  context: Outliering read breadth catches harvesting that stays under absolute thresholds. Baseline the
+    number of deployment records viewed or exported per user, subscription, and resource group over 30
+    days, then flag users whose read breadth, cross-subscription coverage, or off-hours export activity
+    exceeds their 95th-percentile profile, applying rare-API population analysis. A user suddenly reading
+    far more deployments across more subscriptions than their norm is a likely secret-hunting indicator;
+    in-profile activity is benign.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days using a 30-day per-user baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per User 30d (deploy_reads, subs_covered, offhours_exports) p95
+
+      now | where reads>p95 OR subs>p95 OR offhours_exports>p95
+
+      | rare_api_population_score | alert'
+- question: Do any sessions produce a high weighted exposure score when deployment reads are weighted
+    by subscription criticality, number of templates viewed, and overlap with legacy deployments likely
+    to contain insecure parameters?
+  context: Not all deployment reads are equally risky; weighting focuses attention on the most exposing
+    access. Weight deployment reads by subscription criticality, number of templates viewed, and overlap
+    with known legacy deployments that may contain insecure parameters, and elevate sessions whose weighted
+    exposure score materially exceeds the user's normal footprint. A high weighted score concentrated
+    on critical, legacy-template subscriptions indicates targeted secret exposure; low scores on routine
+    reads are deprioritized.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'score = sum(sub_criticality * templates_viewed * legacy_overlap) per session
+
+      | compare to user_normal_footprint
+
+      | where score >> baseline | alert'
+- question: Does a behavioral model of normal deployment administration identify sessions resembling secret
+    hunting that traverse many deployments without the surrounding change activity typical of legitimate
+    operators?
+  context: Modeling the full administrative context distinguishes hunting from genuine operations. Model
+    normal deployment-administration behavior using sign-in telemetry, AzureActivity, and web proxy records,
+    then identify sessions resembling secret hunting that traverse many deployments without the surrounding
+    change activity typical of legitimate operators, surfacing top contributing features. A session that
+    reads/exports many deployments but performs no writes or deployments is a strong hunting signal; reads
+    embedded in real change workflows are normal.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = normal_deploy_admin(signins, AzureActivity, ProxyLogs)
+
+      score each session | where traverses_many_deployments AND lacks_change_activity
+
+      | emit top_features | alert'
+- question: Can a session classifier distinguish benign troubleshooting from deliberate harvesting of
+    deployment-time secrets using page-access order, export frequency, subscription breadth, denied-read
+    ratio, and absence of adjacent deployment writes?
+  context: An Isolation Forest classifier on session features separates legitimate troubleshooting from
+    harvesting. Build the classifier on page-access order, export frequency, subscription breadth, denied-read
+    ratio, and absence of adjacent deployment writes, emitting the top-3 features per alert and validating
+    against the CERT Insider Threat Test Dataset. A 'harvesting' verdict driven by high export frequency,
+    broad subscription coverage, and no adjacent writes is high priority; troubleshooting sessions tied
+    to incidents are deprioritized.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [page_order, export_freq, sub_breadth, denied_read_ratio, no_adjacent_writes]
+
+      model = IsolationForest.fit(normal_sessions)
+
+      | where outlier | explain top3 SHAP | alert'
+- question: Is any principal accumulating AuthorizationFailed or denied deployment-history reads and exports,
+    indicating secret hunting against resource groups the actor cannot yet access?
+  context: Denied deployment reads are a distinct failure-rate signal of targeted reconnaissance. Track
+    AuthorizationFailed/denied deployment-history reads and exports per principal; a burst of denied template-export
+    attempts indicates secret hunting against resource groups the actor cannot yet access. A denied-export
+    burst, especially followed by a successful read after privilege change, is a high-confidence hunting
+    indicator; isolated denials may reflect scoping errors.
+  answer_sources:
+  - AzureActivity
+  - Entra Sign-in Logs
+  - Proxy Logs
+  - 'NAI: Resource groups hosting sensitive workloads, deployment operators, and build systems that submit
+    ARM or Bicep deployments'
+  range: Last 90 days, evaluated in rolling windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'AzureActivity where ActivityStatus=="AuthorizationFailed" AND OperationName matches deployments/(read|exportTemplate)
+
+      | summarize denied=count() by Caller, bin(time,1h)
+
+      | where denied > baseline | flag escalation_if_later_success | alert'
