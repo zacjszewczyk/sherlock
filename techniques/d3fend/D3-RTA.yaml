@@ -1,0 +1,338 @@
+name: 'D3-RTA: RPC Traffic Analysis'
+id: d20b1f30-0c22-4c99-a1ac-995d3e73b513
+description: Investigate potentially malicious use of Remote Procedure Call (RPC) traffic by comparing
+  observed DCE/RPC interfaces, operations, named pipes, and call patterns against a learned baseline of
+  normal enterprise RPC behavior. RPC is heavily used for legitimate Windows administration but is also
+  abused by adversaries for remote execution, service creation, scheduled-task creation, registry manipulation,
+  account/directory enumeration, and lateral movement. This playbook helps an analyst determine whether
+  RPC activity uses approved interfaces and operations for the source and destination roles, whether high-risk
+  remote-administration operations (svcctl, atsvc/ITaskSchedulerService, winreg, samr/lsarpc/drsuapi,
+  srvsvc) originate from sanctioned hosts, and whether the Endpoint Mapper-to-ephemeral-port-to-service-spawn
+  chain reflects benign or hostile activity. It combines deterministic allow-list and high-risk-operation
+  rules, statistical baselining (rare interaction triplets, endpoint-mapper scanning ratios, bind-failure/access-denied
+  rates, periodic/scripted polling, and volume-surge forecasting), and machine learning (graph link prediction
+  for rare RPC edges, sequence modeling of operation chains, host classification from RPC features, and
+  rarity scoring tuned to a fixed alert budget) so the analyst can distinguish legitimate remote management
+  from an adversary abusing RPC for execution, persistence, discovery, and lateral movement.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which RPC interfaces, operations, and named pipes observed in Zeek dce_rpc.log are NOT present
+    in an approved (endpoint, operation, source-role, destination-role) allowlist learned over the prior
+    30 days per server role (domain controllers, management servers, file servers, workstations)?
+  context: 'Detection objective: establish a high-fidelity baseline of normal RPC so rare or off-policy
+    remote procedure activity stands out. Because benign peer-to-peer and client-to-server RPC is enormous
+    and environment-specific, it must be learned rather than assumed (CAR-2014-05-001). Inventory every
+    unique RPC interface, operation, and named pipe in Zeek dce_rpc.log over a 30-day window and build
+    an approved (endpoint, operation, src-role, dst-role) list keyed by server role. The Zeek DCE-RPC
+    analyzer exposes interfaces and operations in human-readable form, making this tractable on first-party
+    telemetry without external lookups. Compare new RPC activity against the allowlist: a tuple absent
+    from the baseline (a workstation invoking a directory-replication operation against a DC, an unmanaged
+    host calling service-control operations) is a strong lead. A positive result (off-allowlist tuple)
+    merits triage under the Detect tactic; a negative result means the activity matches learned norms.
+    Re-learn periodically to absorb legitimate change and suppress drift-driven false positives.'
+  answer_sources: &id001
+  - Zeek dce_rpc.log
+  - Zeek smb_files.log
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, file servers, and endpoint subnets'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      baseline = {}  // learned over trailing 30 days
+      for r in dce_rpc.log[last 30d]:
+        baseline.add((role(r.id.orig_h), role(r.id.resp_h), r.endpoint, r.operation, r.named_pipe))
+      for r in dce_rpc.log[new]:
+        key = (role(r.id.orig_h), role(r.id.resp_h), r.endpoint, r.operation, r.named_pipe)
+        if key not in baseline:
+          alert('off-allowlist RPC operation', r, key)
+- question: Are high-risk remote-administration RPC operations - svcctl (CreateServiceW/StartServiceW),
+    atsvc/ITaskSchedulerService, winreg, samr/lsarpc/drsuapi, and srvsvc - being invoked from sources
+    that are not approved for remote administration?
+  context: 'Detection objective: deterministically catch the RPC operations adversaries use for remote
+    execution, persistence, and discovery, regardless of volume. Trigger high-severity alerts when remote-admin
+    operations are seen from sources outside the approved-admin set: svcctl CreateServiceW/StartServiceW
+    (remote service creation/start, e.g., PsExec-style execution), atsvc/ITaskSchedulerService (remote
+    scheduled tasks), winreg (remote registry), samr/lsarpc/drsuapi (account/SID and directory enumeration,
+    including DCSync-style replication), and srvsvc (share enumeration). Use the operation-to-technique
+    mappings curated in BZAR and the production Zeek named-pipe rule patterns (e.g., SigmaHQ''s ATSVC
+    rule) to label operations. A positive result (a high-risk operation from a non-admin source) is a
+    strong remote-execution or persistence indicator under the Detect tactic; a negative result means
+    the operation came from a sanctioned management host. Maintain the approved-admin source list to keep
+    these rules a non-suppressible detection floor.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      high_risk = {'svcctl':{'CreateServiceW','StartServiceW'},
+                   'atsvc':'*','ITaskSchedulerService':'*','winreg':'*',
+                   'samr':'*','lsarpc':'*','drsuapi':'*','srvsvc':'*'}
+      for r in dce_rpc.log:
+        if r.endpoint in high_risk and (high_risk[r.endpoint]=='*' or r.operation in high_risk[r.endpoint]):
+          if r.id.orig_h not in approved_admin_sources:
+            high_alert('high-risk RPC op from unapproved source', r.endpoint, r.operation, r)
+- question: Is there a deterministic chain on the network and host of a 135/tcp Endpoint Mapper bind,
+    followed by a connection to a dynamically assigned ephemeral port (49152-65535), and then services.exe
+    or WmiPrvSE.exe on the target receiving that connection and spawning a child process?
+  context: 'Detection objective: reconstruct the canonical remote-execution sequence that RPC-based lateral
+    movement tools (PsExec, WMI/wmic, schtasks) produce. An RPC call begins with a bind to the Endpoint
+    Mapper on 135/tcp, which returns the dynamic port (49152-65535) the requested service listens on;
+    the client then connects directly to that ephemeral port (CAR-2014-05-001). On the target, the SCM
+    (services.exe) or WMI provider host (WmiPrvSE.exe) receives the network connection and immediately
+    spawns a child process - the executed payload. Correlate Zeek conn.log/dce_rpc.log (135 bind -> ephemeral
+    connection) with Windows Event ID 5156 (network connection) and process-creation events showing services.exe/WmiPrvSE.exe
+    as parent, using the tool-to-artifact mappings in JPCERT/CC''s lateral movement research. A positive
+    result (the full chain) is a high-confidence remote-execution detection under the Detect tactic; a
+    partial chain warrants context (legitimate admin vs. attacker).'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      // network: endpoint-mapper resolution then ephemeral connection
+      bind = conn/dce_rpc where resp_p==135 (EPM bind)
+      eph  = conn where resp_p in 49152..65535 and same (orig_h,resp_h) shortly after bind
+      // host: target service spawns child after receiving connection
+      spawn = process_create where ParentImage in {services.exe, WmiPrvSE.exe}
+        correlated with Event 5156 inbound to that host within N seconds
+      if bind -> eph -> spawn on same target within window:
+        alert('EPM -> ephemeral -> service spawn (remote exec)', target, child_process)
+- question: Which (source, destination, operation) and (source, destination, account) RPC interaction
+    triplets are never-before-seen or fall in the bottom 5th percentile of historical frequency?
+  context: 'Detection objective: surface improbable RPC relationships that allow-lists may not yet cover,
+    ranking by rarity to keep analyst load manageable. Compute historical frequencies for (source, destination,
+    operation) and (source, destination, account) triplets across Zeek dce_rpc.log and Windows Event IDs
+    5156/5145, then alert on tuples that have never occurred or sit in the bottom 5th percentile, scoring
+    by rarity as in Hopper and the low-probability edge scoring of CyberGraph. Include the specific rare
+    edge, operation, and account in the alert so the analyst can immediately judge whether a host/account
+    is reaching a peer or invoking an operation it normally never touches. A positive result (a rare triplet)
+    is a lateral-movement or discovery indicator under the Detect tactic; a negative result means the
+    interaction is common. Tune the percentile threshold against the environment''s baseline density to
+    balance sensitivity and volume.'
+  answer_sources: &id002
+  - Zeek dce_rpc.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Event ID 5145
+  - 'NAI: Domain Controllers, file servers, and endpoint subnets'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      freq = historical_count(src, dst, operation) over training window
+      freq_acct = historical_count(src, dst, account)
+      for t in new dce_rpc.log / e5156 / e5145 interactions:
+        if freq[(t.src,t.dst,t.op)] == 0 or percentile(freq[(t.src,t.dst,t.op)]) < 5:
+          alert('rare RPC triplet', t.src, t.dst, t.op, t.account)
+        if percentile(freq_acct[(t.src,t.dst,t.account)]) < 5:
+          alert('rare RPC account edge', t)
+- question: Does any source show a high ratio of 135/tcp Endpoint Mapper binds to subsequent ephemeral
+    high-port connections, indicating RPC enumeration or scanning rather than completed RPC calls?
+  context: 'Detection objective: detect RPC reconnaissance where an actor queries the Endpoint Mapper
+    to enumerate services/ports but rarely follows through with an actual high-port RPC session. Per source,
+    track the ratio of 135/tcp EPM binds to the count of subsequent connections to ephemeral ports (49152-65535).
+    A normal client binds then connects to the resolved service; a scanner produces many 135/tcp connections
+    with few or no follow-up high-port sessions (CAR-2014-05-001). Derive the alerting ratio (e.g., >5:1
+    binds-to-followups) from each environment''s baseline rather than a fixed constant. A positive result
+    (high bind-to-followup ratio) is an enumeration signal under the Detect tactic, often a precursor
+    to targeted lateral movement; a negative result means binds are matched by legitimate service connections.
+    Combine with destination spread (one source scanning many hosts) to raise confidence.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src in sources over rolling window:
+        binds = count(conn where resp_p==135 from src)
+        followups = count(conn where resp_p in 49152..65535 from src, paired to a prior bind)
+        ratio = binds / max(followups,1)
+        if ratio > tuned_ratio(baseline(src)) or distinct_dst(src,135) > tuned_fanout:
+          alert('RPC endpoint-mapper scanning', src, ratio)
+- question: Is any source or destination experiencing an abnormal rate of failed RPC binds, access-denied
+    responses, or failed remote service starts - especially a surge of failures immediately preceding
+    a success?
+  context: 'Detection objective: treat RPC failure/denial state as a distinct reconnaissance and brute-force
+    signal. Track per-source and per-destination rates of failed RPC binds, access-denied responses, and
+    failed remote service starts from Zeek dce_rpc.log and Windows Event IDs 5156/5145. A burst of failed
+    or denied operations followed by a success is high-signal: it often indicates an actor probing permissions
+    or guessing/escalating until an operation succeeds, consistent with the success/fail feature emphasis
+    in Bian et al. and the artifact mappings in JPCERT/CC. Baseline normal failure ratios per source/destination
+    and alert on deviations, prioritizing the failure-then-success pattern. A positive result is a strong
+    credential-abuse or privilege-probing indicator under the Detect tactic; a negative result means failures
+    are within normal operational noise (e.g., transient service unavailability). Tune thresholds to each
+    host''s role to avoid alerting on chatty management servers.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for (src,dst) over rolling window:
+        fails = count(rpc bind failures + access_denied + failed_service_start)
+        succ  = count(rpc bind/operation success)
+        base  = failure_baseline(src,dst)
+        if fails > base.mean + 3*base.std:
+          alert('elevated RPC failure/denied rate', src, dst, fails)
+        if fails >= N and succ >= 1 and success_follows_failures:
+          alert('RPC failure-then-success (probing)', src, dst)
+- question: Do repeated RPC connection tuples (135/tcp plus ephemeral port between the same hosts) exhibit
+    machine-like periodicity in their inter-arrival times, indicating scripted/automated RPC polling rather
+    than human-driven administration?
+  context: 'Detection objective: distinguish automated, beacon-like RPC activity (C2 over RPC, scripted
+    lateral-movement tooling, or polling implants) from sporadic human administration. For each repeated
+    RPC connection tuple, apply Discrete Fast Fourier Transform periodicity detection, the Median Absolute
+    Deviation of inter-arrival deltas, and Bowley skewness of connection timing, as implemented in RITA.
+    Highly regular inter-arrival intervals (low MAD, strong DFFT peak, near-zero skew) indicate machine-generated
+    polling; human administration is bursty and irregular. A positive result (strong periodicity) under
+    the Detect tactic flags automated RPC abuse worth investigating for its purpose and operator; a negative
+    result means timing is human-consistent. Require a minimum number of connections before scoring to
+    avoid spurious periodicity on small samples, and whitelist known scheduled/automated administration
+    jobs.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for tuple (orig_h, resp_h) with repeated 135/tcp + ephemeral connections:
+        deltas = inter_arrival_times(connections)
+        if count(connections) >= min_samples:
+          if dfft_periodicity(deltas) high and MAD(deltas) low and |bowley_skew(deltas)| ~ 0:
+            alert('periodic/scripted RPC polling', orig_h, resp_h, period_estimate)
+- question: Do the per-host volume and frequency (calls/min) of high-risk RPC operations on critical hosts
+    exceed rolling or seasonal forecast bounds (e.g., mean+3-sigma or Holt-Winters prediction intervals)?
+  context: 'Detection objective: catch abnormal remote-execution pressure that per-event rules miss by
+    modeling expected high-risk RPC operation volume over time. For each critical host, model the volume
+    and frequency (calls/min) of high-risk operations (service creation/start, scheduled tasks, registry,
+    directory enumeration) with rolling baselines using mean+3-sigma or seasonal Holt-Winters forecasting,
+    then alert when observed counts exceed prediction bounds. A spike in remote-execution operations against
+    a DC or file server reflects the abnormal remote-execution pressure noted in CAR-2014-05-001 and may
+    indicate mass deployment of tooling, ransomware staging, or aggressive lateral movement. A positive
+    result (counts above the upper bound) is a Detect-tactic lead toward an active campaign; a negative
+    result means activity fits the host''s modeled rhythm. Fit per-host seasonality (patch windows, backup
+    jobs) so routine peaks do not generate noise.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for host in critical_hosts:
+        series = high_risk_rpc_ops_per_minute(host) over training window
+        model = holt_winters(series)  // or rolling mean+3*std
+        for window in current:
+          if observed(window) > model.upper_prediction_bound(window):
+            alert('high-risk RPC volume surge', host, observed, bound)
+- question: When RPC interactions are modeled as a host-to-host and account-to-host graph, which new or
+    low-probability edges receive a low predicted-link score from an unsupervised graph-embedding model?
+  context: 'Detection objective: use relationship-aware ML to rank improbable RPC connections that flat
+    rules and per-host stats cannot capture. Build a host-to-host (and account-to-host) RPC interaction
+    graph from Zeek dce_rpc.log/conn.log, Windows Event ID 5156, and Windows Security authentication logs,
+    then score new or low-probability edges with unsupervised graph embeddings plus a link predictor (CyberGraph)
+    or scalable temporal link prediction (EULER). Surface the top-3 contributing edges/entities - the
+    rare peer, operation, and account - in the alert so the analyst can immediately assess the relationship.
+    A positive result (a low-probability edge) indicates a host or account interacting via RPC with a
+    peer it has never reached before, a lateral-movement indicator under the Detect tactic; a negative
+    result means the edge fits learned graph structure. Run in parallel with the deterministic allowlist
+    and high-risk-operation rules rather than replacing them, and retrain on a sliding window to track
+    legitimate topology change.'
+  answer_sources: &id003
+  - Zeek dce_rpc.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Security authentication logs
+  - 'NAI: Domain Controllers, file servers, and endpoint subnets'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      G = build_graph(nodes=hosts+accounts, edges=rpc interactions
+          from dce_rpc.log, conn.log, e5156, security_auth_logs)
+      model = train_unsupervised_embeddings(G)  // CyberGraph / EULER temporal link prediction
+      for new_edge (u -> v):
+        p = model.predict_edge_prob(u, v)
+        if p < tuned_low_prob_threshold:
+          alert('anomalous RPC edge', u, v, top3_contributors(u,v))
+- question: Within each source's ordered chain of RPC operations, are there low-likelihood next-operations
+    (e.g., endpoint-mapper bind -> svcctl CreateService -> StartService) that a learned sequence model
+    considers improbable?
+  context: 'Detection objective: detect malicious RPC operation chains by modeling the order in which
+    operations normally occur, not just individual operations. Train a self-supervised sequence model
+    on per-source ordered RPC operation chains from Zeek dce_rpc.log and Windows Event ID 5156, then flag
+    low-likelihood next-operations following the event-sequence anomaly approach of Gokstorp et al. Attack
+    tradecraft often manifests as a distinctive ordered chain - endpoint-mapper bind, then svcctl CreateService,
+    then StartService - that is rare in benign traffic even when each step is individually common. Report
+    the contributing prior operations alongside the anomaly score so the analyst sees the chain that triggered
+    the alert. A positive result (an improbable sequence) is a remote-execution/persistence indicator
+    under the Detect tactic; a negative result means the operation order matches learned norms. Train
+    per source-role so management servers'' legitimate chains are not penalized.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      seqs = ordered_rpc_operation_chains_per_source(dce_rpc.log, e5156)
+      model = train_self_supervised_sequence_model(seqs)  // Gokstorp et al.
+      for seq in new sequences:
+        for (prior_ops, next_op) in seq:
+          if model.likelihood(next_op | prior_ops) < threshold:
+            alert('improbable RPC operation sequence', source, prior_ops, next_op, score)
+- question: When per-host RPC graph features (in/out degree, distinct-peer counts, high-risk-operation
+    counts, success/fail ratios) are scored by a trained classifier, which hosts are flagged as suspicious,
+    and what top features drive each score?
+  context: 'Detection objective: identify hosts behaving like attack origins or pivots based on the shape
+    of their RPC activity. Engineer per-host features from Zeek dce_rpc.log/conn.log, Windows Event ID
+    5156, and Windows Security authentication logs - in/out degree, distinct-peer counts, high-risk-operation
+    counts, and success/fail ratios - then train an ensemble classifier with class-imbalance handling
+    as in Bian et al., validated against the public LANL authentication dataset. Output the top-3 features
+    driving each host''s score so the analyst understands why a host is flagged (e.g., high distinct-peer
+    fan-out plus many failed service starts). A positive result (a high-scoring host) is a strong lateral-movement-origin
+    lead under the Detect tactic; a negative result means the host''s RPC footprint resembles benign peers.
+    Because supervised models drift, periodically refit on recent labeled/benign data and keep the deterministic
+    rules as a floor.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      for host in hosts:
+        feats[host] = {in_degree, out_degree, distinct_peers,
+                       high_risk_op_count, success_fail_ratio}
+      model = train_ensemble_classifier(feats, imbalance_handling)  // Bian et al., LANL
+      for host in hosts:
+        score = model.predict(feats[host])
+        if score > threshold:
+          alert('suspicious RPC host', host, top3_features(host))
+- question: Can a probabilistic rarity model layered over the deterministic RPC rules be tuned to a fixed
+    daily alert budget while keeping the high-risk-operation rules as a non-suppressible floor?
+  context: 'Detection objective: control analyst alert volume without losing the must-not-miss detections.
+    Layer a probabilistic rarity model over the deterministic RPC rules (allowlist + high-risk-operation
+    + EPM-to-spawn chain) and tune its score threshold to a fixed daily alert budget, as demonstrated
+    by Hopper, so analysts receive a bounded, rarity-ranked queue. Critically, the deterministic high-risk-operation
+    rules remain a non-suppressible floor: even if the budget is exhausted, svcctl/atsvc/winreg/drsuapi-style
+    operations from unapproved sources still alert. This balances precision and recall under the Detect
+    tactic - the rarity model prioritizes the most improbable activity for human attention while the rule
+    floor guarantees coverage of known-dangerous operations. A positive result is a top-ranked rare event
+    within budget or a floor-triggered high-risk operation; tune the budget and threshold to staffing
+    so the queue stays actionable without dropping critical detections.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      rarity = probabilistic_rarity_model(rpc_events)  // Hopper-style
+      ranked = sort(events by rarity.score desc)
+      threshold = calibrate_to_daily_budget(ranked, budget=N_per_day)
+      for e in events:
+        if e matches deterministic_high_risk_rule:
+          alert(e)  // non-suppressible floor, always emitted
+        elif rarity.score(e) >= threshold:
+          alert(e)  // within tuned daily budget
