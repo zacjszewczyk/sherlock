@@ -1,0 +1,345 @@
+name: 'D3-CTS: Credential Transmission Scoping'
+id: 58a34090-fbc3-420e-8c33-3dabbb337688
+description: >-
+  Investigate where credentials are transmitted across the network and determine which transmissions fall
+  outside their approved relying-party scope. This playbook helps an analyst use authentication telemetry
+  (Kerberos, NTLM, and Windows logon events) to map credential transmission paths between hosts and services,
+  surface paths that violate approved scope boundaries, fan out to too many relying parties, or expose
+  privileged credentials beyond their intended destinations. It supports the Isolate defensive tactic
+  of Credential Transmission Scoping by combining deterministic allow-list rules, statistical baselining
+  and change-point detection, graph-based new-edge scoring, and machine-learning causal path inference
+  and graph representation learning. Failed authentications are profiled separately as scope-probing signals,
+  and WebAuthn/FIDO origin binding is verified so cross-origin credential relay attempts are flagged.
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Are there network (Type 3) logons or Kerberos/NTLM authentication events that traverse source-to-destination
+    paths or trust-zone boundaries that are not on the approved authentication allow list?
+  context: >-
+    Maintain an allow list of approved source-destination authentication paths and trust zones grounded
+    in per-request least-privilege scoping, derived from documented application-to-service dependencies.
+    Then alert on Windows Event ID 4624 Type 3 (network) logons and Zeek kerberos/ntlm events whose source
+    and destination cross a zone boundary that is not on the allow list. In the context of the Isolate
+    tactic, any credential transmission crossing an unapproved zone boundary represents a scoping violation:
+    a credential is being presented to a relying party it was never intended to reach. A positive result
+    is an authentication edge between zones with no documented dependency; a negative result confirms
+    the path is sanctioned. Faithful least-privilege scoping per NIST SP 800-207 keeps the allow list
+    tight and the alerts meaningful.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      auth = events where (EventID=4624 and LogonType=3) or source in [zeek.kerberos, zeek.ntlm];
+
+      edge = (src_zone(auth.src), dst_zone(auth.dst));
+
+      allow = lookup approved_auth_paths;  # from app-to-service dependency map
+
+      alert when edge crosses_zone_boundary and edge not_in allow;
+
+      output account, src_host, src_zone, dst_host, dst_zone, auth_protocol, EventID.
+- question: >-
+    Is a privileged account authenticating or requesting service tickets from a source subnet or host
+    role that lies outside the approved administrative segments?
+  context: >-
+    Correlate privileged account authentication, specifically Kerberos service ticket activity in Event
+    ID 4769 and special-privileges assignment in Event ID 4672, with the source subnet and host role,
+    then flag privileged credential transmission originating outside approved admin segments. For the
+    Isolate tactic this catches privileged credentials leaking into general-purpose zones where they should
+    never appear, a strong lateral-movement and credential-exposure indicator. Use deterministic logon-event
+    correlation across 4624/4625/4768/4769/4776/4672 as the first-party authentication path map (LogonTracer
+    approach). A positive result is a domain admin or service account ticket sourced from a user workstation
+    subnet; a negative result confirms the privileged auth came from a sanctioned jump host.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      priv = events where EventID in [4769,4672] and account in privileged_accounts;
+
+      ctx = correlate priv with [4624,4625,4768,4776] by account, logon_id;
+
+      alert when src_subnet(priv) not_in approved_admin_segments
+        or host_role(priv.src) not in [admin_jump, tier0];
+      output account, src_subnet, src_host, host_role, EventID, target_service.
+- question: >-
+    Within a one-hour window, is a single source host using explicit credentials for multiple distinct
+    accounts to reach multiple distinct destinations (an over-scope fan-out)?
+  context: >-
+    Flag a source host where, within a window (e.g., 1 hour), at least N distinct accounts use explicit
+    credentials (Event ID 4648) to reach at least M distinct destinations. This is a deterministic over-scope
+    signature: credentials are being transmitted well beyond their intended relying party, which directly
+    undermines credential transmission scoping in the Isolate tactic. Start at N>=2 accounts and M>=3
+    destinations and tune to local baselines (Azure Sentinel MultipleExplicitCredentialUsage4648 query).
+    A positive result is one host brokering many credential/destination pairs, typical of credential harvesting
+    or pass-the-credential spread; a negative result is normal single-account, few-destination explicit
+    credential use such as a scheduled task or admin tool.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days, evaluated over rolling 1-hour windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      exp = events where EventID=4648;
+
+      group by src_host, window=1h:
+        n_accounts = distinct(subject_account or target_account);
+        m_dests = distinct(target_server);
+      alert when n_accounts >= 2 and m_dests >= 3;  # tune N,M to baseline
+
+      output src_host, n_accounts, m_dests, account_list, destination_list, window.
+- question: >-
+    Is a WebAuthn/FIDO public-key credential being asserted against a relying party ID or origin other
+    than the one it was registered to, or is a session downgrading to a phishable fallback factor?
+  context: >-
+    Verify that public-key credential assertions are presented only to their registered Relying Party
+    ID/origin, and alert when an authentication for a scoped credential is observed against an out-of-scope
+    relying party, or when a session downgrades to a phishable fallback factor. Structurally, WebAuthn
+    credentials are bound to their origin and cannot be relayed to other origins, so any cross-origin
+    assertion attempt is anomalous and a clear scoping violation under the Isolate tactic (W3C Web Authentication
+    Level 2). A positive result indicates attempted credential relay/phishing or a misconfigured RP; a
+    negative result confirms the assertion matched its registered origin. Downgrade to OTP or password
+    fallback is itself a signal that scoped protection was bypassed.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      assert = idp_auth_events where method='webauthn';
+
+      reg = lookup registered_rp_id_origin(credential_id);
+
+      alert when assert.rp_id != reg.rp_id or assert.origin != reg.origin;
+
+      alert when session.factor downgraded_to in [password, otp, sms];
+
+      output user, credential_id, asserted_origin, registered_origin, factor.
+- question: >-
+    Does the daily count of unique authentication destinations, NTLM/Kerberos byte volume, or authentication
+    frequency for a host or identity exceed its role-based percentile threshold?
+  context: >-
+    For each host and identity, compute daily counts of unique authentication destinations, NTLM/Kerberos
+    byte volume, and authentication frequency (events/min), then alert above percentile thresholds (e.g.,
+    95th) derived from local history or an enterprise authentication corpus (LANL User-Computer Authentication
+    Dataset). Overly broad credential transmission shows up as destination spread or volume well above
+    the host's normal range, which is exactly the scope erosion the Isolate tactic seeks to bound. Derive
+    thresholds per role: admin jump hosts have wider legitimate spread than user workstations, so a single
+    global threshold creates noise. A positive result is a workstation suddenly authenticating to dozens
+    of servers; a negative result is steady, role-consistent destination spread.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days, with per-role baselines
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      by entity in [host, identity], day:
+        uniq_dest = distinct(auth.dst);
+        byte_vol  = sum(ntlm_bytes + kerberos_bytes);
+        freq      = count(auth)/active_minutes;
+      thr = percentile_by_role(entity.role, metric, 95);
+
+      alert when uniq_dest>thr.dest or byte_vol>thr.vol or freq>thr.freq;
+
+      output entity, role, uniq_dest, byte_vol, freq, thresholds.
+- question: >-
+    Is there a sustained change point in the rate of cross-segment authentication edges or in the failed-to-successful
+    authentication ratio for any zone pair?
+  context: >-
+    Track rolling rates of cross-segment authentication edges and the failed-to-successful authentication
+    ratio by zone pair, and apply change-point detection (CUSUM, PELT, or Bayesian online change point)
+    to escalate sustained shifts that indicate scoping erosion. Separately profile Event ID 4625/4771
+    failure bursts as a distinct scope-probing signal. For the Isolate tactic, a sustained rise in cross-zone
+    authentication or in failure ratio signals that credentials are increasingly being presented outside
+    their intended scope, or that an actor is probing zone boundaries. LogonTracer applies ChangeFinder/HMM
+    scoring to the same logon streams. A positive result is a durable regime shift (not a transient spike);
+    a negative result is normal diurnal variation within historical bounds.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days, rolling windows with change-point scoring
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      by zone_pair, window:
+        edge_rate = count(cross_zone_auth)/window;
+        fail_ratio = count(EventID in [4625,4771]) / count(success_auth);
+      cp = changepoint(edge_rate) or changepoint(fail_ratio);  # CUSUM/PELT/BOCPD
+
+      alert when cp.sustained=true;
+
+      also alert when failure_burst(EventID in [4625,4771]) per src;
+
+      output zone_pair, change_time, pre/post rates, fail_ratio.
+- question: >-
+    When scored against a learned authentication graph, is a credential transmission occurring over a
+    first-time or low-probability source-to-destination edge?
+  context: >-
+    Build an authentication graph and score each new source-destination credential edge by its learned
+    probability; out-of-scope transmissions appear as low-probability or first-time edges. Surface the
+    top-3 contributing features (destination rarity, account privilege, byte volume) in the alert for
+    triage. Under the Isolate tactic, a brand-new credential edge that has never been observed is a prime
+    candidate for an unscoped or unauthorized transmission. The CyberGraph approach achieved 85% TPR at
+    0.9% FPR versus rule and non-graph baselines. A positive result is a low-probability edge to a rarely
+    contacted, sensitive destination; a negative result is a high-probability edge consistent with the
+    host's established graph neighborhood.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days for graph training, scoring new edges continuously
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      G = build_auth_graph(events over 90d);  # nodes=hosts/accounts, edges=auth
+
+      for edge in new_auth_events:
+        p = G.edge_probability(edge.src, edge.dst, edge.account);
+        feats = top3([dest_rarity, account_privilege, byte_volume]);
+      alert when p < threshold or edge.first_time=true;
+
+      output src, dst, account, probability, contributing_features.
+- question: >-
+    Do reconstructed causal login paths, scored by anomaly detection, rank any credential transmission
+    path as likely out-of-scope lateral movement?
+  context: >-
+    Reconstruct causal login paths and the responsible user from enterprise authentication logs, then
+    combine deterministic detection rules with an anomaly-scoring algorithm to rank the credential-transmission
+    paths most likely to be out-of-scope lateral movement. Emit the contributing path features (rare destination,
+    privilege escalation along the path) for triage. This directly serves the Isolate tactic by tracing
+    multi-hop credential flows that quietly extend a credential's scope across the network. The Hopper
+    approach validated at fewer than 9 alerts/day over 780M logins with 94.5% detection. A positive result
+    is a causal path that escalates privilege or reaches rare destinations across hops; a negative result
+    is a benign single-hop or well-established path.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days for path reconstruction and scoring
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      paths = reconstruct_causal_login_paths(auth_logs);  # attribute responsible user
+
+      score = anomaly_model(paths) combined_with deterministic_rules;
+
+      feats = path_features(rare_destination, privilege_escalation_along_path);
+
+      rank by score desc;
+
+      alert on top paths; output responsible_user, path_hops, score, feats.
+- question: >-
+    Do graph representation-learning embeddings flag any authenticating entity or trust edge as an anomalous
+    node/edge warranting scoping or isolation?
+  context: >-
+    Learn embeddings of authenticating entities and score anomalous nodes/edges in the authentication
+    or provenance graph to prioritize scoping and isolation decisions. Prefer self-supervised methods
+    that need no labeled attacks and tolerate concept drift (ThreaTrace, MAGIC, KAIROS), and surface the
+    top-3 features driving each score in the alert text. For the Isolate tactic, anomalous trust paths
+    in the embedding space reveal credentials traversing relationships that do not fit normal structure,
+    helping defenders decide where to tighten scope or isolate an entity. A positive result is an entity
+    or edge with a high anomaly score and explainable drivers; a negative result is an entity well embedded
+    within its expected trust neighborhood.
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek ntlm.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4769
+  - Windows Event ID 4771
+  - Windows Event ID 4672
+  - 'NAI: Domain Controllers, critical application servers, database servers, identity providers, and
+    network choke points.'
+  range: Last 90 days, with self-supervised retraining to tolerate drift
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      emb = graph_representation_learning(auth_or_provenance_graph);  # self-supervised
+
+      score = node_edge_anomaly(emb);
+
+      feats = top3_drivers(score);
+
+      alert when score >= threshold;
+
+      output entity_or_edge, anomaly_score, contributing_features, recommended_action.
