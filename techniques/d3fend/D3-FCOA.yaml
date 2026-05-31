@@ -1,0 +1,271 @@
+name: 'D3-FCOA: File Content Analysis'
+id: e31a9208-d221-491b-b4c8-71c1337c2a16
+description: This playbook helps an analyst investigate whether files traversing the network or newly
+  created on endpoints contain malicious payloads, using static (non-executed) content analysis. It identifies
+  likely-malicious files through known-bad hash and YARA rule matches, web-shell and server-script signatures,
+  suspicious script/macro tokens, abnormal byte entropy and low printable-string ratios, script-obfuscation
+  scoring, low-prevalence/high-velocity behavior relative to enterprise baselines, and explainable machine-learning
+  classifiers for both binaries and source code. The approach layers deterministic signatures (the floor)
+  with cohort-relative statistical outlier detection and parallel ML classifiers so that detections are
+  granular, defensible, and immediately actionable for triage and containment.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: When a file is observed being transferred across the network (Zeek files.log) or created on
+    an endpoint (Sysmon Event ID 11), does its SHA256 hash match a curated threat-intelligence hash feed,
+    or does its content match a high-confidence YARA rule (e.g., Neo23x0 signature-base, Cobalt Strike
+    beacon rules)?
+  context: This is the deterministic floor of file-content detection. For every file seen in network transfer
+    or written to disk, compute SHA256 and compare it against locally cached, offline threat-intelligence
+    hash feeds (no mandatory live API call, so detection works air-gapped). For executables, scripts,
+    macros, and Office documents, run YARA rules from the Neo23x0 signature-base and beacon-specific rules
+    such as apt_cobaltstrike.yar. A direct hash match or high-confidence YARA hit is a strong, defensible
+    positive that warrants a priority alert enriched with host, user, file path, source IP, and the transfer
+    byte count/direction pulled from Zeek conn.log. A negative result does not clear the file; it simply
+    means no known-bad signature applied, and the statistical and ML methods in this playbook should still
+    run. In the Detect tactic this gives the SOC immediate, low-false-positive identification of known
+    tooling crossing the perimeter or landing on hosts.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Windows Sysmon Event ID 11
+  - Threat-intel hash feeds (offline/cached)
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ON file_event FROM (zeek_files OR sysmon_eid=11):\n  sha256 = compute_sha256(file)\n  IF sha256\
+      \ IN ti_hash_feed_cached: ALERT priority='high', reason='known-bad hash'\n  yara_hits = yara_scan(file,\
+      \ rules=['signature-base/*','apt_cobaltstrike.yar'])\n  IF yara_hits AND confidence(yara_hits) >=\
+      \ HIGH: ALERT priority='high', reason=yara_hits\n  ENRICH alert WITH host, user, file_path, src_ip,\
+      \ conn_bytes, direction FROM zeek_conn"
+  - technology: Zeek/pseudocode
+    query: 'files.log
+
+      | where mime_type in (''application/x-dosexec'',''text/x-script'',''application/vnd.ms-office'')
+
+      | lookup sha256 in ti_hash_feed
+
+      | join conn.log on uid -> orig_h, resp_h, orig_bytes, resp_bytes
+
+      | where hash_match OR yara_high_confidence'
+- question: Are new or modified server-side scripts (.php, .aspx, .jsp) being written to web-server document
+    roots (Sysmon Event ID 11 on IIS/Apache/Nginx hosts) or uploaded over HTTP (Zeek http.log/files.log)
+    that match web-shell signatures or differ from the deployment gold image?
+  context: Web shells are a primary persistence and access mechanism for external actors who compromise
+    internet-facing servers. Watch the document roots of IIS, Apache, and Nginx hosts for newly created
+    or modified server-side script files via Sysmon Event ID 11, and watch HTTP uploads via Zeek http.log/files.log.
+    Apply NSA/ASD 'Mitigating Web Shells' signatures and compare every server-side script against a known-good
+    gold-image baseline of the deployed application. A positive is any .php/.aspx/.jsp that matches a
+    web-shell pattern or that does not exist in (or differs from) the authorized deployment. This is high-value
+    because legitimate web apps rarely change their script set outside of controlled deployments, so deviations
+    are strongly suspicious. A negative means the file set matches the gold image. For the Detect tactic
+    this catches the establishment of attacker footholds on the most exposed assets.
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - Windows Sysmon Event ID 11
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ON file_write (sysmon_eid=11) WHERE path UNDER web_doc_roots\n   OR ON http_upload (zeek_http\
+      \ POST with file payload):\n  IF ext IN ['.php','.aspx','.jsp']:\n    IF matches_webshell_signature(file,\
+      \ ruleset='Mitigating-Web-Shells'): ALERT\n    IF file NOT IN gold_image_baseline OR hash != gold_image_hash(path):\
+      \ ALERT reason='deviation from gold image'"
+  - technology: Zeek/pseudocode
+    query: 'http.log
+
+      | where method==''POST'' and uri matches web_root_path
+
+      | join files.log on uid
+
+      | where filename =~ ''\.(php|aspx|jsp)$'' and (webshell_sig_hit or not in gold_image)'
+- question: Do newly introduced or downloaded script and macro-capable files contain deterministic obfuscation
+    or auto-execution tokens, such as PowerShell -enc/-e encoded flags, VBA auto-run names (AutoOpen,
+    Document_Open), or Shell/WScript launch strings?
+  context: Many initial-access and execution chains rely on lightly obfuscated scripts or macro-enabled
+    documents. Perform deterministic token checks against script and macro-capable files using rules like
+    gen_powershell_obfuscation.yar and the Sigma 'encoded PowerShell command line' rule (looking for -enc/-e
+    flags), plus VBA auto-run entry points such as AutoOpen and Document_Open, and Shell/WScript launch
+    strings used to spawn payloads. The analyst is looking for these high-signal text patterns inside
+    files that are newly created on endpoints or freshly downloaded from external sources. A positive
+    indicates likely malicious automation or staged execution; a negative means none of the known token
+    patterns matched, though statistical obfuscation scoring (next question) may still flag it. In the
+    Detect tactic this surfaces weaponized documents and scripts before or as they execute.
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Windows Sysmon Event ID 1
+  - Zeek http.log
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ON file (sysmon_eid=11) OR process_create (sysmon_eid=1) WHERE file_type IN ['script','macro_doc']:\n\
+      \  tokens = scan(file, rules=['gen_powershell_obfuscation.yar'])\n  IF cmdline ~ '-enc|-e ' (base64)\
+      \ OR\n     content ~ 'AutoOpen|Document_Open' OR\n     content ~ 'WScript.Shell|Shell(' :\n    ALERT\
+      \ reason='suspicious script/macro token', evidence=tokens"
+- question: Which observed files have byte-level Shannon entropy above the 95th percentile, or a printable-string
+    ratio below the 5th percentile, for their file-type cohort — indicating likely packing or encryption?
+  context: Packed or encrypted payloads exhibit much higher byte entropy than native code (commonly >7.0-7.2
+    versus ~5.0-6.5), and they tend to have a low ratio of printable strings. Compute Shannon entropy
+    and printable-string ratio per file, grouped by file type and business context, and use cohort-relative
+    cutoffs derived from a 30-day clean baseline rather than a single global threshold (which produces
+    excessive false positives because, e.g., compressed media is legitimately high-entropy). Flag files
+    above the 95th percentile entropy or below the 5th percentile printable ratio for their cohort. A
+    positive suggests the file is packed/encrypted and warrants deeper inspection or correlation with
+    the hash/YARA and ML methods; a negative means the file looks structurally normal for its type. In
+    the Detect tactic this is a content-agnostic way to surface obfuscated payloads that evade signatures.
+  answer_sources:
+  - Zeek files.log
+  - Windows Sysmon Event ID 11
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days (baseline thresholds derived from a 30-day clean window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each file:\n  entropy = shannon_entropy(bytes)\n  printable_ratio = printable_chars /\
+      \ total_bytes\nGROUP BY file_type:\n  p95_entropy = percentile(entropy, 95) OVER 30d_clean_baseline\n\
+      \  p05_printable = percentile(printable_ratio, 5) OVER 30d_clean_baseline\nALERT WHERE entropy >\
+      \ p95_entropy OR printable_ratio < p05_printable"
+- question: Do any scripts have an obfuscation score (based on character-frequency, token, and AST-structure
+    deviation from a known-good corpus) that exceeds the 99th percentile of the baseline?
+  context: Beyond simple token matching, obfuscated scripts can be detected statistically by how far their
+    character-frequency distribution, token mix, and abstract-syntax-tree structure deviate from a known-good
+    corpus. Implement scoring in the spirit of Revoke-Obfuscation and the hybrid entropy/token feature
+    work of Fang et al. The analyst computes these features for each observed script and compares the
+    resulting obfuscation score against the distribution of a clean baseline corpus. Alert on scripts
+    whose score exceeds the 99th percentile. A positive indicates the script is structurally anomalous
+    in ways consistent with obfuscation (string concatenation, character math, reordered tokens), even
+    when no literal signature matches; a negative means it resembles normal administrative scripting.
+    This complements the deterministic token check and catches novel obfuscation in the Detect tactic.
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Windows Sysmon Event ID 1
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each script file:\n  feats = char_freq(file) + token_stats(file) + ast_structure_stats(file)\n\
+      \  score = deviation(feats, known_good_corpus_model)\nthreshold = percentile(score, 99) OVER baseline_corpus\n\
+      ALERT WHERE score > threshold"
+- question: Are there files that are simultaneously rare across the enterprise (bottom 1st percentile
+    of 30-day hash prevalence) AND newly spreading to multiple hosts within 24 hours, or arriving over
+    connections with abnormal HTTP 4xx/5xx ratios or from low-reputation/NXDOMAIN-prone sources?
+  context: 'Malware that is freshly deployed or targeted tends to be rare (low prevalence across hosts)
+    yet spreads quickly once an operation begins. Track 30-day file-hash prevalence via stack counting,
+    record first-seen time and spread velocity, and compute per-cohort file-size outliers. Apply baseline-deviation/fingerprinting
+    logic in the spirit of DECANTeR. Score as elevated risk any file that is both rare (bottom 1st percentile
+    prevalence) AND newly appearing on multiple hosts within 24 hours. Additionally treat delivery context
+    as a distinct signal: files arriving over connections with abnormal HTTP 4xx/5xx error ratios or originating
+    from low-reputation or NXDOMAIN-prone sources are more suspicious. A positive is a rare, fast-spreading,
+    or poorly-sourced file; a negative is a common, stable, well-sourced file. In the Detect tactic this
+    catches staged payloads and lateral propagation that signatures miss.'
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Sysmon Event ID 11
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days (30-day prevalence window; 24-hour spread correlation)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prevalence = count_distinct(host) PER sha256 OVER 30d
+
+      first_seen = min(timestamp) PER sha256
+
+      spread_24h = count_distinct(host) PER sha256 WHERE ts - first_seen <= 24h
+
+      rare = prevalence <= percentile(prevalence, 1)
+
+      fast = spread_24h >= 3
+
+      bad_delivery = http_4xx5xx_ratio(conn) ABNORMAL OR src_domain_reputation LOW OR nxdomain_prone
+
+      ALERT WHERE (rare AND fast) OR (rare AND bad_delivery)'
+- question: When scored by a gradient-boosted static classifier trained on EMBER-style PE features (byte/entropy
+    histograms, imports, header/section traits, file size, n-grams) plus prevalence, parent process, and
+    source reputation, does any new file receive a maliciousness probability above 0.85?
+  context: A supervised ML classifier can generalize beyond known signatures. Train a gradient-boosted
+    model on EMBER-style static PE features (byte and entropy histograms, imported functions, PE header
+    and section characteristics, file size, byte n-grams) augmented with operational context such as enterprise
+    prevalence, parent process, and source reputation; raw-byte models like MalConv can optionally complement
+    it. All features are derivable from first-party file captures, so no sample needs to leave the environment.
+    Score every new file and route any with probability above 0.85 to analyst review and containment.
+    Critically, this runs in PARALLEL with — never replacing — the deterministic hash/YARA floor, so a
+    model miss does not blind the SOC. A positive (high score) means the static feature profile resembles
+    known malware; a negative means it does not. In the Detect tactic this catches novel and polymorphic
+    binaries that lack signatures.
+  answer_sources:
+  - Zeek files.log
+  - Windows Sysmon Event ID 11
+  - Windows Sysmon Event ID 1
+  - Threat-intel hash feeds (offline/cached)
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "FOR each new PE file:\n  feats = ember_features(file) + [prevalence, parent_process, source_reputation]\n\
+      \  prob = gbdt_model.predict_proba(feats)  # optionally ensemble with malconv(raw_bytes)\n  IF prob\
+      \ > 0.85: ROUTE to analyst_review + containment\n  ALWAYS run in parallel with hash/YARA deterministic\
+      \ floor"
+- question: For every ML alert raised, does the alert surface the top-3 contributing features via SHAP/LIME
+    (e.g., 'high section entropy, suspicious import VirtualAllocEx, rare prevalence') rather than only
+    a numeric score?
+  context: An unexplained ML score is hard to triage and tune. Require every model alert to include the
+    top-3 contributing features computed with SHAP/LIME (as in the CNN-GRU XAI model and TreeSHAP rule
+    extraction on EMBER), so analysts see concrete reasons such as 'high section entropy', 'suspicious
+    import VirtualAllocEx', or 'rare prevalence'. The analyst uses these explanations to confirm true
+    positives quickly, identify systematic false-positive drivers, and feed corrections back into tuning.
+    A positive outcome here is an alert that is human-interpretable and defensible; a missing explanation
+    is itself a process gap to remediate. In the Detect tactic this makes ML-based file detection auditable
+    and trustworthy, which is essential when recommending containment.
+  answer_sources:
+  - Zeek files.log
+  - Windows Sysmon Event ID 11
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "ON ml_alert:\n  explanation = shap_or_lime(model, feats)\n  top3 = top_n(explanation, 3)\n\
+      \  REQUIRE alert.contains(top3)  # e.g. ['section_entropy','import:VirtualAllocEx','rare_prevalence']\n\
+      \  IF alert lacks explanation: FLAG process_gap"
+- question: When server-side scripts and downloaded code are classified by a semantic code model (e.g.,
+    CodeBERT-based web-shell detection), do any receive a high-confidence malicious classification — including
+    obfuscated or multi-language shells that evade keyword/YARA matching?
+  context: Keyword and YARA matching miss obfuscated and multi-language web shells. A semantic code model
+    such as CodeBERT-based web-shell detection understands code structure and intent, generalizing to
+    shells that are obfuscated or written in unexpected languages. Apply it to server-side scripts and
+    downloaded code, alert on high-confidence malicious classifications, and correlate each hit with the
+    deterministic web-shell signature check earlier in this playbook so signature and model evidence reinforce
+    one another. A positive is a high-confidence semantic classification of the file as a shell/malicious
+    code; a negative means the model deems it benign, though signatures and gold-image comparison still
+    apply. In the Detect tactic this strengthens detection of attacker footholds on web-facing servers
+    and of malicious code pulled to endpoints.
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - Windows Sysmon Event ID 11
+  - 'NAI: Network egress/ingress points (web, mail, file transfer), user workstations, and critical/internet-facing
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "FOR each server_side_script OR downloaded_code:\n  pred = codebert_webshell_model.classify(file_content)\n\
+      \  IF pred.label=='malicious' AND pred.confidence >= HIGH:\n    ALERT reason='semantic web-shell\
+      \ classification'\n    CORRELATE with deterministic_webshell_signature_check"
