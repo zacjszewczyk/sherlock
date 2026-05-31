@@ -1,0 +1,538 @@
+name: 'T1110: Brute Force'
+id: d1f98567-6d91-4b70-abb2-258ffbed90cd
+description: 'Investigate suspected brute-force credential access against authentication services across
+  Windows, Linux, macOS, network devices, identity providers, SaaS, IaaS, and on-premises domain infrastructure.
+  This playbook helps an analyst hunt for and triage repetitive or iterative password-guessing activity:
+  high-volume single-account brute forcing, dictionary attacks against default/administrative accounts,
+  low-and-slow password spraying across many accounts, credential-stuffing using breached credentials,
+  and the critical failure-then-success transition that indicates a guessed password actually worked.
+  It correlates failed and successful authentication events (Windows Event IDs 4625/4776/4624, auditd
+  USER_LOGIN, sshd, macOS unified logs, Entra ID/Okta and M365/SaaS sign-in logs) with network flow (Zeek
+  conn.log/http.log), threat-intelligence on brute-force infrastructure, and breached-credential watchlists,
+  layering deterministic rules, statistical baselining, and machine-learning detection so analysts can
+  distinguish a genuine campaign from benign authentication noise and confirm account compromise.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are failed authentication events originating from a source IP, ASN, or user-agent that matches
+    a threat-intelligence feed of known brute-force infrastructure?
+  context: Credential Access via brute force often comes from infrastructure already catalogued in TI
+    feeds (botnets, anonymizing VPNs, residential proxies, prior attack sources). For each failed authentication
+    event (Windows 4625/4776, auditd, sshd, or matching Zeek http.log/conn.log entry) extract the source
+    IP, ASN, and user-agent and compare them deterministically against known brute-force infrastructure
+    feeds, alerting on exact matches. This rule should remain the always-on floor even when scoring/ML
+    layers are disabled. A positive match against an externally-facing auth service is a high-confidence
+    indicator that an external actor is actively probing your perimeter; a negative result does not clear
+    the source but removes the TI-corroborated escalation.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4776
+  - Zeek conn.log
+  - Zeek http.log
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing authentication services (e.g., VPN, OWA, RDP gateways), cloud identity providers
+    (e.g., Microsoft Entra ID, Okta), perimeter firewalls, web application firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=auth (EventCode=4625 OR EventCode=4776 OR source=auditd OR source=zeek)
+
+      | eval src=coalesce(src_ip,IpAddress,id.orig_h)
+
+      | lookup ti_bruteforce_infra ip AS src OUTPUT threat_name
+
+      | lookup ti_bruteforce_ua user_agent OUTPUT ua_threat
+
+      | where isnotnull(threat_name) OR isnotnull(ua_threat)
+
+      | stats count, values(user) AS targeted_users by src, asn, threat_name
+
+      | alert severity=high'
+- question: Do the usernames (or, where available, offline credential hashes) used in failed authentications
+    match a breached-credential watchlist?
+  context: Adversaries running credential-stuffing reuse credentials harvested from prior breaches, so
+    authentication failures (or successes) involving known-breached credentials are far more likely to
+    be malicious. Enrich each authenticating username, and where credential hashes are available offline,
+    by set-membership against a breached-credential corpus using k-anonymity prefixing so no plaintext
+    credential leaves the boundary. Escalate brute-force/credential-stuffing alerts when a match is present.
+    A hit means the attacker is likely working from a curated breach list and may already possess valid
+    credentials; treat any subsequent success as probable compromise. This is a deterministic enrichment
+    that strengthens, not replaces, volumetric detection.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4776
+  - Zeek conn.log
+  - Zeek http.log
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing authentication services (e.g., VPN, OWA, RDP gateways), cloud identity providers
+    (e.g., Microsoft Entra ID, Okta), perimeter firewalls, web application firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=auth (EventCode=4625 OR EventCode=4776 OR source=auditd OR source=zeek)
+
+      | eval pfx=substr(sha1(lower(user)),1,5)
+
+      | lookup breached_cred_kanon prefix AS pfx OUTPUT suffix_set
+
+      | where match_kanon(sha1(lower(user)), suffix_set)
+
+      | stats count, values(src_ip) AS sources by user
+
+      | alert severity=high reason="breached credential used"'
+- question: Which source IPs or ASNs exhibit a 1-hour failed-authentication rate or failure-to-total ratio
+    above their 30-day baseline?
+  context: Brute forcing produces an abnormal volume and proportion of failed authentications from the
+    offending source. Score each source IP/ASN by its 1-hour failed-authentication rate (volume metric)
+    and its failure-to-total ratio (state metric), then flag values above the 95th percentile of the 30-day
+    per-entity baseline, boosting risk for ASNs in the bottom 10% of historical reputation. Derive percentile
+    cutoffs per dataset rather than hard-coding them so the detection adapts to each environment. A source
+    sitting in the tail of both rate and ratio distributions, especially from a low-reputation ASN, is
+    a strong brute-force candidate even if it never tripped a TI match.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4776
+  - Zeek conn.log
+  - Zeek http.log
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing authentication services (e.g., VPN, OWA, RDP gateways), cloud identity providers
+    (e.g., Microsoft Entra ID, Okta), perimeter firewalls, web application firewalls'
+  range: Last 90 days; compute 30-day rolling baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth EventCode IN (4625,4776) OR result IN (success,failure)
+
+      | bin _time span=1h
+
+      | stats count(eval(outcome="failure")) AS fails, count AS total by _time, src_ip, asn
+
+      | eval fail_ratio=fails/total
+
+      | eventstats p95(fails) AS p95_fails, p95(fail_ratio) AS p95_ratio by src_ip
+
+      | where fails>p95_fails AND fail_ratio>p95_ratio
+
+      | lookup asn_reputation asn OUTPUT rep_decile
+
+      | eval risk=if(rep_decile<=1,risk+1,risk)'
+- question: What is the distribution of authentication failure/error codes per source, and is a bad-password
+    code dominating at high volume?
+  context: 'Different failure codes tell different stories: Windows 4625 sub-status 0xC000006A (bad password)
+    versus 0xC0000064 (unknown user), Entra ID error 50126 (invalid credential), and various SSH auth
+    failures. Track the distribution of these codes per source and alert when bad-password failures dominate
+    at high volume, treating mixes of NXDOMAIN/blocked/failed-logon codes as a distinct campaign signal.
+    A source overwhelmingly generating bad-password failures against valid usernames indicates true password
+    guessing rather than misconfiguration or user typos; a source generating mostly unknown-user errors
+    suggests username enumeration. This profiling separates targeted brute force from benign noise.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4776
+  - Zeek conn.log
+  - Zeek http.log
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing authentication services (e.g., VPN, OWA, RDP gateways), cloud identity providers
+    (e.g., Microsoft Entra ID, Okta), perimeter firewalls, web application firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth EventCode IN (4625,4776) OR errorcode=*
+
+      | eval code=coalesce(SubStatus,errorcode,ssh_reason)
+
+      | stats count by src_ip, code
+
+      | eventstats sum(count) AS total by src_ip
+
+      | eval pct=count/total
+
+      | where code IN ("0xC000006A","50126") AND pct>0.8 AND total>20
+
+      | alert reason="bad-password code dominant"'
+- question: Does an ensemble brute-force classifier score authentication and flow activity from a source
+    above the tuned alerting threshold?
+  context: 'Volumetric and code-based rules miss cleverly paced or feature-blended attacks. Train an ensemble
+    (gradient-boosted trees / Random Forest) on first-party authentication and flow features: failed-attempt
+    counts, inter-arrival timing, packet/byte volumes (from Zeek conn.log), success/failure ratio, IP
+    geo/ASN, protocol, and user-agent. Alert when the model score exceeds a tuned threshold and surface
+    the top-3 contributing features (e.g., failure-rate, distinct-target breadth, ASN reputation) in the
+    alert text so analysts can triage. A high score with corroborating top features is strong evidence
+    of brute force; the feature attribution lets the analyst quickly confirm or dismiss.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4776
+  - Zeek conn.log
+  - Zeek http.log
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing authentication services (e.g., VPN, OWA, RDP gateways), cloud identity providers
+    (e.g., Microsoft Entra ID, Okta), perimeter firewalls, web application firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = build_auth_flow_features(src_ip, window=1h)  # fails, inter_arrival, bytes, ratio,\
+      \ geo, asn, proto, ua\nscore = bruteforce_ensemble.predict_proba(features)\nif score > TUNED_THRESHOLD:\n\
+      \    top3 = explain_top_features(features, n=3)\n    alert(src_ip, score, top3)"
+- question: Is a single source IP generating more than 10 failed logins against a curated list of default
+    or administrative account names within 5 minutes?
+  context: Attackers frequently target well-known privileged accounts ('admin', 'administrator', 'root',
+    'support') because compromising them yields immediate high-value access. Track failed logins (Windows
+    4625, auditd, sshd) against a curated default/admin username list per source IP over a 5-minute window
+    and alert when the count exceeds 10. Keep the explicit threshold and username list as a deterministic
+    floor, tuning the threshold just below the account-lockout limit so the attack is caught before it
+    locks accounts. A burst of admin-name failures from one source against a DC, RADIUS server, or device
+    management portal is a classic dictionary brute-force pattern warranting immediate triage.
+  answer_sources:
+  - Windows Event ID 4625
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, authentication servers (e.g., RADIUS), Linux/UNIX servers, database servers,
+    network device administration interfaces, and IoT/OT device management portals'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=auth (EventCode=4625 OR source=auditd OR source=sshd)
+
+      | lookup admin_default_users user OUTPUT is_admin_name
+
+      | where is_admin_name="true"
+
+      | bin _time span=5m
+
+      | stats count by _time, src_ip
+
+      | where count>10
+
+      | alert severity=high reason="admin dictionary brute force"'
+- question: Which source IPs show an admin-dictionary-failure-to-total-failure ratio above the 99th percentile
+    of the per-host baseline?
+  context: Even below the hard count threshold, a source whose failures are disproportionately aimed at
+    admin/default names is suspicious. Score each source IP by the ratio of admin-dictionary failures
+    to total failures within a 1-hour window (a state metric) and flag values above the 99th percentile
+    of the per-host baseline. Derive the cutoff per environment using distinct-count/streamstats baselining
+    rather than a static number. A source that normally has a low admin-failure ratio suddenly concentrating
+    on privileged names indicates targeted credential access against administrative accounts; this catches
+    slow attackers that the count rule misses.
+  answer_sources:
+  - Windows Event ID 4625
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, authentication servers (e.g., RADIUS), Linux/UNIX servers, database servers,
+    network device administration interfaces, and IoT/OT device management portals'
+  range: Last 90 days; 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth (EventCode=4625 OR source=auditd)
+
+      | lookup admin_default_users user OUTPUT is_admin_name
+
+      | bin _time span=1h
+
+      | stats count(eval(is_admin_name="true")) AS admin_fail, count AS total by _time, src_ip
+
+      | eval admin_ratio=admin_fail/total
+
+      | eventstats p99(admin_ratio) AS cutoff by src_ip
+
+      | where admin_ratio>cutoff'
+- question: Does an LSTM sequence model flag a source's username/event stream as a low-probability sequence
+    dense with admin or default names?
+  context: Dictionary attacks produce unusual ordered sequences of target usernames that differ from normal
+    authentication streams. Model the per-source username/event sequence with an LSTM trained on normal
+    authentication streams and flag low-probability sequences that are dense with admin/default names,
+    reporting the contributing high-surprise events for triage. The model learns the typical ordering
+    and identity of accounts that authenticate from each context, so a surprising run heavy with privileged
+    names scores as anomalous even when individual counts stay modest. The reported high-surprise events
+    let an analyst see exactly which guesses drove the alert.
+  answer_sources:
+  - Windows Event ID 4625
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, authentication servers (e.g., RADIUS), Linux/UNIX servers, database servers,
+    network device administration interfaces, and IoT/OT device management portals'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seq = ordered_username_events(src_ip, window=1h)\nlogp = deeplog_lstm.sequence_logprob(seq)\n\
+      if logp < ANOMALY_THRESHOLD and admin_density(seq) high:\n    alert(src_ip, high_surprise_events(seq))"
+- question: Is a single user account receiving more than 20 failed logins from fewer than 3 source IPs
+    within 10 minutes, and does the targeted service show abnormal byte volume?
+  context: Focused brute force against one account produces a tight burst of failures from a small set
+    of sources. Alert when a single account receives more than 20 Windows 4625 (or auditd/sshd) failures
+    from fewer than 3 IPs within 10 minutes, correlating with Zeek conn.log to capture the target service
+    and connection byte/packet volume. Preserve this concrete count as the deterministic floor. The small-source,
+    high-count shape distinguishes targeted brute force from broad spraying; abnormal byte volume on the
+    auth connection can corroborate automated tooling. This pattern against RDP/VPN/webmail or a DC is
+    a high-priority indicator of a determined attacker working a single high-value account.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing services (RDP, VPNs, webmail), Domain Controllers, user workstations with
+    remote access enabled, critical application servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=auth (EventCode=4625 OR source=auditd OR source=sshd)
+
+      | bin _time span=10m
+
+      | stats count AS fails, dc(src_ip) AS src_count, values(src_ip) AS ips by _time, user
+
+      | where fails>20 AND src_count<3
+
+      | join user [search index=zeek source=conn.log | stats sum(orig_bytes) AS bytes by user, service]
+
+      | alert severity=high'
+- question: Does a user's 10-minute failed-logon count exceed 3 standard deviations (z>3) or the per-user
+    99th percentile of their 30-day baseline?
+  context: Each account has a normal level of authentication failures; a sharp departure from it signals
+    an attack. Baseline each user's 10-minute failed-logon counts over 30 days and flag intervals exceeding
+    3 standard deviations (z>3) or the per-user 99th percentile. Compute thresholds per user so chronically
+    noisy service accounts are not constantly flagged while quiet accounts are sensitively monitored.
+    A z-score spike on a normally quiet account is strong evidence of targeted brute force; the per-user
+    model dramatically reduces false positives compared with a global threshold.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing services (RDP, VPNs, webmail), Domain Controllers, user workstations with
+    remote access enabled, critical application servers'
+  range: Last 90 days; 30-day per-user baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth (EventCode=4625 OR source=auditd)
+
+      | bin _time span=10m
+
+      | stats count AS fails by _time, user
+
+      | eventstats avg(fails) AS mu, stdev(fails) AS sd, p99(fails) AS p99 by user
+
+      | eval z=(fails-mu)/sd
+
+      | where z>3 OR fails>p99'
+- question: Does change-point detection on the per-user or per-IP failed-logon time series reveal an abrupt
+    upward shift marking campaign onset?
+  context: Brute-force campaigns begin at a discrete moment, producing a step change in the failure rate.
+    Apply CUSUM or Bayesian online change-point detection to the per-user/per-IP failed-logon time series
+    and alert on an abrupt upward shift in failure rate that marks campaign onset, reporting the change-point
+    time and the pre/post rates. This catches the start of an attack even before absolute counts cross
+    volumetric thresholds, and the reported change-point timestamp gives the analyst a precise pivot for
+    scoping. A clear upward break in an otherwise stable series is a reliable onset signal.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing services (RDP, VPNs, webmail), Domain Controllers, user workstations with
+    remote access enabled, critical application servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "series = per_entity_failure_counts(entity, span=5m, window=30d)\ncp = cusum_or_bocpd(series)\n\
+      for change in cp where direction==up and magnitude high:\n    alert(entity, change.time, pre_rate=change.pre,\
+      \ post_rate=change.post)"
+- question: Do actual per-user failure counts exceed the upper confidence bound of a time-series forecast
+    model?
+  context: A forecasting model captures expected authentication-failure behavior including periodic and
+    trend components. Forecast per-user failure counts with a sequence/time-series model and alert when
+    actual counts exceed the upper confidence bound, surfacing the deviation magnitude and recent failure-code
+    mix as the top contributing features. Because the model accounts for normal variation, an exceedance
+    is a statistically meaningful anomaly rather than noise. The deviation magnitude prioritizes triage
+    and the failure-code mix tells the analyst whether the spike is bad-password guessing versus benign
+    errors.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - auditd:USER_LOGIN
+  - 'NAI: Externally-facing services (RDP, VPNs, webmail), Domain Controllers, user workstations with
+    remote access enabled, critical application servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = forecast_failures.fit(user_history)\nyhat, upper = model.predict(next_interval)\n\
+      if actual > upper:\n    alert(user, deviation=actual-upper, code_mix=recent_failure_codes(user))"
+- question: Is a single source generating failed logins against more than 50 distinct accounts with 3
+    or fewer failures each within 1 hour?
+  context: 'Password spraying flips the brute-force pattern: few guesses against many accounts to evade
+    lockout. Alert when a single source generates failed logins for more than 50 distinct accounts with
+    3 or fewer failures each within 1 hour, excluding known internal IP ranges to surface external sources.
+    Retain this distinct-user threshold as a deterministic floor. The broad-target, shallow-depth shape
+    is the signature of spraying against cloud IdPs, ADFS, or SSO-enabled web apps; excluding internal
+    ranges focuses on external actors. A positive result is a high-confidence spray indicator and should
+    trigger review for any concurrent success.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - azure:signinlogs
+  - m365:unified
+  - 'NAI: Cloud authentication services (e.g., Microsoft Entra ID, Okta), federated identity providers
+    (e.g., ADFS), Domain Controllers, externally-facing web applications with corporate SSO'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=auth (EventCode=4625 OR sourcetype=azure:signinlogs OR sourcetype=m365:unified)\n  outcome=failure\
+      \ NOT src_ip IN internal_ranges\n| bin _time span=1h\n| stats dc(user) AS distinct_users, count\
+      \ by _time, src_ip, user\n| stats max(count) AS max_per_user, dc(user) AS distinct_users by _time,\
+      \ src_ip\n| where distinct_users>50 AND max_per_user<=3\n| alert severity=high reason=\"password\
+      \ spray\""
+- question: Which source IPs show hourly distinct-username count and username entropy above the 98th percentile
+    with low per-account failure depth?
+  context: Spraying creates an unusually wide and uniform spread of target usernames. Compute each source
+    IP's hourly distinct-username count and username entropy and flag values above the 98th percentile
+    paired with a high distinct-target count and low per-account failure depth. Derive cutoffs from per-tenant
+    baselines. High entropy and breadth with shallow depth statistically captures the spray shape even
+    when the source stays under the hard distinct-user threshold or paces itself. A source whose username
+    diversity suddenly jumps into the distribution tail is a strong spray candidate.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - azure:signinlogs
+  - m365:unified
+  - 'NAI: Cloud authentication services (e.g., Microsoft Entra ID, Okta), federated identity providers
+    (e.g., ADFS), Domain Controllers, externally-facing web applications with corporate SSO'
+  range: Last 90 days; per-tenant baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth outcome=failure
+
+      | bin _time span=1h
+
+      | stats dc(user) AS distinct_users, count AS total, max(per_user_count) AS depth by _time, src_ip
+
+      | eval entropy=username_entropy(src_ip,_time)
+
+      | eventstats p98(distinct_users) AS du_cut, p98(entropy) AS ent_cut by tenant
+
+      | where distinct_users>du_cut AND entropy>ent_cut AND depth<=3'
+- question: Does a single bad-password failure/reason code span many distinct accounts from one source
+    or ASN?
+  context: A genuine spray uses the same wrong password across many accounts, producing one dominant failure
+    reason (e.g., Entra ID 50126 invalid-credential) spread across distinct users. Group sign-in failures
+    by error/reason code per source and per ASN and alert when a single bad-password reason spans many
+    accounts, distinguishing spray from benign misconfiguration as a distinct failure-state signal. Benign
+    breakage tends to cluster differently (token/MFA/config errors on few accounts), so a wide bad-password
+    fan-out is a clean spray discriminator that complements volumetric detection.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - azure:signinlogs
+  - m365:unified
+  - 'NAI: Cloud authentication services (e.g., Microsoft Entra ID, Okta), federated identity providers
+    (e.g., ADFS), Domain Controllers, externally-facing web applications with corporate SSO'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=auth (sourcetype=azure:signinlogs OR sourcetype=m365:unified OR EventCode=4625)
+
+      | eval code=coalesce(errorcode,SubStatus)
+
+      | stats dc(user) AS users_spanned, count by src_ip, asn, code
+
+      | where code IN ("50126","0xC000006A") AND users_spanned>30
+
+      | alert reason="single bad-password code across many accounts"'
+- question: Does a clustering or anomaly-scoring model detect low-and-slow distributed spraying across
+    source IPs and ASNs that evades per-IP thresholds?
+  context: Sophisticated actors distribute spraying across many IPs/ASNs so no single source trips a threshold.
+    Cluster/anomaly-score sign-in events across source IPs/ASNs using features such as distinct users
+    per IP/ASN, failure ratio, geo/ASN diversity, and time-of-day to catch low-and-slow distributed sprays,
+    reporting the top-3 contributing features per cluster. By scoring at the campaign level rather than
+    the per-IP level, this catches coordinated activity invisible to single-source rules. A coherent cluster
+    of low-volume sources targeting overlapping accounts is strong evidence of an orchestrated spray;
+    the feature attribution guides analyst confirmation.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - azure:signinlogs
+  - m365:unified
+  - 'NAI: Cloud authentication services (e.g., Microsoft Entra ID, Okta), federated identity providers
+    (e.g., ADFS), Domain Controllers, externally-facing web applications with corporate SSO'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feats = per_source_features(window=24h)  # distinct_users, fail_ratio, geo_div, asn_div, tod\n\
+      clusters = cluster_and_score(feats)\nfor c in clusters where anomaly_score(c) high:\n    alert(c.sources,\
+      \ top_features(c,3), shared_targets(c))"
+- question: Did a successful login occur for a user/source that had more than 10 failed login attempts
+    in the preceding 15 minutes?
+  context: The failure-then-success transition is the moment a brute-force attempt succeeds and is the
+    single most important signal of compromise. After each successful logon (Windows 4624 / IdP success
+    / sshd accepted), scan the prior 15 minutes for matching AccountName/ClientAddress failures and alert
+    when there are more than 10. Keep this deterministic correlation as the floor. A success immediately
+    following a burst of failures from the same source and account strongly indicates the attacker finally
+    guessed the password; on a DC, VPN concentrator, PAW, or cloud admin console this is a critical incident
+    requiring immediate containment and credential reset.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, critical asset servers, VPN concentrators, privileged access workstations,
+    cloud administration consoles'
+  range: Last 90 days; event-centered 15-minute lookback per success
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=auth (EventCode=4624 OR outcome=success OR ssh=accepted)\n| map search=\"search index=auth\
+      \ (EventCode=4625 OR outcome=failure) user=$user$ src_ip=$src_ip$\n    earliest=-15m@m latest=$_time$\
+      \ | stats count AS prior_fails\"\n| where prior_fails>10\n| alert severity=critical reason=\"brute\
+      \ force success transition\""
+- question: Is a successful login preceded by a failure count above the user's 99th-percentile baseline
+    for that source IP, especially for a novel source-target-account triple?
+  context: Not every success after a few failures is malicious, so baseline-relative scoring sharpens
+    detection. Flag successful logins preceded by failure counts above the user's 99th-percentile baseline
+    for that source IP, and weight novel source-target-account triples not observed in the 30-day history.
+    A success that follows an abnormally high preceding-failure count, particularly from a never-before-seen
+    source/account combination, is much more likely to be a successful brute force than a user fumbling
+    a known password from a familiar device. The novelty weighting catches first-time attacker footholds.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, critical asset servers, VPN concentrators, privileged access workstations,
+    cloud administration consoles'
+  range: Last 90 days; 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'successes = auth where outcome=success
+
+      | eval prior_fails=count_failures(user,src_ip,window=-15m)
+
+      | eventstats p99(prior_fails) AS cut by user,src_ip
+
+      | eval novel_triple=NOT seen_in_30d(src_ip,host,user)
+
+      | where prior_fails>cut OR novel_triple
+
+      | alert'
+- question: Does a model scoring successful logins on preceding failures, edge rarity, IP/ASN reputation,
+    and breach-watchlist membership indicate likely post-brute-force compromise?
+  context: Confirming compromise benefits from combining multiple weak signals. Score successful logins
+    with a model using preceding-failure count, time-since-last-success, source-target-account edge rarity,
+    IP/ASN reputation, and breach-watchlist membership, alerting on high probability and surfacing the
+    top-3 contributing features; graph-rank the involved accounts/hosts to confirm compromise. A high-probability
+    success enriched by rare edges, poor IP reputation, and breached credentials is compelling evidence
+    the brute force worked. Graph-ranking the affected accounts/hosts (as in LogonTracer) helps the analyst
+    scope blast radius and prioritize response on the most central, likely-compromised identities.
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - azure:signinlogs
+  - auditd:USER_LOGIN
+  - 'NAI: Domain Controllers, critical asset servers, VPN concentrators, privileged access workstations,
+    cloud administration consoles'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feats = success_features(event)  # prior_fails, time_since_success, edge_rarity, ip_rep, breach_hit\n\
+      p = post_brute_model.predict_proba(feats)\nif p > THRESHOLD:\n    rank = graph_rank(accounts,hosts)\
+      \  # LogonTracer-style\n    alert(event, p, top_features(feats,3), rank)"
