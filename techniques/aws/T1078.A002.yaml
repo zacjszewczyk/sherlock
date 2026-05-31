@@ -1,0 +1,461 @@
+name: 'T1078.A002: Root User Abuse'
+id: aba1abdc-9bc4-49bd-b12d-2883bcfcf0c5
+description: Investigate whether an adversary has gained or expanded unauthorized access in AWS by abusing
+  the account root user. The AWS root user has unrestricted access to every service and resource in an
+  account, so any root authentication or root-attributed API activity outside a documented break-glass
+  procedure is high risk. This playbook helps an analyst determine whether root sign-in or activity is
+  inconsistent with expected emergency use - for example a console login from unfamiliar infrastructure,
+  activity outside approved maintenance windows, missing MFA, or immediate movement into identity, billing,
+  security, or organization control APIs that signals unauthorized initial entry. It then follows the
+  session into actions that establish, preserve, or expand control - creating or restoring credentials
+  (CreateAccessKey, CreateLoginProfile), attaching admin policies, weakening detective and preventive
+  guardrails (StopLogging/DeleteTrail, GuardDuty/Security Hub changes, SCP edits), and AWS Organizations
+  sts:AssumeRoot abuse. Methods span symbolic-logic detections, statistical baselining and rarity/first-seen
+  analysis, and machine-learning sequence and behavioral models so the SOC has granular, defensible coverage
+  of root-user abuse from initial access through persistence enablement.
+type: technique
+related:
+- tactic_id: TA0001
+  tactic_name: Initial Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did the AWS account root user successfully authenticate or perform root-attributed API activity
+    (CloudTrail userIdentity.type=Root) that is NOT an AWS service event and does NOT map to a documented
+    break-glass procedure, an approved maintenance window, or an expected account-recovery process - and
+    was that activity made riskier by missing MFA, a new source IP/ASN/country/user-agent for root, or
+    a correlated GuardDuty Policy:IAMUser/RootCredentialUsage finding?
+  context: In the Initial Access tactic, the root user is the single most powerful identity in an AWS
+    account and should almost never be used; any legitimate use is confined to a tiny allow-list of tasks
+    that genuinely require root. Alert on successful root ConsoleLogin (event.provider=signin.amazonaws.com,
+    eventName=ConsoleLogin, responseElements.ConsoleLogin=Success) and on any root-attributed API call,
+    excluding only AWS service events and the documented break-glass/maintenance/recovery exceptions.
+    Raise severity when MFA was not used, when the source IP/ASN/country/user-agent is new for root, or
+    when GuardDuty raises Policy:IAMUser/RootCredentialUsage. A positive result is a strong indicator
+    of unauthorized initial entry using the most privileged credential available; a negative result means
+    root activity matched a sanctioned exception. Validate the detection with emulated root activity (Stratus
+    Red Team).
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail ConsoleLogin events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Organizations service event logs
+  - AWS Health Dashboard event history
+  - 'NAI: Management accounts and member accounts where root use is rare, CloudTrail records for root
+    ConsoleLogin and management events, and organization-level monitoring for privileged account activity'
+  range: Last 90 days (alert per root session; pivot 1 hour before/after sign-in)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (userIdentity.type="Root")
+
+      | where NOT userIdentity.invokedBy="*.amazonaws.com" AND eventType!="AwsServiceEvent"
+
+      | eval is_login=(eventName="ConsoleLogin" AND responseElements.ConsoleLogin="Success")
+
+      | lookup root_allowlist task OUTPUT is_allowed
+
+      | lookup breakglass_windows time OUTPUT in_window
+
+      | where NOT is_allowed AND NOT in_window
+
+      | eval new_src=NOT [Root,sourceIPAddress,asn,country,userAgent] in root_baseline
+
+      | eval no_mfa=(additionalEventData.MFAUsed!="Yes")
+
+      | eval sev=case(guardduty_finding="Policy:IAMUser/RootCredentialUsage","high", no_mfa OR new_src,"high",
+      true(),"medium")
+
+      | alert'
+- question: Are there repeated failed root ConsoleLogin attempts (event.outcome=failure) from the same
+    source IP or against the same account - for example five or more failures in ten minutes, or above
+    the 99th percentile of that account's historical daily root failures - and did any of them transition
+    from failure to a successful root sign-in from the same source within the window?
+  context: 'Failed root authentication is a distinct, high-signal precursor to Initial Access: because
+    root should rarely if ever log in, even a handful of failures is abnormal and may indicate password
+    guessing or credential-stuffing against the most privileged account. Profile failed root logins (state=failure)
+    per source IP/account, starting at a threshold of >=5 failures in 10 minutes and then deriving the
+    environment-specific threshold from the 99th percentile of historical daily root failures. Escalate
+    immediately on any fail-then-success transition from the same source IP inside the window, which suggests
+    a successful brute force. Correlate with bursts of errorCode=AccessDenied/Client.UnauthorizedOperation
+    (>=10 in 5 minutes, tuned per account) that indicate post-access permission probing. A positive result
+    signals an active attempt to seize the root account; a negative result reflects normal, isolated authentication
+    noise.'
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail ConsoleLogin events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Organizations service event logs
+  - AWS Health Dashboard event history
+  - 'NAI: Management accounts and member accounts where root use is rare, CloudTrail records for root
+    ConsoleLogin and management events, and organization-level monitoring for privileged account activity'
+  range: Last 90 days (alert on a 10-minute sliding window; correlate AccessDenied bursts within 5 minutes)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail userIdentity.type="Root" eventName="ConsoleLogin"
+
+      | eval outcome=if(responseElements.ConsoleLogin="Failure","failure","success")
+
+      | bin _time span=10m
+
+      | stats count(eval(outcome="failure")) as fails values(outcome) as outcomes by sourceIPAddress,
+      recipientAccountId, _time
+
+      | eventstats p99(fails) as acct_p99 by recipientAccountId
+
+      | where fails >= max(5, acct_p99)
+
+      | eval brute_then_success=if("failure" in outcomes AND "success" in outcomes,1,0)
+
+      | join sourceIPAddress [ search source=cloudtrail (errorCode="AccessDenied" OR errorCode="Client.UnauthorizedOperation")
+      earliest=-5m | stats count as denials by sourceIPAddress | where denials>=10 ]
+
+      | alert'
+- question: Does a given root session fall outside the narrow historical envelope of legitimate root use
+    for that account - i.e., is it a first-seen combination of (root principal x API action x region x
+    source IP) over the trailing 90 days, or does its timing, source network/ASN, user-agent family, API
+    mix, or request count deviate from the small baseline of sanctioned break-glass events?
+  context: Root activity is an extreme outlier by design, so rarity-based detection is highly effective
+    for Initial Access. Baseline the small set of legitimate root uses per account by time-of-day, source
+    network/ASN, user-agent family, and API family, then flag any root session whose timing, source, service
+    mix, or request count falls outside that narrow historical envelope. Implement first-seen detection
+    over (root principal x API action x region x source IP not seen in the trailing 90 days), and add
+    CloudWatch metric filters on root ConsoleLogin and root API counts with band anomaly-detection alarms
+    that fire when count or off-hours timing exceeds the learned band. A positive result means root is
+    being used in a way never seen before for this account - a hallmark of takeover; a negative result
+    means the session matches the established break-glass envelope.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail ConsoleLogin events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Organizations service event logs
+  - AWS Health Dashboard event history
+  - 'NAI: Management accounts and member accounts where root use is rare, CloudTrail records for root
+    ConsoleLogin and management events, and organization-level monitoring for privileged account activity'
+  range: Last 90 days (first-seen lookback 90 days; evaluate per session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail userIdentity.type="Root" earliest=-90d
+
+      | inputlookup append=t root_baseline.csv
+
+      | eval first_seen=if(NOT [Root,eventName,awsRegion,sourceIPAddress] in baseline,1,0)
+
+      | stats count as reqs values(eventSource) as services dc(eventName) as api_breadth by sourceIPAddress,
+      userAgent, date_hour
+
+      | eventstats avg(reqs) as mu stdev(reqs) as sd p99(api_breadth) as breadth_band
+
+      | eval offhours=if(date_hour<6 OR date_hour>20,1,0)
+
+      | where first_seen=1 OR reqs > mu+3*sd OR api_breadth > breadth_band OR offhours=1
+
+      | alert'
+- question: When root and near-root administrative sessions are clustered by source context (IP/ASN/geo/user-agent),
+    action ordering, and service breadth, do any clusters separate from the rare legitimate break-glass
+    pattern - especially clusters that begin with sign-in and rapidly move into identity, billing, or
+    organization control APIs?
+  context: Unsupervised clustering helps an analyst distinguish the few legitimate break-glass sessions
+    from suspicious takeover activity during Initial Access, even when each individual event looks plausible.
+    Cluster root and near-root administrative sessions by source context (IP/ASN/geo/user-agent), the
+    ordering of actions, and the breadth of services touched, using rare-function and population analysis
+    over CloudTrail. Escalate clusters that start with a sign-in and then rapidly pivot into identity-management,
+    billing, or organization-control APIs, and surface the top contributing field (rare API, novel geo/IP)
+    in the alert text so triage is explainable. A positive result isolates a session whose shape differs
+    from sanctioned emergency use; a negative result groups the session with known-good break-glass behavior.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail ConsoleLogin events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Organizations service event logs
+  - AWS Health Dashboard event history
+  - 'NAI: Management accounts and member accounts where root use is rare, CloudTrail records for root
+    ConsoleLogin and management events, and organization-level monitoring for privileged account activity'
+  range: Last 90 days (build population/cluster model over 30-90 days; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Cluster root / near-root admin sessions and isolate takeover-shaped clusters
+
+      featurize session: [sourceIP, asn, geo, userAgent, action_sequence, service_breadth, login_to_sensitive_latency]
+
+      | ml rare_function(field=eventName, influencers=[userIdentity.arn, sourceIPAddress, geo])
+
+      | cluster sessions -> cluster_id, distance_to_breakglass_centroid
+
+      | eval pivot=match(action_sequence,"ConsoleLogin.*(iam:|account:|organizations:)")
+
+      | where distance_to_breakglass_centroid>thr OR pivot=1
+
+      | emit cluster_id, top_contributing_field'
+- question: Does a behavioral model score a root session as likely compromise based on features such as
+    source novelty, MFA state, service progression, identity-management actions, billing interactions,
+    and control-plane breadth - particularly rapid sign-in-to-sensitive-action transitions - and do managed
+    GuardDuty behavioral findings (anomalous IAM behavior, impossible travel, malicious/Tor source IP
+    console logins) corroborate it?
+  context: A supervised/behavioral model lets an analyst rank root sessions by compromise likelihood during
+    Initial Access rather than relying on a single rule. Score features including source novelty, whether
+    MFA was used, the progression of services touched, identity-management actions, billing interactions,
+    and control-plane breadth, favoring alerts on rapid sign-in-to-sensitive-action transitions, and emit
+    the top-3 contributing features for triage. Complement the model with managed GuardDuty behavioral
+    findings - anomalous IAM behavior, impossible travel, and console logins from malicious or Tor source
+    IPs - which are trained on the account's CloudTrail/VPC/DNS baseline. A positive result is a high-confidence,
+    explainable indicator of root takeover; a negative result lowers suspicion when features resemble
+    sanctioned use.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail ConsoleLogin events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Organizations service event logs
+  - AWS Health Dashboard event history
+  - 'NAI: Management accounts and member accounts where root use is rare, CloudTrail records for root
+    ConsoleLogin and management events, and organization-level monitoring for privileged account activity'
+  range: Last 90 days (train on 30-90 days; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Behavioral compromise scoring for root sessions + managed findings
+
+      featurize session: [source_novelty, mfa_used, service_progression, iam_action_count, billing_actions,
+      control_plane_breadth, login_to_sensitive_latency]
+
+      | score root_compromise_model -> risk, shap_top3
+
+      | union guardduty_findings(type in ["UnauthorizedAccess:IAMUser/AnomalousBehavior","UnauthorizedAccess:IAMUser/MaliciousIPCaller","UnauthorizedAccess:IAMUser/TorIPCaller","impossible_travel"])
+
+      | where risk>threshold OR guardduty_finding present
+
+      | emit userIdentity.arn, risk, shap_top3'
+- question: Within a single root session, did the root user create access keys (CreateAccessKey), create
+    or reset a login profile/password (CreateLoginProfile/UpdateLoginProfile, including for the root user),
+    attach admin policies (AttachRolePolicy/AttachUserPolicy), change alternate contacts or MFA, weaken
+    CloudTrail (StopLogging/DeleteTrail/UpdateTrail/PutEventSelectors), alter GuardDuty/Security Hub posture,
+    or change SCPs/organization guardrails - and did this chain follow a successful sign-in from a novel
+    source?
+  context: After initial entry, an adversary uses root to establish persistence and dismantle defenses,
+    so this question chains root-attributed credential and guardrail modifications within one session.
+    Detect root sessions that create access keys, create/reset login profiles or passwords (including
+    for the root user itself), attach administrative policies, change alternate contacts or MFA, weaken
+    CloudTrail logging, modify GuardDuty or Security Hub, or change organization SCPs/guardrails. Correlate
+    these to the same root session and escalate when they follow a successful sign-in from a novel source.
+    A positive result indicates the adversary is hardening their foothold and blinding detection after
+    taking the root account; a negative result means the root session performed no persistence- or guardrail-affecting
+    changes.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (correlate within a single root session; pivot 1 hour from sign-in)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail userIdentity.type="Root"
+
+      | eval cred=match(eventName,"CreateAccessKey|CreateLoginProfile|UpdateLoginProfile")
+
+      | eval policy=match(eventName,"AttachRolePolicy|AttachUserPolicy|PutUserPolicy")
+
+      | eval contact=match(eventName,"PutAlternateContact|DeactivateMFADevice|EnableMFADevice|ResyncMFADevice")
+
+      | eval guardrail=match(eventName,"StopLogging|DeleteTrail|UpdateTrail|PutEventSelectors|DisableSecurityHub|DeleteDetector|UpdateDetector|CreatePolicy|AttachPolicy|UpdatePolicy")
+
+      | transaction userIdentity.principalId,accessKeyId maxspan=2h
+
+      | where (cred OR policy OR contact OR guardrail)
+
+      | eval novel_login=NOT [Root,sourceIPAddress] in root_baseline
+
+      | eval sev=if(novel_login,"critical","high")
+
+      | alert'
+- question: Does a root session's API breadth, identity-affecting action count, security-control modification
+    frequency, and configuration-drift volume greatly exceed the account's historical baseline for emergency
+    use - for example via first-seen (principal x API) detection or per-service API-count band alarms?
+  context: Legitimate break-glass root use is narrow and purposeful; takeover activity is broad and high-velocity.
+    To support Initial Access investigation, measure each root session's API breadth, the count of identity-affecting
+    actions, the frequency of security-control modifications, and the volume of configuration drift against
+    the account's historical baseline. Flag sessions whose privileged-action density, service diversity,
+    or change velocity greatly exceeds normal emergency use, using first-seen principal/API detection
+    and per-service API-count band alarms (CloudWatch ML or equivalent). A positive result shows a root
+    session doing far more, across more services, than any sanctioned break-glass event; a negative result
+    indicates a tightly scoped session consistent with normal emergency use.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (baseline 30-90 days; evaluate per session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail userIdentity.type="Root" earliest=-90d
+
+      | stats dc(eventName) as api_breadth dc(eventSource) as service_diversity count(eval(match(eventName,"iam:|Create|Attach|Put|Delete|Update")))
+      as priv_actions count as change_velocity by session_id
+
+      | eventstats p99(api_breadth) as breadth_band p99(priv_actions) as priv_band p99(change_velocity)
+      as vel_band
+
+      | eval first_seen_api=if(NOT [Root,eventName] in baseline_apis,1,0)
+
+      | where api_breadth>breadth_band OR priv_actions>priv_band OR change_velocity>vel_band OR first_seen_api=1
+
+      | alert'
+- question: How quickly after root sign-in did the first credential or guardrail change occur, and how
+    many services were impacted in the first hour - does the session compress multiple persistence-enabling
+    changes (e.g., key creation or logging disablement within minutes of login) into a far shorter window
+    than any prior legitimate root activity?
+  context: 'Speed is a discriminator: an attacker who has just seized root moves fast to create credentials
+    and disable logging before defenders react, whereas legitimate break-glass operators work deliberately.
+    Compute elapsed time from root sign-in to the first credential or guardrail change, and count the
+    services impacted in the first hour (Volume/Frequency). Highlight sessions that compress multiple
+    persistence-enabling changes into a much shorter window than any prior legitimate root activity -
+    for example access-key creation or CloudTrail disablement within minutes of login - deriving the alert
+    threshold from the minimum inter-event interval observed in legitimate break-glass sessions. A positive
+    result indicates a rapid, automated-looking takeover; a negative result reflects the slower cadence
+    of sanctioned emergency work.'
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (measure first hour after each root sign-in)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail userIdentity.type="Root"
+
+      | eval login_time=if(eventName="ConsoleLogin",_time,null())
+
+      | transaction userIdentity.principalId maxspan=1h startswith="ConsoleLogin"
+
+      | eval first_change=min(_time where match(eventName,"CreateAccessKey|CreateLoginProfile|StopLogging|DeleteTrail|AttachUserPolicy"))
+
+      | eval latency=first_change-login_time
+
+      | eval impacted_services=dc(eventSource)
+
+      | eventstats min(latency) as legit_min_interval by recipientAccountId
+
+      | where latency < legit_min_interval OR impacted_services >= 3
+
+      | alert'
+- question: For AWS Organizations centralized root, are there sts:AssumeRoot calls from a previously unseen
+    calling-principal / target-member-account pair (new-terms baseline over the trailing 30-60 days),
+    indicating management-account abuse that obtains member-account root privileges?
+  context: AWS Organizations centralized root management lets a privileged management-account principal
+    assume root in member accounts via sts:AssumeRoot - a powerful path to broad initial access and privilege
+    escalation across the organization. Alert on sts:AssumeRoot calls from a previously unseen calling
+    principal / target member-account pair, building a new-terms baseline over the trailing 30-60 days
+    and combining the deterministic event selector with first-seen rarity. This catches management-account
+    abuse that quietly obtains member-account root privileges. A positive result flags an identity reaching
+    into member-account root in a way never seen before; a negative result confirms the AssumeRoot relationship
+    is established and expected.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (new-terms baseline 30-60 days; evaluate per event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource="sts.amazonaws.com" eventName="AssumeRoot"
+
+      | eval pair=userIdentity.arn."->".resources{}.accountId
+
+      | inputlookup append=t assumeroot_baseline.csv
+
+      | eval first_seen_pair=if(NOT pair in baseline_pairs,1,0)
+
+      | where first_seen_pair=1
+
+      | table _time, userIdentity.arn, targetPrincipal, recipientAccountId, sourceIPAddress
+
+      | alert'
+- question: Following root activity, did a session or principal generate a burst of authorization failures
+    (errorCode=AccessDenied/Client.UnauthorizedOperation) - for example ten or more in five minutes, tuned
+    to the 99th percentile of normal per-account denials - indicating enumeration of reachable services
+    and persistence options?
+  context: After seizing root, an adversary often probes what services and persistence options are reachable,
+    producing clustered authorization failures that are a distinct failure-mode signal during Initial
+    Access and the transition to persistence. Count errorCode=AccessDenied/Client.UnauthorizedOperation
+    per session/principal after root activity and alert on bursts of >=10 in 5 minutes, tuned to the 99th
+    percentile of normal per-account denials. A positive result suggests the actor is mapping the blast
+    radius and looking for ways to entrench; a negative result indicates the root session did not blindly
+    probe permissions. Pair this with the credential/guardrail-chain detection to confirm whether discovery
+    led to concrete persistence changes.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (alert on a 5-minute sliding window after root activity)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail (errorCode="AccessDenied" OR errorCode="Client.UnauthorizedOperation")
+
+      | join session_id [ search source=cloudtrail userIdentity.type="Root" | fields session_id ]
+
+      | bin _time span=5m
+
+      | stats count as denials values(eventName) as denied_actions by userIdentity.arn, session_id, _time
+
+      | eventstats p99(denials) as acct_p99 by recipientAccountId
+
+      | where denials >= max(10, acct_p99)
+
+      | alert'
+- question: Does a sequence model over root-attributed control-plane events flag an improbable next-action
+    ordering characteristic of takeover - for example ConsoleLogin -> CreateAccessKey -> StopLogging,
+    or AttachUserPolicy -> CreateLoginProfile - and do rare-API/population scoring and UEBA anomalies
+    corroborate the deviating subsequence?
+  context: Takeover follows recognizable but improbable action sequences that simple counting misses,
+    so apply sequence modeling (e.g., DeepLog-style next-event prediction) to root-attributed control-plane
+    events to learn normal administrative ordering and flag improbable next actions. Surface the deviating
+    subsequence - such as ConsoleLogin -> CreateAccessKey -> StopLogging, or AttachUserPolicy -> CreateLoginProfile
+    - for triage. Complement with rare-API/population scoring and UEBA anomalies that emit the top contributing
+    features, tying the model score back to concrete evidence. In the Initial Access tactic, a flagged
+    subsequence indicates a root session whose ordering matches credential-establishment-then-defense-evasion
+    patterns; a negative result means the session's action ordering is consistent with learned legitimate
+    administration.
+  answer_sources:
+  - CloudTrail management events
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - AWS Config configuration history
+  - AWS Security Hub findings
+  - 'NAI: Root-level identity operations, organization and account security settings, and detective-control
+    configurations that could be changed to preserve adversary access after initial entry'
+  range: Last 90 days (train on 30-90 days of sequences; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Sequence model over root-attributed control-plane events + rare-API/UEBA
+
+      model deeplog_next_key(sequence=ordered_eventName by session_id where userIdentity.type="Root")
+
+      | eval seq_anomaly=(observed_next not in top_g_predictions)
+
+      | ml rare_function(field=eventName, influencers=[userIdentity.arn, sourceIPAddress])
+
+      | where seq_anomaly==1 OR rare_score>threshold
+
+      | emit session_id, deviating_subsequence, shap_top3'
