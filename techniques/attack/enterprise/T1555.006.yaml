@@ -1,0 +1,596 @@
+name: 'T1555.006: Cloud Secrets Management Stores'
+id: 8d424bc5-d3c6-49ab-bcf2-e7b86fc8605b
+description: Investigate adversary attempts to harvest credentials from cloud-native secret management
+  stores (AWS Secrets Manager, Azure Key Vault, GCP Secret Manager, and HashiCorp/Terraform Vault). This
+  playbook helps an analyst determine whether a principal has abused privileges to retrieve secrets via
+  API/CLI calls such as GetSecretValue, BatchGetSecretValue, AccessSecretVersion, or az key vault secret
+  show. It guides hunting for threat-intel/allow-list violations on secret retrievals, cloud CLI/CloudShell
+  enumeration and scripted bulk scraping, first-time and contextually anomalous secret access, high-volume
+  'scrape all secrets' bursts, harvest-then-exfil network correlation, and AccessDenied permission-probing
+  that precedes a successful retrieval. Each question pairs deterministic (symbolic-logic), statistical,
+  and machine-learning detection approaches against cloud audit logs, endpoint process telemetry, and
+  network logs so a SOC analyst can confirm or rule out unauthorized access to cloud secrets.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any successful or denied cloud secret-retrieval API calls (GetSecretValue, BatchGetSecretValue,
+    Azure Key Vault SecretGet, GCP AccessSecretVersion) originating from a source IP on a threat-intelligence
+    blocklist, or from a principal not on the explicit allow-list for that secretId?
+  context: Deterministic, high-confidence check for Credential Access against cloud secrets stores. Query
+    cloud audit logs for secret-retrieval events, join sourceIPAddress against threat-intel feeds, and
+    check each (principal_id, secretId) pair against a maintained allow-list. A blocklist match, or access
+    by a principal not authorized for that specific secret, strongly indicates adversary credential theft
+    - mirroring GuardDuty UnauthorizedAccess:IAMUser/MaliciousIPCaller and Policy:IAMUser/RootCredentialUsage.
+    Profile both successful (errorCode absent) and denied retrievals as distinct states; a denied-then-success
+    transition is especially suspicious. Tune the allow-list per environment but never remove the threat-intel
+    join. A positive result warrants immediate session scoping and rotation of exposed secrets.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane API endpoints, Network egress points, Virtual Private Cloud (VPC)
+    flow logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (eventSource=secretsmanager.amazonaws.com OR eventSource=Microsoft.KeyVault
+      OR eventName=AccessSecretVersion)
+
+      | where eventName IN (GetSecretValue, BatchGetSecretValue, SecretGet)
+
+      | lookup threat_intel_ip sourceIPAddress AS ip OUTPUT verdict
+
+      | lookup secret_allowlist principal_id, secretId OUTPUT allowed
+
+      | where verdict=malicious OR isnull(allowed)
+
+      | eval state=if(isnull(errorCode),"success","denied")
+
+      | table _time, principal_id, secretId, sourceIPAddress, state, verdict'
+- question: For each principal, is a new secret-access event using a source ASN or userAgent that is rare
+    relative to that principal's historical distribution (below the 5th percentile)?
+  context: Statistical rarity scoring catches adversaries who obtain valid credentials but operate from
+    infrastructure (ASN) or tooling (userAgent) the legitimate identity has never used. For each principal_id,
+    build historical frequency distributions of source ASN and userAgent across secret-access events,
+    then score each new event's rarity. Alerting below the 5th percentile surfaces rare-context access
+    following population/rare-context analysis (Elastic ML over CloudTrail) and per-principal credential-access
+    baselining (Wiz IMDS anomaly hunting). A low-rarity score on a high-value secret is a strong Credential
+    Access lead; tune the percentile to balance noise against coverage.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane API endpoints, Network egress points, Virtual Private Cloud (VPC)
+    flow logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,BatchGetSecretValue,SecretGet,AccessSecretVersion)
+
+      | stats count BY principal_id, source_asn, userAgent
+
+      | eventstats sum(count) AS total BY principal_id
+
+      | eval freq=count/total
+
+      | where freq < 0.05
+
+      | table principal_id, source_asn, userAgent, freq'
+- question: Does a supervised classifier score a secret-access event as suspicious (P(suspicious) above
+    the calibrated threshold), and what top contributing features (rare ASN, off-hours, denied-then-success)
+    drive that score?
+  context: A trained classifier (XGBoost/Random Forest) fuses weak signals into a single calibrated probability,
+    improving over any single rule. Train on labeled secret-access logs with features is_weekend, hour_of_day,
+    source_asn_rarity, user_agent_rarity, errorCode_state, and principal_id; alert when P(suspicious)
+    exceeds a calibrated threshold (e.g., 0.9) and surface the top-3 contributing features in the alert
+    text for analyst triage. Explainable, rarity-ranked outputs follow Elastic ML over CloudTrail and
+    Isolation Forest (Liu et al). Label training/eval data with detonations from Stratus Red Team bulk
+    Secrets Manager retrieval. A high score with corroborating features (rare ASN + off-hours + denied-then-success)
+    is a strong Credential Access indication.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane API endpoints, Network egress points, Virtual Private Cloud (VPC)
+    flow logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=secret_access_classifier
+
+      features=[is_weekend,hour_of_day,source_asn_rarity,user_agent_rarity,errorCode_state,principal_id]
+
+      score=model.predict_proba(event)
+
+      | where score >= 0.9
+
+      | eval top3=explain(model,event)
+
+      | table _time, principal_id, secretId, score, top3'
+- question: Is a cloud CLI/console tool (aws, az, gcloud, AWS CloudShell) issuing secret-management enumeration
+    commands (list-secrets, list-versions) or scripted iterative retrieval (get-secret-value in a loop)
+    on a host or in a CloudShell session?
+  context: Adversaries such as LUCR-3/Scattered Spider use CloudShell to scrape all stored secrets. Scan
+    process command lines (Windows Event ID 4688 / auditd execve) and the CloudTrail userAgent field for
+    cloud CLI executables plus secret commands, alerting on enumeration flags (list-secrets) or scripting
+    syntax (--query, | jq, ForEach-Object) and on CloudShell/aws-cli user agents performing bulk retrieval.
+    This is the exact CloudShell-scraping tradecraft documented by Permiso; portable rule skeletons exist
+    in SigmaHQ AWS CloudTrail rules. A match on enumeration-then-scripted-retrieval from an unexpected
+    host or session is a strong Credential Access lead requiring rapid containment.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, CloudShell sessions, Container
+    orchestration platforms'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=wineventlog EventCode=4688 OR source=auditd type=EXECVE OR source=cloudtrail)
+
+      | eval cmd=coalesce(CommandLine, execve_args, userAgent)
+
+      | where match(cmd,"(aws|az|gcloud).*(secret)") AND match(cmd,"(list-secrets|list-versions|get-secret-value|secret
+      show)")
+
+      | where match(cmd,"(--query|\| jq|ForEach-Object|for |while )") OR match(userAgent,"(CloudShell|aws-cli)")
+
+      | table _time, host, principal_id, cmd'
+- question: Per host or principal, does the ratio of enumeration calls (ListSecrets) to retrieval calls
+    (GetSecretValue), or the AccessDenied rate, exceed a Z-score of ~3 in a 1-hour window?
+  context: Permission-probing adversaries enumerate broadly before retrieving, and generate denied bursts
+    while discovering accessible secrets. Per host/principal, baseline the ratio of enumeration (ListSecrets)
+    to retrieval (GetSecretValue) calls and the AccessDenied rate in 1-hour windows, compute Z-scores,
+    and alert when either exceeds ~3. Denied bursts preceding a success follow the AWS IAM AccessDenied
+    Discovery pattern (Splunk), and novel role/API combinations follow Splunk's previously-unseen-user-roles
+    research. A high enumeration-to-retrieval ratio or denied-rate spike indicates discovery-driven Credential
+    Access rather than routine application use.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, CloudShell sessions, Container
+    orchestration platforms'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource=secretsmanager.amazonaws.com
+
+      | bin _time span=1h
+
+      | stats count(eval(eventName="ListSecrets")) AS enum count(eval(eventName="GetSecretValue")) AS
+      get count(eval(errorCode="AccessDenied")) AS denied BY principal_id,_time
+
+      | eval ratio=enum/(get+1)
+
+      | eventstats mean(ratio) AS m stdev(ratio) AS s mean(denied) AS dm stdev(denied) AS ds BY principal_id
+
+      | eval z_ratio=(ratio-m)/s, z_denied=(denied-dm)/ds
+
+      | where z_ratio>3 OR z_denied>3'
+- question: Does a sequence model flag a low-probability cloud command/API chain such as list-secrets
+    -> many get-secret-value -> curl/powershell -enc, and what is the offending subsequence?
+  context: Adversary tradecraft is recognizable as an unusual ordering of API calls even when each individual
+    call is permitted. Model legitimate command/API sequences with an LSTM or Transformer and flag low-probability
+    chains - e.g., list-secrets followed by many get-secret-value calls then an encoded curl/powershell
+    exfil step - surfacing the offending subsequence in the alert. Rare-sequence/population modeling follows
+    Elastic ML over CloudTrail, trained and tuned on labeled Stratus Red Team detonations. A flagged enumerate-then-scrape-then-exfil
+    chain is a high-fidelity Credential Access plus exfil signal that should escalate immediately.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, CloudShell sessions, Container
+    orchestration platforms'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=cloud_cmd_sequence_lstm
+
+      input=ordered_api_sequence(principal_id, window=1h)
+
+      seq_prob=model.score(input)
+
+      | where seq_prob < threshold_low
+
+      | eval offending=lowest_prob_subsequence(model,input)
+
+      | table _time, principal_id, offending, seq_prob'
+- question: Has a principal successfully retrieved a secretId it has never accessed before (a first-seen
+    principal->secret pair)?
+  context: 'First-time access is a simple, robust anomaly: legitimate workloads access a stable set of
+    secrets, so a principal touching a brand-new secretId is notable. Maintain a stateful table of observed
+    (principal_id, secretId) pairs and alert ''First Time Secret Access by Principal'' on any missing
+    pair. This first-seen approach is implemented per-principal over CloudTrail by the Netflix CloudTrail
+    Anomaly Detector and Splunk''s previously-unseen-user-roles research. A first-time access to a high-value
+    secret - especially by a compromised or rarely-used principal - is a strong Credential Access lead;
+    baseline initially to suppress legitimate onboarding noise.'
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Authentication logs
+  - 'NAI: Cloud provider control plane, Authentication logs, Developer workstations, CI/CD servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,BatchGetSecretValue,SecretGet,AccessSecretVersion)
+      errorCode=null
+
+      | stats earliest(_time) AS first_seen BY principal_id, secretId
+
+      | where first_seen > relative_time(now(), "-24h")
+
+      | table first_seen, principal_id, secretId'
+- question: Does a successful secret retrieval deviate from the principal's established baseline of source
+    countries/ASNs, userAgents, and access hours above the 95th percentile, or constitute a new high-weight
+    principal->secret edge?
+  context: Contextual deviation scoring catches valid-credential abuse where the access context is anomalous
+    even if not strictly first-time. Build a per-principal profile of source countries/ASNs, userAgents,
+    and access hours, assign risk points for deviations, and alert above the 95th percentile. Treat a
+    first observed principal->secret edge as a high-weight signal using the Bayesian new-edge formulation
+    (Metelli & Heard) and credential-access baselining (Wiz IMDS hunting). A high cumulative risk score
+    - new country plus odd hour plus new secret - indicates likely Credential Access from a compromised
+    identity and merits session review.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Authentication logs
+  - 'NAI: Cloud provider control plane, Authentication logs, Developer workstations, CI/CD servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,SecretGet,AccessSecretVersion) errorCode=null
+
+      | eval risk=0
+
+      | eval risk=risk+if(NOT in_baseline(principal_id,"country",src_country),30,0)
+
+      | eval risk=risk+if(NOT in_baseline(principal_id,"asn",source_asn),25,0)
+
+      | eval risk=risk+if(NOT in_baseline(principal_id,"ua",userAgent),20,0)
+
+      | eval risk=risk+if(NOT in_baseline(principal_id,"hour",strftime(_time,"%H")),15,0)
+
+      | eval risk=risk+if(new_edge(principal_id,secretId),40,0)
+
+      | where risk >= p95_threshold
+
+      | table _time, principal_id, secretId, risk'
+- question: Does an Isolation Forest trained on legitimate secret-access events flag an event as anomalous,
+    and which top-3 features (principal, secretId, source subnet/ASN, userAgent, hour, errorCode state)
+    contribute?
+  context: Unsupervised isolation efficiently surfaces rare multivariate combinations without labeled
+    data. Train Isolation Forest on legitimate secret-access events with features principal_id, secretId,
+    source_ip_subnet, source_asn, userAgent, hour, and errorCode_state, then alert on anomalies and report
+    the top-3 feature contributions. This is the approach productionized as GuardDuty's CredentialAccess:IAMUser/AnomalousBehavior
+    per-principal ML detector (Liu et al). An anomaly driven by rare ASN + off-hours + new secret is a
+    strong Credential Access indication; periodically retrain to track legitimate drift.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Authentication logs
+  - 'NAI: Cloud provider control plane, Authentication logs, Developer workstations, CI/CD servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=isolation_forest(secret_access)
+
+      features=[principal_id,secretId,source_ip_subnet,source_asn,userAgent,hour,errorCode_state]
+
+      score=model.anomaly_score(event)
+
+      | where score >= anomaly_threshold
+
+      | eval top3=feature_contributions(model,event)
+
+      | table _time, principal_id, secretId, score, top3'
+- question: Has a single principal or source IP issued more than ~20 GetSecretValue/BatchGetSecretValue
+    events within any 10-minute window (a bulk 'scrape all secrets' burst)?
+  context: Bulk retrieval is the signature of the LUCR-3 CloudShell scrape - an adversary enumerating
+    and pulling every accessible secret quickly. Implement a sliding-window counter alerting when a single
+    principal_id or sourceIPAddress issues more than ~20 GetSecretValue/BatchGetSecretValue events in
+    any 10-minute window (tune to environment). This pattern is documented by Permiso and emulated by
+    Stratus Red Team. Keep this deterministic floor while layering statistical/ML methods in parallel.
+    A burst above threshold is a high-confidence Credential Access alert that should trigger immediate
+    session isolation and mass secret rotation.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane, VPC flow logs, Network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,BatchGetSecretValue,SecretGet,AccessSecretVersion)
+
+      | bin _time span=10m
+
+      | stats count AS retrievals dc(secretId) AS distinct_secrets BY principal_id, sourceIPAddress, _time
+
+      | where retrievals > 20
+
+      | table _time, principal_id, sourceIPAddress, retrievals, distinct_secrets'
+- question: For each principal, does the hourly count of distinct secrets accessed exceed mean+3*stddev
+    versus the trailing 30-day baseline?
+  context: Volume baselining catches scrapers that stay under a static floor but spike well above their
+    own norm. For each principal_id compute a 30-day mean and standard deviation of distinct secrets accessed
+    per hour, then alert when a new hourly count exceeds mean+3*stddev. Band-based volume baselining over
+    CloudTrail metrics follows AWS CloudWatch ML over CloudTrail. A statistically significant spike in
+    distinct-secret volume indicates probable bulk Credential Access harvesting and should be correlated
+    with the principal's session origin and downstream network activity.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane, VPC flow logs, Network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,BatchGetSecretValue,SecretGet,AccessSecretVersion)
+
+      | bin _time span=1h
+
+      | stats dc(secretId) AS distinct BY principal_id, _time
+
+      | eventstats mean(distinct) AS m stdev(distinct) AS s BY principal_id
+
+      | eval z=(distinct-m)/s
+
+      | where z > 3
+
+      | table _time, principal_id, distinct, z'
+- question: Does a time-series forecast (e.g., Prophet) of per-principal secret-access counts show observed
+    volume exceeding the upper confidence bound (yhat_upper) after accounting for intra-day/week seasonality?
+  context: Seasonality-aware forecasting reduces false positives for principals with naturally bursty
+    but periodic access. For high-activity principals, apply time-series forecasting to minute/hour secret-access
+    counts, learn intra-day and weekly seasonality, and alert when observed counts exceed the forecast
+    upper confidence bound (yhat_upper), reporting the magnitude over the band. This approach is validated
+    for cloud intrusion detection via time-series forecasting. An out-of-band spike that the seasonal
+    model did not anticipate is a strong bulk Credential Access signal worth correlating with session
+    and network telemetry.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - 'NAI: Cloud provider control plane, VPC flow logs, Network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=prophet(secret_access_counts, by=principal_id, seasonality=[daily,weekly])
+
+      forecast=model.predict(window=now)
+
+      | where observed > forecast.yhat_upper
+
+      | eval magnitude=observed-forecast.yhat_upper
+
+      | table _time, principal_id, observed, yhat_upper, magnitude'
+- question: Within 5 minutes of a secret-retrieval event, did the originating host make an outbound connection
+    to a destination on a high-confidence threat-intel blocklist?
+  context: 'This models the harvest-then-exfil/pivot chain: retrieve secrets, then connect outbound to
+    attacker infrastructure. Join cloud audit logs (eventName like GetSecretValue) with network logs (Zeek
+    conn.log / Windows Event ID 3) on source IP within a 5-minute window and alert when the following
+    outbound connection hits a high-confidence blocklist destination. The sequence is documented in ScarletEel
+    2.0 (Sysdig). A confirmed secret-read immediately followed by blocklisted egress is a high-fidelity
+    Credential Access + exfiltration alert demanding immediate isolation and incident response.'
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 3
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, Network egress points'
+  range: 'Last 90 days, event-centered: +5 minutes after each secret retrieval'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventName IN (GetSecretValue,BatchGetSecretValue,SecretGet,AccessSecretVersion)
+
+      | join type=inner src_ip [ search (source=zeek_conn OR (source=sysmon EventCode=3)) ]
+
+      | where conn._time >= secret._time AND conn._time <= secret._time+300
+
+      | lookup threat_intel_ip dest_ip OUTPUT verdict
+
+      | where verdict=malicious
+
+      | table secret._time, principal_id, secretId, src_ip, dest_ip, verdict'
+  - technology: Zeek/pseudocode
+    query: "# correlate conn.log egress with prior secret read on same host within 5m\nevent conn.log:\
+      \ if (orig_h in recent_secret_hosts && ts - secret_ts <= 300s && id.resp_h in ti_blocklist)\n  ->\
+      \ notice(HarvestThenExfil, orig_h, id.resp_h)"
+- question: Within 10 minutes after a secret access, did the originating host connect to any destination
+    domain or IP absent from that host's historical baseline?
+  context: First-time-destination monitoring catches novel exfil channels even when the destination is
+    not yet on a blocklist. Per host, maintain historical sets of destination domains (Zeek dns.log) and
+    IPs (Zeek conn.log), monitor egress for 10 minutes after a secret access, and alert on any destination
+    absent from the host baseline, using the first-time-edge principle (Metelli & Heard). A previously
+    unseen destination contacted right after a secret read suggests possible exfil or C2 pivot following
+    Credential Access; corroborate against the secret's sensitivity and the host's role.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 3
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, Network egress points'
+  range: 'Last 90 days, event-centered: +10 minutes after each secret access'
+  queries:
+  - technology: Zeek/pseudocode
+    query: "# baseline per-host dest sets from dns.log + conn.log\nfor each secret_access(host, ts):\n\
+      \  for conn in egress(host, ts, ts+600s):\n    if conn.dest_domain not in baseline_domains[host]\
+      \ OR conn.dest_ip not in baseline_ips[host]:\n      notice(NewDestinationAfterSecret, host, conn.dest)"
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventName=GetSecretValue
+
+      | join host [ search source=zeek_dns OR source=zeek_conn ]
+
+      | where net._time between secret._time and secret._time+600
+
+      | where NOT in_baseline(host, dest)
+
+      | table secret._time, host, secretId, dest'
+- question: Does a graph model of user/role/host/secret/destination nodes reveal a rare or unseen path
+    such as User->Host->GetSecret->PasteSiteIP rather than the expected User->Host->GetSecret->InternalDB?
+  context: Graph-based detection captures the relational structure of legitimate secret usage and flags
+    anomalous paths an adversary creates. Build a graph with user/role/host/secret/destination nodes,
+    learn normal subgraphs (e.g., User->Host->GetSecret->InternalDB) and flag rare or unseen paths (e.g.,
+    User->Host->GetSecret->PasteSiteIP) as high-risk, surfacing the anomalous edge. Attention-based dynamic
+    IAM-graph modeling is described in GNN-based threat detection for cloud IAM logs. An anomalous secret-to-external-destination
+    path is a strong harvest-then-exfil signal that should escalate to incident response.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 3
+  - 'NAI: Developer workstations, CI/CD servers, Cloud-hosted virtual machines, Network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph=build_graph(nodes=[user,role,host,secret,dest], edges=audit+network)
+
+      model=gnn_subgraph_anomaly(graph)
+
+      | score paths containing GetSecret->dest
+
+      | where path_score >= anomaly_threshold AND dest_category IN (paste,proxy,external)
+
+      | eval anomalous_edge=highest_score_edge(path)
+
+      | table window, user, secret, dest, anomalous_edge, path_score'
+- question: Has a principal generated a burst of denied secret-management calls (errorCode AccessDenied
+    / Client.UnauthorizedOperation on GetSecretValue, ListSecrets, DescribeSecret) - e.g., more than 10
+    in 5 minutes?
+  context: A denied-call burst is an explicit failure-mode signal of permission enumeration that often
+    precedes a successful retrieval. Count CloudTrail errorCode=AccessDenied (and Client.UnauthorizedOperation)
+    on secrets-manager events per principal in a rolling window and alert above a tuned threshold (e.g.,
+    >10 in 5 minutes), per AWS IAM AccessDenied Discovery (Splunk). A burst of denials, especially from
+    a principal that does not normally fail, indicates an adversary probing what secrets it can reach
+    as part of Credential Access; correlate with any subsequent successful GetSecretValue.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Cloud provider control plane, Authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource=secretsmanager.amazonaws.com (errorCode=AccessDenied OR errorCode="Client.UnauthorizedOperation")
+
+      | bin _time span=5m
+
+      | stats count AS denials BY principal_id, _time
+
+      | where denials > 10
+
+      | table _time, principal_id, denials'
+- question: Does a principal's AccessDenied rate spike (high Z-score) versus its baseline, especially
+    when a denied burst is immediately followed by a successful GetSecretValue on a new secretId?
+  context: Combining failure-rate profiling with first-seen access pinpoints the probe-then-succeed transition
+    that signals successful privilege discovery. Baseline each principal's normal AccessDenied rate and
+    alert on Z-score spikes, prioritizing a denied burst immediately followed by a successful GetSecretValue
+    on a previously unseen secretId (AWS IAM AccessDenied Discovery + previously-unseen-user-roles, Splunk).
+    This denied-to-success transition is a strong indicator that an adversary found and retrieved a reachable
+    secret during Credential Access, and warrants immediate rotation of the affected secret.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Cloud provider control plane, Authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource=secretsmanager.amazonaws.com
+
+      | bin _time span=5m
+
+      | stats count(eval(errorCode="AccessDenied")) AS denied count(eval(errorCode="null")) AS success
+      BY principal_id,_time
+
+      | eventstats mean(denied) AS m stdev(denied) AS s BY principal_id
+
+      | eval z=(denied-m)/s
+
+      | where z>3 AND success>0 AND new_edge(principal_id, last_success_secretId)
+
+      | table _time, principal_id, denied, success, z'
+- question: Does the per-principal anomaly model rank a probing-then-success sequence as anomalous with
+    the denied burst named among the top-3 contributing features?
+  context: Folding denied-call behavior into the ML model lets probe-then-succeed sequences score as anomalous
+    holistically. Include errorCode_state and denied-call frequency as features in the per-principal anomaly
+    model so probing-then-success sequences score as anomalous, with the denied burst named among the
+    top-3 contributing features. This is productionized in GuardDuty IAM finding types and reproducible
+    with Isolation Forest (Liu et al). An anomaly whose explanation highlights a denied burst preceding
+    a successful, novel secret retrieval is a high-confidence Credential Access lead suitable for automated
+    escalation.
+  answer_sources:
+  - AWS CloudTrail GetSecretValue
+  - AWS CloudTrail BatchGetSecretValue
+  - Azure Key Vault SecretGet (AuditEvent)
+  - GCP Cloud Audit Logs AccessSecretVersion
+  - AWS CloudTrail ListSecrets
+  - 'NAI: Cloud provider control plane, Authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=isolation_forest(secret_access)
+
+      features=[principal_id,secretId,source_asn,userAgent,hour,errorCode_state,denied_freq_5m]
+
+      score=model.anomaly_score(event)
+
+      | where score >= anomaly_threshold
+
+      | eval top3=feature_contributions(model,event)
+
+      | where "denied_freq_5m" in top3
+
+      | table _time, principal_id, secretId, score, top3'
