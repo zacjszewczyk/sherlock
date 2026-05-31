@@ -1,0 +1,482 @@
+name: 'T1119: Automated Collection'
+id: cde49131-51ae-4183-8b38-04ed04bbfa7c
+description: Investigate whether an adversary is using automated techniques (scripts, native utilities,
+  remote-access tooling, or cloud APIs/ETL pipelines) to discover, stage, and collect internal data at
+  scale. This playbook helps an analyst hunt for execution of known collection tools and password-protected
+  archivers; command-line and PowerShell one-liners that chain file discovery, filtering, and archival;
+  processes that read large volumes of files across many directories before writing to a single archive
+  or staging file; non-interactive or unusually-parented processes touching sensitive document types and
+  honeypot/canary files; outbound data spikes temporally correlated with on-host collection; and cloud
+  control-plane bulk reads, exports, or ETL/automation fan-out by unusual principals. It combines deterministic
+  symbolic-logic floors, statistical baselining, and machine-learning anomaly detection across Windows,
+  Linux, macOS, network (Zeek), and cloud/SaaS telemetry to surface automated collection tied to the Collection
+  tactic.
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process execute whose image name or SHA256 hash matches a known automated-collection
+    tool (e.g., rclone, megacmd, WinSCP, custom collectors) or invoke an archiver (7z/7za/rar) with password/encryption
+    switches such as -p, -mhe, or -hp?
+  context: Adversaries frequently deploy purpose-built or off-the-shelf collection and staging utilities
+    to gather and compress internal data before exfiltration. Matching process names and SHA256 hashes
+    against a curated CTI list of collection tools, and detecting archiver invocations carrying encryption/password
+    flags, gives a high-confidence deterministic signal directly tied to the Collection tactic. A match
+    means a known tool ran; investigate the user context, parent process, and files touched. Keep this
+    list as a hard deterministic floor and tune (never delete) the tool inventory; a negative result lowers
+    but does not eliminate suspicion because custom collectors may be renamed.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: All endpoints and servers, particularly file servers, domain controllers, developer workstations,
+    and CI/CD pipeline runners.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=endpoint (EventID=4688 OR (source=Sysmon EventID=1))\n| where (lower(process_name) IN\
+      \ cti_collection_tool_names\n        OR sha256 IN cti_collection_tool_hashes)\n   OR (process_name\
+      \ IN (\"7z.exe\",\"7za.exe\",\"rar.exe\",\"winrar.exe\")\n       AND command_line MATCH /(-p|-mhe|-hp)/)\n\
+      | table _time host user parent_process process_name command_line sha256"
+- question: Which executions involve unsigned binaries whose name or path is statistically rare for the
+    host or environment, and did those executions succeed or get blocked by AppLocker/WDAC?
+  context: 'Renamed or one-off collection tools evade static IOC lists, so baselining process-name and
+    path prevalence per host and per environment over ~30 days surfaces unsigned binaries in the bottom
+    1st percentile of prevalence. Profiling execution success vs. failure (started vs. blocked by AppLocker/WDAC)
+    is a distinct state signal: a blocked-then-retried-with-new-name pattern is strongly suspicious. In
+    the Collection context this catches novel automated collectors that would otherwise slip past hash
+    matching. A positive result is a rare, unsigned, low-prevalence binary; correlate with subsequent
+    file-read and archive activity.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: All endpoints and servers, particularly file servers, domain controllers, developer workstations,
+    and CI/CD pipeline runners.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=endpoint (EventID=4688 OR Sysmon EventID=1) earliest=-30d\n| stats count AS prevalence\
+      \ by process_name path signature_status host\n| eventstats perc1(prevalence) AS p1 by host\n| where\
+      \ signature_status=\"unsigned\" AND prevalence<=p1\n| join process_name [ search EventID=4688 OR\
+      \ Sysmon EventID=1\n      | eval state=if(status=\"blocked\",\"blocked\",\"started\") ]\n| table\
+      \ host process_name path prevalence signature_status state"
+- question: When scored by a supervised collection-tool classifier using parent name, user context, command-line
+    length, token entropy, name/hash prevalence, and signature info, which processes rank as likely-malicious
+    collectors, and what top-3 features drove the score?
+  context: A supervised model (XGBoost/Random Forest) trained on features like parent process name, user
+    context, command-line length, command-line token entropy, name/hash prevalence, and signature info
+    can score the malicious likelihood of an execution and rank candidates that neither IOC matching nor
+    simple prevalence catch. Surfacing the top-3 contributing features (e.g., 'unsigned + rare parent
+    + high cmdline entropy') makes the alert explainable and triagable. In the Collection tactic this
+    prioritizes which low-prevalence executions are worth deep-dive. A high score with explainable features
+    warrants pulling full command line, parentage, and downstream file/network activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek conn.log
+  - 'NAI: All endpoints and servers, particularly file servers, domain controllers, developer workstations,
+    and CI/CD pipeline runners.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model: RandomForest/XGBoost\nfeatures: [parent_name, user_context, cmdline_len, cmdline_token_entropy,\n\
+      \           name_prevalence, hash_prevalence, signature_info]\nscore = clf.predict_proba(features)\n\
+      where score >= threshold\nemit: host, process_name, score, top3_shap_features"
+- question: Did any command line or PowerShell script block chain file-discovery, filtering, and archival
+    in a single construct (e.g., Get-ChildItem -Recurse piped to Compress-Archive, dir /s piped to findstr,
+    for-loops over file extensions, robocopy/copy to staging dirs, or output redirection)?
+  context: Automated collection is often implemented as a single pipelined one-liner that enumerates files,
+    filters by name/type/content, and compresses or copies results to a staging location. A regex scan
+    of Event ID 4688 command lines and PowerShell 4104 script blocks for these chained discovery/filter/archive
+    constructs provides a deterministic detection tied to Collection. A positive hit reveals the exact
+    collection logic, the targeted extensions/paths, and the staging destination; a negative result does
+    not rule out collection split across multiple processes or obfuscated commands.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All endpoints and servers, especially those with enhanced PowerShell script block logging enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=endpoint (EventID=4688 OR EventID=4104)\n| where command_line MATCH /(gci|Get-ChildItem|dir).{0,80}(-r|-Recurse|\\\
+      /s)/i\n   AND command_line MATCH /(Compress-Archive|findstr|Where-Object|tar|robocopy|copy|>)/i\n\
+      | table _time host user process_name command_line script_block"
+- question: Which command lines or PowerShell script blocks have character-frequency or token-category
+    distributions in the top 5th percentile of deviation from the benign corpus, indicating obfuscation?
+  context: Obfuscated collection commands evade keyword regexes, so baselining command/script-block character-frequency
+    and token-category distributions against a benign corpus and flagging values above the 95th percentile
+    (or with high cosine distance from the benign profile) detects encoding, concatenation, and escape-heavy
+    tradecraft. In the Collection context, obfuscation often wraps the very discovery/archive logic above.
+    A positive result is an outlier-structured command; decode/normalize it and inspect for collection
+    intent. A clean profile is consistent with routine administrative scripting.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All endpoints and servers, especially those with enhanced PowerShell script block logging enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint (EventID=4688 OR EventID=4104) earliest=-90d
+
+      | eval charfreq=char_freq_vector(command_line), toks=token_categories(command_line)
+
+      | eval cos_dist=cosine_distance(charfreq, benign_profile)
+
+      | eventstats perc95(cos_dist) AS p95
+
+      | where cos_dist>=p95
+
+      | table host user command_line cos_dist'
+- question: When command lines and script blocks are encoded as BERT-style embeddings and scored by unsupervised
+    outlier detectors (COPOD, Isolation Forest, PCA, autoencoder), which novel or obfuscated collection
+    one-liners appear as outliers even without known keywords?
+  context: Semantic embeddings of command lines let unsupervised detectors flag novel collection one-liners
+    that share no literal keywords with known rules. Reporting the nearest benign exemplar and top contributing
+    tokens makes the outlier triagable. This catches the long tail of automated-collection scripting in
+    the Collection tactic that signatures miss. A high outlier score with collection-suggestive nearest
+    tokens warrants decoding and execution-context review; a low score that clusters near benign administrative
+    commands is likely routine.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All endpoints and servers, especially those with enhanced PowerShell script block logging enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'emb = bert_encode(command_line)
+
+      score = ensemble([COPOD, IsolationForest, PCA, AutoEncoder]).decision(emb)
+
+      where score >= outlier_threshold
+
+      emit: host, command_line, score, nearest_benign_exemplar, top_tokens'
+- question: Did a single process log more than 500 file reads (Event ID 4663) across more than 10 unique
+    directories within a 5-minute window and then spawn an archiver (7z/rar/tar/Compress-Archive)?
+  context: High-volume, multi-directory file reads followed by archive creation is the canonical fingerprint
+    of automated bulk collection and staging. Alerting when one PID exceeds 500 4663 reads across >10
+    directories in 5 minutes and then spawns an archiver provides a deterministic floor tied to Collection.
+    Thresholds should be derived from per-role read baselines on sensitive hosts. A positive correlation
+    pinpoints the collecting process, its scope, and the staged archive; investigate the archive destination
+    and any subsequent egress.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Critical file servers, SharePoint sites, and repositories of sensitive intellectual property
+    or Personally Identifiable Information (PII).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=endpoint EventID=4663 action=read\n| bin _time span=5m\n| stats dc(directory) AS dirs\
+      \ count AS reads by _time process_id host\n| where reads>500 AND dirs>10\n| join process_id host\
+      \ [ search EventID=4688\n      process_name IN (\"7z.exe\",\"rar.exe\",\"tar.exe\",\"powershell.exe\"\
+      )\n      command_line=\"*Compress-Archive*\" OR process_name IN (\"7z.exe\",\"rar.exe\",\"tar.exe\"\
+      ) ]\n| table _time host process_id reads dirs archiver_cmd"
+- question: Which processes have a unique-path access rate or read volume (count and bytes) more than
+    3 standard deviations above (or in the 99th percentile of) their host baseline, and what is their
+    read-failure/AccessDenied rate?
+  context: 'Baselining per-process unique-path access rate and read volume per host detects bulk collection
+    that may stay just under static thresholds but is anomalous for that host. Tracking read-failure/AccessDenied
+    rate is a distinct enumeration signal: automated crawlers often hit permission boundaries. Flagging
+    >3 sigma or the 99th percentile on sensitive hosts ties this to Collection. A positive result is a
+    process reading far more paths/bytes than its norm, often with elevated AccessDenied; correlate with
+    archiver spawns and egress.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Critical file servers, SharePoint sites, and repositories of sensitive intellectual property
+    or Personally Identifiable Information (PII).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=endpoint EventID=4663 earliest=-30d\n| stats dc(path) AS upaths sum(bytes) AS rbytes\
+      \ count AS reads,\n        sum(eval(status=\"AccessDenied\")) AS denied by process host\n| eventstats\
+      \ avg(upaths) AS m stdev(upaths) AS s perc99(upaths) AS p99 by host\n| eval z=(upaths-m)/s\n| where\
+      \ z>3 OR upaths>=p99\n| table host process upaths rbytes reads denied z"
+- question: When the access->read->compress causal subgraph is scored by a node-level provenance graph
+    model (GraphSAGE), which process has file fan-out and outbound edges that deviate from learned benign
+    neighborhoods?
+  context: A provenance graph model learns benign neighborhoods of process/file/network nodes; a collecting
+    process exhibits abnormal file fan-out (many file-read edges) feeding a compress/stage node and outbound
+    edges. GraphSAGE-style node scoring flags such a node and returns its anomalous edges for explainability,
+    tying the alert to the Collection chain. A positive result is a node whose subgraph topology matches
+    read-then-compress collection; the returned offending edges show exactly which files and destinations
+    are involved.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Critical file servers, SharePoint sites, and repositories of sensitive intellectual property
+    or Personally Identifiable Information (PII).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = build_provenance_graph(file_access, process, network)
+
+      node_scores = GraphSAGE_anomaly(graph)
+
+      where node_scores.process >= threshold
+
+      emit: process_node, anomalous_edges(file_fanout, outbound), score'
+- question: When an LSTM/temporal-GNN autoencoder is trained on per-host file-access traces, which hosts
+    show reconstruction spikes or rare access sequences inconsistent with their historical rhythm?
+  context: Per-host file-access traces have a temporal rhythm; an autoencoder learns it and flags spikes
+    and rare sequences that signal bursty automated collection rather than human-paced access. Emitting
+    a compact causal footprint of the collection chain aids analyst triage. In the Collection tactic this
+    catches stealthy or throttled crawlers whose absolute volume is modest but whose sequence is abnormal.
+    A high reconstruction error with a bursty/rare access footprint warrants reviewing the implicated
+    process and staged output.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Critical file servers, SharePoint sites, and repositories of sensitive intellectual property
+    or Personally Identifiable Information (PII).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'trace = per_host_file_access_sequence(window)
+
+      recon_err = LSTM_autoencoder.reconstruct(trace)
+
+      where recon_err >= threshold OR sequence_rarity_high
+
+      emit: host, recon_err, causal_footprint(access->read->compress)'
+- question: Did any process access planted honeypot/canary files (e.g., C:\CorpData\2026_M&A_Strategy.docx)
+    as recorded by Event ID 4663?
+  context: 'Honeypot/canary files are decoys no legitimate workflow should ever touch, so any access is
+    a near-zero-false-positive deterministic trigger for collection or reconnaissance. This is one of
+    the strongest signals tied to the Collection tactic: an automated collector indiscriminately crawling
+    sensitive directories will read the canary. A positive result identifies the offending process, user,
+    and time with extremely high confidence; immediately scope what else that process accessed. This rule
+    must be retained as a deterministic floor.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations (specifically C:\Users\*\Documents), network shares containing HR or financial
+    data, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=endpoint EventID=4663 action=read
+
+      | where object_name IN canary_file_list
+
+      | table _time host user process_name process_id object_name'
+- question: Which non-interactive processes have weighted path/extension access scores (over 5-minute
+    windows) above the 98th percentile relative to per-user and peer-group baselines, including off-hours
+    activity and removable-media writes?
+  context: Weighting accesses by sensitive path and extension (.docx, .xlsx, .pdf, .pst, .kdbx) and comparing
+    per-process 5-minute scores against per-user and peer-group baselines flags automated collection that
+    mimics user activity. Including off-hours timing, removable-media writes, and files-per-window enriches
+    the signal. Focusing on non-interactive processes (services/scheduled tasks) above the 98th percentile
+    ties this to automated Collection. A positive result is a non-interactive process touching many sensitive
+    files unlike its user/peers; investigate parentage and destination.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations (specifically C:\Users\*\Documents), network shares containing HR or financial
+    data, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=endpoint EventID=4663 earliest=-30d\n| eval w=ext_weight(extension)*path_weight(path)\n\
+      | bin _time span=5m\n| stats sum(w) AS score sum(eval(removable_write=1)) AS rmw,\n        max(off_hours)\
+      \ AS oh by process host user interactive\n| eventstats perc98(score) AS p98 by user\n| where interactive=0\
+      \ AND score>=p98\n| table host user process score rmw oh"
+- question: When user/process/file relationships are modeled as a graph, which edges bridge normally disconnected
+    communities (e.g., winword.exe -> powershell.exe -> sensitive share)?
+  context: Community detection and graph learning over user/process/file graphs reveal anomalous bridges
+    between clusters that are normally disconnected, such as an Office app spawning a script interpreter
+    that then reaches a sensitive share. These bridging edges are exactly the unusual-parent automated-collection
+    patterns described in the evidence, and surfacing the bridging entities as top contributors makes
+    the alert explainable. A positive result is a low-probability edge connecting distinct communities;
+    investigate the full parent/child chain and the accessed share for Collection activity.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations (specifically C:\Users\*\Documents), network shares containing HR or financial
+    data, and code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = build_graph(users, processes, files)
+
+      comm = community_detection(graph)
+
+      bridges = edges_between_distinct_communities(graph, comm)
+
+      where bridge.prob <= low_threshold
+
+      emit: bridging_entities(parent->child->resource), score'
+- question: Did an automated-collection alert on a host get followed within 1 hour by a Zeek conn.log
+    connection to a new external IP with orig_bytes greater than 100MB?
+  context: Collection is usually a precursor to exfiltration, so temporally correlating on-host collection
+    alerts with a subsequent large outbound transfer to a new external destination within 1 hour gives
+    a high-confidence deterministic signal of the full kill-chain segment. Keep the 100MB/1-hour thresholds
+    as a floor and tune per egress profile. A positive correlation strongly indicates active data theft
+    following automated collection; capture the destination, byte volume, and the originating collection
+    process for immediate response. A negative result may mean staging without (yet) exfiltration.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days; correlate within 1 hour after a collection alert
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=alerts alert_type=\"automated_collection\"\n| join host [ search index=zeek sourcetype=conn\n\
+      \      | where orig_bytes>104857600 AND dest_is_new_external=true\n      | eval conn_time=_time\
+      \ ]\n| where conn_time>=alert_time AND conn_time<=alert_time+3600\n| table host alert_time conn_time\
+      \ dest_ip orig_bytes"
+- question: Which hosts exceed their 99th-percentile 10-minute outbound byte baseline, and do those flows
+    correlate with newly-seen/low-prevalence destinations or elevated NXDOMAIN and long high-entropy DNS
+    labels?
+  context: Baselining each host's 10-minute orig_bytes with a 99th-percentile threshold detects abnormal
+    outbound volume even to otherwise-normal-looking destinations. Enriching with destination age/prevalence
+    from Zeek dns.log and explicitly profiling DNS failure modes (elevated NXDOMAIN, long high-entropy
+    labels) catches covert/DNS-tunneled exfiltration of collected data. In the Collection-to-exfil context
+    this finds the egress that follows automated collection. A positive result is a host above its outbound
+    baseline toward rare destinations and/or with anomalous DNS; correlate back to on-host collection.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=zeek sourcetype=conn earliest=-30d\n| bin _time span=10m\n| stats sum(orig_bytes) AS\
+      \ ob by _time orig_host\n| eventstats perc99(ob) AS p99 by orig_host\n| where ob>=p99\n| join orig_host\
+      \ [ search index=zeek sourcetype=dns\n      | stats sum(eval(rcode=\"NXDOMAIN\")) AS nx max(label_entropy)\
+      \ AS ent,\n              min(dest_age) AS dage by orig_host ]\n| table _time orig_host ob nx ent\
+      \ dage"
+- question: When an attention-RNN/sequence model is run over combined host+network event sequences, which
+    chains (e.g., PowerShell -> bulk read -> rare DNS -> large outbound) score as anomalous, and what
+    events did attention weight as most contributory?
+  context: An attention-based sequence model over interleaved host and network events learns normal operational
+    sequences and flags cross-domain chains characteristic of collect-then-exfil, such as PowerShell execution
+    followed by bulk file reads, a rare DNS lookup, and a large outbound transfer. Attention weights surface
+    the top contributing events, making the multi-stage alert explainable across the Collection-to-exfiltration
+    boundary. A high anomaly score with a coherent attention-highlighted chain is strong evidence of automated
+    collection feeding exfiltration; review each highlighted stage.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = merge_host_network_events(per_host, time_ordered)
+
+      score, attn = AttentionRNN.score(seq)
+
+      where score >= threshold
+
+      emit: host, anomalous_chain, top_attention_events'
+- question: Did a cloud identity invoke control-plane automation for at-scale collection, such as SSM
+    SendCommand/document execution across managed instances, or bulk export APIs (CreateExportTask, StartExportJob)
+    by a non-pipeline principal?
+  context: Cloud adversaries leverage native automation to collect data at scale without dropping tools,
+    e.g., fanning out SSM SendCommand across instances or launching bulk export/ETL jobs. Alerting when
+    such control-plane automation is invoked by principals that are not the established pipeline/automation
+    identities is a deterministic signal tied to Collection in IaaS/SaaS/Office Suite. A positive result
+    names the principal, the API, and the targeted resources; verify against change tickets and known
+    automation. A non-pipeline principal triggering mass export is high-priority.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD Sign-in Logs
+  - Microsoft Graph Activity Logs
+  - Office 365 Unified Audit Log
+  - 'NAI: Cloud control-plane audit logs (CloudTrail, Azure activity/sign-in, M365 unified audit), data
+    stores holding sensitive objects (S3 buckets, SharePoint/OneDrive sites, mailboxes), and automation
+    services (SSM, data pipelines, ETL).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=cloud sourcetype=aws:cloudtrail\n| where eventName IN (\"SendCommand\",\"CreateExportTask\"\
+      ,\"StartExportJob\")\n   OR (eventSource=\"ssm.amazonaws.com\" AND eventName=\"StartSession\")\n\
+      | where userIdentity.arn NOT IN known_pipeline_principals\n| table _time userIdentity.arn eventName\
+      \ resources sourceIPAddress"
+- question: Which principals performed first-seen bulk data-access/export/ETL actions, read counts above
+    their 99th-percentile baseline, or elevated AccessDenied/403 rates within a short window?
+  context: Baselining CloudTrail (and equivalent) API calls per principal over a lookback period lets
+    you alert on first-seen bulk data-access/export/ETL actions, read counts above the principal's 99th
+    percentile, and elevated AccessDenied/403 rates that indicate automated enumeration. This catches
+    programmatic mass collection that is anomalous for that identity, tying it to the Collection tactic
+    in cloud. A positive result is a principal suddenly doing high-volume reads/exports or generating
+    many access-denied errors; correlate with sign-in method (scripting agent) and source IP.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD Sign-in Logs
+  - Microsoft Graph Activity Logs
+  - Office 365 Unified Audit Log
+  - 'NAI: Cloud control-plane audit logs (CloudTrail, Azure activity/sign-in, M365 unified audit), data
+    stores holding sensitive objects (S3 buckets, SharePoint/OneDrive sites, mailboxes), and automation
+    services (SSM, data pipelines, ETL).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=cloud sourcetype=aws:cloudtrail earliest=-30d\n| stats count AS calls values(eventName)\
+      \ AS apis,\n        sum(eval(errorCode IN (\"AccessDenied\",\"403\"))) AS denied by userIdentity.arn\
+      \ eventName\n| eventstats perc99(calls) AS p99 by eventName\n| eval first_seen=if(seen_in_baseline(userIdentity.arn,eventName)==0,1,0)\n\
+      | where first_seen=1 OR calls>=p99 OR denied>denied_threshold\n| table userIdentity.arn eventName\
+      \ calls denied first_seen"
+- question: When unsupervised rare-by-population jobs are run over CloudTrail, which principals show unusual
+    API calls, user-command pairs, geographies, or high error-code rates, ranked by influencer?
+  context: Rare-by-population ML over CloudTrail flags API calls, user-command pairings, geographies,
+    and error-code rates that are unusual relative to the whole population of principals, ranking influencers
+    so the alert names the rare action and identity. This surfaces automated cloud collection by compromised
+    or rogue identities that individual baselines might miss. In the Collection tactic this prioritizes
+    the rarest, most anomalous principal/action combinations. A positive result names a principal performing
+    population-rare bulk actions; validate against legitimate automation and investigate the targeted
+    data stores.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD Sign-in Logs
+  - Microsoft Graph Activity Logs
+  - Office 365 Unified Audit Log
+  - 'NAI: Cloud control-plane audit logs (CloudTrail, Azure activity/sign-in, M365 unified audit), data
+    stores holding sensitive objects (S3 buckets, SharePoint/OneDrive sites, mailboxes), and automation
+    services (SSM, data pipelines, ETL).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "job = rare_by_population(cloudtrail,\n        fields=[eventName, user_command_pair, geo, errorCode])\n\
+      where rarity_score >= threshold\nemit: principal, rare_action, top_influencers, score"
+- question: When users, services, and activities are modeled as a dynamic graph with GNN embeddings, which
+    principals touch services/objects outside their normal community (cross-service bulk reads/exports)?
+  context: Modeling cloud users, services, and activities as a dynamic graph and learning GNN embeddings
+    flags a principal that begins touching services or objects outside its normal community, e.g., an
+    identity that suddenly performs cross-service bulk reads/exports. Surfacing the anomalous service
+    edges as top contributors makes the alert explainable. This ties to the Collection tactic by detecting
+    identities reaching into data stores they do not normally use. A positive result is a principal with
+    new cross-community service edges; investigate which sensitive objects (S3, SharePoint/OneDrive, mailboxes)
+    were accessed and why.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD Sign-in Logs
+  - Microsoft Graph Activity Logs
+  - Office 365 Unified Audit Log
+  - 'NAI: Cloud control-plane audit logs (CloudTrail, Azure activity/sign-in, M365 unified audit), data
+    stores holding sensitive objects (S3 buckets, SharePoint/OneDrive sites, mailboxes), and automation
+    services (SSM, data pipelines, ETL).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = dynamic_graph(users, services, activities)
+
+      emb = GNN_embeddings(graph)
+
+      where principal.community_deviation >= threshold
+
+      emit: principal, anomalous_service_edges, score'
