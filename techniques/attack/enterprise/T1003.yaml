@@ -1,0 +1,546 @@
+name: 'T1003: OS Credential Dumping'
+id: 92722b49-27fe-4910-9529-81ecba17f5ec
+description: Investigate adversary attempts to dump operating-system credential material (hashes or clear-text
+  passwords) from compromised Windows, Linux, and macOS hosts. This playbook helps an analyst hunt for
+  execution of known credential-dumping tooling, suspicious access to LSASS process memory, reads of the
+  SAM registry hive and LSA secrets, Volume Shadow Copy abuse to extract NTDS.dit/SAM/SYSTEM, DCSync-style
+  directory-replication requests, theft of Linux /etc/shadow and SSH private keys, disabling of LSA protected-process
+  (RunAsPPL), and obfuscated PowerShell credential modules. It combines signature/symbolic-logic detections,
+  statistical baselining (rarity, volume, failure-rate, and timing anomalies at mean + 3 sigma), and machine-learning
+  approaches (classifiers, sequence models, clustering, and provenance-graph autoencoders) so the analyst
+  can confirm whether credential theft occurred, scope affected accounts and hosts, and support follow-on
+  lateral movement investigations.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process matching a known credential-dumping tool (e.g., mimikatz, procdump -ma lsass,
+    comsvcs.dll MiniDump, nanodump, secretsdump, pwdump, gsecdump) execute on any host, and did it correlate
+    with a network file transfer whose hash matches threat intelligence?
+  context: This is the primary signature-based lead for Credential Access via OS Credential Dumping. Build
+    a watchlist of well-known dumping binaries and their command-line patterns and alert on Windows Event
+    ID 4688 / Sysmon Event ID 1 matches, then correlate against Zeek files.log hashes tied to TI feeds.
+    Because adversaries routinely rename or recompile these tools, supplement exact matching with adaptive
+    misuse detection (AMIDES) so renamed/repacked variants are still caught. A positive result — a dumping
+    binary plus a TI-matched transfer off the host — strongly indicates staged credential theft and exfiltration;
+    validate detection coverage with Atomic Red Team T1003.001 executables.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Privileged Access Workstations, User Endpoints'
+  range: Last 90 days, pivoting on the process-creation timestamp.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "dump = FILTER proc_create (Event4688 OR Sysmon1)\n  WHERE image IN dumping_watchlist\n   \
+      \  OR cmdline MATCHES /(sekurlsa|-ma\\s+lsass|comsvcs.*MiniDump|nanodump|secretsdump|pwdump|gsecdump)/i\n\
+      xfer = FILTER zeek_files WHERE sha256 IN ti_malicious_hashes\nALERT WHERE dump JOIN xfer ON host\
+      \ WITHIN 30m"
+  - technology: ML/AMIDES pseudocode
+    query: 'score = AMIDES_misuse_model(proc.cmdline, proc.image)
+
+      ALERT WHERE score >= threshold  // catches renamed/recompiled variants'
+- question: Is a file transferred off a host both rare across the fleet (bottom 1% prevalence for its
+    hash/MIME) and unusually large or moving over a non-standard port, suggesting staged credential data
+    leaving the environment?
+  context: 'Credential dumps are often novel artifacts unique to the attack. Compute fleet-wide prevalence/rarity
+    for the transferred file by hash and MIME/extension combination, and flag transfers in the bottom
+    1% prevalence or above the 99th percentile size for that MIME, especially over non-standard ports
+    in Zeek conn.log. Frequency analysis turns ''never-seen-before'' into a measurable signal: a rare,
+    oversized file egressing from a host that just ran a dumping-tool candidate is a high-confidence exfiltration
+    lead.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Privileged Access Workstations, User Endpoints'
+  range: Last 90 days for baseline prevalence; alert on current transfers.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "prev = COUNT_DISTINCT(host) PER file_hash OVER fleet/90d\nsize_p99 = PERCENTILE(file_size,\
+      \ 99) PER mime\nALERT WHERE prev <= bottom_1pct\n  AND (file_size > size_p99 OR dest_port NOT IN\
+      \ standard_ports)"
+- question: After a host spawned a credential-dumping candidate, did its rate of blocked or failed egress
+    connections and failed file transfers spike beyond its own baseline (mean + 3 sigma)?
+  context: Failure is itself a signal. Adversaries frequently make several aborted or blocked attempts
+    before successfully staging or exfiltrating a dump. Baseline per-host blocked egress and failed transfers
+    using Zeek conn.log connection states (S0, REJ, RSTO) and alert when a host that just ran a dumping-tool
+    candidate shows a spike beyond mean + 3 sigma. A burst of failed/blocked egress immediately after
+    dumping-tool execution suggests staged exfiltration attempts that warrant containment even if no successful
+    transfer is seen.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Privileged Access Workstations, User Endpoints'
+  range: Last 90 days for the per-host baseline; evaluate the window after tool execution.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = COUNT(conn WHERE conn_state IN [S0,REJ,RSTO]) PER host PER 1h\nmu,sigma = BASELINE(fails)\
+      \ PER host OVER 90d\nALERT WHERE fails > mu + 3*sigma\n  AND host IN recent_dumping_tool_hosts"
+- question: Does a supervised classifier, using process/memory and file-transfer features, flag an event
+    as a likely credential-dumping chain, and what top features drive that score?
+  context: Where single signatures miss novel tooling, a trained Random Forest/XGBoost can combine weak
+    signals into a strong decision. Features include parent process, command-line length and entropy,
+    user, image rarity, and file-transfer metadata (size, MIME, destination subnets). Train on labeled
+    benign vs. dumping events and surface the top-3 contributing features (e.g., image prevalence, command-line
+    entropy, transfer size) in each alert so the analyst can triage quickly. A high-probability classification
+    with intuitive contributors is an actionable Credential Access lead.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Privileged Access Workstations, User Endpoints'
+  range: Last 90 days of features for inference; retrain periodically.
+  queries:
+  - technology: ML/Classifier pseudocode
+    query: "X = FEATURES(parent, cmdline_len, cmdline_entropy, user, image_rarity,\n             xfer_size,\
+      \ xfer_mime, dest_subnet)\np = RandomForest.predict_proba(X)\nALERT WHERE p >= 0.8 WITH top3 = SHAP(X)"
+- question: Does a PowerShell script-block log (Event ID 4104) contain credential-dumping keywords or
+    API calls such as Invoke-Mimikatz, Get-GPPPassword, sekurlsa::logonpasswords, LsaSecrets, DumpCreds,
+    or MiniDumpWriteDump, including base64/obfuscated variants?
+  context: Many credential dumpers run as in-memory PowerShell, leaving traces only in script-block logging.
+    Search Event ID 4104 for known module names, function calls, and API invocations associated with credential
+    dumping, and decode base64 to catch obfuscated payloads. A match indicates an attempt to extract LSA
+    secrets, logon passwords, or GPP credentials directly through PowerShell — a core Credential Access
+    behavior. Validate detection with emulated payloads from Atomic Red Team T1003.001.
+  answer_sources:
+  - Windows Event ID 4104
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Active Directory Domain Controllers'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE Event4104.ScriptBlockText MATCHES\n  /(Invoke-Mimikatz|Get-GPPPassword|sekurlsa::logonpasswords|LsaSecrets|DumpCreds|MiniDumpWriteDump)/i\n\
+      \  OR base64_decode(ScriptBlockText) MATCHES same_patterns"
+- question: Is a PowerShell script block's entropy abnormally high for the host (exceeding its mean +
+    3 sigma baseline), indicating obfuscation that may hide credential-dumping logic?
+  context: Obfuscation raises a script's character entropy. Baseline normal script-block entropy per host
+    (and per role) and flag PowerShell blocks exceeding mean + 3 sigma as likely obfuscated. High entropy
+    alone is not malicious, but obfuscated PowerShell on a server or DC, especially near other Credential
+    Access indicators, is a strong lead. Per-host baselining limits false positives from legitimately
+    complex admin scripts.
+  answer_sources:
+  - Windows Event ID 4104
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Active Directory Domain Controllers'
+  range: Last 90 days for per-host baseline; score new blocks continuously.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ent = SHANNON_ENTROPY(Event4104.ScriptBlockText)
+
+      mu,sigma = BASELINE(ent) PER host OVER 90d
+
+      ALERT WHERE ent > mu + 3*sigma'
+- question: Do the frequency and average entropy of PowerShell executions on a host deviate from their
+    forecast (ARIMA) while an NLP/token classifier scores a new script as malicious despite renaming or
+    reordering?
+  context: Combine time-series and language modeling to catch evasive PowerShell. Apply ARIMA to per-host
+    PowerShell execution frequency and average entropy to detect anomalous spikes, and use a token/NLP
+    classifier robust to renaming and command reordering to score the script content itself. Alert when
+    both signals fire, and list the top-3 tokens/features driving the classifier so the analyst sees why
+    it is suspicious. This catches living-off-the-land credential dumping that evades keyword lists.
+  answer_sources:
+  - Windows Event ID 4104
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Active Directory Domain Controllers'
+  range: Last 90 days for ARIMA training; score in near-real-time.
+  queries:
+  - technology: ML/Time-series+NLP pseudocode
+    query: 'fc = ARIMA(freq, entropy) PER host
+
+      anom = ABS(observed - fc) > tolerance
+
+      mal = NLP_token_classifier(ScriptBlockText)
+
+      ALERT WHERE anom AND mal.prob >= 0.8 WITH top3_tokens'
+- question: Was a Volume Shadow Copy created (vssadmin/diskshadow/wmic shadowcopy) and then, within ~10
+    minutes, used to copy NTDS.dit, SAM, or SYSTEM — or did ntdsutil run IFM commands (ac i ntds / ifm
+    / create full)?
+  context: Bulk credential extraction on Windows commonly abuses Volume Shadow Copies to grab locked database/hive
+    files. Alert when shadow-creation commands are followed within 10 minutes by NTDS.dit/SAM/SYSTEM file
+    copies from the shadow path, or when ntdsutil executes IFM 'install from media' commands on a DC.
+    This sequence (per CAR-2019-08-002) is a high-fidelity sign of Active Directory domain-database theft.
+    On non-DC hosts, SAM/SYSTEM copies indicate local hash harvesting.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers (for NTDS.dit), All Windows Systems (for SAM/SYSTEM hives)'
+  range: Last 90 days; correlate within a 10-minute window per host.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "shadow = FILTER proc WHERE cmdline MATCHES\n  /(vssadmin\\s+create\\s+shadow|diskshadow|wmic\\\
+      s+shadowcopy\\s+call\\s+create)/i\ncopy = FILTER proc WHERE cmdline MATCHES /(ntds.dit|\\\\config\\\
+      \\SAM|\\\\config\\\\SYSTEM)/i\nifm = FILTER proc WHERE cmdline MATCHES /ntdsutil.*(ac i ntds|ifm|create\
+      \ full)/i\nALERT WHERE (shadow THEN copy WITHIN 10m ON host) OR ifm"
+- question: Is the per-user/per-host usage of reg.exe, vssadmin, ntdsutil, or diskshadow above the 99th
+    percentile, or occurring for the first time ever — especially on a non-DC host?
+  context: These utilities are rarely run interactively by most users. Baseline their usage per user/host
+    and flag occurrences above the 99th percentile or any first-ever execution, weighting non-DC hosts
+    more heavily since shadow/NTDS tooling there is highly anomalous. Additionally score the multi-step
+    trace (create -> copy -> delete) for combined rarity using statistical leverage. A first-time vssadmin/ntdsutil
+    run on a workstation is a strong Credential Access lead.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers (for NTDS.dit), All Windows Systems (for SAM/SYSTEM hives)'
+  range: Last 90 days for per-user/host baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "cnt = COUNT(proc WHERE image IN [reg.exe,vssadmin,ntdsutil,diskshadow])\n      PER user PER\
+      \ host\np99 = PERCENTILE(cnt, 99) PER role\nALERT WHERE cnt > p99 OR first_ever(user,host,image)\n\
+      \  WEIGHT *2 IF host NOT IN domain_controllers"
+- question: After a shadow copy was created, was a file matching ntds.dit or SAM read/written that exceeds
+    the host's normal write-size distribution (mean + 3 sigma), consistent with bulk database extraction?
+  context: 'The physics of credential-database theft show up in volume: ntds.dit copies are typically
+    tens of MB to GB. Profile the byte volume of files written/read after shadow creation and alert when
+    a copied file matching ntds.dit/SAM exceeds the host''s normal write-size distribution by mean + 3
+    sigma. A large, unusual write tied to shadow-copy activity captures even renamed output files that
+    signature rules would miss.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers (for NTDS.dit), All Windows Systems (for SAM/SYSTEM hives)'
+  range: Last 90 days for per-host write-size baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "mu,sigma = BASELINE(file_write_bytes) PER host OVER 90d\nALERT WHERE file_name MATCHES /(ntds.dit|SAM)/i\n\
+      \  AND file_bytes > mu + 3*sigma\n  AND host IN recent_shadow_copy_hosts"
+- question: Does a sequence model (HMM/LSTM) trained on benign command sequences flag a command chain
+    matching the credential-harvest pattern (vssadmin create -> copy -> delete) as malicious?
+  context: Individual commands may be benign, but their ordering reveals intent. Train an HMM or LSTM
+    on benign command sequences and flag sequences matching the credential-harvest chain (create shadow
+    -> copy hive/DB -> delete shadow) as anomalous, reporting which steps contributed. This catches attackers
+    who space out or vary their commands, and complements the strict 10-minute correlation rule by learning
+    the broader behavioral pattern.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers (for NTDS.dit), All Windows Systems (for SAM/SYSTEM hives)'
+  range: Last 90 days of command sequences for training and scoring.
+  queries:
+  - technology: ML/Sequence-model pseudocode
+    query: "seq = ORDERED(proc.cmdline) PER host PER session\nscore = LSTM_anomaly(seq)\nALERT WHERE score\
+      \ >= threshold\n  AND seq MATCHES create_shadow -> copy -> delete_shadow"
+- question: Was a file whose name contains Linux credential indicators (shadow, passwd, .ssh, id_rsa,
+    authorized_keys, .gnupg, *key*) transferred unencrypted or to an external destination?
+  context: On Linux/macOS, credential theft frequently means copying /etc/shadow or SSH private keys off
+    the host. Search Zeek files.log for filenames containing shadow/passwd/.ssh/id_rsa/authorized_keys/.gnupg/*key*
+    and alert when transfers are unencrypted or destined externally. These are core T1003 sub-paths; an
+    outbound transfer of id_rsa or shadow is a high-confidence Credential Access and exfiltration lead
+    requiring rapid key rotation.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssh.log
+  - 'NAI: Network segments containing critical Linux servers, Network egress points, VPN concentrators'
+  range: Last 90 days.
+  queries:
+  - technology: Zeek/pseudocode
+    query: "ALERT WHERE files.log.filename MATCHES\n  /(shadow|passwd|\\.ssh|id_rsa|authorized_keys|\\\
+      .gnupg|key)/i\n  AND (NOT encrypted_channel OR dest_ip IN external_space)"
+- question: Does an SSH session show an anomalously high server-to-client byte ratio or total byte volume
+    for a short-duration session (exceeding mean + 3 sigma), suggesting credential files were pulled off
+    a server?
+  context: 'Exfiltrating credential files over SSH/SCP inverts the normal interactive ratio: the server
+    sends far more than the client. Compute server-to-client byte ratios and session byte volume per SSH
+    session and mark sessions exceeding mean + 3 sigma as likely carrying exfiltrated credential files.
+    A short session that moves a large server-to-client payload is suspicious even when the file name
+    is not visible due to encryption.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssh.log
+  - 'NAI: Network segments containing critical Linux servers, Network egress points, VPN concentrators'
+  range: Last 90 days for SSH session baseline.
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "ratio = resp_bytes / GREATEST(orig_bytes,1) PER ssh_session\nmu,sigma = BASELINE(ratio, resp_bytes)\
+      \ OVER 90d\nALERT WHERE (ratio > mu+3*sigma OR resp_bytes > vol_mu+3*sigma)\n  AND duration < short_threshold"
+- question: Did a source produce a burst of failed SSH authentications (auth_success=F) beyond its baseline
+    (mean + 3 sigma) immediately before a successful login?
+  context: Failed-then-successful authentication marks brute force or credential stuffing that finally
+    worked — a precursor to on-host credential dumping. Baseline failed SSH authentications per source
+    from Zeek ssh.log and alert on bursts beyond mean + 3 sigma that precede a successful session, treating
+    failure rate as a distinct Credential Access signal. The failure burst plus subsequent success tightens
+    confidence and identifies the compromised account and source.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssh.log
+  - 'NAI: Network segments containing critical Linux servers, Network egress points, VPN concentrators'
+  range: Last 90 days for per-source failure baseline.
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "fails = COUNT(ssh WHERE auth_success=F) PER src PER 10m\nmu,sigma = BASELINE(fails) PER src\
+      \ OVER 90d\nALERT WHERE fails > mu+3*sigma\n  THEN EXISTS ssh WHERE auth_success=T SAME src WITHIN\
+      \ 30m"
+- question: Does a host-communication/provenance graph reveal anomalous edges, or does clustering of SSH
+    sessions isolate outliers consistent with a credential access->read->transfer chain?
+  context: Graph methods reveal relationships that flat logs hide. Build a host communication/provenance
+    graph from conn.log to spot anomalous edges and cluster SSH sessions by duration, bytes, and client/server
+    versions. A provenance-graph autoencoder (KAIROS-style) scores the access -> read -> transfer chain
+    and emits a compact subgraph naming the top contributing nodes. This surfaces stealthy lateral credential
+    theft and gives the analyst an explainable subgraph to investigate.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssh.log
+  - 'NAI: Network segments containing critical Linux servers, Network egress points, VPN concentrators'
+  range: Last 90 days of connection/session data for graph construction.
+  queries:
+  - technology: ML/Graph pseudocode
+    query: "G = BUILD_GRAPH(conn.log edges host->host)\nscore = ProvenanceAutoencoder(G).recon_error\n\
+      clusters = KMEANS(ssh_sessions[duration,bytes,versions])\nALERT WHERE score high OR session IN outlier_cluster\n\
+      \  EMIT top_contributing_subgraph"
+- question: Did a non-allowlisted process request a handle to lsass.exe with a high-risk access mask (e.g.,
+    0x1010, 0x1410, 0x143A, 0x1438, 0x1FFFFF) that includes PROCESS_VM_READ, particularly with dbghelp.dll/dbgcore.dll
+    (MiniDumpWriteDump) call traces?
+  context: Reading LSASS memory is the most direct route to clear-text passwords and hashes. Alert when
+    Sysmon Event ID 10 shows lsass.exe access with high-risk GrantedAccess masks including PROCESS_VM_READ
+    and the SourceImage is not allowlisted (svchost.exe, wininit.exe, approved security tools), especially
+    when dbghelp/dbgcore call traces indicate MiniDumpWriteDump. This Sigma-backed detection is one of
+    the strongest single indicators of OS Credential Dumping; a positive is a near-certain lead.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Domain Controllers'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE Sysmon10.TargetImage ENDSWITH 'lsass.exe'\n  AND GrantedAccess IN [0x1010,0x1410,0x143A,0x1438,0x1FFFFF]\n\
+      \  AND SourceImage NOT IN lsass_reader_allowlist\n  AND CallTrace CONTAINS (dbghelp.dll OR dbgcore.dll)"
+- question: Aggregating LSASS accesses into 5-minute sessions per source process, do total bytes read
+    and number of reads exceed the benign baseline (mean + 3 sigma), and is the source image rare across
+    the fleet?
+  context: Benign LSASS readers issue a few small reads; credential dumping reads large contiguous memory
+    regions. Aggregate LSASS accesses into 5-minute sessions per source process and flag sessions whose
+    total bytes read and read count exceed the benign baseline by mean + 3 sigma, then rarity-score the
+    source image fleet-wide. A rare process performing high-volume LSASS reads is highly indicative of
+    memory scraping even when the access mask is borderline.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Domain Controllers'
+  range: Last 90 days for read-volume and image-rarity baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "sess = AGGREGATE(lsass_reads) PER source_proc PER 5m\nmu,sigma = BASELINE(sess.bytes, sess.read_count)\
+      \ OVER 90d\nrarity = COUNT_DISTINCT(host) PER source_image / fleet\nALERT WHERE (sess.bytes>mu+3*sigma\
+      \ OR sess.read_count>mu+3*sigma)\n  AND rarity <= bottom_1pct"
+- question: Did denied/failed handle requests to lsass.exe (Event ID 4656 failure, or 4663 with restricted
+    access) spike on a host beyond its baseline (mean + 3 sigma), suggesting PPL-blocked dumping or tool
+    retries?
+  context: When LSASS is protected (PPL) or EDR blocks access, dumping tools generate failed/denied handle
+    requests as they retry. Baseline failed/denied handle requests to lsass.exe per host and alert on
+    spikes beyond mean + 3 sigma. Treating this failure mode as a distinct signal catches dumping attempts
+    that did not succeed, giving early warning before the adversary finds a working technique.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Domain Controllers'
+  range: Last 90 days for per-host denied-handle baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "den = COUNT(Event4656 failure OR Event4663 restricted)\n      WHERE object='lsass.exe' PER\
+      \ host PER 1h\nmu,sigma = BASELINE(den) PER host OVER 90d\nALERT WHERE den > mu + 3*sigma"
+- question: Does a classifier (Logistic Regression/Random Forest) over LSASS-access features label an
+    event as malicious, and what top features drive it?
+  context: Combine the LSASS-access signals into a single decision. Train a Logistic Regression/Random
+    Forest on features such as source/parent process, user, access mask, signature status, bytes read,
+    and read count to classify LSASS access events, surfacing the top-3 contributors (e.g., bytes read,
+    source-image rarity, access mask) per alert. This reduces analyst load by ranking access events and
+    explaining why each was flagged.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: All Windows Endpoints, Windows Servers, Domain Controllers'
+  range: Last 90 days of LSASS-access features for inference.
+  queries:
+  - technology: ML/Classifier pseudocode
+    query: "X = FEATURES(source_proc, parent, user, access_mask, signed,\n             bytes_read, read_count)\n\
+      p = RandomForest.predict_proba(X)\nALERT WHERE p >= 0.8 WITH top3 = SHAP(X)"
+- question: Was a directory-replication right (DS-Replication-Get-Changes / -All) exercised by a non-DC
+    account (Event ID 4662), or did Zeek dce_rpc.log show DRSUAPI DsGetNCChanges from a source outside
+    the DC allowlist (DCSync)?
+  context: DCSync lets an attacker with replication rights pull password hashes from a DC without touching
+    disk. Alert when Event ID 4662 logs DS-Replication-Get-Changes/-All for a non-DC account, or when
+    Zeek dce_rpc.log shows DRSUAPI DsGetNCChanges (drsuapi) from a source IP outside the DC allowlist.
+    Legitimate replication only occurs between DCs, so any replication request from a workstation or non-DC
+    account is a high-fidelity Credential Access lead (per BZAR).
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, Network links between domain member segments and the DC segment'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE Event4662.properties CONTAINS\n  (DS-Replication-Get-Changes OR DS-Replication-Get-Changes-All)\n\
+      \  AND account NOT IN dc_computer_accounts"
+  - technology: Zeek/pseudocode
+    query: "ALERT WHERE dce_rpc.endpoint='drsuapi'\n  AND operation='DsGetNCChanges'\n  AND id.orig_h\
+      \ NOT IN dc_allowlist"
+- question: Did replication traffic volume/frequency between DCs spike beyond the per-pair baseline (mean
+    + 3 sigma), or did any replication originate from a non-DC host?
+  context: Even authorized-looking replication can be abused. Baseline replication traffic volume and
+    frequency between DCs and flag sudden increases or any replication initiated from non-DC hosts using
+    per-pair mean + 3 sigma thresholds. An unexpected replication spike or a brand-new replication source
+    is a statistical indicator of DCSync abuse that complements the signature rule.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, Network links between domain member segments and the DC segment'
+  range: Last 90 days for per-pair replication baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'rep = COUNT/VOLUME(replication) PER (src,dst) PER 1h
+
+      mu,sigma = BASELINE(rep) PER pair OVER 90d
+
+      ALERT WHERE rep > mu+3*sigma OR src NOT IN domain_controllers'
+- question: Does clustering of replication initiators (by protocol, frequency, time, object scope) place
+    any host outside the legitimate DC cluster?
+  context: Unsupervised clustering separates legitimate DC replication peers from impostors. Cluster replication
+    initiators with K-Means on protocol, frequency, time-of-day, and object scope and flag hosts that
+    fall outside the legitimate DC cluster, reporting the distinguishing features (source not in DC cluster,
+    off-hours timing, broad object scope). This catches DCSync from compromised hosts that mimic protocol
+    details but differ in behavioral profile.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, Network links between domain member segments and the DC segment'
+  range: Last 90 days of replication behavior for clustering.
+  queries:
+  - technology: ML/Clustering pseudocode
+    query: "C = KMEANS(initiators[protocol,freq,hour,object_scope])\nALERT WHERE host NOT IN legitimate_DC_cluster\n\
+      \  WITH distinguishing_features"
+- question: Did a process outside a strict allowlist access the SAM file (%SystemRoot%\system32\config\SAM)
+    or HKLM\SECURITY\Policy\Secrets (Event ID 4663/4656/4657), or did reg.exe save HKLM\SAM|SYSTEM|SECURITY?
+  context: Local hash and LSA-secret theft requires reading the SAM hive and LSA secrets. Alert when Event
+    IDs 4663/4656/4657 log access to %SystemRoot%\system32\config\SAM or HKLM\SECURITY\Policy\Secrets
+    by processes outside a strict allowlist (lsass.exe, services.exe, System, approved backup agents),
+    and on reg.exe save of HKLM\SAM|SYSTEM|SECURITY. These are textbook T1003 actions; validate via Atomic
+    Red Team T1003.001.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - 'NAI: All Windows Systems, Domain Controllers'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE Event IN [4663,4656,4657]\n  AND object MATCHES /(\\\\config\\\\SAM|SECURITY\\\
+      \\Policy\\\\Secrets)/i\n  AND process NOT IN sam_lsa_allowlist\nOR proc.cmdline MATCHES /reg(.exe)?\\\
+      s+save\\s+HKLM\\\\(SAM|SYSTEM|SECURITY)/i"
+- question: Are SAM/LSA access events occurring outside normal time windows (outside the 5th-95th percentile)
+    or in counts beyond the host/role baseline (mean + 3 sigma)?
+  context: Legitimate access to SAM/LSA follows predictable timing (e.g., backups, patching). Baseline
+    normal access time windows and counts per host/role and flag events outside the 5th-95th percentile
+    of the timing distribution or beyond mean + 3 sigma in count. Off-hours or unusually frequent SAM/LSA
+    access, even by a normally-allowed process, can indicate misuse or a masquerading process worth investigating.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - 'NAI: All Windows Systems, Domain Controllers'
+  range: Last 90 days for per-host/role timing and count baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "t_lo,t_hi = PERCENTILE(access_hour,[5,95]) PER host/role\nmu,sigma = BASELINE(access_count)\
+      \ PER host/role OVER 90d\nALERT WHERE access_hour NOT IN [t_lo,t_hi]\n  OR access_count > mu + 3*sigma"
+- question: Did non-allowlisted processes generate failed handle requests (Event ID 4656 with failure
+    result) to the SAM or SECURITY objects?
+  context: 'Failed access to SAM/SECURITY is itself diagnostic: a process that tries and is denied is
+    probing for credentials. Track failed handle requests to SAM/SECURITY by non-allowlisted processes
+    as a distinct signal and alert on any occurrence or on spikes beyond baseline. Because legitimate
+    processes rarely fail accessing these objects, even a single denied attempt by an unexpected process
+    is a meaningful Credential Access lead.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - 'NAI: All Windows Systems, Domain Controllers'
+  range: Last 90 days for the per-host baseline of denied requests.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fail = COUNT(Event4656 result=failure\n  WHERE object MATCHES /(SAM|SECURITY)/i\n  AND process\
+      \ NOT IN sam_lsa_allowlist) PER host\nALERT WHERE fail >= 1 OR fail > baseline_mu + 3*sigma"
+- question: Does a one-class model trained on legitimate SAM/LSA access traces flag an event or trace
+    as falling outside the learned normal boundary?
+  context: When allowlists are incomplete, anomaly detection fills the gap. Train a one-class SVM or leverage-based
+    scorer on legitimate SAM/LSA access traces (process, user, timing, access type) and flag events or
+    traces that fall outside the learned boundary, reporting the deviating features. This catches novel
+    or masquerading processes accessing credential stores that no static rule anticipated.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - 'NAI: All Windows Systems, Domain Controllers'
+  range: Last 90 days of legitimate access traces for training.
+  queries:
+  - technology: ML/One-class pseudocode
+    query: 'X = FEATURES(process,user,access_type,hour,object) ON sam_lsa_access
+
+      model = OneClassSVM.fit(legitimate_traces)
+
+      ALERT WHERE model.predict(X) = outlier WITH deviating_features'
+- question: Did Wininit log Event ID 12 stating 'LSA was not started as a protected process', or did Event
+    ID 4657 record a modification to HKLM\SYSTEM\CurrentControlSet\Control\Lsa\RunAsPPL disabling it?
+  context: 'Disabling LSA protected process (RunAsPPL) removes the main barrier to LSASS memory dumping
+    and is a common precursor step. Trigger immediately on Event ID 12 (Wininit) containing ''LSA was
+    not started as a protected process'' and on Event ID 4657 changes to HKLM\SYSTEM\CurrentControlSet\Control\Lsa\RunAsPPL
+    that disable it. On a DC or PAW this is critical: a RunAsPPL regression should be treated as an imminent-LSASS-dumping
+    warning.'
+  answer_sources:
+  - Windows Event ID 12
+  - Windows Event ID 4657
+  - 'NAI: All Windows 8.1/Server 2012 R2 and newer systems, especially Domain Controllers and PAWs'
+  range: Last 90 days; alert immediately on occurrence.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE (Event12.source='Wininit'\n  AND message CONTAINS 'LSA was not started as a protected\
+      \ process')\nOR (Event4657.key ENDSWITH '\\\\Control\\\\Lsa\\\\RunAsPPL'\n  AND new_value IN [0,\
+      \ removed])"
+- question: Did modifications to HKLM\SYSTEM\CurrentControlSet\Control\Lsa increase significantly on a
+    host versus its own or peer baseline (mean + 3 sigma)?
+  context: Tampering with the LSA control key may extend beyond just RunAsPPL. Monitor modification frequency
+    for HKLM\SYSTEM\CurrentControlSet\Control\Lsa and flag hosts with statistically significant increases
+    versus their own baseline or peer group (mean + 3 sigma). A burst of LSA-key changes, especially clustered
+    with other indicators, suggests an adversary weakening credential protections.
+  answer_sources:
+  - Windows Event ID 12
+  - Windows Event ID 4657
+  - 'NAI: All Windows 8.1/Server 2012 R2 and newer systems, especially Domain Controllers and PAWs'
+  range: Last 90 days for per-host/peer LSA-key baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "mods = COUNT(Event4657 WHERE key STARTSWITH\n  'HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\
+      \\Lsa') PER host PER 1d\nmu,sigma = BASELINE(mods) PER host/peer OVER 90d\nALERT WHERE mods > mu\
+      \ + 3*sigma"
+- question: Does an autoencoder trained on golden-image security-registry values flag a host's configuration
+    (e.g., RunAsPPL) as drifted via high reconstruction error, and can the change be tied to a causal
+    process chain?
+  context: Configuration drift away from a hardened baseline is a leading indicator of defense weakening.
+    Train an autoencoder on golden-image values for security registry keys including RunAsPPL and alert
+    when a host's configuration yields high reconstruction error, surfacing the top deviating keys. A
+    provenance autoencoder (KAIROS-style) can additionally tie the change to the causal process chain
+    so the analyst sees who/what disabled the protection.
+  answer_sources:
+  - Windows Event ID 12
+  - Windows Event ID 4657
+  - 'NAI: All Windows 8.1/Server 2012 R2 and newer systems, especially Domain Controllers and PAWs'
+  range: Last 90 days; compare against the golden-image baseline.
+  queries:
+  - technology: ML/Autoencoder pseudocode
+    query: "X = security_registry_values(host)  // incl. RunAsPPL\nerr = Autoencoder(golden_image).recon_error(X)\n\
+      ALERT WHERE err > threshold WITH top_deviating_keys\n  ENRICH causal_process_chain via provenance_graph"
