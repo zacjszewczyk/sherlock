@@ -1,0 +1,430 @@
+name: 'T1582: SMS Control'
+id: 9fbcc509-ff8a-4380-b32e-a5a797cb8a3e
+description: 'Investigate adversary manipulation of SMS messaging on managed Android mobile devices, where
+  a malicious application deletes, alters, sends, or intercepts SMS messages without user authorization
+  in order to hide command-and-control (C2) SMS traffic, steal one-time passcodes, spread smishing or
+  malware, or commit premium-rate toll fraud. This playbook helps an analyst hunt for the Android control-plane
+  preconditions and effects of SMS Control: an application becoming the device default SMS handler (the
+  only role permitted to receive SMS_DELIVER and write to the content://sms provider), apps that are over-permissioned
+  with SEND_SMS/RECEIVE_SMS/READ_SMS relative to their stated category, outgoing SMS to premium/short-code
+  or threat-intel destinations, abnormal SMS volume/frequency/destination-entropy or rising send-failure
+  ratios, and non-default apps directly inserting, updating, deleting, or marking-as-read rows in the
+  SMS message store to conceal or forge messages. Detection methods span symbolic logic (allowlist and
+  role-change rules, provider-write rules, received-then-deleted concealment), statistical baselining
+  (fleet prevalence, permission-vector similarity, volume/entropy outliers, failure-rate profiling), and
+  machine learning (app classifiers, permission-vector clustering, and LSTM/next-event sequence models)
+  so an analyst can determine whether an adversary is actively manipulating SMS to achieve impact on the
+  mobile fleet.'
+type: technique
+related:
+- tactic_id: TA0034
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is the device's current default SMS handler an application whose package name is NOT on the
+    approved SMS-app allowlist?
+  context: 'On Android API 19+ only the single user-selected default SMS app receives the SMS_DELIVER
+    broadcast and is permitted to write to the content://sms provider, so the identity of the default
+    handler is the strongest control-plane precondition for SMS interception, modification, or deletion.
+    This symbolic-logic check compares the reported default_sms_handler package against a curated allowlist
+    of sanctioned messaging apps. A package that holds the default-handler role but is not on the allowlist
+    has obtained the gateway capability needed to silently intercept incoming SMS (e.g., OTP theft) or
+    rewrite/delete the message store. A positive hit is a high-priority lead: pivot to the app''s permissions,
+    install source, and any subsequent provider writes. A negative result means the role is held by a
+    sanctioned app, lowering but not eliminating suspicion. This maps directly to Impact: control of the
+    default SMS role enables manipulation, interception, and destruction of the user''s messages.'
+  answer_sources:
+  - MDM device_settings.log
+  - MDM app_inventory.log
+  - 'NAI: Centralized Mobile Device Management (MDM) and Mobile Threat Defense (MTD) Platforms; SIEM Log
+    Aggregation Layer'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'settings = mdm_device_settings.log;
+
+      allow = feed[''approved_sms_app_allowlist''];
+
+      alert when settings.default_sms_handler not in allow;
+
+      output device_id, default_sms_handler, change_time, install_source'
+- question: Did the device's default SMS handler role transition to a non-baselined package, especially
+    from a background context with no recent user interaction?
+  context: 'Granting the default-SMS-app role is the gateway to SMS provider writes and SMS_DELIVER handling,
+    so an adversary''s first observable step in SMS Control is often a change of the default handler to
+    a malicious package. This symbolic-logic check alerts on any transition of default_sms_handler to
+    a package not in the device''s established baseline, and weights the alert higher when the change
+    occurred while the screen was locked, the app was in the background, or there was no recent user interaction
+    recorded - because legitimate default-app changes are user-driven through a system dialog. A positive
+    result indicates programmatic or coerced role acquisition consistent with malware seizing the SMS
+    control plane. Correlate with the time of app install/update and any SMS provider activity that immediately
+    follows. This is tactic-relevant to Impact: seizing the role precedes message manipulation, interception,
+    or deletion.'
+  answer_sources:
+  - MDM device_settings.log
+  - MDM app_inventory.log
+  - 'NAI: Centralized Mobile Device Management (MDM) and Mobile Threat Defense (MTD) Platforms; SIEM Log
+    Aggregation Layer'
+  range: Last 90 days; pivot +/- 5 minutes around the role-change event for user-interaction context
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'changes = mdm_device_settings.log where field == ''default_sms_handler'' and old != new;
+
+      baseline = feed[''baselined_sms_packages''];
+
+      alert when changes.new not in baseline;
+
+      raise severity when changes.user_interaction_recent == false or changes.device_locked == true;
+
+      output device_id, old_handler, new_handler, change_time, foreground_state, user_interaction_recent'
+- question: Is the package acting as the default SMS handler present on fewer than 1% of devices across
+    the mobile fleet (a low-prevalence outlier)?
+  context: Sanctioned messaging apps are widely and consistently deployed, so a default SMS handler that
+    appears on only a tiny fraction of the fleet is a strong statistical signal of a rogue or sideloaded
+    handler. This statistical method computes each handler package's prevalence across the fleet and alerts
+    when prevalence falls below the 1st percentile (<1%), deriving the threshold per environment from
+    the empirical fleet distribution rather than a fixed constant so it adapts to your population. A positive
+    result flags rare handlers that warrant inspection of permissions, signing certificate, and install
+    source; this complements the allowlist rule by catching novel packages that have not yet been triaged.
+    A negative (high-prevalence) result is consistent with a broadly sanctioned app. This supports the
+    Impact tactic by surfacing unusual control-plane occupants before they are used to manipulate messages.
+  answer_sources:
+  - MDM device_settings.log
+  - MDM app_inventory.log
+  - 'NAI: Centralized Mobile Device Management (MDM) and Mobile Threat Defense (MTD) Platforms; SIEM Log
+    Aggregation Layer'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'handlers = mdm_device_settings.log | dedup device_id, default_sms_handler;
+
+      fleet = count(distinct device_id);
+
+      prev = stats count(distinct device_id) as devs by default_sms_handler | eval prevalence = devs/fleet;
+
+      p01 = percentile(prevalence, 1);
+
+      alert when prevalence < max(0.01, p01);
+
+      output default_sms_handler, devs, prevalence'
+- question: Does a machine-learning classifier score the default SMS handler application as likely non-legitimate
+    (malicious) based on its permissions, signature, intents, category, and provenance?
+  context: 'Static allowlists and prevalence rules can miss a freshly weaponized or repackaged handler,
+    so this machine-learning method trains a classifier on features such as requested permissions, developer
+    signing certificate, declared intents, store category, ratings, install source, and app age (DREBIN-style
+    features) to estimate the probability an app is malicious. Alert when the non-legitimate score exceeds
+    0.9 and include the top-3 contributing features (for example: requests SEND_SMS, registers SMS_DELIVER,
+    sideloaded install source) via SHAP/LIME so an analyst can immediately understand and triage the decision.
+    Validate the model time-consistently and retrain on a schedule to counter concept drift (TESSERACT).
+    A high score on the package that holds the default-handler role is a strong indication that the SMS
+    control plane is in adversary hands. This serves the Impact tactic by proactively identifying malicious
+    handlers poised to manipulate or destroy messages.'
+  answer_sources:
+  - MDM device_settings.log
+  - MDM app_inventory.log
+  - 'NAI: Centralized Mobile Device Management (MDM) and Mobile Threat Defense (MTD) Platforms; SIEM Log
+    Aggregation Layer'
+  range: Last 90 days; retrain on a recurring schedule with time-aware validation splits
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = features(app){permissions, dev_signature, intents, category, ratings, install_source,
+      app_age};
+
+      score = classifier.predict_proba(feat, label=''non_legitimate'');
+
+      alert when app.is_default_sms_handler and score > 0.9;
+
+      explain = SHAP_top3(feat);
+
+      output package, score, explain  // e.g., SEND_SMS, SMS_DELIVER, sideloaded'
+- question: Does an application hold SEND_SMS or RECEIVE_SMS permission while belonging to a store category
+    (e.g., Games, Utilities) where SMS access is not functionally justified?
+  context: 'Over-permissioning is a hallmark of SMS-abusing trojans: a flashlight or game app that requests
+    SEND_SMS/RECEIVE_SMS has no legitimate need for it and is positioned to intercept OTPs or send premium
+    messages. This symbolic-logic check maps each app''s declared category to an sms_permission_expected
+    flag and alerts when an app holding SMS permissions sits in a category where SMS access is not expected.
+    SMS permissions are among the top discriminative features for fraud/trojan families, so a category
+    mismatch is a meaningful precondition for SMS Control. A positive result should drive review of the
+    app''s provenance, signer, and any actual SMS activity; a negative result (SMS app in a messaging/communication
+    category) is expected. This maps to Impact because the unjustified capability is the means by which
+    the adversary later manipulates or exfiltrates messages.'
+  answer_sources:
+  - MDM app_permissions.log
+  - MDM app_inventory.log
+  - Application risk intelligence feed
+  - 'NAI: Centralized Mobile Device Management (MDM) Platform; Application Risk Intelligence Feeds; SIEM
+    Log Aggregation Layer'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "apps = mdm_app_permissions.log join mdm_app_inventory.log on package;\nexpected = map category\
+      \ -> sms_permission_expected;\nalert when ('SEND_SMS' in apps.permissions or 'RECEIVE_SMS' in apps.permissions)\n\
+      \      and expected[apps.category] == false;\noutput device_id, package, category, permissions"
+- question: Is an application's overall requested-permission set a statistical outlier compared to the
+    baseline permission profile of legitimate apps in the same category?
+  context: Beyond a single SMS permission, malicious apps often request a permission combination that
+    diverges sharply from honest peers in their category. This statistical method represents each app
+    as a permission vector and computes its Jaccard similarity to the category baseline vector, alerting
+    when similarity falls below 0.5 (with the exact cutoff derived from the per-category similarity distribution
+    rather than fixed). Low similarity means the app's permission footprint looks unlike its category,
+    a known indicator for over-permissioned fraud/trojan apps. A positive result flags the app for deeper
+    inspection, particularly when the divergent permissions include SMS-related grants; a high-similarity
+    result is consistent with a normal app. This supports the Impact tactic by catching apps that have
+    quietly accumulated the capabilities needed for SMS manipulation.
+  answer_sources:
+  - MDM app_permissions.log
+  - MDM app_inventory.log
+  - Application risk intelligence feed
+  - 'NAI: Centralized Mobile Device Management (MDM) Platform; Application Risk Intelligence Feeds; SIEM
+    Log Aggregation Layer'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'vec = permission_vector(app);
+
+      base = category_baseline_vector(app.category);
+
+      sim = jaccard(vec, base);
+
+      cutoff = min(0.5, percentile(category_sim_distribution, 5));
+
+      alert when sim < cutoff;
+
+      output package, category, sim, divergent_permissions'
+- question: Do unsupervised clustering results flag an application's permission vector as a noise point
+    or member of a small anomalous cluster indicative of an unseen over-permissioned app?
+  context: Signature- and rule-based checks miss permission combinations not seen before, so this machine-learning
+    method applies DBSCAN to app permission vectors and treats noise points and very small clusters as
+    candidate over-permissioned or novel malicious apps. Because DBSCAN does not require predefined labels,
+    it surfaces emergent outliers in the permission space; the alert should explicitly list the specific
+    outlier permissions (SEND_SMS, RECEIVE_SMS, READ_SMS) to make the result explainable and actionable.
+    A positive (noise/small-cluster) result identifies an app whose capability profile does not match
+    any established group and merits manual triage; a result placing the app in a large dense cluster
+    is consistent with normal apps. This serves the Impact tactic by proactively discovering apps capable
+    of SMS Control before they act.
+  answer_sources:
+  - MDM app_permissions.log
+  - MDM app_inventory.log
+  - Application risk intelligence feed
+  - 'NAI: Centralized Mobile Device Management (MDM) Platform; Application Risk Intelligence Feeds; SIEM
+    Log Aggregation Layer'
+  range: Last 90 days; recluster periodically as the app population changes
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = permission_vectors(all_apps);
+
+      labels = DBSCAN(eps, min_samples).fit_predict(X);
+
+      alert when labels[app] == -1 (noise) or cluster_size(labels[app]) < min_cluster;
+
+      highlight = intersect(app.permissions, {SEND_SMS, RECEIVE_SMS, READ_SMS});
+
+      output package, cluster_label, highlight'
+- question: Did a device send outgoing SMS to a known-malicious destination (premium/short-code or threat-intel
+    IOC number), or send message bodies matching smishing lure patterns?
+  context: 'C2-over-SMS, premium-rate toll fraud, and smishing propagation all manifest as outgoing messages
+    to specific bad destinations or with recognizable lure content. This symbolic-logic check matches
+    each outbound destination_number against premium/short-code ranges and threat-intel phone-number IOC
+    feeds, and matches message bodies against smishing rules (shortened or lure URLs, embedded APK download
+    links). A hit on a malicious destination indicates likely toll fraud or C2; a hit on lure content
+    indicates the device is being used to spread smishing/malware. A positive result is a strong, directly
+    actionable indicator: identify the sending app and quarantine the device. A negative result does not
+    clear anomalous-volume concerns checked elsewhere. This maps to Impact via toll fraud and adversary
+    use of SMS to propagate effects beyond the device.'
+  answer_sources:
+  - Carrier SMS Detail Records
+  - Threat Intelligence Phone Number IOC Feed
+  - MDM app_inventory.log
+  - MDM device_state.log
+  - 'NAI: Carrier Billing and Usage Portals; Threat Intelligence Platform (TIP); Mobile Device Management
+    (MDM) Platform; SIEM Log Storage'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'sms = carrier_sms_detail_records where direction == ''outbound'';
+
+      ioc = feed[''phone_number_iocs''] + premium_shortcode_ranges;
+
+      smish = rules[''smishing_body''];  // shortened/lure URLs, embedded APK links
+
+      alert when sms.destination_number in ioc or sms.body matches any(smish);
+
+      output device_id, destination_number, body, sending_app'
+- question: Does a device's outgoing SMS volume, send frequency, or destination/country-code entropy deviate
+    sharply (above the 98th percentile or >3 sigma) from its established 90-day baseline, including first-seen
+    foreign or premium codes?
+  context: Toll fraud and smishing fan-out produce spikes in send volume, bursty per-minute frequency,
+    or a sudden broadening of destinations that differ from a user's normal pattern. This statistical
+    method builds 90-day per-user baselines for SMS volume (daily/hourly send counts, segment/byte counts),
+    frequency (sends per minute, capturing smishing bursts), and destination/country-code entropy, then
+    alerts when counts exceed the 98th percentile, exceed 3 standard deviations over the user mean, or
+    include first-seen foreign/premium codes - with thresholds derived from each tenant's empirical distribution.
+    A positive result indicates the device's messaging behavior has materially changed in a way consistent
+    with automated abuse; a negative result is consistent with normal usage. This supports the Impact
+    tactic by catching fraud/propagation activity even absent a known-bad destination.
+  answer_sources:
+  - Carrier SMS Detail Records
+  - Threat Intelligence Phone Number IOC Feed
+  - MDM app_inventory.log
+  - MDM device_state.log
+  - 'NAI: Carrier Billing and Usage Portals; Threat Intelligence Platform (TIP); Mobile Device Management
+    (MDM) Platform; SIEM Log Storage'
+  range: Last 90 days for baseline; evaluate per hour/day
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = baseline_90d(device){daily_count, hourly_count, segments, sends_per_min, dest_entropy};\n\
+      now = current_window(device);\nalert when now.count > percentile(base.count, 98)\n      or now.count\
+      \ > mean(base.count) + 3*stdev(base.count)\n      or now.sends_per_min > percentile(base.sends_per_min,\
+      \ 98)\n      or now.dest_country_code in first_seen_foreign_or_premium;\noutput device_id, metric,\
+      \ value, threshold"
+- question: Is a device's outgoing SMS failure/rejection ratio (carrier RESULT_ERROR_* / blocked sends)
+    rising even when total send volume appears normal?
+  context: Mass-send fraud and propagation campaigns frequently incur elevated carrier rejections (invalid
+    numbers, premium blocks, rate limiting), so a rising failure ratio is a distinct fraud/propagation
+    signal that can fire even when raw volume looks unremarkable. This statistical method tracks the ratio
+    of failed/carrier-rejected/blocked sends (RESULT_ERROR_* outcomes) per device over time and alerts
+    on an abnormal upward trend relative to that device's history. A positive result suggests the device
+    is attempting many sends that the carrier rejects - consistent with automated smishing/toll-fraud
+    against stale or blocked number lists - and warrants correlating with the sending app and recent installs.
+    A negative (low, stable) failure ratio is normal. This supports the Impact tactic by exposing covert
+    send activity that volume thresholds alone would miss.
+  answer_sources:
+  - Carrier SMS Detail Records
+  - Threat Intelligence Phone Number IOC Feed
+  - MDM app_inventory.log
+  - MDM device_state.log
+  - 'NAI: Carrier Billing and Usage Portals; Threat Intelligence Platform (TIP); Mobile Device Management
+    (MDM) Platform; SIEM Log Storage'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'sms = carrier_sms_detail_records where direction == ''outbound'';
+
+      ratio = count(result like ''RESULT_ERROR_*'' or status in {rejected, blocked}) / count(*) by device_id,
+      time_window;
+
+      base = baseline_ratio_90d(device_id);
+
+      alert when ratio > mean(base) + 3*stdev(base);
+
+      output device_id, time_window, ratio, total_sends'
+- question: Does a sequence model (LSTM autoencoder / next-event predictor) flag a device's SMS send/receive/delete
+    event sequence as anomalously low-probability?
+  context: Static-feature classifiers are evadable, so modeling the temporal structure of messaging adds
+    resilience. This machine-learning method trains an LSTM autoencoder or next-event predictor on hourly
+    SMS counts and ordered send/receive/delete event sequences per user (DeepLog-style), and uses attention
+    to surface which fields (destination, hour, app) drove a high anomaly score (Brown et al.). Enrich
+    each detection with MDM context and device integrity status, and run it alongside the deterministic
+    IOC and statistical rules because no single approach is sufficient. A positive result indicates the
+    device's recent SMS behavior is improbable under its learned normal model - consistent with C2 beaconing
+    over SMS, burst propagation, or concealment patterns; a negative result is consistent with normal
+    sequences. This supports the Impact tactic by detecting subtle, evolving SMS-abuse behavior that point
+    rules miss.
+  answer_sources:
+  - Carrier SMS Detail Records
+  - Threat Intelligence Phone Number IOC Feed
+  - MDM app_inventory.log
+  - MDM device_state.log
+  - 'NAI: Carrier Billing and Usage Portals; Threat Intelligence Platform (TIP); Mobile Device Management
+    (MDM) Platform; SIEM Log Storage'
+  range: Last 90 days for training; score on streaming/rolling windows with time-aware validation
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = ordered_events(device){hourly_counts, send/receive/delete};
+
+      model = LSTM_autoencoder.train(normal_seq);
+
+      score = model.reconstruction_error(seq) or 1 - next_event_prob(seq);
+
+      alert when score > learned_threshold;
+
+      attn = attention_top_fields(seq);  // destination, hour, app
+
+      enrich with mdm_device_state.log integrity_status;
+
+      output device_id, score, attn'
+- question: Did a package that is NOT the current default SMS handler perform insert/update/delete operations
+    on the content://sms provider or invoke SMS_DELIVER/SmsManager write paths?
+  context: 'Android restricts writes to the SMS content provider to the single current default SMS app,
+    so any other package performing insert/update/delete on content://sms - or handling SMS_DELIVER and
+    exercising provider-write code paths - is manipulating the message store outside the sanctioned model.
+    This symbolic-logic check is a deterministic, first-party host signal that does not depend on external
+    lookups: it compares the package performing the provider operation against the device''s current default_sms_handler
+    and alerts on any mismatch. A positive result is high-confidence evidence of message forging, hiding
+    of C2 messages, or unauthorized deletion, and should trigger immediate device isolation and app review.
+    A negative result (operations only by the legitimate default app) is expected. This maps directly
+    to Impact: writing to the message store is the manipulation/destruction action itself.'
+  answer_sources:
+  - MobileEDR:telemetry (OS API Execution)
+  - MobileEDR:telemetry (File Modification)
+  - MDM device_settings.log
+  - 'NAI: Mobile Threat Defense / Mobile EDR Telemetry; Centralized MDM Platform; SIEM Log Aggregation
+    Layer'
+  range: Last 90 days
+  queries:
+  - technology: MobileEDR/Rule pseudocode
+    query: "ops = mobileedr_os_api where target in {content://sms, SmsManager, SMS_DELIVER}\n      and\
+      \ operation in {insert, update, delete, write};\ndefault = mdm_device_settings.log.default_sms_handler;\n\
+      alert when ops.package != default;\noutput device_id, package, operation, target, time"
+- question: Was an incoming SMS (SMS_RECEIVED / SMS_DELIVER) followed within seconds by a delete or mark-as-read
+    of the same record by an app, while the device was locked or backgrounded with no recent user interaction?
+  context: 'A classic OTP-theft and C2-concealment pattern is to silently receive a message and immediately
+    delete or mark it read before the user can see it. This symbolic-logic check correlates an SMS_RECEIVED/SMS_DELIVER
+    event with a delete/mark-read on the same message record occurring within seconds, and qualifies the
+    alert on the device being locked or backgrounded with no recent user interaction - because legitimate
+    reads are user-driven. A positive result strongly indicates programmatic concealment: an adversary
+    is hiding incoming messages (e.g., bank OTPs or C2 acknowledgements) from the user. Pivot to the responsible
+    app, its default-handler status, and its permissions. A negative result is consistent with normal
+    user-driven reads. This maps to Impact through concealment/manipulation of received messages.'
+  answer_sources:
+  - MobileEDR:telemetry (OS API Execution)
+  - MobileEDR:telemetry (File Modification)
+  - MDM device_settings.log
+  - 'NAI: Mobile Threat Defense / Mobile EDR Telemetry; Centralized MDM Platform; SIEM Log Aggregation
+    Layer'
+  range: Last 90 days; correlate received and delete events within a seconds-level window
+  queries:
+  - technology: MobileEDR/Rule pseudocode
+    query: 'recv = events(type in {SMS_RECEIVED, SMS_DELIVER});
+
+      del = events(operation in {delete, mark_read} on content://sms);
+
+      join recv, del on record_id where del.time - recv.time <= 5s;
+
+      alert when device_locked == true or (backgrounded and user_interaction_recent == false);
+
+      output device_id, package, record_id, recv.time, del.time'
+- question: Does a next-event model flag a low-probability ordering of an app's SMS receive -> provider
+    write/delete operations?
+  context: Beyond single deterministic rules, modeling the ordered sequence of an app's SMS operations
+    catches subtle manipulation that does not match a fixed signature. This machine-learning method trains
+    a next-event predictor on the per-app ordering of SMS receive -> provider write/delete operations
+    (DeepLog-style) and flags improbable orderings; it reports the contributing event fields for triage
+    (Brown et al.) and is validated with time-aware splits (TESSERACT) to avoid optimistic evaluation.
+    A positive (low-probability) result indicates an app is performing provider operations in a pattern
+    unlike its learned normal behavior - consistent with stealthy insertion, forging, or deletion of messages.
+    A negative result is consistent with normal operation ordering. This supports the Impact tactic by
+    detecting evolving message-store manipulation behavior that static rules may miss.
+  answer_sources:
+  - MobileEDR:telemetry (OS API Execution)
+  - MobileEDR:telemetry (File Modification)
+  - MDM device_settings.log
+  - 'NAI: Mobile Threat Defense / Mobile EDR Telemetry; Centralized MDM Platform; SIEM Log Aggregation
+    Layer'
+  range: Last 90 days for training; score continuously with time-aware validation splits
+  queries:
+  - technology: MobileEDR/ML pseudocode
+    query: 'seq = ordered_ops(app){receive -> provider_write/delete};
+
+      model = next_event_predictor.train(normal_seq);
+
+      alert when next_event_prob(seq) < learned_threshold;
+
+      report = contributing_fields(seq);
+
+      output device_id, package, seq, report'
