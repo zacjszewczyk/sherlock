@@ -1,0 +1,966 @@
+name: 'T1574.009: Hijack Execution Flow: Path Interception by Unquoted Path'
+id: 74f18aa0-c43d-40cc-91d2-b9051e2f1f9f
+description: Investigate adversary abuse of unquoted Windows service and shortcut paths (path interception
+  by unquoted path) to hijack execution flow for persistence, privilege escalation, defense evasion, and
+  execution. When a service ImagePath contains a space and is not wrapped in quotation marks (for example
+  C:\Program Files\My App\svc.exe instead of "C:\Program Files\My App\svc.exe"), Windows resolves each
+  space-delimited prefix in turn (C:\Program.exe, C:\Program Files\My.exe), so an attacker who can write
+  an executable into an ancestor directory causes Windows to launch the planted binary instead of the
+  intended service image. This playbook helps an analyst (1) enumerate vulnerable unquoted service paths
+  from the registry and precompute their exact interception targets; (2) correlate the full hijack chain
+  of an interception-path file creation followed by a service install/restart, execution of the planted
+  binary in service/SYSTEM context, and any follow-on network egress; (3) detect privilege escalation
+  when a non-admin identity writes the interception binary that later runs elevated; and (4) detect defense
+  evasion when the hijacked service is a security/EDR product and its telemetry, heartbeat, or stability
+  drops. It pairs high-fidelity symbolic-logic rules with statistical baselining (prevalence, entropy,
+  modified Z-score) and machine-learning provenance/graph and autoencoder models to surface low-and-slow
+  abuse that blends in with legitimate service activity.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0002
+  tactic_name: Execution
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which installed Windows services have ImagePath values that contain a space and are NOT enclosed
+    in quotation marks, and what are the exact higher-level executable paths (e.g. C:\program.exe, 'C:\Program
+    Files\Common.exe') that an adversary could plant to intercept each one?
+  context: '[TA0005 Stealth] This is the foundational enumeration step: parse every service ImagePath
+    under HKLM\SYSTEM\CurrentControlSet\Services\* and flag any value that contains a space and is not
+    wrapped in quotes, ignoring arguments. For each vulnerable path, auto-generate the precise interception
+    targets by taking each space-delimited prefix and appending ''.exe'' (so ''C:\Program Files\My App\svc.exe''
+    yields candidate targets C:\Program.exe and ''C:\Program Files\My.exe''). This watchlist of interception
+    targets is what every downstream correlation rule keys on. Also alert on creation or modification
+    of these service keys via Security Event ID 4657, because an adversary may add a new vulnerable service
+    or rewrite an ImagePath. A populated list of vulnerable services is itself an exposure to remediate
+    (re-quote the path); creation of a file at any generated interception target is a strong hijack indicator.
+    In the context of the Stealth tactic, this matters because unquoted-path hijack of "Hijack Execution
+    Flow: Path Interception by Unquoted Path" lets an adversary blend planted execution into legitimate
+    service activity while satisfying the information requirement: "Is the adversary maintaining persistence
+    using an unquoted service path?". Method type: Symbolic Logic. Detection approach "Enumerate vulnerable
+    unquoted paths".'
+  answer_sources: &id001
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4697
+  - Windows Event ID 7045
+  - Windows Event ID 7036
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Windows Registry on all endpoints (HKLM\SYSTEM\CurrentControlSet\Services to identify vulnerable
+    unquoted service paths), file systems of endpoints and servers (especially C:\ and C:\Program Files),
+    and network traffic logs at egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'registry where path startswith ''HKLM\\SYSTEM\\CurrentControlSet\\Services'' and value_name==''ImagePath''
+
+      | eval img=trim(ImagePath)
+
+      | where match(img, ''\\s'') AND NOT match(img, ''^\"'')
+
+      | eval targets=gen_prefixes(img)   // each space-delimited prefix + ''.exe''
+
+      | output service_name, img, targets  -> interception_watchlist'
+  - technology: SIEM/Rule pseudocode
+    query: 'WinEventLog:Security EventCode=4657 ObjectName endswith ''\\ImagePath''
+
+      | where match(NewValue,''\\s'') AND NOT match(NewValue,''^\"'')
+
+      | alert ''New/modified unquoted service path'''
+- question: Did a file get created at a path that EXACTLY matches a precomputed unquoted-path interception
+    target, followed within 24 hours by a service install or restart and then execution of that same planted
+    binary — and did the planted process run as SYSTEM, appear unsigned/first-seen, or open an outbound
+    connection within 60 seconds?
+  context: '[TA0005 Stealth] This stitches the full hijack chain together. Start from a Sysmon EID 11
+    file-creation whose TargetFilename matches an entry on the interception watchlist. Look for a service
+    install or state change (EID 7045 install, 4697 service installed, 7036 service entered running) within
+    24 hours, then a Sysmon EID 1 process creation of that exact planted image. Escalate sharply when
+    the executed image is unsigned, first-seen in the fleet, runs at IntegrityLevel=System, or makes a
+    Sysmon EID 3 outbound network connection within ~60 seconds of launch — those are the behaviors of
+    an adversary-controlled binary rather than a benign installer. A positive result is a high-confidence
+    execution-flow hijack; a negative (file creation without the restart/execute follow-on) may be a staged-but-not-yet-triggered
+    payload worth hunting. In the context of the Stealth tactic, this matters because unquoted-path hijack
+    of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted execution
+    into legitimate service activity while satisfying the information requirement: "Is the adversary maintaining
+    persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach "Sequence-based
+    hijack correlation".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '(EID11 TargetFilename IN interception_watchlist) as plant
+
+      JOIN (EID7045 OR EID4697 OR EID7036) as svc ON host AND svc.time-plant.time<=24h
+
+      JOIN (EID1 Image==plant.TargetFilename) as exec ON host
+
+      | eval risk = unsigned + first_seen + (IntegrityLevel==''System'') + has_EID3_within(exec,60s)
+
+      | where risk>=1 | alert sort by risk desc'
+- question: Did services.exe (the Service Control Manager) spawn a child process whose image path is NOT
+    the registered ImagePath of any installed service — i.e., a binary resolving to an ancestor directory
+    of an unquoted service path — particularly in SYSTEM context?
+  context: '[TA0005 Stealth] The SCM (services.exe) should only ever launch the exact registered ImagePath
+    of each service. If services.exe spawns a child whose full image path does not match any service''s
+    configured binary, the most likely explanation is that an unquoted path was intercepted and Windows
+    resolved a planted ancestor-directory executable instead. Build the set of legitimate registered service
+    images, then flag any services.exe child not in that set. This is very high fidelity in SYSTEM context
+    because legitimate parentage is tightly constrained. A match strongly indicates path interception;
+    benign edge cases (newly installed services not yet inventoried) should be reconciled against the
+    current registry snapshot. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Anomalous SCM child lineage".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID1 where ParentImage endswith ''\\services.exe''
+
+      | lookup registered_service_images Image OUTPUT is_registered
+
+      | where is_registered!=true
+
+      | alert ''SCM spawned non-registered image'' (priority high if IntegrityLevel==''System'')'
+- question: For executables created at interception-path locations, are the file hashes first-seen or
+    rare across the fleet (present on under ~0.5% of hosts), and do the filenames show high entropy (>4.0
+    bits/char) suggestive of randomly generated dropper names?
+  context: '[TA0005 Stealth] Legitimate service binaries are widely deployed and have stable, recognizable
+    names; adversary-planted interception binaries are typically novel, rare, and sometimes randomly named.
+    Baseline filename/hash prevalence as the count of distinct hosts carrying each hash, and the rarity
+    of writes into ancestor directories for service-associated binaries. Alert on first-seen hashes, fleet
+    prevalence below ~0.5% of hosts, or filename Shannon entropy above ~4.0 bits/char for interception-path
+    creations, scaling thresholds to host role. High score plus an interception-path location is a strong
+    lead; common, widely deployed signed binaries score low and are deprioritized. Useful for catching
+    novel payloads that signature rules miss. In the context of the Stealth tactic, this matters because
+    unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary
+    blend planted execution into legitimate service activity while satisfying the information requirement:
+    "Is the adversary maintaining persistence using an unquoted service path?". Method type: Statistical
+    Method. Detection approach "Entropy and prevalence scoring".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EID11 TargetFilename IN interception_watchlist
+
+      | stats dc(host) as prevalence by Hashes
+
+      | eval pct=prevalence/total_hosts, ent=shannon_entropy(filename)
+
+      | where first_seen==true OR pct<0.005 OR ent>4.0
+
+      | alert score=f(pct,ent,host_role)'
+- question: Has the population of services with unquoted paths on a host changed recently — a new vulnerable
+    service appearing or an existing service's path hierarchy changing — within ~7 days before an interception-path
+    file write?
+  context: '[TA0005 Stealth] Adversaries sometimes create or reconfigure a vulnerable service to set up
+    the interception, so configuration drift immediately preceding a planted file is suspicious. Maintain
+    per-host baselines of services with unquoted paths and detect when new vulnerable services appear
+    or an existing service''s directory hierarchy changes, then look for an interception-path file write
+    within ~7 days. Apply a modified Z-score (>3.5) on the per-host count of new unquoted services so
+    that hosts that are simply noisy don''t generate constant alerts. A drift-then-write sequence is a
+    strong staging signal; drift alone is an exposure to remediate by re-quoting the path. In the context
+    of the Stealth tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception
+    by Unquoted Path" lets an adversary blend planted execution into legitimate service activity while
+    satisfying the information requirement: "Is the adversary maintaining persistence using an unquoted
+    service path?". Method type: Statistical Method. Detection approach "Detect vulnerable path drift
+    before interception".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'daily snapshot unquoted_services by host
+
+      | delta new_unquoted = today - baseline
+
+      | eval mz = 0.6745*(new_unquoted-median)/MAD
+
+      | where mz>3.5 AND exists(EID11 in interception_watchlist within 7d after change)
+
+      | alert ''Vulnerable path drift before interception'''
+- question: Does host provenance contain the hijack motif — write-to-service-ancestor directory, then
+    SCM service start, then a SYSTEM child process, then network egress — when matched as an inexact graph
+    pattern?
+  context: '[TA0005 Stealth] Encode the canonical interception kill chain as a query graph (file write
+    to a service-ancestor directory -> SCM starts the service -> a SYSTEM-context child process is created
+    -> the child makes an outbound connection) and run inexact graph-pattern matching (e.g. POIROT/KAIROS
+    style) over the host''s provenance graph. This catches the behavioral shape even when individual node
+    attributes vary (different filenames, services, or C2 destinations), which evades brittle string rules.
+    The alert should surface the matched subgraph''s top-3 nodes/edges as evidence so an analyst can validate
+    quickly. A confident subgraph match is strong corroboration of a hijack; partial matches help prioritize
+    hunting. In the context of the Stealth tactic, this matters because unquoted-path hijack of "Hijack
+    Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted execution into
+    legitimate service activity while satisfying the information requirement: "Is the adversary maintaining
+    persistence using an unquoted service path?". Method type: Machine Learning. Detection approach "Provenance
+    subgraph query match".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Graph/Provenance pseudocode
+    query: 'Q = pattern{ (write:File ~ service_ancestor_dir)->(svc:SCM start)->(p:Process integrity=SYSTEM)->(net:Conn
+      egress) }
+
+      matches = inexact_subgraph_match(host_provenance, Q, threshold=0.8)
+
+      for m in matches: alert(evidence=top3_nodes_edges(m))'
+- question: Across the normal service-lifecycle provenance for this host, is there a low-probability subgraph
+    in which an interception-path write is followed by a service restart and anomalous child execution
+    or network behavior?
+  context: '[TA0005 Stealth] Train a temporal graph or sequence model (KAIROS / ThreaTrace / FLASH style)
+    on benign service-lifecycle provenance, then flag low-probability subgraphs that contain an interception-path
+    write followed by a service restart and anomalous child-process execution or unexpected network behavior.
+    Unlike a fixed query graph, this learns what ''normal'' service starts look like per host and surfaces
+    statistically improbable deviations, catching novel hijack variants. The alert must list the top-3
+    contributing nodes/features for analyst triage. A flagged low-probability subgraph involving an interception
+    target warrants investigation; well-modeled benign restarts score as expected and are suppressed.
+    In the context of the Stealth tactic, this matters because unquoted-path hijack of "Hijack Execution
+    Flow: Path Interception by Unquoted Path" lets an adversary blend planted execution into legitimate
+    service activity while satisfying the information requirement: "Is the adversary maintaining persistence
+    using an unquoted service path?". Method type: Machine Learning. Detection approach "Service sequence
+    anomaly model".'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/Sequence model pseudocode
+    query: 'model = train_temporal_graph(benign_service_lifecycle_provenance)
+
+      score = model.anomaly(subgraph containing EID11-in-watchlist -> svc_restart -> child_exec/net)
+
+      if score < p_low: alert(top3_features(subgraph))'
+- question: Did a non-admin (medium-integrity) process create or overwrite an executable in a parent/ancestor
+    directory (e.g. C:\ or the C:\Program Files root) that could intercept a known unquoted service path?
+  context: '[TA0005 Stealth] Ancestor directories like C:\ and the C:\Program Files root are normally
+    writable only by administrators and installers, so a write into one of them by a medium-integrity
+    (non-admin) process is highly anomalous and is the classic setup for unquoted-path privilege escalation.
+    Detect Sysmon EID 11 creations/overwrites of .exe files at interception-target locations where the
+    creating process runs at medium integrity / as a standard user. This is high fidelity because the
+    privilege mismatch is rare for legitimate software. A hit means a low-privileged actor has staged
+    a binary that a higher-privileged service may execute — investigate the writer''s process tree and
+    the target service immediately. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Alert on non-admin writes to service binary ancestors".'
+  answer_sources: &id002
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 7036
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - 'NAI: Authentication logs and file systems on multi-user systems like terminal servers and workstations.
+    The Windows Registry (HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services) on all hosts is the NAI
+    for identifying vulnerable service configurations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID11 TargetFilename IN interception_watchlist AND TargetFilename endswith ''.exe''
+
+      | join creator process integrity
+
+      | where creator.IntegrityLevel in (''Medium'',''Low'') OR creator.user NOT in admins
+
+      | alert ''Non-admin write to service binary ancestor'''
+- question: Was a non-admin file creation at an interception path followed within 24 hours by SYSTEM/elevated
+    execution from that SAME path, with linkage across the user SID, the targeted service, and the process
+    image hash?
+  context: '[TA0005 Stealth] This confirms actual privilege escalation, not just staging. Correlate the
+    non-admin EID 11 file creation at an interception target with later elevated execution from the same
+    path: Windows 4672 (special privileges assigned), 4688 with token elevation, or Sysmon EID 1 with
+    IntegrityLevel=System, all referencing the same image. Require linkage across the creating user SID,
+    the targeted unquoted service, and the process image hash to keep false positives low. A confirmed
+    medium-to-SYSTEM transition from an attacker-written binary is a definitive escalation via path interception;
+    absence of the elevated run may mean the payload hasn''t been triggered yet. In the context of the
+    Stealth tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception
+    by Unquoted Path" lets an adversary blend planted execution into legitimate service activity while
+    satisfying the information requirement: "Is the adversary maintaining persistence using an unquoted
+    service path?". Method type: Symbolic Logic. Detection approach "Privilege escalation path correlation".'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "(EID11 TargetFilename IN interception_watchlist, creator_integrity=Medium) as plant\nJOIN\
+      \ (EID4672 OR EID4688 token_elevation OR EID1 IntegrityLevel=System) as elev\n  ON elev.Image==plant.TargetFilename\
+      \ AND elev.time-plant.time<=24h AND same(Hashes)\n| alert 'Privilege escalation via unquoted path'"
+- question: What is the composite risk score — derived from the privilege delta between binary creator
+    and executor, path criticality, signer trust, and fleet prevalence — for interception-path binaries,
+    and which exceed the top ~1% threshold (especially on multi-user servers and admin workstations)?
+  context: '[TA0005 Stealth] Combine multiple weak signals into one prioritized score. Inputs: the privilege
+    delta (creator integrity vs. execution integrity — a large medium->SYSTEM gap scores high), path criticality
+    (ancestor of a real unquoted service), signer trust (unsigned adds risk), and historical fleet prevalence
+    of the binary path (rare adds risk). Alert when the score exceeds a tuned percentile such as the top
+    1%, weighting multi-user terminal servers and admin workstations more heavily because escalation impact
+    is greatest there. The alert should emit the top-3 contributing factors for explainability. High score
+    concentrates analyst attention on the riskiest few interception-path binaries while common signed
+    software is deprioritized. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Privilege gap risk scoring".'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each interception-path binary:
+
+      score = w1*priv_delta + w2*path_criticality + w3*unsigned + w4*(1-prevalence) + w5*host_role
+
+      | where score >= pct99
+
+      | alert score, top3_factors'
+- question: Is there a spike in the rate of new SYSTEM-context process images per host, or in medium-to-SYSTEM
+    transitions tied to file writes, that coincides with interception-path writes (modified Z-score >
+    3.5)?
+  context: '[TA0005 Stealth] Track, per host, the rate at which new SYSTEM-context process images appear
+    and the rate of medium->SYSTEM privilege transitions linked to recent file writes. Apply a modified
+    Z-score (>3.5) so only statistically significant spikes alert. When such a spike coincides in time
+    with an interception-path file write, it suggests an unquoted-path hijack just produced new elevated
+    execution. Baselining cadence catches escalation even when an individual binary looks unremarkable.
+    A coincident spike-plus-write is the signal; steady-state elevation from well-known service binaries
+    is expected and suppressed. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Elevation cadence baseline".'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host, daily: new_system_images, med_to_system_transitions_with_write
+
+      | eval mz=0.6745*(metric-median)/MAD
+
+      | where mz>3.5 AND interception_path_write_in_window
+
+      | alert ''Elevation cadence spike vs interception write'''
+- question: In user-file-process provenance graphs, do subgraphs show non-admin creation of a binary followed
+    by high-privilege execution within a vulnerable service-path hierarchy that a graph anomaly model
+    flags as anomalous?
+  context: '[TA0005 Stealth] Build user-file-process provenance graphs and train node-level or graph-level
+    anomaly detection (ThreaTrace / MAGIC / FLASH style) on benign escalation patterns. Flag subgraphs
+    in which a non-admin user creates a binary that is subsequently executed at high privilege inside
+    a vulnerable service-path hierarchy. This learns the normal shape of legitimate elevation (installers,
+    scheduled maintenance) and surfaces the abnormal non-admin->SYSTEM structure characteristic of unquoted-path
+    escalation. The model should report the anomalous node(s) and top contributing features. A flagged
+    subgraph is a strong escalation lead; benign elevation patterns score normal. In the context of the
+    Stealth tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception
+    by Unquoted Path" lets an adversary blend planted execution into legitimate service activity while
+    satisfying the information requirement: "Is the adversary maintaining persistence using an unquoted
+    service path?". Method type: Machine Learning. Detection approach "High-privileged subgraph classification".'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: ML/Graph model pseudocode
+    query: "G = build_user_file_process_graph(host)\nmodel = train_node_graph_anomaly(benign_escalation)\n\
+      for n in G: if model.is_anomalous(n) and n in vuln_service_path_hierarchy and creator=non_admin\
+      \ and exec=high_priv:\n    alert(node=n, top_features=...)"
+- question: For critical security/EDR services that have known unquoted paths, was an interception-path
+    executable created and then followed by a service crash/stop/unexpected restart (7034/7036) or execution
+    of a binary that is NOT the registered service image?
+  context: '[TA0005 Stealth] Maintain a curated watchlist of critical security/EDR service binaries that
+    have unquoted paths (e.g. an agent installed under C:\Program Files\... without quotes). Alert when
+    a Sysmon EID 11 creation occurs at one of those interception targets and is followed by service instability
+    — 7034 (service terminated unexpectedly), 7036 (state change / unexpected restart), 7045 (new service
+    install) — or by execution of a binary that is not the registered service image. Hijacking a protection
+    component is a defense-evasion move designed to blind the defender while appearing as a normal service.
+    A match here is high priority because it can disable monitoring; validate the running image against
+    the registered ImagePath. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Security service intercept rule".'
+  answer_sources: &id003
+  - Sysmon Event ID 11
+  - Windows Event ID 7034
+  - Windows Event ID 7036
+  - Windows Event ID 7045
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Sysmon Event ID 3
+  - 'NAI: File system directories containing security agent installations (e.g., C:\Program Files\Windows
+    Defender). Service Control Manager event logs on all endpoints. Log ingestion dashboards and health
+    monitoring views within the SIEM platform.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID11 TargetFilename IN security_service_interception_watchlist
+
+      | join following (EID7034 OR EID7036 OR EID7045 OR (EID1 Image!=registered_image)) within window
+
+      | alert ''Possible hijack of security service'' priority=high'
+- question: After execution from an interception path, did the affected security product show log ingest
+    gaps, abrupt heartbeat loss, or failed update checks within the same analysis window?
+  context: '[TA0005 Stealth] This is the failure-mode counterpart to the intercept rule: rather than looking
+    for the malicious execution directly, look for the silence it creates. When interception-path execution
+    is followed by gaps in a security product''s log ingestion, sudden loss of its heartbeat, or failed
+    update checks in the same window, the protection component has likely been hijacked or disabled. Because
+    adversaries seeking stealth try to suppress telemetry, the absence of expected events is itself a
+    strong signal. Trigger a high-priority alert and correlate the suppression to the recent interception-path
+    write/launch. A confirmed gap concurrent with a hijack chain is a serious defense-evasion indicator
+    that should be escalated immediately. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Detect telemetry suppression after service hijack".'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'let hijack = interception_path_execution(host, window)
+
+      let gap = (no agent events >5m) OR heartbeat_loss OR failed_update_check (same host, window)
+
+      if hijack AND gap: alert ''Telemetry suppression after service hijack'' priority=high'
+- question: Did a host's security-agent telemetry volume or heartbeat cadence drop sharply (modified Z-score
+    < -3.5, or >5 minutes of zero events from a normally chatty agent), correlating with a recent interception-path
+    file creation or process launch?
+  context: '[TA0005 Stealth] Baseline per-host agent telemetry volume (events/min) and service-heartbeat
+    cadence, then alert when a modified Z-score shows a significant drop (>3.5 in magnitude) or an abrupt
+    gap such as more than 5 minutes of zero events from an agent that is normally chatty. Correlate any
+    such drop to recent interception-path file-creation and process-launch events on the same host. A
+    sudden telemetry collapse on a host that just experienced an interception-path write is consistent
+    with a hijacked or killed security service. Statistical baselining adapts to each host''s normal volume,
+    avoiding fixed thresholds. A correlated drop is the alertable condition; routine diurnal volume changes
+    stay within the baseline. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Log volume deviation alerting".'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host: events_per_min(agent), heartbeat_interval
+
+      | eval mz=0.6745*(rate-median)/MAD
+
+      | where mz<-3.5 OR zero_events_gap>5m
+
+      | where interception_path_write_or_launch_recent
+
+      | alert ''Agent telemetry deviation post-interception'''
+- question: Is there a step-change increase in security-service failure signals — 7034 unexpected terminations,
+    failed update/heartbeat checks, blocked outbound connections — that occurs concurrently with an interception-path
+    write?
+  context: '[TA0005 Stealth] Profile security-service error and failure rates as a first-class signal
+    distinct from raw telemetry volume: count 7034 unexpected service terminations, failed update or heartbeat
+    checks, and blocked/failed outbound connections from the security product. A sudden step-change increase
+    in these failures that coincides with an interception-path file write is a strong indicator that the
+    service''s execution flow was hijacked and the legitimate component is failing while the planted binary
+    runs. Use modified Z-score / isolation-forest style anomaly detection on the failure-rate time series.
+    A concurrent failure spike plus interception write is a high-confidence hijack signal; isolated transient
+    failures without a corresponding write are lower priority. In the context of the Stealth tactic, this
+    matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted Path"
+    lets an adversary blend planted execution into legitimate service activity while satisfying the information
+    requirement: "Is the adversary maintaining persistence using an unquoted service path?". Method type:
+    Statistical Method. Detection approach "Failure-rate profiling".'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host: failure_rate = count(EID7034, failed_update, failed_heartbeat, blocked_conn)/window
+
+      | eval mz=0.6745*(failure_rate-median)/MAD
+
+      | where mz>3.5 AND interception_path_write_in_window
+
+      | alert ''Security-service failure step-change vs interception'''
+- question: Does an autoencoder trained on normal security-tool directory manifests, service-behavior
+    features, and egress patterns produce a high reconstruction error that coincides with new interception-path
+    executables or unusual service-process lineage?
+  context: '[TA0005 Stealth] Train an autoencoder on the normal state of security tooling: directory manifests
+    of the agent''s install path, service-behavior features (start/stop cadence, child processes, resource
+    use), and typical egress patterns. At inference, a high reconstruction error means the current state
+    deviates from learned normal. Flag reconstruction anomalies that coincide with new interception-path
+    executables or unusual service-process lineage, and surface the top-3 highest-error features in the
+    alert so an analyst can see what changed (e.g. an unexpected binary in the manifest, an abnormal child,
+    or new egress). This catches subtle tampering with a protection component that rule logic might miss.
+    High reconstruction error plus an interception-path artifact is a strong defense-evasion lead; normal
+    tool state reconstructs cleanly. In the context of the Stealth tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary blend planted
+    execution into legitimate service activity while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Machine Learning. Detection
+    approach "Security tool state autoencoder".'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: ML/Autoencoder pseudocode
+    query: "X = features(security_tool_dir_manifest, service_behavior, egress)\nerr = autoencoder.reconstruction_error(X)\n\
+      if err>threshold AND (new_interception_path_exe OR unusual_service_lineage):\n    alert(top3_error_features(X))"
+- question: Which installed Windows services have ImagePath values that contain a space and are NOT enclosed
+    in quotation marks, and what are the exact higher-level executable paths (e.g. C:\program.exe, 'C:\Program
+    Files\Common.exe') that an adversary could plant to intercept each one?
+  context: '[TA0002 Execution] This is the foundational enumeration step: parse every service ImagePath
+    under HKLM\SYSTEM\CurrentControlSet\Services\* and flag any value that contains a space and is not
+    wrapped in quotes, ignoring arguments. For each vulnerable path, auto-generate the precise interception
+    targets by taking each space-delimited prefix and appending ''.exe'' (so ''C:\Program Files\My App\svc.exe''
+    yields candidate targets C:\Program.exe and ''C:\Program Files\My.exe''). This watchlist of interception
+    targets is what every downstream correlation rule keys on. Also alert on creation or modification
+    of these service keys via Security Event ID 4657, because an adversary may add a new vulnerable service
+    or rewrite an ImagePath. A populated list of vulnerable services is itself an exposure to remediate
+    (re-quote the path); creation of a file at any generated interception target is a strong hijack indicator.
+    In the context of the Execution tactic, this matters because unquoted-path hijack of "Hijack Execution
+    Flow: Path Interception by Unquoted Path" lets an adversary obtain code execution via a trusted service
+    launch while satisfying the information requirement: "Is the adversary maintaining persistence using
+    an unquoted service path?". Method type: Symbolic Logic. Detection approach "Enumerate vulnerable
+    unquoted paths".'
+  answer_sources: &id004
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4697
+  - Windows Event ID 7045
+  - Windows Event ID 7036
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Windows Registry on all endpoints (HKLM\SYSTEM\CurrentControlSet\Services to identify vulnerable
+    unquoted service paths), file systems of endpoints and servers (especially C:\ and C:\Program Files),
+    and network traffic logs at egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'registry where path startswith ''HKLM\\SYSTEM\\CurrentControlSet\\Services'' and value_name==''ImagePath''
+
+      | eval img=trim(ImagePath)
+
+      | where match(img, ''\\s'') AND NOT match(img, ''^\"'')
+
+      | eval targets=gen_prefixes(img)   // each space-delimited prefix + ''.exe''
+
+      | output service_name, img, targets  -> interception_watchlist'
+  - technology: SIEM/Rule pseudocode
+    query: 'WinEventLog:Security EventCode=4657 ObjectName endswith ''\\ImagePath''
+
+      | where match(NewValue,''\\s'') AND NOT match(NewValue,''^\"'')
+
+      | alert ''New/modified unquoted service path'''
+- question: Did a file get created at a path that EXACTLY matches a precomputed unquoted-path interception
+    target, followed within 24 hours by a service install or restart and then execution of that same planted
+    binary — and did the planted process run as SYSTEM, appear unsigned/first-seen, or open an outbound
+    connection within 60 seconds?
+  context: '[TA0002 Execution] This stitches the full hijack chain together. Start from a Sysmon EID 11
+    file-creation whose TargetFilename matches an entry on the interception watchlist. Look for a service
+    install or state change (EID 7045 install, 4697 service installed, 7036 service entered running) within
+    24 hours, then a Sysmon EID 1 process creation of that exact planted image. Escalate sharply when
+    the executed image is unsigned, first-seen in the fleet, runs at IntegrityLevel=System, or makes a
+    Sysmon EID 3 outbound network connection within ~60 seconds of launch — those are the behaviors of
+    an adversary-controlled binary rather than a benign installer. A positive result is a high-confidence
+    execution-flow hijack; a negative (file creation without the restart/execute follow-on) may be a staged-but-not-yet-triggered
+    payload worth hunting. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Sequence-based hijack correlation".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '(EID11 TargetFilename IN interception_watchlist) as plant
+
+      JOIN (EID7045 OR EID4697 OR EID7036) as svc ON host AND svc.time-plant.time<=24h
+
+      JOIN (EID1 Image==plant.TargetFilename) as exec ON host
+
+      | eval risk = unsigned + first_seen + (IntegrityLevel==''System'') + has_EID3_within(exec,60s)
+
+      | where risk>=1 | alert sort by risk desc'
+- question: Did services.exe (the Service Control Manager) spawn a child process whose image path is NOT
+    the registered ImagePath of any installed service — i.e., a binary resolving to an ancestor directory
+    of an unquoted service path — particularly in SYSTEM context?
+  context: '[TA0002 Execution] The SCM (services.exe) should only ever launch the exact registered ImagePath
+    of each service. If services.exe spawns a child whose full image path does not match any service''s
+    configured binary, the most likely explanation is that an unquoted path was intercepted and Windows
+    resolved a planted ancestor-directory executable instead. Build the set of legitimate registered service
+    images, then flag any services.exe child not in that set. This is very high fidelity in SYSTEM context
+    because legitimate parentage is tightly constrained. A match strongly indicates path interception;
+    benign edge cases (newly installed services not yet inventoried) should be reconciled against the
+    current registry snapshot. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Anomalous SCM child lineage".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID1 where ParentImage endswith ''\\services.exe''
+
+      | lookup registered_service_images Image OUTPUT is_registered
+
+      | where is_registered!=true
+
+      | alert ''SCM spawned non-registered image'' (priority high if IntegrityLevel==''System'')'
+- question: For executables created at interception-path locations, are the file hashes first-seen or
+    rare across the fleet (present on under ~0.5% of hosts), and do the filenames show high entropy (>4.0
+    bits/char) suggestive of randomly generated dropper names?
+  context: '[TA0002 Execution] Legitimate service binaries are widely deployed and have stable, recognizable
+    names; adversary-planted interception binaries are typically novel, rare, and sometimes randomly named.
+    Baseline filename/hash prevalence as the count of distinct hosts carrying each hash, and the rarity
+    of writes into ancestor directories for service-associated binaries. Alert on first-seen hashes, fleet
+    prevalence below ~0.5% of hosts, or filename Shannon entropy above ~4.0 bits/char for interception-path
+    creations, scaling thresholds to host role. High score plus an interception-path location is a strong
+    lead; common, widely deployed signed binaries score low and are deprioritized. Useful for catching
+    novel payloads that signature rules miss. In the context of the Execution tactic, this matters because
+    unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary
+    obtain code execution via a trusted service launch while satisfying the information requirement: "Is
+    the adversary maintaining persistence using an unquoted service path?". Method type: Statistical Method.
+    Detection approach "Entropy and prevalence scoring".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EID11 TargetFilename IN interception_watchlist
+
+      | stats dc(host) as prevalence by Hashes
+
+      | eval pct=prevalence/total_hosts, ent=shannon_entropy(filename)
+
+      | where first_seen==true OR pct<0.005 OR ent>4.0
+
+      | alert score=f(pct,ent,host_role)'
+- question: Has the population of services with unquoted paths on a host changed recently — a new vulnerable
+    service appearing or an existing service's path hierarchy changing — within ~7 days before an interception-path
+    file write?
+  context: '[TA0002 Execution] Adversaries sometimes create or reconfigure a vulnerable service to set
+    up the interception, so configuration drift immediately preceding a planted file is suspicious. Maintain
+    per-host baselines of services with unquoted paths and detect when new vulnerable services appear
+    or an existing service''s directory hierarchy changes, then look for an interception-path file write
+    within ~7 days. Apply a modified Z-score (>3.5) on the per-host count of new unquoted services so
+    that hosts that are simply noisy don''t generate constant alerts. A drift-then-write sequence is a
+    strong staging signal; drift alone is an exposure to remediate by re-quoting the path. In the context
+    of the Execution tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path
+    Interception by Unquoted Path" lets an adversary obtain code execution via a trusted service launch
+    while satisfying the information requirement: "Is the adversary maintaining persistence using an unquoted
+    service path?". Method type: Statistical Method. Detection approach "Detect vulnerable path drift
+    before interception".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'daily snapshot unquoted_services by host
+
+      | delta new_unquoted = today - baseline
+
+      | eval mz = 0.6745*(new_unquoted-median)/MAD
+
+      | where mz>3.5 AND exists(EID11 in interception_watchlist within 7d after change)
+
+      | alert ''Vulnerable path drift before interception'''
+- question: Does host provenance contain the hijack motif — write-to-service-ancestor directory, then
+    SCM service start, then a SYSTEM child process, then network egress — when matched as an inexact graph
+    pattern?
+  context: '[TA0002 Execution] Encode the canonical interception kill chain as a query graph (file write
+    to a service-ancestor directory -> SCM starts the service -> a SYSTEM-context child process is created
+    -> the child makes an outbound connection) and run inexact graph-pattern matching (e.g. POIROT/KAIROS
+    style) over the host''s provenance graph. This catches the behavioral shape even when individual node
+    attributes vary (different filenames, services, or C2 destinations), which evades brittle string rules.
+    The alert should surface the matched subgraph''s top-3 nodes/edges as evidence so an analyst can validate
+    quickly. A confident subgraph match is strong corroboration of a hijack; partial matches help prioritize
+    hunting. In the context of the Execution tactic, this matters because unquoted-path hijack of "Hijack
+    Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code execution via a
+    trusted service launch while satisfying the information requirement: "Is the adversary maintaining
+    persistence using an unquoted service path?". Method type: Machine Learning. Detection approach "Provenance
+    subgraph query match".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: Graph/Provenance pseudocode
+    query: 'Q = pattern{ (write:File ~ service_ancestor_dir)->(svc:SCM start)->(p:Process integrity=SYSTEM)->(net:Conn
+      egress) }
+
+      matches = inexact_subgraph_match(host_provenance, Q, threshold=0.8)
+
+      for m in matches: alert(evidence=top3_nodes_edges(m))'
+- question: Across the normal service-lifecycle provenance for this host, is there a low-probability subgraph
+    in which an interception-path write is followed by a service restart and anomalous child execution
+    or network behavior?
+  context: '[TA0002 Execution] Train a temporal graph or sequence model (KAIROS / ThreaTrace / FLASH style)
+    on benign service-lifecycle provenance, then flag low-probability subgraphs that contain an interception-path
+    write followed by a service restart and anomalous child-process execution or unexpected network behavior.
+    Unlike a fixed query graph, this learns what ''normal'' service starts look like per host and surfaces
+    statistically improbable deviations, catching novel hijack variants. The alert must list the top-3
+    contributing nodes/features for analyst triage. A flagged low-probability subgraph involving an interception
+    target warrants investigation; well-modeled benign restarts score as expected and are suppressed.
+    In the context of the Execution tactic, this matters because unquoted-path hijack of "Hijack Execution
+    Flow: Path Interception by Unquoted Path" lets an adversary obtain code execution via a trusted service
+    launch while satisfying the information requirement: "Is the adversary maintaining persistence using
+    an unquoted service path?". Method type: Machine Learning. Detection approach "Service sequence anomaly
+    model".'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: ML/Sequence model pseudocode
+    query: 'model = train_temporal_graph(benign_service_lifecycle_provenance)
+
+      score = model.anomaly(subgraph containing EID11-in-watchlist -> svc_restart -> child_exec/net)
+
+      if score < p_low: alert(top3_features(subgraph))'
+- question: Did a non-admin (medium-integrity) process create or overwrite an executable in a parent/ancestor
+    directory (e.g. C:\ or the C:\Program Files root) that could intercept a known unquoted service path?
+  context: '[TA0002 Execution] Ancestor directories like C:\ and the C:\Program Files root are normally
+    writable only by administrators and installers, so a write into one of them by a medium-integrity
+    (non-admin) process is highly anomalous and is the classic setup for unquoted-path privilege escalation.
+    Detect Sysmon EID 11 creations/overwrites of .exe files at interception-target locations where the
+    creating process runs at medium integrity / as a standard user. This is high fidelity because the
+    privilege mismatch is rare for legitimate software. A hit means a low-privileged actor has staged
+    a binary that a higher-privileged service may execute — investigate the writer''s process tree and
+    the target service immediately. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Symbolic Logic. Detection approach
+    "Alert on non-admin writes to service binary ancestors".'
+  answer_sources: &id005
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 7036
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - 'NAI: Authentication logs and file systems on multi-user systems like terminal servers and workstations.
+    The Windows Registry (HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services) on all hosts is the NAI
+    for identifying vulnerable service configurations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID11 TargetFilename IN interception_watchlist AND TargetFilename endswith ''.exe''
+
+      | join creator process integrity
+
+      | where creator.IntegrityLevel in (''Medium'',''Low'') OR creator.user NOT in admins
+
+      | alert ''Non-admin write to service binary ancestor'''
+- question: Was a non-admin file creation at an interception path followed within 24 hours by SYSTEM/elevated
+    execution from that SAME path, with linkage across the user SID, the targeted service, and the process
+    image hash?
+  context: '[TA0002 Execution] This confirms actual privilege escalation, not just staging. Correlate
+    the non-admin EID 11 file creation at an interception target with later elevated execution from the
+    same path: Windows 4672 (special privileges assigned), 4688 with token elevation, or Sysmon EID 1
+    with IntegrityLevel=System, all referencing the same image. Require linkage across the creating user
+    SID, the targeted unquoted service, and the process image hash to keep false positives low. A confirmed
+    medium-to-SYSTEM transition from an attacker-written binary is a definitive escalation via path interception;
+    absence of the elevated run may mean the payload hasn''t been triggered yet. In the context of the
+    Execution tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception
+    by Unquoted Path" lets an adversary obtain code execution via a trusted service launch while satisfying
+    the information requirement: "Is the adversary maintaining persistence using an unquoted service path?".
+    Method type: Symbolic Logic. Detection approach "Privilege escalation path correlation".'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "(EID11 TargetFilename IN interception_watchlist, creator_integrity=Medium) as plant\nJOIN\
+      \ (EID4672 OR EID4688 token_elevation OR EID1 IntegrityLevel=System) as elev\n  ON elev.Image==plant.TargetFilename\
+      \ AND elev.time-plant.time<=24h AND same(Hashes)\n| alert 'Privilege escalation via unquoted path'"
+- question: What is the composite risk score — derived from the privilege delta between binary creator
+    and executor, path criticality, signer trust, and fleet prevalence — for interception-path binaries,
+    and which exceed the top ~1% threshold (especially on multi-user servers and admin workstations)?
+  context: '[TA0002 Execution] Combine multiple weak signals into one prioritized score. Inputs: the privilege
+    delta (creator integrity vs. execution integrity — a large medium->SYSTEM gap scores high), path criticality
+    (ancestor of a real unquoted service), signer trust (unsigned adds risk), and historical fleet prevalence
+    of the binary path (rare adds risk). Alert when the score exceeds a tuned percentile such as the top
+    1%, weighting multi-user terminal servers and admin workstations more heavily because escalation impact
+    is greatest there. The alert should emit the top-3 contributing factors for explainability. High score
+    concentrates analyst attention on the riskiest few interception-path binaries while common signed
+    software is deprioritized. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Privilege gap risk scoring".'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each interception-path binary:
+
+      score = w1*priv_delta + w2*path_criticality + w3*unsigned + w4*(1-prevalence) + w5*host_role
+
+      | where score >= pct99
+
+      | alert score, top3_factors'
+- question: Is there a spike in the rate of new SYSTEM-context process images per host, or in medium-to-SYSTEM
+    transitions tied to file writes, that coincides with interception-path writes (modified Z-score >
+    3.5)?
+  context: '[TA0002 Execution] Track, per host, the rate at which new SYSTEM-context process images appear
+    and the rate of medium->SYSTEM privilege transitions linked to recent file writes. Apply a modified
+    Z-score (>3.5) so only statistically significant spikes alert. When such a spike coincides in time
+    with an interception-path file write, it suggests an unquoted-path hijack just produced new elevated
+    execution. Baselining cadence catches escalation even when an individual binary looks unremarkable.
+    A coincident spike-plus-write is the signal; steady-state elevation from well-known service binaries
+    is expected and suppressed. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Elevation cadence baseline".'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host, daily: new_system_images, med_to_system_transitions_with_write
+
+      | eval mz=0.6745*(metric-median)/MAD
+
+      | where mz>3.5 AND interception_path_write_in_window
+
+      | alert ''Elevation cadence spike vs interception write'''
+- question: In user-file-process provenance graphs, do subgraphs show non-admin creation of a binary followed
+    by high-privilege execution within a vulnerable service-path hierarchy that a graph anomaly model
+    flags as anomalous?
+  context: '[TA0002 Execution] Build user-file-process provenance graphs and train node-level or graph-level
+    anomaly detection (ThreaTrace / MAGIC / FLASH style) on benign escalation patterns. Flag subgraphs
+    in which a non-admin user creates a binary that is subsequently executed at high privilege inside
+    a vulnerable service-path hierarchy. This learns the normal shape of legitimate elevation (installers,
+    scheduled maintenance) and surfaces the abnormal non-admin->SYSTEM structure characteristic of unquoted-path
+    escalation. The model should report the anomalous node(s) and top contributing features. A flagged
+    subgraph is a strong escalation lead; benign elevation patterns score normal. In the context of the
+    Execution tactic, this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception
+    by Unquoted Path" lets an adversary obtain code execution via a trusted service launch while satisfying
+    the information requirement: "Is the adversary maintaining persistence using an unquoted service path?".
+    Method type: Machine Learning. Detection approach "High-privileged subgraph classification".'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: ML/Graph model pseudocode
+    query: "G = build_user_file_process_graph(host)\nmodel = train_node_graph_anomaly(benign_escalation)\n\
+      for n in G: if model.is_anomalous(n) and n in vuln_service_path_hierarchy and creator=non_admin\
+      \ and exec=high_priv:\n    alert(node=n, top_features=...)"
+- question: For critical security/EDR services that have known unquoted paths, was an interception-path
+    executable created and then followed by a service crash/stop/unexpected restart (7034/7036) or execution
+    of a binary that is NOT the registered service image?
+  context: '[TA0002 Execution] Maintain a curated watchlist of critical security/EDR service binaries
+    that have unquoted paths (e.g. an agent installed under C:\Program Files\... without quotes). Alert
+    when a Sysmon EID 11 creation occurs at one of those interception targets and is followed by service
+    instability — 7034 (service terminated unexpectedly), 7036 (state change / unexpected restart), 7045
+    (new service install) — or by execution of a binary that is not the registered service image. Hijacking
+    a protection component is a defense-evasion move designed to blind the defender while appearing as
+    a normal service. A match here is high priority because it can disable monitoring; validate the running
+    image against the registered ImagePath. In the context of the Execution tactic, this matters because
+    unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary
+    obtain code execution via a trusted service launch while satisfying the information requirement: "Is
+    the adversary maintaining persistence using an unquoted service path?". Method type: Symbolic Logic.
+    Detection approach "Security service intercept rule".'
+  answer_sources: &id006
+  - Sysmon Event ID 11
+  - Windows Event ID 7034
+  - Windows Event ID 7036
+  - Windows Event ID 7045
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Sysmon Event ID 3
+  - 'NAI: File system directories containing security agent installations (e.g., C:\Program Files\Windows
+    Defender). Service Control Manager event logs on all endpoints. Log ingestion dashboards and health
+    monitoring views within the SIEM platform.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID11 TargetFilename IN security_service_interception_watchlist
+
+      | join following (EID7034 OR EID7036 OR EID7045 OR (EID1 Image!=registered_image)) within window
+
+      | alert ''Possible hijack of security service'' priority=high'
+- question: After execution from an interception path, did the affected security product show log ingest
+    gaps, abrupt heartbeat loss, or failed update checks within the same analysis window?
+  context: '[TA0002 Execution] This is the failure-mode counterpart to the intercept rule: rather than
+    looking for the malicious execution directly, look for the silence it creates. When interception-path
+    execution is followed by gaps in a security product''s log ingestion, sudden loss of its heartbeat,
+    or failed update checks in the same window, the protection component has likely been hijacked or disabled.
+    Because adversaries seeking stealth try to suppress telemetry, the absence of expected events is itself
+    a strong signal. Trigger a high-priority alert and correlate the suppression to the recent interception-path
+    write/launch. A confirmed gap concurrent with a hijack chain is a serious defense-evasion indicator
+    that should be escalated immediately. In the context of the Execution tactic, this matters because
+    unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary
+    obtain code execution via a trusted service launch while satisfying the information requirement: "Is
+    the adversary maintaining persistence using an unquoted service path?". Method type: Symbolic Logic.
+    Detection approach "Detect telemetry suppression after service hijack".'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'let hijack = interception_path_execution(host, window)
+
+      let gap = (no agent events >5m) OR heartbeat_loss OR failed_update_check (same host, window)
+
+      if hijack AND gap: alert ''Telemetry suppression after service hijack'' priority=high'
+- question: Did a host's security-agent telemetry volume or heartbeat cadence drop sharply (modified Z-score
+    < -3.5, or >5 minutes of zero events from a normally chatty agent), correlating with a recent interception-path
+    file creation or process launch?
+  context: '[TA0002 Execution] Baseline per-host agent telemetry volume (events/min) and service-heartbeat
+    cadence, then alert when a modified Z-score shows a significant drop (>3.5 in magnitude) or an abrupt
+    gap such as more than 5 minutes of zero events from an agent that is normally chatty. Correlate any
+    such drop to recent interception-path file-creation and process-launch events on the same host. A
+    sudden telemetry collapse on a host that just experienced an interception-path write is consistent
+    with a hijacked or killed security service. Statistical baselining adapts to each host''s normal volume,
+    avoiding fixed thresholds. A correlated drop is the alertable condition; routine diurnal volume changes
+    stay within the baseline. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Statistical Method. Detection
+    approach "Log volume deviation alerting".'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host: events_per_min(agent), heartbeat_interval
+
+      | eval mz=0.6745*(rate-median)/MAD
+
+      | where mz<-3.5 OR zero_events_gap>5m
+
+      | where interception_path_write_or_launch_recent
+
+      | alert ''Agent telemetry deviation post-interception'''
+- question: Is there a step-change increase in security-service failure signals — 7034 unexpected terminations,
+    failed update/heartbeat checks, blocked outbound connections — that occurs concurrently with an interception-path
+    write?
+  context: '[TA0002 Execution] Profile security-service error and failure rates as a first-class signal
+    distinct from raw telemetry volume: count 7034 unexpected service terminations, failed update or heartbeat
+    checks, and blocked/failed outbound connections from the security product. A sudden step-change increase
+    in these failures that coincides with an interception-path file write is a strong indicator that the
+    service''s execution flow was hijacked and the legitimate component is failing while the planted binary
+    runs. Use modified Z-score / isolation-forest style anomaly detection on the failure-rate time series.
+    A concurrent failure spike plus interception write is a high-confidence hijack signal; isolated transient
+    failures without a corresponding write are lower priority. In the context of the Execution tactic,
+    this matters because unquoted-path hijack of "Hijack Execution Flow: Path Interception by Unquoted
+    Path" lets an adversary obtain code execution via a trusted service launch while satisfying the information
+    requirement: "Is the adversary maintaining persistence using an unquoted service path?". Method type:
+    Statistical Method. Detection approach "Failure-rate profiling".'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host: failure_rate = count(EID7034, failed_update, failed_heartbeat, blocked_conn)/window
+
+      | eval mz=0.6745*(failure_rate-median)/MAD
+
+      | where mz>3.5 AND interception_path_write_in_window
+
+      | alert ''Security-service failure step-change vs interception'''
+- question: Does an autoencoder trained on normal security-tool directory manifests, service-behavior
+    features, and egress patterns produce a high reconstruction error that coincides with new interception-path
+    executables or unusual service-process lineage?
+  context: '[TA0002 Execution] Train an autoencoder on the normal state of security tooling: directory
+    manifests of the agent''s install path, service-behavior features (start/stop cadence, child processes,
+    resource use), and typical egress patterns. At inference, a high reconstruction error means the current
+    state deviates from learned normal. Flag reconstruction anomalies that coincide with new interception-path
+    executables or unusual service-process lineage, and surface the top-3 highest-error features in the
+    alert so an analyst can see what changed (e.g. an unexpected binary in the manifest, an abnormal child,
+    or new egress). This catches subtle tampering with a protection component that rule logic might miss.
+    High reconstruction error plus an interception-path artifact is a strong defense-evasion lead; normal
+    tool state reconstructs cleanly. In the context of the Execution tactic, this matters because unquoted-path
+    hijack of "Hijack Execution Flow: Path Interception by Unquoted Path" lets an adversary obtain code
+    execution via a trusted service launch while satisfying the information requirement: "Is the adversary
+    maintaining persistence using an unquoted service path?". Method type: Machine Learning. Detection
+    approach "Security tool state autoencoder".'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: ML/Autoencoder pseudocode
+    query: "X = features(security_tool_dir_manifest, service_behavior, egress)\nerr = autoencoder.reconstruction_error(X)\n\
+      if err>threshold AND (new_interception_path_exe OR unusual_service_lineage):\n    alert(top3_error_features(X))"
