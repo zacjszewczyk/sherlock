@@ -1,0 +1,388 @@
+name: 'D3-TBI: TPM Boot Integrity'
+id: 6652e103-63f7-4ef4-9f0e-aa42b8b23ec2
+description: Investigate the deployment, health, and integrity of TPM-based boot integrity (Static Root
+  of Trust Measurement) across the endpoint fleet. This playbook helps an analyst verify that each host's
+  measured boot matches an authorized golden baseline, that TPM Quotes are fresh and cryptographically
+  valid, and that boot-state security claims have not regressed. It also surfaces host-side boot-chain
+  tampering observables (unsigned/revoked driver loads, EFI System Partition writes, boot-binary downgrades,
+  and bcdedit-based weakening of boot-integrity enforcement) that precede or accompany a PCR/measurement
+  change, inventories TPM/Secure Boot coverage gaps, statistically baselines attestation outcomes to separate
+  genuine tampering from benign churn, and applies machine-learning anomaly detection layered on top of
+  the deterministic golden-measurement floor. Together these questions let a SOC analyst detect firmware/bootkit
+  tampering (e.g., LoJax, BlackLotus), identify non-attesting or insecurely configured hosts, and prioritize
+  root-cause analysis across the fleet.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: For each host, does the PCR aggregate reconstructed from the measured-boot event log match
+    an authorized golden baseline keyed by hardware-model and firmware-version, with every individual
+    measurement present on the allowlist?
+  context: This is the deterministic floor of TPM boot-integrity verification and supports the Harden
+    tactic by confirming each endpoint boots from a trusted hardware/software combination. The analyst
+    reconstructs the PCR aggregate by replaying the measured-boot (TBS/WBCL or IMA) event log and compares
+    the resulting hash and each component measurement against a golden baseline enrolled from a known-good
+    gold image, keyed per hardware-model+firmware-version. Baselines should only be re-enrolled when an
+    authorized, signed firmware/OS update is applied (per NIST SP 800-155 and the Root of Trust for Detection
+    in SP 800-193). A positive result (aggregate mismatch or any measurement absent from the allowlist)
+    is high-fidelity tamper evidence indicating altered firmware or boot components; a negative result
+    confirms boot integrity for that model/firmware combination.
+  answer_sources:
+  - TPM Quote (PCR values + AIK signature)
+  - Measured-boot event log (Windows TBS/WBCL; Linux IMA ascii_runtime_measurements)
+  - Windows Event ID 14 (Microsoft-Windows-MeasuredBoot/Operational)
+  - Device Health Attestation / verifier service logs
+  - 'NAI: All corporate endpoints (laptops, desktops, servers) equipped with a TPM chip and reporting
+    to an attestation/health verifier.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for host in fleet:
+        measured = reconstruct_pcr_aggregate(measured_boot_event_log[host])
+        baseline = golden_baseline[host.model][host.firmware_version]
+        if measured.aggregate != baseline.aggregate
+           or any(m not in baseline.allowlist for m in measured.components):
+          alert("PCR aggregate/measurement mismatch", host)
+- question: Does every TPM Quote contain a fresh server-generated nonce and a valid AIK/EK signature chain
+    back to the enrolled TPM identity, and are replayed or stale Quotes treated as attestation failures
+    rather than success?
+  context: Freshness and signature validation are essential to the Harden tactic because host-reported
+    state is untrustworthy once firmware or kernel is subverted (per Copilot/Petroni et al), so the verifier
+    must rely on an out-of-band cryptographic proof. The analyst confirms each Quote carries a unique,
+    server-issued nonce and that the AIK/EK signature validates to the TPM identity enrolled during provisioning
+    (per Principles of Remote Attestation, Coker et al). A missing/reused nonce or an invalid signature
+    means the attestation cannot be trusted and must be scored as a FAILURE — not silently accepted. Treating
+    replays/stale Quotes as success is exactly how an attacker would mask a subverted boot.
+  answer_sources:
+  - TPM Quote (PCR values + AIK signature)
+  - Measured-boot event log (Windows TBS/WBCL; Linux IMA ascii_runtime_measurements)
+  - Windows Event ID 14 (Microsoft-Windows-MeasuredBoot/Operational)
+  - Device Health Attestation / verifier service logs
+  - 'NAI: All corporate endpoints (laptops, desktops, servers) equipped with a TPM chip and reporting
+    to an attestation/health verifier.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for quote in tpm_quotes:
+        if quote.nonce is None or quote.nonce in seen_nonces
+           or not verify_sig(quote, enrolled_AIK[quote.host]):
+          alert("Attestation FAILURE: stale/replayed/invalid Quote", quote.host)
+        else:
+          seen_nonces.add(quote.nonce)
+- question: Has any host generated a Windows Event ID 14 (Microsoft-Windows-MeasuredBoot/Operational)
+    indicating a measured boot component changed since baseline that cannot be correlated to an authorized,
+    signed firmware/OS update within an approved maintenance window?
+  context: Measured-boot change events directly support the Harden tactic by flagging tampering with the
+    very components TPM measurement is meant to protect. The analyst investigates each Event ID 14 and
+    attempts to correlate it to an authorized, signed firmware/OS update inside an approved change window;
+    only correlated changes should be suppressed (Root of Trust for Update, NIST SP 800-147). An unexplained
+    measured-boot change is high-fidelity tamper evidence — it means a boot component's measurement diverged
+    without a sanctioned cause, which is consistent with firmware implants or bootkits.
+  answer_sources:
+  - TPM Quote (PCR values + AIK signature)
+  - Measured-boot event log (Windows TBS/WBCL; Linux IMA ascii_runtime_measurements)
+  - Windows Event ID 14 (Microsoft-Windows-MeasuredBoot/Operational)
+  - Device Health Attestation / verifier service logs
+  - 'NAI: All corporate endpoints (laptops, desktops, servers) equipped with a TPM chip and reporting
+    to an attestation/health verifier.'
+  range: Last 90 days (correlate each Event ID 14 against the change-management window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for evt in events where evt.id == 14 and evt.channel == "Microsoft-Windows-MeasuredBoot/Operational":
+        if not correlated_to_authorized_signed_update(evt.host, evt.time, maintenance_windows):
+          alert("Unexplained measured-boot component change", evt.host)
+- question: Do Device Health Attestation / Defender System Guard runtime reports show any host whose boot-state
+    security claims have regressed to insecure values (Secure Boot off, test-signing on, kernel-debug
+    on, DEP off, code-integrity off, BitLocker off, or DRTM not present)?
+  context: Boot-state claim regression undermines the Harden tactic by silently weakening protections
+    an attacker would disable to load unsigned or malicious boot code. The analyst evaluates the attestation
+    claim set per host against the expected secure posture and alerts on any regression. A positive result
+    means a security feature that normally gates boot integrity has been turned off — frequently a precursor
+    or symptom of bootkit activity — while a negative result confirms the hardened boot posture remains
+    intact. These claims and the measured-boot/attestation flow are defined in Microsoft's Secure the
+    Windows boot process and hardware root-of-trust documentation.
+  answer_sources:
+  - TPM Quote (PCR values + AIK signature)
+  - Measured-boot event log (Windows TBS/WBCL; Linux IMA ascii_runtime_measurements)
+  - Windows Event ID 14 (Microsoft-Windows-MeasuredBoot/Operational)
+  - Device Health Attestation / verifier service logs
+  - 'NAI: All corporate endpoints (laptops, desktops, servers) equipped with a TPM chip and reporting
+    to an attestation/health verifier.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for report in device_health_attestation_reports:
+        claims = report.boot_state_claims
+        if not claims.secure_boot or claims.test_signing or claims.kernel_debug
+           or not claims.dep or not claims.code_integrity or not claims.bitlocker
+           or not claims.drtm_present:
+          alert("Boot-state claim regression to insecure value", report.host, claims)
+- question: Are there CodeIntegrity events 3004/3033 (failed signature validation), 3037 (unsigned image
+    loaded), or 3077 (blocked by policy), or Sysmon Event ID 6 loads of known low-level SPI/flash-access
+    drivers (e.g., RwDrv.sys), on any endpoint?
+  context: These first-party Windows signals corroborate attestation failures without external lookups
+    and support the Harden tactic by catching the host-side mechanism of boot-chain tampering. The analyst
+    hunts for CodeIntegrity signature/policy failures and for driver loads of raw SPI/flash-access drivers
+    commonly abused to reflash BIOS. LoJax used exactly such a raw SPI-access driver to reflash the BIOS
+    and alter measured firmware. A positive result — an unsigned/revoked image load or a suspicious low-level
+    driver — strongly indicates an attempt to subvert the firmware/boot chain that TPM measurement protects.
+  answer_sources:
+  - Windows Event ID 24620 / CodeIntegrity 3004,3033,3037,3077 (Microsoft-Windows-CodeIntegrity)
+  - Sysmon Event ID 1 (process creation), 6 (driver load), 11 (file create on \EFI)
+  - Windows Event Log (bcdedit / boot configuration changes)
+  - 'NAI: All Windows endpoints with Secure Boot/HVCI and Sysmon deployed.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      alert if event.provider == "Microsoft-Windows-CodeIntegrity"
+         and event.id in [3004, 3033, 3037, 3077]
+      or (sysmon.event_id == 6
+          and sysmon.ImageLoaded in known_low_level_spi_flash_drivers /* e.g. RwDrv.sys */)
+- question: Has any host written to the EFI System Partition (\EFI\Microsoft\Boot\) via Sysmon Event ID
+    11, or shown a bootmgfw/bootmgr/winload version downgrade or a hash matching a revoked (dbx) boot
+    binary?
+  context: ESP writes and boot-binary downgrades are the persistence technique behind Secure Boot bypasses,
+    so detecting them supports the Harden tactic. The analyst monitors Sysmon EID 11 file creates/writes
+    into the ESP boot path and checks bootmgr/bootmgfw/winload versions against the expected current versions
+    and against the dbx revocation list. BlackLotus persisted by writing old, vulnerable-but-signed boot
+    binaries to the ESP to bypass Secure Boot. A positive result — an unexpected ESP write or a downgraded/revoked
+    boot binary — indicates an attempt to install a bootkit beneath the OS.
+  answer_sources:
+  - Windows Event ID 24620 / CodeIntegrity 3004,3033,3037,3077 (Microsoft-Windows-CodeIntegrity)
+  - Sysmon Event ID 1 (process creation), 6 (driver load), 11 (file create on \EFI)
+  - Windows Event Log (bcdedit / boot configuration changes)
+  - 'NAI: All Windows endpoints with Secure Boot/HVCI and Sysmon deployed.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      alert if sysmon.event_id == 11
+         and sysmon.TargetFilename startswith "\\EFI\\Microsoft\\Boot\\"
+      or (boot_binary in [bootmgfw, bootmgr, winload]
+          and (boot_binary.version < expected_version
+               or boot_binary.hash in dbx_revoked_hashes))
+- question: Has bcdedit.exe (Sysmon Event ID 1) been used to set testsigning on, nointegritychecks on,
+    disable recovery, or ignoreallfailures on any endpoint?
+  context: bcdedit-based weakening directly degrades the enforcement that TPM measurement protects, so
+    detecting it supports the Harden tactic. The analyst alerts on bcdedit command lines that enable test-signing,
+    disable integrity checks, disable recovery, or set ignoreallfailures (per the SigmaHQ bcdedit boot-config
+    tampering rule). A positive result means an actor or insider is deliberately lowering boot-integrity
+    enforcement, typically to permit unsigned drivers or boot code; a negative result indicates boot configuration
+    enforcement is intact.
+  answer_sources:
+  - Windows Event ID 24620 / CodeIntegrity 3004,3033,3037,3077 (Microsoft-Windows-CodeIntegrity)
+  - Sysmon Event ID 1 (process creation), 6 (driver load), 11 (file create on \EFI)
+  - Windows Event Log (bcdedit / boot configuration changes)
+  - 'NAI: All Windows endpoints with Secure Boot/HVCI and Sysmon deployed.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      alert if sysmon.event_id == 1 and process.name == "bcdedit.exe"
+         and process.command_line matches /(testsigning\s+on|nointegritychecks\s+on|ignoreallfailures|bootstatuspolicy\s+ignoreallfailures|delete.*recovery)/i
+- question: Which systems lack a TPM, have the TPM disabled, use deprecated TPM 1.2 where TPM 2.0 is the
+    standard, or have Secure Boot off — particularly among high-value targets?
+  context: Coverage-gap inventory is foundational to the Harden tactic because boot integrity cannot protect
+    hosts that lack or disable the underlying hardware/firmware controls. The analyst periodically inventories
+    TPM presence, version, enabled/owned state, and Secure Boot status via WMI/MDM, and alerts on any
+    host missing the expected configuration, with per-model/firmware baselining of expected state (NIST
+    SP 800-155, SP 800-193). A positive result identifies unprotected or under-protected endpoints to
+    remediate; gaps on high-value targets should be prioritized.
+  answer_sources:
+  - WMI query results for TPM status (presence, version, enabled, owned)
+  - MDM/inventory attestation status
+  - Verifier service pass/fail logs
+  - 'NAI: All corporate endpoints expected to support TPM 2.0 and remote attestation.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for host in fleet:
+        tpm = wmi_tpm_status[host]; sb = secure_boot_status[host]
+        if not tpm.present or not tpm.enabled
+           or (tpm.version == "1.2" and standard == "2.0")
+           or not sb.enabled:
+          report_gap(host, tpm, sb, priority=high if host in high_value_targets else normal)
+- question: How many hosts are in each distinct attestation failure state (PCR/measurement mismatch, signature-validation
+    failure, stale/replayed Quote, or never reporting/silent), and does the count of non-attesting hosts
+    in any business unit exceed a derived threshold?
+  context: Profiling failure modes separately supports the Harden tactic by distinguishing explicit failures
+    from silent non-reporters, which is the freshness principle of Coker et al. The analyst tracks each
+    failure state as its own signal and alerts when non-attesting (silent) hosts in a business unit exceed
+    a derived threshold — e.g., >2% of expected, or >3 sigma above the unit's 30-day mean of silent hosts.
+    A positive result reveals attestation coverage erosion or a cluster of failures that may indicate
+    a spreading campaign or a broken rollout, rather than allowing silent hosts to disappear from monitoring.
+  answer_sources:
+  - WMI query results for TPM status (presence, version, enabled, owned)
+  - MDM/inventory attestation status
+  - Verifier service pass/fail logs
+  - 'NAI: All corporate endpoints expected to support TPM 2.0 and remote attestation.'
+  range: Last 90 days (30-day baseline for silent-host mean)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      states = {pcr_mismatch, sig_failure, stale_quote, silent}
+      for bu in business_units:
+        silent = count(hosts in bu with no attestation report)
+        mean30, sd30 = rolling_stats(silent_hosts[bu], days=30)
+        if silent > max(0.02*expected[bu], mean30 + 3*sd30):
+          alert("Non-attesting host concentration", bu, breakdown=states)
+- question: Which host models or OS versions fall in the top 5% by boot-integrity failure rate over the
+    last 30 days, using a percentile cut derived from your own fleet distribution?
+  context: Quantifying failure concentration supports the Harden tactic by directing limited analyst effort
+    to the segments most likely harboring a systemic problem or campaign. The analyst collects all boot-integrity
+    failures over 30 days and uses percentile analysis to surface the top 5% of host models/OS versions
+    by failure rate, deriving the cut from the fleet's own distribution rather than a fixed value (consistent
+    with per-model golden baselines, NIST SP 800-155). A positive result prioritizes those segments for
+    root-cause analysis — distinguishing a faulty patch on one model from a targeted bootkit.
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Windows Event ID 14 volume
+  - Boot integrity event counts per host/model/business-unit
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints.'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      rates = failure_rate_by(model_or_os_version, window=30d)
+      cut = percentile(rates.values, 95)
+      for seg, rate in rates:
+        if rate >= cut:
+          prioritize_rca(seg, rate)
+- question: Is the rolling 7-day mean and variance of boot-integrity events per business unit showing
+    a sustained increase exceeding the 95th percentile of historical variance (EWMA/z-score)?
+  context: Tracking attestation failure drift supports the Harden tactic by catching a faulty patch or
+    a spreading bootkit campaign before it saturates the fleet. The analyst computes a rolling 7-day mean
+    and variance of boot-integrity events per business unit and alerts on sustained increases beyond the
+    95th percentile of historical variance using EWMA or z-score. BlackLotus-style campaigns spread gradually,
+    so a sustained, statistically significant uptick (rather than a single spike) is the meaningful signal;
+    a negative result indicates normal churn.
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Windows Event ID 14 volume
+  - Boot integrity event counts per host/model/business-unit
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints.'
+  range: Last 90 days (7-day rolling window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for bu in business_units:
+        series = daily_boot_integrity_events[bu]
+        ewma, var = rolling(series, window=7d)
+        if zscore(today, ewma, var) > p95(historical_variance[bu]):
+          alert("Sustained attestation failure drift", bu)
+- question: Per hardware model, do any hosts have a measured boot-component set that diverges (added or
+    removed entries) from the model's stable steady-state peer baseline?
+  context: 'Peer-divergence comparison supports the Harden tactic without requiring labels or training:
+    Sailer et al show the measured-component set is small (~250-500 entries) and quickly stabilizes per
+    model, so divergence is suspicious. The analyst computes the stable steady-state set of measured components
+    for each model and alerts on hosts whose set adds or removes entries relative to peers (the training-less
+    approach of ReplicaWatcher). A positive result — an outlier component set on one host of a homogeneous
+    model fleet — indicates that host''s boot chain differs from its peers, a strong tamper signal.'
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Windows Event ID 14 volume
+  - Boot integrity event counts per host/model/business-unit
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for model in models:
+        peer_set = steady_state_measured_set(model)  # ~250-500 stable entries
+        for host in hosts_of(model):
+          diff = symmetric_difference(measured_set[host], peer_set)
+          if diff:
+            alert("Measured-component divergence from model peers", host, diff)
+- question: Using an Isolation Forest over per-host attestation features (PCR-change count, attestation-failure
+    rate, firmware/version tuple, boot-driver set size, boot-event timing), which hosts are isolated as
+    rare anomalies, and what are the top-3 contributing features?
+  context: This unsupervised model layers on top of — never replaces — the deterministic golden-measurement
+    floor, supporting the Harden tactic by surfacing rare hosts that evade simple rules. The analyst trains
+    an Isolation Forest on per-host attestation feature vectors to isolate outliers without labels, and
+    the alert must name the top-3 contributing features (e.g., 'unexpected boot-driver', 'PCR7 mismatch',
+    'failure-rate spike') for triage (Liu et al). Every model output must be corroborated against the
+    deterministic golden-baseline verdict (NIST SP 800-193); a host isolated as anomalous AND failing
+    the golden comparison is high-confidence tampering.
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Per-host attestation feature vectors (PCR-change count, failure rate, firmware/version, boot-driver
+    set, boot-event timing)
+  - Boot/CodeIntegrity event sequences
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints with sufficient history for
+    modeling.'
+  range: Last 90 days (with sufficient history for modeling)
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      X = per_host_features[[pcr_change_count, failure_rate, firmware_version,
+                             boot_driver_set_size, boot_event_timing]]
+      model = IsolationForest().fit(X)
+      for host in hosts:
+        if model.predict(host) == -1:
+          alert(host, top3=shap_top_features(model, host),
+                corroborate=golden_baseline_verdict[host])
+- question: Using DeepLog (LSTM) trained on the normal ordering of boot/measured-boot/code-integrity log
+    keys, which boot event sequences have low predicted likelihood, and which log key is offending?
+  context: Sequence modeling supports the Harden tactic by catching tamper or attestation-failure chains
+    that appear only as an abnormal ordering of otherwise-benign events. The analyst trains DeepLog on
+    the normal sequence of boot/measured-boot/code-integrity log keys and flags sequences whose next-key
+    likelihood is low, naming the offending log key in the alert (Du et al). A positive result — an out-of-distribution
+    boot event sequence — indicates the boot process deviated from its learned normal path, which may
+    represent a tamper chain; corroborate against the deterministic verdict before escalating.
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Per-host attestation feature vectors (PCR-change count, failure rate, firmware/version, boot-driver
+    set, boot-event timing)
+  - Boot/CodeIntegrity event sequences
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints with sufficient history for
+    modeling.'
+  range: Last 90 days (with sufficient history for modeling)
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      model = DeepLog_LSTM().train(normal_boot_log_key_sequences)
+      for seq in boot_event_sequences:
+        p, offending = model.predict_next(seq)
+        if p < likelihood_threshold:
+          alert("Out-of-distribution boot sequence", seq.host, offending_log_key=offending)
+- question: Using a time-series model (SARIMA/Prophet) on the daily volume of boot-integrity failures,
+    does the observed count exceed the predicted confidence interval, and what is the magnitude and driving
+    segment of the deviation?
+  context: Forecasting fleet-wide boot integrity supports the Harden tactic by detecting a fleet-wide
+    regression — a bad firmware rollout or a spreading bootkit — before it is obvious in raw counts. The
+    analyst trains SARIMA/Prophet on the daily volume of boot-integrity failures (capturing trend and
+    weekly seasonality) and alerts when the observed count exceeds the predicted confidence interval,
+    reporting the magnitude of deviation and the driving segment for explainability. A positive result
+    indicates an abnormal fleet-wide change warranting investigation; a negative result confirms failures
+    track expected seasonal patterns.
+  answer_sources:
+  - Verifier service pass/fail logs
+  - Per-host attestation feature vectors (PCR-change count, failure rate, firmware/version, boot-driver
+    set, boot-event timing)
+  - Boot/CodeIntegrity event sequences
+  - 'NAI: Aggregated attestation telemetry across all attesting endpoints with sufficient history for
+    modeling.'
+  range: Last 90 days (daily aggregation for forecasting)
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      series = daily_boot_integrity_failures
+      model = Prophet().fit(series)            # or SARIMA
+      forecast = model.predict(horizon=1)
+      if observed_today > forecast.upper_ci:
+        alert("Fleet-wide boot-integrity regression",
+              magnitude=observed_today - forecast.yhat,
+              driving_segment=top_contributing_segment())
