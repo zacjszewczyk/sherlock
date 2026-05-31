@@ -34,7 +34,7 @@ contributors:
 - Zachary Szewczyk
 created: '2026-05-31'
 modified: '2026-05-31'
-version: '1.0'
+version: '1.1'
 tags: none
 questions:
 - question: '[Resource Development] Using the ''Symbolic (IOC + default-cert match)'' (Symbolic Logic)
@@ -123,16 +123,17 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/Stats pseudocode
-    query: 'x509.log JOIN ssl.log JOIN conn.log
+    query: 'ioc_matches = x509.log JOIN ssl.log JOIN conn.log ON uid
 
-      | stats by dest: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence, fail_count(firewall_deny
-      + tls_handshake_fail + validation_status!=''ok'')
+      | stats by dest_ip,dest_domain: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence
 
       | eval rare = hist_freq_90d <= p1 OR first_seen==true
 
-      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains) BETWEEN 1 AND 2
+      | eval single_host = distinct_internal_hosts==1
 
-      | where rare OR typosquat OR (fail_then_success AND rare)
+      | eval rare_client = ja3_prevalence <= p1
+
+      | where rare AND single_host AND rare_client
 
       | sort by severity desc'
 - question: '[Resource Development] Using the ''Statistical (Failure-mode profiling)'' (Statistical Method)
@@ -170,18 +171,18 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/Stats pseudocode
-    query: 'x509.log JOIN ssl.log JOIN conn.log
+    query: 'conn.log JOIN x509.log JOIN ssl.log JOIN dns.log ON uid/sni
 
-      | stats by dest: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence, fail_count(firewall_deny
-      + tls_handshake_fail + validation_status!=''ok'')
+      | stats by dest: firewall_deny_count, tls_handshake_fail_count, count(x509.validation_status!=''ok''),
+      dns_nxdomain_servfail_count
 
       | eval rare = hist_freq_90d <= p1 OR first_seen==true
 
-      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains) BETWEEN 1 AND 2
+      | eval fail_then_success = (failed_or_blocked_attempts>0 BEFORE successful_conn)
 
-      | where rare OR typosquat OR (fail_then_success AND rare)
+      | where fail_then_success AND rare AND (ioc_match OR suspicious_cert)
 
-      | sort by severity desc'
+      | alert'
 - question: '[Resource Development] Using the ''Machine Learning (Threat-feed scoring, explainable)''
     (Machine Learning) approach: can you determine whether an outbound SSL/TLS connection is established
     with a remote server whose certificate hash (SHA1/SHA256), serial number, Subject/Issuer fields, or
@@ -216,18 +217,9 @@ questions:
   range: Last 90 days
   queries:
   - technology: ML/pseudocode
-    query: 'features = x509/ssl(validity_duration, key_length, sig_algo, issuer_prevalence, san_count,
-      generic_subject, typosquat_dist, domain_age, subject_issuer_charseq)
-
-      | model = {classifier(labeled benign/malware/phish) | IsolationForest/autoencoder(unlabeled) | SARIMA/Prophet(daily
-      first_seen_issuer_count) | Louvain(host<->cert_sha bipartite graph) | feed_score(provider_rep, age,
-      tp_fp_rate)}
-
-      | where score > threshold OR outside 99% PI
-
-      | emit top3_shap_features
-
-      | alert'
+    query: "for each ioc_match:\n    feed_score = model(provider_reputation, indicator_age, historical_tp_fp_rate,\
+      \ associated_ttps, destination_rarity)\n| rank ioc_matches by feed_score desc\n| emit top3_features(feed_precision,\
+      \ indicator_recency, destination_rarity)\n| alert"
 - question: '[Resource Development] Using the ''Symbolic (Rule-based suspicious cert)'' (Symbolic Logic)
     approach: can you determine whether an outbound SSL/TLS connection uses a certificate with suspicious
     attributes: a subject domain that is a likely typosquat of a corporate domain (Damerau-Levenshtein
@@ -264,16 +256,21 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/pseudocode
-    query: 'ssl.log JOIN x509.log ON cert_chain_fps JOIN conn.log ON uid
+    query: 'ssl.log JOIN x509.log ON cert_chain_fps
 
-      | eval cert_sha=x509.fingerprint, serial=x509.serial, issuer=x509.certificate.issuer, subject=x509.certificate.subject,
-      sni=ssl.server_name
+      | eval issuer=x509.certificate.issuer, subject_cn=x509.certificate.subject_cn, sni=ssl.server_name
 
-      | lookup ioc_certs(cert_sha, serial, sni) OR issuer CONTAINS ''Major Cobalt Strike'' OR serial==''146473198''
+      | eval free_ca = issuer CONTAINS (''Let''s Encrypt'',''ZeroSSL'')
 
-      | lookup ct_monitor_absent(subject) for brand/lookalike domains
+      | eval new_domain = whois_creation_age(subject_domain) < 30d
 
-      | where match==true
+      | eval cn_sni_mismatch = subject_cn != sni
+
+      | eval short_validity = (not_after - not_before) < 90d
+
+      | eval ct_absent = ct_monitor_absent(subject) for brand/lookalike domains
+
+      | where (free_ca AND new_domain) OR cn_sni_mismatch OR short_validity OR ct_absent
 
       | alert priority=high'
 - question: '[Resource Development] Using the ''Statistical (Typosquatting + cert-feature scoring)'' (Statistical
@@ -311,18 +308,16 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/Stats pseudocode
-    query: 'x509.log JOIN ssl.log JOIN conn.log
+    query: 'x509.log
 
-      | stats by dest: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence, fail_count(firewall_deny
-      + tls_handshake_fail + validation_status!=''ok'')
+      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains/brands/partners) BETWEEN 1 AND
+      2
 
-      | eval rare = hist_freq_90d <= p1 OR first_seen==true
+      | eval cert_score = distance_from_benign(validity_duration, key_length, san_count, issuer_prevalence)
 
-      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains) BETWEEN 1 AND 2
+      | where (typosquat AND (low_reputation OR recent_registration)) OR cert_score > threshold
 
-      | where rare OR typosquat OR (fail_then_success AND rare)
-
-      | sort by severity desc'
+      | sort by cert_score desc'
 - question: '[Resource Development] Using the ''Machine Learning (Suspicious-certificate classification,
     explainable)'' (Machine Learning) approach: can you determine whether an outbound SSL/TLS connection
     uses a certificate with suspicious attributes: a subject domain that is a likely typosquat of a corporate
@@ -361,26 +356,25 @@ questions:
   queries:
   - technology: ML/pseudocode
     query: 'features = x509/ssl(validity_duration, key_length, sig_algo, issuer_prevalence, san_count,
-      generic_subject, typosquat_dist, domain_age, subject_issuer_charseq)
+      generic_subject_flag, typosquat_dist, domain_age, subject_issuer_charseq)
 
-      | model = {classifier(labeled benign/malware/phish) | IsolationForest/autoencoder(unlabeled) | SARIMA/Prophet(daily
-      first_seen_issuer_count) | Louvain(host<->cert_sha bipartite graph) | feed_score(provider_rep, age,
-      tp_fp_rate)}
+      | model = classifier(labeled benign/malware/phish)   # RandomForest/GradientBoosting + char-level
+      NN over CN+O
 
-      | where score > threshold OR outside 99% PI
+      | where p_malicious > threshold
 
-      | emit top3_shap_features
+      | emit top3_feature_importances
 
       | alert'
 - question: '[Resource Development] Using the ''Symbolic (First-seen issuer/cert rule)'' (Symbolic Logic)
-    approach: can you determine whether sSL/TLS certificates observed on the network exhibit characteristics
+    approach: can you determine whether SSL/TLS certificates observed on the network exhibit characteristics
     that are statistical outliers versus an established enterprise-wide baseline, such as an anomalous
     spike in first-seen certificate issuers, certificates with unusually low- or high-entropy subject/issuer
     names, or rare combinations of issuer + short validity + self-signed status.'
   context: 'Why this matters: Under the Resource Development tactic (TA0042), the adversary installs SSL/TLS
     digital certificates on infrastructure they control or have compromised, enabling encrypted command-and-control
     or lending credibility to credential-harvesting and phishing sites. This evidence focuses on the condition
-    that sSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
+    that SSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
     versus an established enterprise-wide baseline, such as an anomalous spike in first-seen certificate
     issuers, certificates with unusually low- or high-entropy subject/issuer names, or rare combinations
     of issuer + short validity + self-signed status. This Symbolic Logic approach works as follows: Maintain
@@ -403,27 +397,26 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/pseudocode
-    query: 'ssl.log JOIN x509.log ON cert_chain_fps JOIN conn.log ON uid
+    query: 'lookup_90d = distinct(x509.fingerprint_sha1, x509.issuer_O) seen on network last 90d
 
-      | eval cert_sha=x509.fingerprint, serial=x509.serial, issuer=x509.certificate.issuer, subject=x509.certificate.subject,
-      sni=ssl.server_name
+      | current = ssl.log JOIN x509.log ON cert_chain_fps
 
-      | lookup ioc_certs(cert_sha, serial, sni) OR issuer CONTAINS ''Major Cobalt Strike'' OR serial==''146473198''
+      | where current.cert_sha NOT IN lookup_90d OR current.issuer_O NOT IN lookup_90d
 
-      | lookup ct_monitor_absent(subject) for brand/lookalike domains
+      | eval prioritized = free_ca OR short_validity OR self_signed
 
-      | where match==true
+      | sort by prioritized desc
 
-      | alert priority=high'
+      | alert'
 - question: '[Resource Development] Using the ''Statistical (Entropy + feature-distribution outliers)''
-    (Statistical Method) approach: can you determine whether sSL/TLS certificates observed on the network
+    (Statistical Method) approach: can you determine whether SSL/TLS certificates observed on the network
     exhibit characteristics that are statistical outliers versus an established enterprise-wide baseline,
     such as an anomalous spike in first-seen certificate issuers, certificates with unusually low- or
     high-entropy subject/issuer names, or rare combinations of issuer + short validity + self-signed status.'
   context: 'Why this matters: Under the Resource Development tactic (TA0042), the adversary installs SSL/TLS
     digital certificates on infrastructure they control or have compromised, enabling encrypted command-and-control
     or lending credibility to credential-harvesting and phishing sites. This evidence focuses on the condition
-    that sSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
+    that SSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
     versus an established enterprise-wide baseline, such as an anomalous spike in first-seen certificate
     issuers, certificates with unusually low- or high-entropy subject/issuer names, or rare combinations
     of issuer + short validity + self-signed status. This Statistical Method approach works as follows:
@@ -447,27 +440,26 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/Stats pseudocode
-    query: 'x509.log JOIN ssl.log JOIN conn.log
+    query: 'x509.log
 
-      | stats by dest: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence, fail_count(firewall_deny
-      + tls_handshake_fail + validation_status!=''ok'')
+      | eval subj_entropy = shannon(subject), iss_entropy = shannon(issuer)
 
-      | eval rare = hist_freq_90d <= p1 OR first_seen==true
+      | eval generic = subj_entropy <= p5, randomized = subj_entropy >= p95
 
-      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains) BETWEEN 1 AND 2
+      | eval mv_outlier = multivariate_score(validity_duration, key_length, san_count, issuer_prevalence)
 
-      | where rare OR typosquat OR (fail_then_success AND rare)
+      | where generic OR randomized OR (rare_issuer AND short_validity AND self_signed)
 
-      | sort by severity desc'
+      | sort by mv_outlier desc'
 - question: '[Resource Development] Using the ''Machine Learning (Unsupervised outlier + time-series anomaly)''
-    (Machine Learning) approach: can you determine whether sSL/TLS certificates observed on the network
+    (Machine Learning) approach: can you determine whether SSL/TLS certificates observed on the network
     exhibit characteristics that are statistical outliers versus an established enterprise-wide baseline,
     such as an anomalous spike in first-seen certificate issuers, certificates with unusually low- or
     high-entropy subject/issuer names, or rare combinations of issuer + short validity + self-signed status.'
   context: 'Why this matters: Under the Resource Development tactic (TA0042), the adversary installs SSL/TLS
     digital certificates on infrastructure they control or have compromised, enabling encrypted command-and-control
     or lending credibility to credential-harvesting and phishing sites. This evidence focuses on the condition
-    that sSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
+    that SSL/TLS certificates observed on the network exhibit characteristics that are statistical outliers
     versus an established enterprise-wide baseline, such as an anomalous spike in first-seen certificate
     issuers, certificates with unusually low- or high-entropy subject/issuer names, or rare combinations
     of issuer + short validity + self-signed status. This Machine Learning approach works as follows:
@@ -492,16 +484,20 @@ questions:
   range: Last 90 days
   queries:
   - technology: ML/pseudocode
-    query: 'features = x509/ssl(validity_duration, key_length, sig_algo, issuer_prevalence, san_count,
-      generic_subject, typosquat_dist, domain_age, subject_issuer_charseq)
+    query: 'features = per_cert(validity_duration, key_length, sig_algo, issuer_prevalence, san_count,
+      entropy, self_signed)
 
-      | model = {classifier(labeled benign/malware/phish) | IsolationForest/autoencoder(unlabeled) | SARIMA/Prophet(daily
-      first_seen_issuer_count) | Louvain(host<->cert_sha bipartite graph) | feed_score(provider_rep, age,
-      tp_fp_rate)}
+      | model = IsolationForest/autoencoder(unlabeled)
 
-      | where score > threshold OR outside 99% PI
+      | where anomaly_score > threshold ; emit driving_features
 
-      | emit top3_shap_features
+      PARALLEL:
+
+      ts = daily_count(first_seen_issuers)
+
+      | model = SARIMA/Prophet
+
+      | where observation outside 99% prediction_interval
 
       | alert'
 - question: '[Resource Development] Using the ''Symbolic (Self-signed beaconing threshold)'' (Symbolic
@@ -534,18 +530,21 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/pseudocode
-    query: 'ssl.log JOIN x509.log ON cert_chain_fps JOIN conn.log ON uid
+    query: 'conn.log JOIN x509.log JOIN ssl.log ON uid
 
-      | eval cert_sha=x509.fingerprint, serial=x509.serial, issuer=x509.certificate.issuer, subject=x509.certificate.subject,
-      sni=ssl.server_name
+      | where x509.validation_status==''self-signed''
 
-      | lookup ioc_certs(cert_sha, serial, sni) OR issuer CONTAINS ''Major Cobalt Strike'' OR serial==''146473198''
+      | stats by src_ip over 1h window: distinct_dest_ip_count
 
-      | lookup ct_monitor_absent(subject) for brand/lookalike domains
+      | where distinct_dest_ip_count > 10
 
-      | where match==true
+      PARALLEL:
 
-      | alert priority=high'
+      | stats by src_ip,dest: cov(inter_arrival_times)
+
+      | where cov < 0.1 AND cert IN (self_signed OR short_validity)
+
+      | alert'
 - question: '[Resource Development] Using the ''Statistical (Outlier + cadence detection)'' (Statistical
     Method) approach: can you determine whether a single internal host communicates with an anomalously
     high number of distinct external destinations using suspicious certificates (self-signed, short validity,
@@ -577,18 +576,17 @@ questions:
   range: Last 90 days
   queries:
   - technology: Zeek/Stats pseudocode
-    query: 'x509.log JOIN ssl.log JOIN conn.log
+    query: 'conn.log JOIN ssl.log JOIN x509.log ON uid
 
-      | stats by dest: hist_freq_90d, distinct_internal_hosts, bytes_out, bytes_in, ja3_prevalence, fail_count(firewall_deny
-      + tls_handshake_fail + validation_status!=''ok'')
+      | stats by src_ip over 24h: distinct_dest_domains_with_newly_observed_certs as n, blocked_failed_conn_count
 
-      | eval rare = hist_freq_90d <= p1 OR first_seen==true
+      | eval threshold = enterprise_p99(n)
 
-      | eval typosquat = damerau_levenshtein(subject_domain, corp_domains) BETWEEN 1 AND 2
+      | where n > threshold
 
-      | where rare OR typosquat OR (fail_then_success AND rare)
+      | corroborate fft_periodicity(inter_arrival_times), bytes_out/bytes_in ratio, payload_size_variance
 
-      | sort by severity desc'
+      | alert'
 - question: '[Resource Development] Using the ''Machine Learning (Graph + encrypted-flow anomaly)'' (Machine
     Learning) approach: can you determine whether a single internal host communicates with an anomalously
     high number of distinct external destinations using suspicious certificates (self-signed, short validity,
@@ -621,16 +619,18 @@ questions:
   range: Last 90 days
   queries:
   - technology: ML/pseudocode
-    query: 'features = x509/ssl(validity_duration, key_length, sig_algo, issuer_prevalence, san_count,
-      generic_subject, typosquat_dist, domain_age, subject_issuer_charseq)
+    query: 'graph = bipartite(internal_host <-> external_cert_sha1, edge per connection)
 
-      | model = {classifier(labeled benign/malware/phish) | IsolationForest/autoencoder(unlabeled) | SARIMA/Prophet(daily
-      first_seen_issuer_count) | Louvain(host<->cert_sha bipartite graph) | feed_score(provider_rep, age,
-      tp_fp_rate)}
+      | communities = Louvain(graph)
 
-      | where score > threshold OR outside 99% PI
+      | where small_dense_community sharing suspicious external certs
 
-      | emit top3_shap_features
+      FALLBACK (TLS1.3/ECH hides cert fields):
+
+      | self_supervised_anomaly(encrypted_flow_metadata: size/timing sequences, version-agnostic flow
+      features)
+
+      | where anomaly_score > threshold
 
       | alert'
 - question: '[Resource Development] Using the ''Symbolic (Cert-install command rule)'' (Symbolic Logic)
