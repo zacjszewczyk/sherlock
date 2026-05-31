@@ -1,0 +1,477 @@
+name: 'T1021.003: Distributed Component Object Model'
+id: a93ced71-4830-43e8-ad33-7dc4d99e946d
+description: Investigate adversary lateral movement via Distributed Component Object Model (DCOM) on Windows,
+  where an actor uses valid (often privileged) accounts to remotely activate COM objects over DCE/RPC
+  and execute code as the logged-on user. This playbook correlates inbound DCOM/DCE-RPC traffic (TCP 135
+  plus negotiated dynamic high ports) with remote Type-3 logons (Event ID 4624/4625) and execution-related
+  RPC operations; hunts for COM-host parents (mmc.exe, explorer.exe, Office apps, mshta.exe) and the COM
+  surrogate dllhost.exe spawning interpreters or loading rare modules; profiles DCOM connection bursts,
+  fan-out/out-degree, and segmentation violations across east-west network flows; and detects registry
+  tampering of DCOM permissions and COM server registration (AppID LaunchPermission/RunAs, CLSID LocalServer32/InprocServer32)
+  preceding remote logon. It blends deterministic symbolic-logic rules, statistical baselining (MAD, percentiles,
+  conditional probability, entropy), and machine-learning detectors (supervised classifiers, Isolation
+  Forest/DBSCAN, temporal graph link prediction, sequence models) so an analyst can confirm or refute
+  DCOM-based remote code execution under Lateral Movement.
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is inbound DCOM/DCE-RPC traffic to TCP 135 (with its follow-on ephemeral RPC port) being immediately
+    followed by a successful remote Type-3 logon (Event ID 4624) on the same destination from the same
+    source, particularly for never-before-seen source->destination pairs or watchlisted source IPs/accounts?
+  context: 'Under Lateral Movement, DCOM abuse begins with a remote COM activation over DCE/RPC that authenticates
+    to the target and then drives code execution as the logged-on user. Build a SIEM correlation rule
+    joining Zeek conn.log (successful inbound connection to dst port 135 plus the negotiated ephemeral
+    RPC port) with a Windows Event ID 4624 Logon Type 3 on the destination from the same Source Network
+    Address within ~60 seconds. Escalate when the source IP/account is on a suspicious watchlist OR the
+    source->destination edge has not been seen in the prior 30 days, and raise severity further when Zeek
+    dce_rpc.log shows execution-related interfaces on that flow (IWbemServices::ExecMethod, ITaskSchedulerService::SchRpc*,
+    svcctl) per BZAR. A positive result is a strong, low-volume signal of credentialed remote activation;
+    a negative result (RPC without the paired logon, or a long-established edge) lowers concern. This
+    mirrors the inbound-RPC-then-execute artifact of MMC20.Application-style DCOM lateral movement. (Source
+    method: Correlate DCOM activation to remote logon — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Internal network segments, Domain Controllers, Member Servers, Core network switches providing
+    traffic telemetry'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: Zeek+SIEM/Correlation pseudocode
+    query: conn = Zeek_conn WHERE id.resp_p=135 AND conn_state in [SF,S1,RSTO_after_data]; logon = WinEvent
+      4624 WHERE LogonType=3; rpc = Zeek_dce_rpc WHERE operation IN [IWbemServices::ExecMethod, ITaskSchedulerService::SchRpc*,
+      svcctl]; ALERT where JOIN(conn,logon ON src_ip=IpAddress AND dst=host AND logon.ts BETWEEN conn.ts
+      AND conn.ts+60s) AND (src_account IN watchlist OR edge(src->dst) NOT seen in prior 30d); severity
+      += 2 if matching rpc on same flow; OUTPUT src_ip, account, dst_host, rpc_ops, bytes.
+- question: Is a single source generating a burst of failed Type-3 logons (Event ID 4625) or firewall-blocked
+    TCP 135 attempts across multiple distinct destinations, indicating DCOM authentication probing or
+    privilege-failure during attempted remote activation?
+  context: 'Failed and blocked DCOM activations are a distinct detection signal from successful ones:
+    an adversary spraying DCOM or hitting access-denied on COM ACLs leaves behind failed Type-3 logons
+    and rejected port-135 connections before any success. Treat the failure state separately and alert
+    when one source produces >=5 Event ID 4625 Type-3 failures or firewall-blocked port-135 connections
+    to >=3 distinct destinations within 10 minutes, using the source-vs-destination event-log artifact
+    maps from JPCERT''s lateral-movement research. Tune the count to your environment''s baseline failed-logon
+    rate to control noise. A positive result suggests reconnaissance or privilege fumbling that often
+    precedes a successful activation; absence of failures does not rule out a clean, targeted single-host
+    activation, so pair this with the success-correlation rule. (Source method: Profile failed and blocked
+    DCOM activations — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Internal network segments, Domain Controllers, Member Servers, Core network switches providing
+    traffic telemetry'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'GROUP BY src_ip, 10m: fail4625 = count(WinEvent 4625 WHERE LogonType=3), blocked135 = count(fw_deny
+      WHERE dst_port=135), distinct_dst = distinct(dst_host); ALERT where (fail4625>=5 OR blocked135>=5)
+      AND distinct_dst>=3; baseline-tune threshold to env failed-logon rate; OUTPUT src_ip, dst_list,
+      fail_count.'
+- question: Does a host's hourly count or total byte volume of DCOM (TCP 135) connections from Zeek conn.log
+    exceed its own robust baseline or the peer population, indicating an abnormal burst of DCOM activity?
+  context: 'Lateral movement via DCOM often produces volume/frequency anomalies even when individual connections
+    look benign. For each host, profile the hourly count AND total byte volume of inbound/outbound port-135
+    connections from Zeek conn.log, then alert when either metric exceeds the greater of (a) 3x median-absolute-deviation
+    above the host''s 30-day rolling baseline for that hour-of-day, or (b) the 99th percentile across
+    peer hosts, following the robust MAD ensemble approach of Bohara et al. MAD is preferred over mean/stddev
+    because it resists contamination from prior attack traffic in the baseline. Report the observed value,
+    the baseline, and the contributing flows so the analyst can pivot. A positive result flags a host
+    whose DCOM behavior diverged sharply; a negative result indicates DCOM volume within normal seasonal
+    bounds. (Source method: Score DCOM connection bursts (volume/frequency) — Statistical Method; tactic:
+    Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Internal network segments, Domain Controllers, Member Servers, Core network switches providing
+    traffic telemetry'
+  range: Last 90 days, with a 30-day rolling baseline and per-window scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each host, hour_of_day: cnt = count(Zeek_conn WHERE id.resp_p=135), vol = sum(bytes);
+      base = rolling_30d(host,hour_of_day); ALERT where cnt > max(median(base.cnt)+3*MAD(base.cnt), p99_peer(cnt))
+      OR vol > max(median(base.vol)+3*MAD(base.vol), p99_peer(vol)); OUTPUT observed, baseline, contributing_flows.'
+- question: When a supervised model scores DCOM-associated Type-3 logon sessions using features such as
+    first-seen edge, account type, time-of-day, logon-to-execution latency, and RPC byte volume, which
+    sessions rank as high-risk and what top features drive the score?
+  context: 'Beyond deterministic rules, a supervised classifier (gradient-boosted trees / Random Forest)
+    can rank DCOM Type-3 logon sessions by maliciousness using authentication-log features (first-seen-edge
+    flag, source/destination, admin-vs-user account type, time-of-day, logon-to-execution latency, RPC
+    byte volume, watchlist membership) per Bian et al. Train and evaluate on labeled red-team data such
+    as the LANL Comprehensive Cyber-Security Events. The alert MUST surface the top-3 contributing features
+    (e.g., ''never-before-seen source->dest edge'', ''off-hours'', ''admin account from user subnet'')
+    so analysts can triage and defend the call. This model runs in PARALLEL with the deterministic correlation/failure
+    rules and never replaces them: a high score corroborates suspicious DCOM logons, while a low score
+    with deterministic hits still warrants review. (Source method: Score and classify DCOM logon sessions
+    — Machine Learning; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Internal network segments, Domain Controllers, Member Servers, Core network switches providing
+    traffic telemetry'
+  range: Last 90 days for training/validation, with parallel scoring on incoming events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: feats = build_features(dcom_type3_sessions, [first_seen_edge, src, dst, account_type, hour_of_day,
+      logon_to_exec_latency, rpc_bytes, watchlist]); model = gbt_or_rf.train(labeled_LANL); score = model.predict_proba(feats);
+      explain = top3_features(score); ALERT where score>=threshold; OUTPUT session, score, explain; run
+      parallel to deterministic rules.
+- question: Is a COM-host process commonly used for DCOM instantiation (mmc.exe, explorer.exe, Office
+    apps, mshta.exe, or dllhost.exe) spawning a command interpreter or scripting host (cmd.exe, powershell.exe,
+    wscript.exe, cscript.exe, rundll32.exe), especially within ~2 minutes of an inbound Type-3 logon?
+  context: 'DCOM remote code execution surfaces on the endpoint as an unusual parent->child lineage: the
+    activated COM server (mmc.exe for MMC20.Application, explorer.exe for ShellWindows/ShellBrowserWindow,
+    Office hosts excel.exe/winword.exe/outlook.exe, or the surrogate dllhost.exe) launches an interpreter.
+    Trigger on process creation (Event ID 4688 / Sysmon 1) where ParentImage in [mmc.exe, explorer.exe,
+    excel.exe, winword.exe, outlook.exe, mshta.exe, dllhost.exe] and child Image in [cmd.exe, powershell.exe,
+    wscript.exe, cscript.exe, rundll32.exe]. Promote to high severity when it occurs within 120 seconds
+    of an Event ID 4624 Type-3 logon on the same host, tying the local execution to a remote activation.
+    The explorer.exe parent covers ShellWindows/ShellBrowserWindow (Impacket dcomexec.py); the mmc.exe
+    parent covers MMC20.Application. A positive result is high-fidelity for DCOM execution; tune against
+    legitimate admin tooling that uses these lineages. (Source method: Alert on COM-host spawning interpreters
+    — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: proc = (WinEvent 4688 OR Sysmon 1) WHERE ParentImage IN [mmc.exe,explorer.exe,excel.exe,winword.exe,outlook.exe,mshta.exe,dllhost.exe]
+      AND Image IN [cmd.exe,powershell.exe,wscript.exe,cscript.exe,rundll32.exe]; logon = WinEvent 4624
+      WHERE LogonType=3 same host; ALERT on proc; severity=high where proc.ts within 120s of logon.ts;
+      OUTPUT host, parent, child, cmdline, account.
+- question: Is there remote activation of CLSIDs known to be weaponized for DCOM lateral movement (MMC20.Application,
+    ShellWindows, ShellBrowserWindow, or Office Application/ExecuteExcel4Macro objects)?
+  context: 'Specific COM objects expose insecure methods abused for remote execution. Where COM instantiation
+    telemetry is available (Sysmon ImageLoad/Registry or EDR), alert on remote activation of the CLSIDs
+    weaponized by Impacket dcomexec.py: MMC20.Application {49B2791A-B1AE-4C90-9B8E-E860BA07F889}, ShellWindows
+    {9BA05972-F6A8-11CF-A442-00A0C90A8F39}, ShellBrowserWindow {C08AFD90-F2A1-11D1-8455-00A0C91F3880},
+    plus Office Application/ExecuteExcel4Macro objects flagged in Hunting COM Objects. This is a signature-grade
+    detection: a match on these CLSIDs during remote activation is strong evidence of known DCOM tradecraft,
+    while absence means either novel CLSID abuse or insufficient COM telemetry, so layer with the lineage
+    and surrogate rules. Maintain the CLSID set as tooling evolves. (Source method: Match known DCOM execution
+    CLSIDs — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ALERT FROM (Sysmon Registry/ImageLoad OR EDR COM-activation) WHERE CLSID IN ['{49B2791A-B1AE-4C90-9B8E-E860BA07F889}','{9BA05972-F6A8-11CF-A442-00A0C90A8F39}','{C08AFD90-F2A1-11D1-8455-00A0C91F3880}',
+      office_app_clsids, excel4macro_clsids] AND activation=remote; OUTPUT host, clsid, account, src.
+- question: When a COM-host parent spawns an interpreter, how rare is that parent->child pair relative
+    to a 90-day enterprise baseline, and does the conditional probability P(child|parent) fall in the
+    lowest 1st percentile?
+  context: 'Statistical rarity scoring catches DCOM execution lineages that an allowlist might miss. Build
+    a 90-day enterprise baseline of parent->child process pairs and compute the conditional probability
+    P(child|parent). Alert when a COM-host parent (e.g., excel.exe, explorer.exe) spawns an interpreter
+    and P(child|parent) lands in the bottom 1st percentile of observed pairs, including command-line length
+    and argument entropy as additional volume/obfuscation features. Report the observed probability and
+    the rarity rank so the analyst sees how anomalous the lineage is. A very low P(child|parent) for a
+    COM host -> interpreter pair is suspicious because legitimate Office/Explorer rarely spawn shells;
+    common pairs score benign. This complements the deterministic lineage rule by surfacing unusual but
+    not-yet-listed combinations. (Source method: Score rare parent-child pairs — Statistical Method; tactic:
+    Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days, with a 30-day rolling baseline and per-window scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = 90d counts of (ParentImage->Image); P = count(parent,child)/count(parent); FOR new
+      proc where parent IN com_hosts AND child IN interpreters: ALERT where P(child|parent) <= p01(all_pairs);
+      features += [cmdline_len, arg_entropy]; OUTPUT parent, child, P, rarity_rank, cmdline.'
+- question: Does an unsupervised model (Isolation Forest / DBSCAN) over COM-host process-creation feature
+    vectors flag outlier executions such as outlook.exe spawning a high-entropy PowerShell command under
+    a standard user, and what are the top anomalous features?
+  context: 'Unsupervised anomaly detection catches novel DCOM execution that rules and rarity scoring
+    miss. Run an Isolation Forest (or DBSCAN) over COM-host process-creation feature vectors: parent image,
+    child image, user context, command-line length, argument entropy, and time-since-remote-logon. Flag
+    outliers such as ''outlook.exe -> powershell.exe with a high-entropy command line under a standard
+    user''. The alert MUST list the top-3 anomalous features for analyst triage and defensibility. Layer
+    this in PARALLEL with the deterministic allowlist/lineage rule; do not delete the rule. A flagged
+    outlier with a recent remote Type-3 logon and high command entropy is a strong DCOM-execution lead;
+    a point inside dense benign clusters is low priority. (Source method: Anomaly detection on COM process
+    events — Machine Learning; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days for training/validation, with parallel scoring on incoming events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: X = vectors(com_host_proc_events, [parent_image, child_image, user_context, cmdline_len, arg_entropy,
+      time_since_remote_logon]); model = IsolationForest_or_DBSCAN.fit(X); ALERT on outliers; explain
+      = top3_anomalous_features(point); OUTPUT host, parent, child, user, explain; run parallel to allowlist
+      rule.
+- question: Is the DCOM surrogate dllhost.exe spawning a child process that is not on a curated per-environment
+    allowlist of legitimate COM-surrogate children, while running under a non-SYSTEM user context?
+  context: 'dllhost.exe is the COM surrogate that hosts out-of-process and surrogate COM objects, so DCOM-driven
+    code execution frequently appears as dllhost.exe spawning an unexpected child. Alert on process creation
+    where ParentImage=''dllhost.exe'', the child Image is NOT on a curated per-environment allowlist of
+    legitimate COM-surrogate children, AND the user context is NOT ''NT AUTHORITY\\SYSTEM''. dllhost.exe
+    spawning interpreters or network tools is a high-fidelity execution signal per Hunting COM Objects
+    and ATT&CK T1021.003. Build and maintain the allowlist from a 30-day learning window so legitimate
+    custom COM apps are not flagged. A positive result (unknown child under a user identity) is a strong
+    execution indicator under Lateral Movement; SYSTEM-context known children are expected and suppressed.
+    (Source method: Alert on dllhost anomalies — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Sysmon Event ID 1
+  - Windows Sysmon Event ID 7
+  - 'NAI: Application Servers, Workstations with custom COM objects, Member Servers'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: allow = learn_30d(child images where Parent=dllhost.exe AND user='NT AUTHORITY\\SYSTEM'); ALERT
+      FROM (WinEvent 4688 OR Sysmon 1) WHERE ParentImage='dllhost.exe' AND Image NOT IN allow AND User
+      != 'NT AUTHORITY\\SYSTEM'; OUTPUT host, child, user, cmdline.
+- question: Is dllhost.exe loading a DLL from a user-writable or temporary path, or a DLL whose hash/path
+    prevalence is in the organization's bottom 1st percentile, indicating COM-object DLL execution via
+    the surrogate?
+  context: 'DCOM execution via in-proc COM objects manifests as the dllhost.exe surrogate loading an attacker-supplied
+    or rarely-seen DLL. Using Sysmon Event ID 7 (Module Load), alert when dllhost.exe loads a DLL from
+    a user-writable or temp path, or a DLL whose hash/path has organizational prevalence in the bottom
+    1st percentile, consistent with the COM-object DLL execution surface in Hunting COM Objects. Legitimate
+    COM surrogate DLLs live in system/program paths and are broadly prevalent; loads from %TEMP%, user
+    profiles, or one-off hashes are suspicious. A positive result points to surrogate-hosted malicious
+    COM execution; combine with the dllhost child-process rule to confirm follow-on execution. (Source
+    method: Flag rare modules loaded by dllhost — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Sysmon Event ID 1
+  - Windows Sysmon Event ID 7
+  - 'NAI: Application Servers, Workstations with custom COM objects, Member Servers'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ALERT FROM Sysmon 7 WHERE Image='dllhost.exe' AND (ImageLoaded path IN [user_writable, temp]
+      OR org_prevalence(ImageLoaded.hash) <= p01); OUTPUT host, loaded_dll, path, hash, prevalence.
+- question: For children spawned by dllhost.exe, does the command-line argument entropy exceed the child's
+    baseline by more than 3 standard deviations (obfuscation) or does the per-host hourly spawn rate exceed
+    the 99th host percentile?
+  context: 'Statistical profiling of dllhost.exe children catches obfuscated or high-rate surrogate execution.
+    For each child spawned by dllhost.exe, baseline command-line argument entropy and the per-host hourly
+    spawn rate. Alert when entropy exceeds the child''s specific baseline by >3 standard deviations (a
+    marker of encoded/obfuscated commands) OR the spawn rate exceeds the 99th host percentile (a marker
+    of automated/scripted abuse). Include the raw entropy value and spawn rate in the alert text so analysts
+    can judge severity. High entropy often accompanies encoded PowerShell or packed payloads delivered
+    through DCOM; an elevated spawn rate can indicate scripted lateral execution. Normal repetitive surrogate
+    activity stays near baseline and is not flagged. (Source method: Score dllhost child entropy and rate
+    — Statistical Method; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Sysmon Event ID 1
+  - Windows Sysmon Event ID 7
+  - 'NAI: Application Servers, Workstations with custom COM objects, Member Servers'
+  range: Last 90 days, with a 30-day rolling baseline and per-window scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = per_child baseline(arg_entropy), per_host hourly spawn_rate dist; FOR dllhost children:
+      ALERT where arg_entropy > base.mean + 3*base.std OR hourly_spawn_rate > p99_host; OUTPUT host, child,
+      entropy, baseline, spawn_rate.'
+- question: When DBSCAN clusters dllhost.exe child-event feature vectors (one-hot child image, user context,
+    TF-IDF of command line), which events fall outside dense legitimate clusters as noise points, and
+    what features distinguish them?
+  context: 'Legitimate, repetitive COM-surrogate activity forms dense clusters in feature space, so DCOM
+    abuse can be isolated as cluster noise. Apply DBSCAN to feature vectors of dllhost.exe child events
+    using one-hot child image, user context, and TF-IDF of the command line. Alert on noise points (events
+    not assigned to any dense cluster). Surface the nearest-cluster distance and the top-3 distinguishing
+    features in the alert so analysts understand why an event is anomalous and can defend the escalation.
+    Run this alongside the deterministic allowlist rule, not instead of it. A noise point with an unusual
+    child and user context is a strong surrogate-execution lead; points inside large benign clusters are
+    routine. (Source method: Cluster dllhost child events — Machine Learning; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Sysmon Event ID 1
+  - Windows Sysmon Event ID 7
+  - 'NAI: Application Servers, Workstations with custom COM objects, Member Servers'
+  range: Last 90 days for training/validation, with parallel scoring on incoming events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: X = features(dllhost_children, [onehot(child_image), user_context, tfidf(cmdline)]); labels
+      = DBSCAN.fit_predict(X); ALERT where label == -1 (noise); OUTPUT host, child, user, nearest_cluster_distance,
+      top3_distinguishing_features; run alongside allowlist rule.
+- question: Is any DCOM traffic (Zeek conn.log id.resp_p == 135) crossing network zones where such communication
+    is forbidden by policy, for example from a user VLAN into a server, PCI, or OT/ICS VLAN?
+  context: 'DCOM east-west traffic that crosses segmentation boundaries is rarely legitimate and is a
+    high-value lateral-movement signal. Generate a high-severity alert for any DCOM traffic (Zeek conn.log
+    id.resp_p == 135) crossing network zones where the policy forbids it (e.g., user VLAN -> server/PCI/OT
+    VLAN). DCOM between user endpoints, or from user space into protected segments, is almost never legitimate
+    per ATT&CK T1021.003. This is a policy-grounded deterministic rule: a single crossing into a protected
+    zone justifies investigation regardless of volume. A positive result indicates either misconfiguration
+    or active lateral movement into a sensitive segment; maintain an accurate zone map and allowlist of
+    sanctioned admin paths to keep this precise. (Source method: Detect segmentation violations — Symbolic
+    Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - 'NAI: East-West traffic on core network switches, Internal network segments, VLANs containing servers
+    and workstations'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: Zeek/pseudocode
+    query: ALERT FROM Zeek_conn WHERE id.resp_p=135 AND zone(id.orig_h)->zone(id.resp_h) IN forbidden_zone_pairs
+      (e.g., user_vlan->server_vlan, user_vlan->PCI, *->OT) AND pair NOT IN sanctioned_admin_paths; severity=high;
+      OUTPUT src, dst, src_zone, dst_zone.
+- question: Is a single source accumulating failed or firewall-blocked port-135 connection attempts (Zeek
+    conn.log conn_state in S0/REJ/RSTO) to many unique destinations in a short window, indicating DCOM
+    spraying or reconnaissance?
+  context: 'Profiling the failure state of network DCOM fan-out separately from successful activations
+    surfaces spraying and probing. Alert when a source accumulates failed or firewall-blocked port-135
+    attempts (Zeek conn.log conn_state in S0/REJ/RSTO) to >=10 unique destinations within 10 minutes,
+    treating failure as its own signal as recommended by JPCERT''s lateral-movement tracking. A high count
+    of failed/blocked DCOM connections to many hosts is characteristic of an adversary searching for a
+    host where their credentials can activate COM objects. A positive result is an early indicator that
+    often precedes a successful activation elsewhere; pair with the success-correlation rule to find the
+    eventual landing host. Tune the destination threshold to your environment. (Source method: Profile
+    blocked/failed RPC fan-out — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - 'NAI: East-West traffic on core network switches, Internal network segments, VLANs containing servers
+    and workstations'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'GROUP BY id.orig_h, 10m: failed = count(Zeek_conn WHERE id.resp_p=135 AND conn_state IN [S0,REJ,RSTO]),
+      uniq_dst = distinct(id.resp_h WHERE failed); ALERT where uniq_dst>=10; OUTPUT src, dst_list, failed_count.'
+- question: In a 1-hour sliding window, does a source IP's DCOM out-degree (count of unique destinations
+    on TCP 135) exceed the 99th peer percentile or 3x MAD above its own 30-day baseline, indicating abnormal
+    DCOM fan-out?
+  context: 'Out-degree is a robust statistical measure of lateral spread: a host suddenly reaching many
+    DCOM destinations is anomalous. In a 1-hour sliding window, compute each source IP''s out-degree =
+    count of unique destinations on TCP 135. Alert when out-degree exceeds the greater of the 99th percentile
+    across peers or 3x MAD above the source''s 30-day baseline, the spraying/new-host pattern grounded
+    in Bohara et al. and Hopper. Report the destination list and degree in the alert so analysts can scope
+    the spread. Most hosts talk DCOM to a small, stable set of servers; a sudden high out-degree from
+    a workstation is a hallmark of lateral movement. A within-baseline degree is benign. This complements
+    the deterministic blocked-fan-out rule by catching successful (not just failed) spread. (Source method:
+    Score DCOM fan-out (out-degree) — Statistical Method; tactic: Lateral Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - 'NAI: East-West traffic on core network switches, Internal network segments, VLANs containing servers
+    and workstations'
+  range: Last 90 days, with a 30-day rolling baseline and per-window scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each src_ip, 1h sliding: outdeg = distinct(id.resp_h WHERE id.resp_p=135); base = rolling_30d(src_ip).outdeg;
+      ALERT where outdeg > max(p99_peer(outdeg), median(base)+3*MAD(base)); OUTPUT src_ip, outdeg, dst_list.'
+- question: When internal RPC connectivity is modeled as a temporal communication graph, which newly-appearing
+    source->destination DCOM edges rank as most improbable under node2vec/temporal-GNN link prediction,
+    and what reasons explain the ranking?
+  context: 'Graph-based link prediction detects DCOM lateral movement as anomalous new edges in the network''s
+    communication structure. Model internal RPC connectivity as a temporal authentication/communication
+    graph and rank newly-appearing source->destination DCOM edges by improbability using node2vec link
+    prediction (CyberGraph) or temporal GNNs (Euler), evaluated on the LANL Comprehensive Cyber-Security
+    Events dataset. The alert MUST cite the top-3 reasons (e.g., ''first-seen edge'', ''source never reaches
+    servers'', ''off-hours burst'') for analyst triage and defensibility. An improbable new DCOM edge—especially
+    a workstation suddenly activating COM on a server it never contacted—is a strong lateral-movement
+    lead. Operate this in PARALLEL with the out-degree threshold; deterministic and graph methods reinforce
+    each other. (Source method: Temporal link prediction on DCOM edges — Machine Learning; tactic: Lateral
+    Movement.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dce_rpc.log
+  - 'NAI: East-West traffic on core network switches, Internal network segments, VLANs containing servers
+    and workstations'
+  range: Last 90 days for training/validation, with parallel scoring on incoming events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'G = temporal_graph(internal_RPC_edges, port=135); emb = node2vec_or_temporalGNN(G); FOR new
+      edge(src->dst): p = link_probability(emb, src, dst); ALERT where p <= threshold AND edge first_seen;
+      explain = top3_reasons; OUTPUT src, dst, p, explain; run parallel to out-degree rule.'
+- question: Is a modification to a registry key under \AppID\ (LaunchPermission/RunAs) or \CLSID\ (LocalServer32/InprocServer32/TreatAs)
+    followed within 10 minutes by a remote Type-3 logon (Event ID 4624) on the same host from an IP outside
+    the admin-subnet allowlist?
+  context: 'Adversaries weaken DCOM ACLs or hijack COM server registration to enable remote execution,
+    so registry tampering that precedes a remote logon is a high-confidence chain. Fire when (1) Event
+    ID 4657 shows a modification to a key path containing ''\AppID\'' (LaunchPermission/RunAs) or ''\CLSID\''
+    (LocalServer32/InprocServer32/TreatAs), AND (2) within 10 minutes a remote logon (Event ID 4624 Type
+    3) occurs on the same host from an IP not in the admin-subnet allowlist. COM registration/ACL tampering
+    as an execution enabler is detailed in Hunting COM Objects; correlate using JPCERT''s source/destination
+    event-ID maps. A positive result strongly suggests deliberate COM hijack/ACL weakening to permit lateral
+    execution; legitimate software installs that touch these keys typically originate from admin context
+    and management tooling, which the allowlist suppresses. (Source method: Correlate registry COM changes
+    with remote logon — Symbolic Logic; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Registry hives on critical servers and workstations, Domain Controllers'
+  range: Last 90 days, with event-centered correlation windows as specified in the query.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: regmod = WinEvent 4657 WHERE ObjectName CONTAINS '\\AppID\\' (LaunchPermission|RunAs) OR '\\CLSID\\'
+      (LocalServer32|InprocServer32|TreatAs); logon = WinEvent 4624 WHERE LogonType=3 AND IpAddress NOT
+      IN admin_subnet_allowlist; ALERT where JOIN(regmod, logon ON host AND logon.ts BETWEEN regmod.ts
+      AND regmod.ts+10m); OUTPUT host, key, src_ip, account.
+- question: Does the per-host rate of HKCR\CLSID\ and HKCR\AppID\ key modifications (Event ID 4657) in
+    a 1-hour window exceed 3x MAD above the host baseline, indicating COM-hijack staging or enumeration?
+  context: 'A burst of COM-related registry modifications can indicate an adversary staging multiple COM
+    hijacks or enumerating/altering CLSID/AppID registration. Baseline the per-host modification rate
+    for HKCR\CLSID\ and HKCR\AppID\ keys, then alert when Event ID 4657 modifications in a 1-hour window
+    exceed 3x MAD above the host baseline. Report the changed keys and the rate so analysts can determine
+    whether the changes are a legitimate software install or malicious tampering. MAD-based thresholds
+    resist baseline contamination and seasonal install activity. A positive result (a spike of CLSID/AppID
+    writes) warrants pairing with the registry-to-logon correlation rule to see whether the changes enabled
+    remote execution; a within-baseline rate is routine. (Source method: Score registry COM-change frequency
+    — Statistical Method; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Registry hives on critical servers and workstations, Domain Controllers'
+  range: Last 90 days, with a 30-day rolling baseline and per-window scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each host, 1h: mods = count(WinEvent 4657 WHERE ObjectName CONTAINS [''HKCR\\CLSID\\'',''HKCR\\AppID\\'']);
+      base = host_baseline(mods); ALERT where mods > median(base)+3*MAD(base); OUTPUT host, changed_keys,
+      rate, baseline.'
+- question: Does a self-supervised sequence model (transformer/LSTM) over per-host event streams flag
+    low-probability chains such as [CLSID/AppID registry write -> remote Type-3 logon -> dllhost.exe/COM-host
+    child spawn], and what are the lowest-probability transitions?
+  context: 'DCOM lateral execution unfolds as a multi-step host sequence, and sequence modeling scores
+    whole chains rather than isolated events. Train a self-supervised sequence model (transformer/LSTM)
+    on per-host event streams (registry modifications, logons, process creations) following Gokstorp et
+    al., and score the joint probability of observed sequences. Flag low-probability chains such as [CLSID/AppID
+    write -> remote Type-3 logon -> dllhost.exe/COM-host child spawn], which mirror the multi-step credentialed
+    paths modeled by Hopper. The alert MUST surface the top-3 lowest-probability transitions so analysts
+    see exactly which steps make the chain anomalous. Run in PARALLEL with the deterministic registry-to-logon
+    correlation rule. A low-probability COM-tampering->logon->execution chain is a high-confidence lateral-movement
+    indicator; common benign sequences score high probability and are not flagged. (Source method: Sequence
+    anomaly detection on host events — Machine Learning; tactic: Lateral Movement.)'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Registry hives on critical servers and workstations, Domain Controllers'
+  range: Last 90 days for training/validation, with parallel scoring on incoming events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: seq = per_host_event_stream([reg_mod, logon, proc_create]); model = selfsupervised_transformer_or_LSTM.train(seq);
+      p = model.joint_prob(window); ALERT where p <= anomaly_threshold; explain = top3_lowest_prob_transitions;
+      OUTPUT host, sequence, explain; run parallel to deterministic correlation.
