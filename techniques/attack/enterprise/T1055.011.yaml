@@ -1,0 +1,1718 @@
+name: 'T1055.011: Process Injection: Extra Window Memory Injection'
+id: 02467b6e-23f6-49c2-b289-a817af7dd28a
+description: Investigate adversary use of Extra Window Memory (EWM) injection (T1055.011), a stealthy
+  process-injection technique in which malicious code writes a pointer into a GUI window's extra window
+  memory at the GWLP_WNDPROC index via SetWindowLongPtr/SetClassLongPtr and then triggers execution by
+  dispatching a window message (SendNotifyMessage/PostMessage/NtUserMessageCall), running shellcode under
+  a legitimate, often higher-privilege process while avoiding heavily monitored APIs like WriteProcessMemory
+  and CreateRemoteThread. This playbook helps an analyst hunt that behavior across endpoint and network
+  telemetry to answer whether the adversary leveraged EWM injection for stealth and privilege escalation.
+  It correlates the cross-process window-procedure-hijack API chain in Microsoft-Windows-Win32k ETW and
+  Sysmon (Event IDs 10 and 25); detects unbacked/private-memory window-procedure callbacks; baselines
+  rare window-management API usage by script hosts; spots injected privileged behavior such as out-of-character
+  user/service creation (EID 4720/4697), SeDebugPrivilege abuse and LSASS access (EID 4672/4656/4663),
+  GUI applications spawning interpreters with high-entropy command lines, and anomalous scheduled tasks
+  (EID 4698); and surfaces injected command-and-control and exfiltration through system-process and trusted-app
+  network egress (Zeek conn/dns/http/ssl logs, EID 5156), JA3/JA4 fingerprint drift, beacon regularity,
+  and crash-correlated volume spikes (EID 1000). It combines deterministic symbolic-logic floors, statistical
+  baselining, and machine-learning anomaly detection to make EWM injection defensible and actionable for
+  a SOC.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process call SetWindowLongPtrA/W or SetClassLongPtr against a window or class handle
+    owned by a DIFFERENT process using nIndex = GWLP_WNDPROC (-4) to overwrite the window-procedure address,
+    and then within roughly one second send a triggering window message (SendNotifyMessage, NtUserMessageCall,
+    or PostMessage) to that same hWnd?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    This is the deterministic detection floor for Extra Window Memory (EWM) injection. EWM injection works
+    by writing a 32-bit/64-bit code pointer into a target window''s extra window memory at the GWLP_WNDPROC
+    index (-4), which replaces the address of the function that handles that window''s messages; the adversary
+    then dispatches a window message to force the hijacked procedure to run their shellcode. Look for
+    the full causal chain captured in Microsoft-Windows-Win32k ETW and Sysmon Event ID 10 (ProcessAccess):
+    a section create/map, a cross-process SetWindowLongPtr/SetClassLongPtr at index -4, and a message-trigger
+    call all bound to the same window/memory object. A positive result is a high-confidence injection
+    finding, especially when the caller is not a window manager and the target is a higher-privilege GUI
+    process. Suppress benign window management by excluding verified managers dwm.exe, csrss.exe, and
+    explorer.exe; a negative result does not clear the host because attackers may stage the chain across
+    longer intervals or different handles.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days; correlate the SetWindowLongPtr and message-trigger events within a ~1s window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'setcalls = win32k where api in (SetWindowLongPtrA,SetWindowLongPtrW,SetClassLongPtr) AND nIndex
+      == -4 (GWLP_WNDPROC) AND target_pid != source_pid
+
+      triggers = win32k where api in (SendNotifyMessage,NtUserMessageCall,PostMessage)
+
+      alert when setcalls JOIN triggers on hWnd within 1s AND source_image NOT IN (dwm.exe,csrss.exe,explorer.exe)
+
+      output source_image, source_pid, target_pid, hWnd, nIndex'
+- question: Which executables are issuing SetWindowLongPtr, SetClassLongPtr, or SendNotifyMessage calls
+    at a rate more than three standard deviations above their own 30-day historical mean, or for the very
+    first time — particularly script and interpreter hosts (powershell.exe, mshta.exe, wscript.exe, rundll32.exe)
+    that never legitimately manage GUI windows?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    EWM injection requires window-management APIs that most processes — and nearly all script interpreters
+    — never call. Baseline per-executable call frequency (calls/hour) for SetWindowLongPtr/SetClassLongPtr/SendNotifyMessage
+    from 30 days of Win32k ETW, then alert when a process exceeds its 3-sigma threshold or emits any such
+    call for the first time. A scripting or LOLBin host suddenly invoking window-procedure APIs is a strong
+    tell that injected code is preparing an EWM callback. Use approximate (Smith-Waterman-style) sequence
+    matching so that benign calls interleaved by the attacker do not let the malicious sequence slip below
+    threshold. A positive result warrants pivoting to the deterministic EWM callback rule; a negative
+    result is expected for normal GUI applications that routinely manage their own windows.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days; baseline derived from 30 days of Win32k ETW
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = stats mean(calls_per_hour) as mu, stddev(calls_per_hour) as sd by image where api
+      in (SetWindowLongPtr,SetClassLongPtr,SendNotifyMessage) over 30d
+
+      alert when (calls_per_hour > mu + 3*sd) OR first_seen(image,api)
+
+      prioritize image in (powershell.exe,mshta.exe,wscript.exe,rundll32.exe)
+
+      output image, api, calls_per_hour, mu, sd'
+- question: When a window message is dispatched, does the executing window-procedure call-stack frame
+    reside in unbacked/private (non-image) memory rather than in a module file on disk — indicating that
+    the window procedure now points to injected shellcode instead of legitimate code?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    A defining artifact of EWM/shellcode callbacks is that the code executed when the window procedure
+    runs lives in private, executable memory that is not backed by any DLL or EXE on disk. Walk the ETW/Sysmon
+    call stack at message dispatch and flag any frame whose return address falls in unbacked/private memory
+    regions. This catches injection that evades classic thread-start-address checks because the malicious
+    code never creates a remote thread — it rides an existing GUI thread via the hijacked window procedure.
+    A positive result (an unbacked window-procedure frame) is high-fidelity evidence of in-memory code
+    execution under a legitimate process; benign window procedures resolve to on-disk image modules.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for each window_message_dispatch event with call_stack:\n  wndproc_frame = frame_executing_window_procedure(call_stack)\n\
+      \  if wndproc_frame.memory_type in (PRIVATE,MAPPED) AND wndproc_frame.backed_by_image == false:\n\
+      \    alert(image, pid, hWnd, wndproc_frame.address)"
+- question: Does a learned sequence model score the API chain [CreateFileMapping -> MapViewOfFile -> SetWindowLongPtr
+    -> SendNotifyMessage] originating from a script host or document reader as a low-probability (anomalous)
+    sequence relative to benign Win32k+memory API behavior?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    EWM injection has a recognizable primitive chain: allocate/map a shared section, write shellcode,
+    set the window-procedure pointer into EWM, then trigger it with a message. Train an HMM/LSTM/Transformer
+    on benign Win32k and memory-API sequences and score live sequences; the full malicious chain from
+    an unexpected host (script interpreter, document reader) scores as extremely unlikely. Combining ETW
+    with parallel memory analysis that requires the complete primitive chain has been shown to reach ~99.93%
+    accuracy at ~0.068% FPR. The alert must surface the top-3 contributing features (e.g., the GWLP_WNDPROC
+    set, the unbacked-memory frame, the calling image) via SHAP/LIME so an analyst can triage quickly.
+    A high anomaly score is a strong injection signal; the model complements, not replaces, the deterministic
+    rule.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = train_sequence_model(benign Win32k+memory API sequences)  # HMM/LSTM/Transformer
+
+      score = model.logprob([CreateFileMapping,MapViewOfFile,SetWindowLongPtr,SendNotifyMessage] for image)
+
+      alert when score < threshold AND image in (script_hosts, document_readers)
+
+      explain top3 features via SHAP/LIME'
+- question: Did a watchlisted low-privilege process (mshta.exe, wscript.exe, regsvr32.exe, rundll32.exe)
+    execute within 60 seconds before a sensitive privileged action on the same host — such as user creation
+    (EID 4720) or service installation (EID 4697) emitted by a high-privilege process (services.exe, lsass.exe,
+    wininit.exe) — with no logged parent-child relationship between them?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    When code is injected into a privileged GUI/system process, that process suddenly performs privileged
+    actions it normally never initiates, and crucially there is no parent-child link to the low-privilege
+    launcher that staged the injection. Correlate watchlisted low-privilege launchers against subsequent
+    EID 4720/4697 events from high-privilege processes within a 60s window on the same host where no direct
+    lineage exists. A positive result is consistent with EWM injection leading to out-of-character privileged
+    behavior. The temporal proximity plus the missing lineage is what distinguishes this from ordinary
+    administrative activity, where the privileged action traces back through a legitimate parent chain.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days; correlate precursor and privileged action within 60s
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'precursor = proc_create(EID 4688/Sysmon 1) where image in (mshta.exe,wscript.exe,regsvr32.exe,rundll32.exe)
+
+      sensitive = (EID 4720 user_create OR EID 4697 service_install) where actor_image in (services.exe,lsass.exe,wininit.exe)
+
+      alert when sensitive within 60s after precursor on same host AND no_parent_child_link(precursor,
+      sensitive)'
+- question: For each high-privilege process, does the set of non-parent processes active in the preceding
+    5-minute window contain a precursor that appears in fewer than 1% of that process's historical sequences
+    — and is that rare precursor accompanied by a spike in failed privileged actions (failed 4720/4697
+    or Access Denied)?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Even without a parent-child link, injected privileged behavior leaves a statistical footprint: an
+    unusual process becomes active just before a privileged process performs a sensitive action. Baseline,
+    per high-privilege process, the distribution of non-parent processes seen in the preceding 5 minutes,
+    and flag sequences where the precursor is in the bottom 1%. Explicitly track failure state — a burst
+    of failed user creations or service installs (Access Denied) alongside the rare precursor strengthens
+    the signal, because injected code often probes before succeeding. A positive result is a behavioral
+    anomaly worth correlating against the EWM API evidence; a negative result reflects normal, frequently-seen
+    precursor processes.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days; 5-minute preceding window per privileged action
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(precursor_image | privileged_proc) over 30d using 5-min preceding windows
+
+      alert when seen(precursor_image) has historical_freq < 1%
+
+      boost score when failed_4720 OR failed_4697 OR access_denied spikes in same window
+
+      output privileged_proc, precursor_image, freq, failed_count'
+- question: Does a sequence model (LSTM/HMM) trained on benign host event streams (process, user, and
+    service creations) assign a low probability to chains such as [mshta_activity -> services_creates_user],
+    indicating an anomalous precursor-to-privileged-action sequence?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Privileged actions stemming from injected code form improbable event sequences across the host's process/user/service
+    streams. Train an LSTM/HMM on benign sequences and score live chains; low-probability chains like
+    a script host immediately preceding a privileged user creation alert. Augment with provenance-graph
+    models (e.g., KAIROS) that add causal context and reconstruct the precursor-to-privileged-action subgraph,
+    giving the analyst the full lineage for triage. A high anomaly score points to out-of-character privileged
+    behavior consistent with EWM injection into a system process; benign administrative sequences score
+    as expected.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = train_sequence_model(benign host event streams: proc/user/service creations)
+
+      score = model.logprob(observed_chain)
+
+      alert when score < threshold  # e.g., [mshta_activity -> services_creates_user]
+
+      augment with provenance_graph.reconstruct(precursor -> privileged_action)'
+- question: Did a non-administrative GUI parent (winword.exe, acrord32.exe, excel.exe) launch a command
+    interpreter (cmd.exe/powershell.exe), followed within 5 minutes by a service install (EID 4697) or
+    scheduled task (EID 4698) whose binary path points to a non-standard directory such as C:\Users\Public\
+    or C:\Windows\Temp\?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    GUI document applications spawning shells is a classic exploitation/injection lineage, and when that
+    shell is quickly followed by a service or task install pointing at a suspicious directory, it suggests
+    injected code establishing execution or persistence under cover of a trusted process. Correlate the
+    GUI->interpreter spawn with subsequent EID 4697/4698 events within 5 minutes and inspect the binary/command
+    path for non-standard locations. A positive result is a high-fidelity chain worth immediate triage;
+    legitimate office workflows rarely spawn interpreters that then install services from world-writable
+    directories.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days; correlate the spawn and the install within 5 minutes
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'spawn = proc_create where parent_image in (winword.exe,acrord32.exe,excel.exe) AND child_image
+      in (cmd.exe,powershell.exe)
+
+      install = (EID 4697 service_install OR EID 4698 task_create) where binary_path matches (C:\\Users\\Public\\*,
+      C:\\Windows\\Temp\\*)
+
+      alert when install within 5m after spawn on same host'
+- question: Do any newly created scheduled tasks (EID 4698) have command-line arguments whose Shannon
+    entropy and length exceed the 95th percentile of the host's historical task distribution, especially
+    shortly after a non-admin process spawned a shell?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injected/automated payloads often register scheduled tasks with obfuscated or encoded command lines
+    that exhibit abnormally high entropy and length compared to the routine, human-authored tasks on a
+    host. Compute Shannon entropy and length for each new task's arguments and flag values above the 95th
+    percentile derived from 30 days of local task history, prioritizing tasks created soon after a non-admin
+    process spawned a shell. A positive result flags likely encoded/obfuscated payload delivery; normal
+    administrative tasks have low-entropy, readable command lines.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days; percentile baseline from 30 days of local task history
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for task in EID 4698:\n  e = shannon_entropy(task.args); L = len(task.args)\n  baseline =\
+      \ percentile(host_task_args_entropy_len, 95) over 30d\n  alert when e > baseline.entropy OR L >\
+      \ baseline.length\n  boost when preceded by nonadmin_spawned_shell"
+- question: Does a Random Forest classifier, trained on features from process creation and the subsequent
+    task/service creation (parent/child image, user context, time delta, command-line length/entropy/special-character
+    ratio), label the observed sequence as malicious?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Malicious injection-to-persistence chains differ from benign ones across many weak features that a
+    tree ensemble can combine. Train a Random Forest on labeled process-creation + task/service-creation
+    sequences using parent/child image, user context, time delta, and command-line length/entropy/special-char
+    ratio, then classify live sequences and surface the top-3 SHAP features in the alert. Injection-related
+    APIs and obfuscated command lines typically dominate feature importance. A malicious classification
+    with interpretable feature attribution gives the analyst a defensible, actionable lead; the model
+    complements the deterministic lineage rule above.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [parent_image, child_image, user_context, time_delta, cmd_len, cmd_entropy, special_char_ratio]
+
+      model = RandomForest.train(labeled process+task/service sequences)
+
+      alert when model.predict(features) == malicious
+
+      explain top3 SHAP features in alert'
+- question: Was a process that is not on the allowlist of debuggers/security tools (procexp.exe, windbg.exe)
+    granted SeDebugPrivilege (EID 4672) and then observed opening a handle to lsass.exe (EID 4656/4663
+    or Sysmon EID 10 with TargetImage lsass.exe)?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    A benign-looking host such as notepad.exe or calc.exe being assigned SeDebugPrivilege and then touching
+    LSASS memory is a strong sign that injected code is abusing privileges to harvest credentials. GUI
+    utilities should essentially never open lsass. Trigger when a non-allowlisted process receives SeDebugPrivilege
+    via EID 4672 and subsequently opens an lsass handle. A positive result is a high-severity credential-access/privilege-abuse
+    lead; legitimate debuggers and security tools that need this access are excluded via the allowlist.
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days; correlate the privilege grant and the lsass handle open
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'sedebug = EID 4672 where SeDebugPrivilege granted AND image NOT IN (procexp.exe,windbg.exe,
+      allowlisted_tools)
+
+      lsass = (EID 4656/4663 OR Sysmon 10) where target_image == lsass.exe AND source_image == sedebug.image
+
+      alert when lsass after sedebug on same host'
+- question: For each process image, does any granted privilege (EID 4672) appear in fewer than 0.1% of
+    that executable's historical privilege-assignment instances — and is there a corresponding burst of
+    failed lsass handle opens (Access Denied in EID 4656/4663)?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Per-executable privilege baselines expose injected code that suddenly wields privileges its host process
+    never normally receives. Baseline assigned privileges per image and alert when a privilege appears
+    in under 0.1% of that image''s history. Track failure state explicitly: a burst of failed lsass handle
+    opens is itself a distinct signal of injected code probing for credential access before it succeeds.
+    A positive result is a rare-privilege anomaly worth correlating with the LSASS-access rule; common,
+    expected privileges for an image score as normal.'
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days; per-image privilege baseline over 30+ days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(privilege | image) from EID 4672 over history
+
+      alert when historical_freq(privilege | image) < 0.1%
+
+      corroborate when failed_lsass_open (access_denied in 4656/4663) bursts for same image
+
+      output image, privilege, freq, failed_open_count'
+- question: Does an Isolation Forest scoring feature vectors of (ProcessName, GrantedPrivilege, TargetProcessName,
+    EWM-API-count) flag instances like (notepad.exe, SeDebugPrivilege, lsass.exe) as high anomalies?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Combinations of process, granted privilege, target process, and EWM-API activity that never co-occur
+    in benign data stand out to an unsupervised anomaly detector. Score (ProcessName, GrantedPrivilege,
+    TargetProcessName, EWM-API-count) vectors with Isolation Forest; benign-looking GUI utilities holding
+    SeDebugPrivilege and touching lsass score as strong outliers. Provenance GNNs (e.g., ThreaTrace) then
+    flag the anomalous node and trace its causal lineage for triage. A high anomaly score is a defensible
+    lead for privilege-abuse via injection; normal process/privilege/target combinations score low.
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = IsolationForest.train(benign (ProcessName,GrantedPrivilege,TargetProcessName,EWM_API_count)
+      vectors)
+
+      alert when model.anomaly_score(vector) > threshold  # e.g., (notepad.exe,SeDebugPrivilege,lsass.exe)
+
+      trace lineage via provenance GNN'
+- question: Did a high-privilege system process (services.exe, wininit.exe, svchost.exe) initiate an external
+    network connection (Zeek conn.log / EID 5156) — in particular svchost.exe whose parent is not services.exe,
+    or a system process with a zero-length command line making a connection — correlated with recent suspicious
+    host activity?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    System processes are predictable; injected code riding them breaks that predictability by reaching
+    out to the network. Deterministically flag svchost.exe not parented by services.exe and system processes
+    with zero-length command lines that initiate connections — both strong injection/hollowing tells —
+    and correlate with recent suspicious activity such as a user launching a document reader. A positive
+    result is a high-confidence injection lead against a Tier-0/system process; legitimately networked
+    system services with correct lineage and command lines are expected.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; correlate egress with preceding suspicious host activity (e.g., 5 minutes)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'egress = (Zeek conn.log OR EID 5156) where image in (services.exe,wininit.exe,svchost.exe)
+      AND resp_h is external
+
+      alert when (image==svchost.exe AND parent_image != services.exe) OR (command_line length == 0)
+
+      correlate with recent suspicious host activity
+
+      output image, parent_image, resp_h, resp_p'
+- question: Do any critical system processes connect to destination ports outside their 99th-percentile
+    historical set, transfer byte volumes (orig_bytes) outside their normal profile, or spawn never-before-seen
+    children (e.g., svchost.exe -> powershell.exe) — accompanied by bursts of blocked/failed connections
+    (EID 5157)?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Profile each critical system process's destination ports, outbound byte volume, and child processes,
+    then alert on connections to rare ports, abnormal volumes, or unprecedented children. Track state
+    by watching for blocked/failed connection bursts (EID 5157) from a normally quiet process, which is
+    a distinct anomaly. A positive result indicates a system process behaving outside its established
+    network/spawn profile, consistent with injected code; expected destinations and children for that
+    service score as normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; profiles over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'profile = per system_proc: ports@p99, dist(orig_bytes), child_set over 30d
+
+      alert when dst_port NOT IN ports@p99 OR orig_bytes outlier OR child NOT IN child_set
+
+      track failed/blocked bursts (EID 5157) from quiet process
+
+      output proc, dst_port, orig_bytes, new_child'
+- question: Does time-series forecasting (ARIMA) of a system process's outbound byte volume show the observed
+    volume exceeding the forecast confidence band, and does a provenance GNN score the document-reader
+    -> system-process -> external-egress causal path as improbable?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injected exfiltration or C2 over a system process perturbs its outbound byte-volume time series beyond
+    normal bounds. Fit ARIMA per process and alert when observed volume breaches the forecast confidence
+    interval. Augment with a provenance GNN (e.g., KAIROS) that scores the improbable document-reader
+    -> system-process -> external-egress path and reconstructs it for triage. A positive result couples
+    a volumetric anomaly with an implausible causal chain, strongly suggesting injection-driven egress;
+    stable, in-band traffic from the process is normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; ARIMA fit over rolling 30 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = ARIMA.fit(per_process outbound_bytes timeseries)
+
+      alert when observed_bytes outside model.forecast_confidence_band
+
+      augment provenance_GNN.score(document_reader -> system_proc -> external_egress)'
+- question: Did any process call SetWindowLongPtrA/W or SetClassLongPtr at the GWLP_WNDPROC index on a
+    window handle owned by a different process — especially allow-listed targets like browsers and office
+    applications — outside of the verified window managers dwm.exe, csrss.exe, and explorer.exe?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    EWM injection is frequently aimed at allow-listed GUI applications so that malicious code runs under
+    a process security tools implicitly trust. Alert on any cross-process SetWindowLongPtr/SetClassLongPtr
+    at the GWLP_WNDPROC index targeting browsers/office apps, excluding the legitimate window managers.
+    This is the stealth-focused complement to the EWM callback-hijack rule and is the core technique-level
+    signature: writing the window-procedure pointer of a foreign window. A positive result is high-confidence
+    cross-process window-procedure tampering; benign window management by the excluded managers is filtered
+    out.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert = win32k where api in (SetWindowLongPtrA,SetWindowLongPtrW,SetClassLongPtr) AND nIndex
+      == -4 (GWLP_WNDPROC) AND target_pid != source_pid
+
+      filter source_image NOT IN (dwm.exe,csrss.exe,explorer.exe)
+
+      flag target_image in (browsers, office_apps)
+
+      output source_image, target_image, hWnd'
+- question: For each common GUI application (chrome.exe, outlook.exe, winword.exe), does a statistically
+    rare actor — such as a script interpreter in the bottom 1st percentile by frequency — access its memory
+    or window handles via EWM-related APIs?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Baseline the set of processes that legitimately access each common GUI application's memory or window
+    handles, then alert when a rare actor (a script interpreter or other low-frequency process below the
+    1st percentile) interacts via EWM-related APIs. Injection campaigns introduce novel, rare cross-process
+    interactions into an otherwise stable access graph. A positive result flags an unusual actor manipulating
+    a trusted GUI app's windows, consistent with EWM injection for stealth; routine, frequently-seen accessors
+    score as normal.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days; accessor baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(accessor_image | target_gui_app) for chrome.exe,outlook.exe,winword.exe over
+      30d
+
+      alert when accessor uses EWM-related API AND historical_freq(accessor | target) < 1st percentile
+
+      output accessor_image, target_gui_app, freq'
+- question: Modeling processes as nodes and cross-process interactions (e.g., SetWindowLongPtr) as edges,
+    does a graph model trained on benign interaction graphs flag a new structural edge from a script host
+    to a browser or office process as anomalous?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Cross-process window-procedure manipulation creates edges in a process-interaction graph that simply
+    do not exist in benign baselines. Train on benign interaction graphs and flag new structural edges
+    — especially from a script host to a browser/office process — with node-level attribution for triage
+    (ThreaTrace/KAIROS). A positive result surfaces a novel injection relationship even when individual
+    API calls look superficially valid; the attribution points the analyst directly at the offending node.
+    Established benign edges score as expected.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = build_graph(nodes=processes, edges=cross_process_interactions e.g. SetWindowLongPtr)
+
+      model = train_graph_anomaly(benign G)
+
+      alert when new_edge(script_host -> browser/office) flagged anomalous
+
+      report node-level attribution'
+- question: Did an injection-target user application (chrome.exe, winword.exe, outlook.exe) communicate
+    with an IP/domain listed on a threat-intel feed, or connect to known C2 ports such as 4444 or 8443,
+    in Zeek conn.log?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injected C2 code often rides a trusted user application, so its egress appears to come from chrome.exe,
+    outlook.exe, or winword.exe. Join Zeek conn.log against a threat-intel feed and alert when these processes
+    contact listed infrastructure or known C2 ports. The first-party rule also works on internal Zeek/firewall
+    logs without mandatory external lookups by matching the suspicious-port set. A positive result is
+    a strong injected-C2 lead; a negative result does not clear the host, since attackers may use unflagged
+    infrastructure and non-standard ports, so pair with the statistical and ML methods.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'alert = conn.log where image in (chrome.exe,winword.exe,outlook.exe) AND (resp_h in ti_feed
+      OR resp_p in (4444,8443))
+
+      output image, resp_h, resp_p, ti_match'
+- question: Do any user applications present JA3/JA4 client TLS fingerprints or use destination ports
+    below the 1st percentile of that application's own history (suggesting a non-standard TLS library
+    used by injected code), accompanied by spikes in NXDOMAIN/failed resolutions and blocked connections?
+  context: 'In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injected code frequently uses a different TLS stack than its host application, producing anomalous
+    JA3/JA4 fingerprints, and reaches unusual destinations. Baseline per-application JA3/JA4 hashes and
+    destination ports from Zeek ssl.log and alert on values below the 1st percentile of that app''s history.
+    Track failure state: spikes in NXDOMAIN/failed resolutions and blocked connections from the app are
+    distinct corroborating signals. A positive result indicates the app is speaking TLS in a way it never
+    has, consistent with injected C2; familiar fingerprints and ports are normal.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days; fingerprint/port baselines over 30 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'baseline = per app: dist(ja3/ja4), dist(dst_port) from ssl.log over 30d
+
+      alert when ja3/ja4 OR dst_port below 1st percentile for that app
+
+      corroborate with NXDOMAIN/failed-resolution and blocked-connection spikes
+
+      output app, ja3, dst_port'
+- question: Does an LSTM autoencoder trained on benign per-application traffic (connection frequency,
+    duration, byte volume, inter-arrival jitter) flag highly regular, small fixed-size beacons from a
+    user application as anomalous?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Beaconing C2 produces traffic that is too regular and too uniform compared with the bursty, variable
+    traffic of genuine user activity. Train an LSTM autoencoder on benign per-app traffic and flag flows
+    with high reconstruction error — especially highly regular small fixed-size beacons. Surface the top-3
+    deviating features (periodicity, payload size, rare port) in the alert via SHAP/LIME. A positive result
+    is a strong indication of injected beaconing riding a trusted app; normal interactive traffic reconstructs
+    with low error.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = LSTM_autoencoder.train(benign per-app traffic: conn_freq,duration,byte_vol,inter_arrival_jitter)
+
+      alert when reconstruction_error(flow) > threshold AND pattern == regular_small_fixed_beacon
+
+      explain top3 deviating features (periodicity,payload_size,rare_port)'
+- question: Did a GUI parent application (winword.exe, excel.exe, acrord32.exe) spawn a command interpreter
+    or LOLBin (cmd.exe, powershell.exe, rundll32.exe)?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    A GUI document application spawning a shell or rundll32 is one of the highest-fidelity injection/exploitation
+    lineages available, because office and PDF readers have no legitimate reason to launch interpreters
+    during normal use. Alert on any such parent-child relationship. A positive result warrants immediate
+    triage of the child's command line and subsequent network activity (a powershell.exe with an encoded
+    command then connecting out is the classic macro/injection follow-on). This is a deterministic floor
+    that benefits from being paired with the entropy and graph methods below.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert = proc_create(EID 4688/Sysmon 1) where parent_image in (winword.exe,excel.exe,acrord32.exe)
+      AND child_image in (cmd.exe,powershell.exe,rundll32.exe)
+
+      output parent_image, child_image, command_line'
+- question: Per GUI parent application, does a spawned child process fall in the bottom 0.5% of that parent's
+    historical child distribution, or does the child command line exceed the 98th percentile of Shannon
+    entropy/length for that parent-child pair (catching encoded commands)?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Even when a GUI parent does occasionally spawn helpers, malicious children are rare and their command
+    lines are often encoded. Build per-parent child-process frequency distributions and alert on children
+    below the 0.5% threshold; additionally compute Shannon entropy/length of the child command line and
+    flag values above the 98th percentile for that parent-child pair, using approximate sequence matching
+    to resist evasion. A positive result flags either a rare child or an obfuscated command from a trusted
+    GUI app, consistent with injection follow-on; common children with readable command lines are normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days; baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(child | gui_parent), dist(entropy/len of cmdline | parent,child) over 30d
+
+      alert when freq(child|parent) < 0.5% OR cmdline_entropy/len > p98 for (parent,child)
+
+      output parent_image, child_image, freq, cmd_entropy'
+- question: Does a provenance-graph model trained on benign process trees flag an unseen subgraph such
+    as acrord32.exe -> powershell.exe -> external_ip as anomalous, with subgraph reconstruction provided
+    for triage?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injection follow-on activity forms process-tree subgraphs that never appear in benign baselines. Train
+    a provenance-graph model (KAIROS/ThreaTrace) on benign process trees and flag unseen subgraphs — e.g.,
+    a PDF reader spawning PowerShell that then connects to an external IP — reconstructing the subgraph
+    for analyst triage. A positive result delivers the full malicious lineage rather than an isolated
+    event, which is far more defensible and actionable; familiar process trees score as benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = provenance_graph.train(benign process trees)
+
+      alert when subgraph (e.g., acrord32.exe -> powershell.exe -> external_ip) is unseen/anomalous
+
+      reconstruct subgraph for triage'
+- question: Did any process on the explicit list of non-networking GUI applications (notepad.exe, calc.exe,
+    mspaint.exe) generate an outbound network connection (EID 5156 / Zeek conn.log), for example over
+    port 53 for DNS tunneling?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Applications like Notepad, Calculator, and Paint never legitimately initiate network connections,
+    so any egress from them is a near-certain sign of injected code using them as a host. Maintain an
+    explicit allowlist-by-exception of non-networking GUI apps and raise a high-severity alert on any
+    outbound connection they generate. A positive result is a high-confidence injection finding requiring
+    immediate response; there is essentially no benign explanation, which makes this a low-false-positive
+    deterministic floor.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'non_net_apps = [notepad.exe,calc.exe,mspaint.exe]
+
+      alert = (EID 5156 OR Zeek conn.log) where image in non_net_apps AND direction == outbound
+
+      output image, resp_h, resp_p'
+- question: For network-capable applications, do any connections use destination ports outside the top
+    99% of that app's historical ports (e.g., chrome.exe -> 6667/IRC) or transfer byte volume more than
+    3 standard deviations above the per-hour mean, with corresponding failed/blocked connection or NXDOMAIN
+    bursts?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Network-capable apps have a stable port and volume profile; injected code drifts outside it. Baseline
+    destination ports and byte volume per app and alert on connections outside the top 99% of ports or
+    volume beyond 3 sigma of the hourly mean. Track failure state — failed/blocked connection and NXDOMAIN
+    bursts are distinct corroborating signals. A positive result (e.g., a browser suddenly speaking IRC)
+    is a strong drift anomaly consistent with injected C2; normal ports and volumes for the app score
+    as benign.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days; baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per app: ports@top99, mean/std(byte_vol per hour) over 30d
+
+      alert when dst_port NOT IN ports@top99 OR byte_vol > mean + 3*std
+
+      corroborate failed/blocked + NXDOMAIN bursts
+
+      output app, dst_port, byte_vol'
+- question: Does DBSCAN clustering of processes by network-behavior features (ports, protocols, byte volume,
+    destination ASN) reveal a process that has shifted from an 'internal services' cluster to an 'external
+    C2' cluster, with the contributing features reported?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Processes naturally group by network behavior; injection moves a process from its benign cluster into
+    one characteristic of external C2. Cluster processes with DBSCAN on ports/protocols/byte-volume/destination-ASN
+    features and flag any process whose membership shifts toward an external-C2 cluster, reporting the
+    contributing features via SHAP/LIME. A positive result captures a behavioral migration that single-event
+    rules miss; processes that remain in their expected cluster are normal.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [dst_ports, protocols, byte_volume, dst_asn]
+
+      clusters = DBSCAN.fit(per-process features)
+
+      alert when process membership shifts from internal_services_cluster -> external_c2_cluster
+
+      report contributing features'
+- question: Did a process generate more than 5 application-crash events (EID 1000) within 10 minutes,
+    correlated with connections to newly-registered (<30 days old) domains or other external egress?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Injected code is often unstable and destabilizes its host process, so a cluster of application crashes
+    coinciding with suspicious egress is a meaningful failure-mode signal. Alert when a process emits
+    more than 5 EID 1000 crash events in 10 minutes correlated with connections to newly-registered domains
+    or external destinations. A positive result links instability with covert communication, consistent
+    with injection/exfiltration; isolated crashes without egress, or normal egress without crash clustering,
+    are weaker individually.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days; crash burst within a 10-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'crashes = count(EID 1000 by process) within 10m
+
+      egress = conn.log/EID 5156 to (newly_registered_domain age<30d OR external)
+
+      alert when crashes > 5 AND egress correlated for same process
+
+      output process, crash_count, resp_h, domain_age'
+- question: For each major user application, does current outbound byte volume per hour exceed 3 standard
+    deviations over the moving average for that hour-of-day/day-of-week, or does the crash rate exceed
+    its historical 99th percentile?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    Exfiltration via injected code produces volume and crash anomalies relative to seasonal baselines.
+    Build a per-app time-series baseline of network byte volume per hour and crash frequency, accounting
+    for hour-of-day and day-of-week, and alert when current volume exceeds 3 sigma over the moving average
+    or the crash rate exceeds the 99th percentile, deriving thresholds per host from 30 days of data.
+    A positive result is a seasonally-adjusted volumetric/stability anomaly consistent with injection-driven
+    exfiltration; traffic within seasonal norms is benign.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days; thresholds from 30 days, seasonally adjusted
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per app: moving_avg/std(byte_vol) by hour_of_day/day_of_week, p99(crash_rate) over
+      30d
+
+      alert when byte_vol > avg + 3*std OR crash_rate > p99
+
+      output app, byte_vol, avg, std, crash_rate'
+- question: Does multivariate change-point detection across a process's streams (connections/min, byte
+    volume, errors/min) identify a simultaneous significant change-point across streams, indicating a
+    behavioral shift consistent with injection/compromise?
+  context: In the Stealth context, EWM injection lets the adversary execute under a trusted, allow-listed
+    process so their activity blends in with benign behavior; this method helps surface that concealment.
+    A genuine compromise shifts several behavioral signals at once. Run multivariate change-point detection
+    over per-process connections/min, byte volume, and errors/min and alert when a significant change-point
+    occurs simultaneously across streams. Provenance modeling (KAIROS) adds causal context and reconstructs
+    the change window for triage. A positive result captures the moment of behavioral transition that
+    single-metric thresholds may miss, providing a defensible incident timeline; steady multivariate behavior
+    is normal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'streams = per process: [connections_per_min, byte_volume, errors_per_min]
+
+      alert when multivariate_change_point(streams) is simultaneous AND significant
+
+      augment provenance.reconstruct(change_window)'
+- question: Did any process call SetWindowLongPtrA/W or SetClassLongPtr against a window or class handle
+    owned by a DIFFERENT process using nIndex = GWLP_WNDPROC (-4) to overwrite the window-procedure address,
+    and then within roughly one second send a triggering window message (SendNotifyMessage, NtUserMessageCall,
+    or PostMessage) to that same hWnd?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. This is the deterministic
+    detection floor for Extra Window Memory (EWM) injection. EWM injection works by writing a 32-bit/64-bit
+    code pointer into a target window''s extra window memory at the GWLP_WNDPROC index (-4), which replaces
+    the address of the function that handles that window''s messages; the adversary then dispatches a
+    window message to force the hijacked procedure to run their shellcode. Look for the full causal chain
+    captured in Microsoft-Windows-Win32k ETW and Sysmon Event ID 10 (ProcessAccess): a section create/map,
+    a cross-process SetWindowLongPtr/SetClassLongPtr at index -4, and a message-trigger call all bound
+    to the same window/memory object. A positive result is a high-confidence injection finding, especially
+    when the caller is not a window manager and the target is a higher-privilege GUI process. Suppress
+    benign window management by excluding verified managers dwm.exe, csrss.exe, and explorer.exe; a negative
+    result does not clear the host because attackers may stage the chain across longer intervals or different
+    handles.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days; correlate the SetWindowLongPtr and message-trigger events within a ~1s window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'setcalls = win32k where api in (SetWindowLongPtrA,SetWindowLongPtrW,SetClassLongPtr) AND nIndex
+      == -4 (GWLP_WNDPROC) AND target_pid != source_pid
+
+      triggers = win32k where api in (SendNotifyMessage,NtUserMessageCall,PostMessage)
+
+      alert when setcalls JOIN triggers on hWnd within 1s AND source_image NOT IN (dwm.exe,csrss.exe,explorer.exe)
+
+      output source_image, source_pid, target_pid, hWnd, nIndex'
+- question: Which executables are issuing SetWindowLongPtr, SetClassLongPtr, or SendNotifyMessage calls
+    at a rate more than three standard deviations above their own 30-day historical mean, or for the very
+    first time — particularly script and interpreter hosts (powershell.exe, mshta.exe, wscript.exe, rundll32.exe)
+    that never legitimately manage GUI windows?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. EWM injection
+    requires window-management APIs that most processes — and nearly all script interpreters — never call.
+    Baseline per-executable call frequency (calls/hour) for SetWindowLongPtr/SetClassLongPtr/SendNotifyMessage
+    from 30 days of Win32k ETW, then alert when a process exceeds its 3-sigma threshold or emits any such
+    call for the first time. A scripting or LOLBin host suddenly invoking window-procedure APIs is a strong
+    tell that injected code is preparing an EWM callback. Use approximate (Smith-Waterman-style) sequence
+    matching so that benign calls interleaved by the attacker do not let the malicious sequence slip below
+    threshold. A positive result warrants pivoting to the deterministic EWM callback rule; a negative
+    result is expected for normal GUI applications that routinely manage their own windows.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days; baseline derived from 30 days of Win32k ETW
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = stats mean(calls_per_hour) as mu, stddev(calls_per_hour) as sd by image where api
+      in (SetWindowLongPtr,SetClassLongPtr,SendNotifyMessage) over 30d
+
+      alert when (calls_per_hour > mu + 3*sd) OR first_seen(image,api)
+
+      prioritize image in (powershell.exe,mshta.exe,wscript.exe,rundll32.exe)
+
+      output image, api, calls_per_hour, mu, sd'
+- question: When a window message is dispatched, does the executing window-procedure call-stack frame
+    reside in unbacked/private (non-image) memory rather than in a module file on disk — indicating that
+    the window procedure now points to injected shellcode instead of legitimate code?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. A defining artifact
+    of EWM/shellcode callbacks is that the code executed when the window procedure runs lives in private,
+    executable memory that is not backed by any DLL or EXE on disk. Walk the ETW/Sysmon call stack at
+    message dispatch and flag any frame whose return address falls in unbacked/private memory regions.
+    This catches injection that evades classic thread-start-address checks because the malicious code
+    never creates a remote thread — it rides an existing GUI thread via the hijacked window procedure.
+    A positive result (an unbacked window-procedure frame) is high-fidelity evidence of in-memory code
+    execution under a legitimate process; benign window procedures resolve to on-disk image modules.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for each window_message_dispatch event with call_stack:\n  wndproc_frame = frame_executing_window_procedure(call_stack)\n\
+      \  if wndproc_frame.memory_type in (PRIVATE,MAPPED) AND wndproc_frame.backed_by_image == false:\n\
+      \    alert(image, pid, hWnd, wndproc_frame.address)"
+- question: Does a learned sequence model score the API chain [CreateFileMapping -> MapViewOfFile -> SetWindowLongPtr
+    -> SendNotifyMessage] originating from a script host or document reader as a low-probability (anomalous)
+    sequence relative to benign Win32k+memory API behavior?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. EWM injection
+    has a recognizable primitive chain: allocate/map a shared section, write shellcode, set the window-procedure
+    pointer into EWM, then trigger it with a message. Train an HMM/LSTM/Transformer on benign Win32k and
+    memory-API sequences and score live sequences; the full malicious chain from an unexpected host (script
+    interpreter, document reader) scores as extremely unlikely. Combining ETW with parallel memory analysis
+    that requires the complete primitive chain has been shown to reach ~99.93% accuracy at ~0.068% FPR.
+    The alert must surface the top-3 contributing features (e.g., the GWLP_WNDPROC set, the unbacked-memory
+    frame, the calling image) via SHAP/LIME so an analyst can triage quickly. A high anomaly score is
+    a strong injection signal; the model complements, not replaces, the deterministic rule.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k (SetWindowLong/SetClassLong, NtUserMessageCall, SendNotifyMessage, PostMessage)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: Endpoint devices, Privileged Access Workstations, Critical Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = train_sequence_model(benign Win32k+memory API sequences)  # HMM/LSTM/Transformer
+
+      score = model.logprob([CreateFileMapping,MapViewOfFile,SetWindowLongPtr,SendNotifyMessage] for image)
+
+      alert when score < threshold AND image in (script_hosts, document_readers)
+
+      explain top3 features via SHAP/LIME'
+- question: Did a watchlisted low-privilege process (mshta.exe, wscript.exe, regsvr32.exe, rundll32.exe)
+    execute within 60 seconds before a sensitive privileged action on the same host — such as user creation
+    (EID 4720) or service installation (EID 4697) emitted by a high-privilege process (services.exe, lsass.exe,
+    wininit.exe) — with no logged parent-child relationship between them?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. When code is
+    injected into a privileged GUI/system process, that process suddenly performs privileged actions it
+    normally never initiates, and crucially there is no parent-child link to the low-privilege launcher
+    that staged the injection. Correlate watchlisted low-privilege launchers against subsequent EID 4720/4697
+    events from high-privilege processes within a 60s window on the same host where no direct lineage
+    exists. A positive result is consistent with EWM injection leading to out-of-character privileged
+    behavior. The temporal proximity plus the missing lineage is what distinguishes this from ordinary
+    administrative activity, where the privileged action traces back through a legitimate parent chain.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days; correlate precursor and privileged action within 60s
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'precursor = proc_create(EID 4688/Sysmon 1) where image in (mshta.exe,wscript.exe,regsvr32.exe,rundll32.exe)
+
+      sensitive = (EID 4720 user_create OR EID 4697 service_install) where actor_image in (services.exe,lsass.exe,wininit.exe)
+
+      alert when sensitive within 60s after precursor on same host AND no_parent_child_link(precursor,
+      sensitive)'
+- question: For each high-privilege process, does the set of non-parent processes active in the preceding
+    5-minute window contain a precursor that appears in fewer than 1% of that process's historical sequences
+    — and is that rare precursor accompanied by a spike in failed privileged actions (failed 4720/4697
+    or Access Denied)?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Even without
+    a parent-child link, injected privileged behavior leaves a statistical footprint: an unusual process
+    becomes active just before a privileged process performs a sensitive action. Baseline, per high-privilege
+    process, the distribution of non-parent processes seen in the preceding 5 minutes, and flag sequences
+    where the precursor is in the bottom 1%. Explicitly track failure state — a burst of failed user creations
+    or service installs (Access Denied) alongside the rare precursor strengthens the signal, because injected
+    code often probes before succeeding. A positive result is a behavioral anomaly worth correlating against
+    the EWM API evidence; a negative result reflects normal, frequently-seen precursor processes.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days; 5-minute preceding window per privileged action
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(precursor_image | privileged_proc) over 30d using 5-min preceding windows
+
+      alert when seen(precursor_image) has historical_freq < 1%
+
+      boost score when failed_4720 OR failed_4697 OR access_denied spikes in same window
+
+      output privileged_proc, precursor_image, freq, failed_count'
+- question: Does a sequence model (LSTM/HMM) trained on benign host event streams (process, user, and
+    service creations) assign a low probability to chains such as [mshta_activity -> services_creates_user],
+    indicating an anomalous precursor-to-privileged-action sequence?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Privileged actions
+    stemming from injected code form improbable event sequences across the host's process/user/service
+    streams. Train an LSTM/HMM on benign sequences and score live chains; low-probability chains like
+    a script host immediately preceding a privileged user creation alert. Augment with provenance-graph
+    models (e.g., KAIROS) that add causal context and reconstruct the precursor-to-privileged-action subgraph,
+    giving the analyst the full lineage for triage. A high anomaly score points to out-of-character privileged
+    behavior consistent with EWM injection into a system process; benign administrative sequences score
+    as expected.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4672
+  - Windows Event ID 4720
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = train_sequence_model(benign host event streams: proc/user/service creations)
+
+      score = model.logprob(observed_chain)
+
+      alert when score < threshold  # e.g., [mshta_activity -> services_creates_user]
+
+      augment with provenance_graph.reconstruct(precursor -> privileged_action)'
+- question: Did a non-administrative GUI parent (winword.exe, acrord32.exe, excel.exe) launch a command
+    interpreter (cmd.exe/powershell.exe), followed within 5 minutes by a service install (EID 4697) or
+    scheduled task (EID 4698) whose binary path points to a non-standard directory such as C:\Users\Public\
+    or C:\Windows\Temp\?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. GUI document
+    applications spawning shells is a classic exploitation/injection lineage, and when that shell is quickly
+    followed by a service or task install pointing at a suspicious directory, it suggests injected code
+    establishing execution or persistence under cover of a trusted process. Correlate the GUI->interpreter
+    spawn with subsequent EID 4697/4698 events within 5 minutes and inspect the binary/command path for
+    non-standard locations. A positive result is a high-fidelity chain worth immediate triage; legitimate
+    office workflows rarely spawn interpreters that then install services from world-writable directories.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days; correlate the spawn and the install within 5 minutes
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'spawn = proc_create where parent_image in (winword.exe,acrord32.exe,excel.exe) AND child_image
+      in (cmd.exe,powershell.exe)
+
+      install = (EID 4697 service_install OR EID 4698 task_create) where binary_path matches (C:\\Users\\Public\\*,
+      C:\\Windows\\Temp\\*)
+
+      alert when install within 5m after spawn on same host'
+- question: Do any newly created scheduled tasks (EID 4698) have command-line arguments whose Shannon
+    entropy and length exceed the 95th percentile of the host's historical task distribution, especially
+    shortly after a non-admin process spawned a shell?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injected/automated
+    payloads often register scheduled tasks with obfuscated or encoded command lines that exhibit abnormally
+    high entropy and length compared to the routine, human-authored tasks on a host. Compute Shannon entropy
+    and length for each new task's arguments and flag values above the 95th percentile derived from 30
+    days of local task history, prioritizing tasks created soon after a non-admin process spawned a shell.
+    A positive result flags likely encoded/obfuscated payload delivery; normal administrative tasks have
+    low-entropy, readable command lines.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days; percentile baseline from 30 days of local task history
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for task in EID 4698:\n  e = shannon_entropy(task.args); L = len(task.args)\n  baseline =\
+      \ percentile(host_task_args_entropy_len, 95) over 30d\n  alert when e > baseline.entropy OR L >\
+      \ baseline.length\n  boost when preceded by nonadmin_spawned_shell"
+- question: Does a Random Forest classifier, trained on features from process creation and the subsequent
+    task/service creation (parent/child image, user context, time delta, command-line length/entropy/special-character
+    ratio), label the observed sequence as malicious?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Malicious injection-to-persistence
+    chains differ from benign ones across many weak features that a tree ensemble can combine. Train a
+    Random Forest on labeled process-creation + task/service-creation sequences using parent/child image,
+    user context, time delta, and command-line length/entropy/special-char ratio, then classify live sequences
+    and surface the top-3 SHAP features in the alert. Injection-related APIs and obfuscated command lines
+    typically dominate feature importance. A malicious classification with interpretable feature attribution
+    gives the analyst a defensible, actionable lead; the model complements the deterministic lineage rule
+    above.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4698
+  - Windows Event ID 4702
+  - Windows Event ID 4697
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [parent_image, child_image, user_context, time_delta, cmd_len, cmd_entropy, special_char_ratio]
+
+      model = RandomForest.train(labeled process+task/service sequences)
+
+      alert when model.predict(features) == malicious
+
+      explain top3 SHAP features in alert'
+- question: Was a process that is not on the allowlist of debuggers/security tools (procexp.exe, windbg.exe)
+    granted SeDebugPrivilege (EID 4672) and then observed opening a handle to lsass.exe (EID 4656/4663
+    or Sysmon EID 10 with TargetImage lsass.exe)?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. A benign-looking
+    host such as notepad.exe or calc.exe being assigned SeDebugPrivilege and then touching LSASS memory
+    is a strong sign that injected code is abusing privileges to harvest credentials. GUI utilities should
+    essentially never open lsass. Trigger when a non-allowlisted process receives SeDebugPrivilege via
+    EID 4672 and subsequently opens an lsass handle. A positive result is a high-severity credential-access/privilege-abuse
+    lead; legitimate debuggers and security tools that need this access are excluded via the allowlist.
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days; correlate the privilege grant and the lsass handle open
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'sedebug = EID 4672 where SeDebugPrivilege granted AND image NOT IN (procexp.exe,windbg.exe,
+      allowlisted_tools)
+
+      lsass = (EID 4656/4663 OR Sysmon 10) where target_image == lsass.exe AND source_image == sedebug.image
+
+      alert when lsass after sedebug on same host'
+- question: For each process image, does any granted privilege (EID 4672) appear in fewer than 0.1% of
+    that executable's historical privilege-assignment instances — and is there a corresponding burst of
+    failed lsass handle opens (Access Denied in EID 4656/4663)?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Per-executable
+    privilege baselines expose injected code that suddenly wields privileges its host process never normally
+    receives. Baseline assigned privileges per image and alert when a privilege appears in under 0.1%
+    of that image''s history. Track failure state explicitly: a burst of failed lsass handle opens is
+    itself a distinct signal of injected code probing for credential access before it succeeds. A positive
+    result is a rare-privilege anomaly worth correlating with the LSASS-access rule; common, expected
+    privileges for an image score as normal.'
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days; per-image privilege baseline over 30+ days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(privilege | image) from EID 4672 over history
+
+      alert when historical_freq(privilege | image) < 0.1%
+
+      corroborate when failed_lsass_open (access_denied in 4656/4663) bursts for same image
+
+      output image, privilege, freq, failed_open_count'
+- question: Does an Isolation Forest scoring feature vectors of (ProcessName, GrantedPrivilege, TargetProcessName,
+    EWM-API-count) flag instances like (notepad.exe, SeDebugPrivilege, lsass.exe) as high anomalies?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Combinations
+    of process, granted privilege, target process, and EWM-API activity that never co-occur in benign
+    data stand out to an unsupervised anomaly detector. Score (ProcessName, GrantedPrivilege, TargetProcessName,
+    EWM-API-count) vectors with Isolation Forest; benign-looking GUI utilities holding SeDebugPrivilege
+    and touching lsass score as strong outliers. Provenance GNNs (e.g., ThreaTrace) then flag the anomalous
+    node and trace its causal lineage for triage. A high anomaly score is a defensible lead for privilege-abuse
+    via injection; normal process/privilege/target combinations score low.
+  answer_sources:
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers (for LSASS access), Privileged Access Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = IsolationForest.train(benign (ProcessName,GrantedPrivilege,TargetProcessName,EWM_API_count)
+      vectors)
+
+      alert when model.anomaly_score(vector) > threshold  # e.g., (notepad.exe,SeDebugPrivilege,lsass.exe)
+
+      trace lineage via provenance GNN'
+- question: Did a high-privilege system process (services.exe, wininit.exe, svchost.exe) initiate an external
+    network connection (Zeek conn.log / EID 5156) — in particular svchost.exe whose parent is not services.exe,
+    or a system process with a zero-length command line making a connection — correlated with recent suspicious
+    host activity?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. System processes
+    are predictable; injected code riding them breaks that predictability by reaching out to the network.
+    Deterministically flag svchost.exe not parented by services.exe and system processes with zero-length
+    command lines that initiate connections — both strong injection/hollowing tells — and correlate with
+    recent suspicious activity such as a user launching a document reader. A positive result is a high-confidence
+    injection lead against a Tier-0/system process; legitimately networked system services with correct
+    lineage and command lines are expected.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; correlate egress with preceding suspicious host activity (e.g., 5 minutes)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'egress = (Zeek conn.log OR EID 5156) where image in (services.exe,wininit.exe,svchost.exe)
+      AND resp_h is external
+
+      alert when (image==svchost.exe AND parent_image != services.exe) OR (command_line length == 0)
+
+      correlate with recent suspicious host activity
+
+      output image, parent_image, resp_h, resp_p'
+- question: Do any critical system processes connect to destination ports outside their 99th-percentile
+    historical set, transfer byte volumes (orig_bytes) outside their normal profile, or spawn never-before-seen
+    children (e.g., svchost.exe -> powershell.exe) — accompanied by bursts of blocked/failed connections
+    (EID 5157)?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Profile each
+    critical system process's destination ports, outbound byte volume, and child processes, then alert
+    on connections to rare ports, abnormal volumes, or unprecedented children. Track state by watching
+    for blocked/failed connection bursts (EID 5157) from a normally quiet process, which is a distinct
+    anomaly. A positive result indicates a system process behaving outside its established network/spawn
+    profile, consistent with injected code; expected destinations and children for that service score
+    as normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; profiles over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'profile = per system_proc: ports@p99, dist(orig_bytes), child_set over 30d
+
+      alert when dst_port NOT IN ports@p99 OR orig_bytes outlier OR child NOT IN child_set
+
+      track failed/blocked bursts (EID 5157) from quiet process
+
+      output proc, dst_port, orig_bytes, new_child'
+- question: Does time-series forecasting (ARIMA) of a system process's outbound byte volume show the observed
+    volume exceeding the forecast confidence band, and does a provenance GNN score the document-reader
+    -> system-process -> external-egress causal path as improbable?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injected exfiltration
+    or C2 over a system process perturbs its outbound byte-volume time series beyond normal bounds. Fit
+    ARIMA per process and alert when observed volume breaches the forecast confidence interval. Augment
+    with a provenance GNN (e.g., KAIROS) that scores the improbable document-reader -> system-process
+    -> external-egress path and reconstructs it for triage. A positive result couples a volumetric anomaly
+    with an implausible causal chain, strongly suggesting injection-driven egress; stable, in-band traffic
+    from the process is normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, Endpoint devices, Internal Network Segments'
+  range: Last 90 days; ARIMA fit over rolling 30 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = ARIMA.fit(per_process outbound_bytes timeseries)
+
+      alert when observed_bytes outside model.forecast_confidence_band
+
+      augment provenance_GNN.score(document_reader -> system_proc -> external_egress)'
+- question: Did any process call SetWindowLongPtrA/W or SetClassLongPtr at the GWLP_WNDPROC index on a
+    window handle owned by a different process — especially allow-listed targets like browsers and office
+    applications — outside of the verified window managers dwm.exe, csrss.exe, and explorer.exe?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. EWM injection
+    is frequently aimed at allow-listed GUI applications so that malicious code runs under a process security
+    tools implicitly trust. Alert on any cross-process SetWindowLongPtr/SetClassLongPtr at the GWLP_WNDPROC
+    index targeting browsers/office apps, excluding the legitimate window managers. This is the stealth-focused
+    complement to the EWM callback-hijack rule and is the core technique-level signature: writing the
+    window-procedure pointer of a foreign window. A positive result is high-confidence cross-process window-procedure
+    tampering; benign window management by the excluded managers is filtered out.'
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert = win32k where api in (SetWindowLongPtrA,SetWindowLongPtrW,SetClassLongPtr) AND nIndex
+      == -4 (GWLP_WNDPROC) AND target_pid != source_pid
+
+      filter source_image NOT IN (dwm.exe,csrss.exe,explorer.exe)
+
+      flag target_image in (browsers, office_apps)
+
+      output source_image, target_image, hWnd'
+- question: For each common GUI application (chrome.exe, outlook.exe, winword.exe), does a statistically
+    rare actor — such as a script interpreter in the bottom 1st percentile by frequency — access its memory
+    or window handles via EWM-related APIs?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Baseline the
+    set of processes that legitimately access each common GUI application's memory or window handles,
+    then alert when a rare actor (a script interpreter or other low-frequency process below the 1st percentile)
+    interacts via EWM-related APIs. Injection campaigns introduce novel, rare cross-process interactions
+    into an otherwise stable access graph. A positive result flags an unusual actor manipulating a trusted
+    GUI app's windows, consistent with EWM injection for stealth; routine, frequently-seen accessors score
+    as normal.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days; accessor baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(accessor_image | target_gui_app) for chrome.exe,outlook.exe,winword.exe over
+      30d
+
+      alert when accessor uses EWM-related API AND historical_freq(accessor | target) < 1st percentile
+
+      output accessor_image, target_gui_app, freq'
+- question: Modeling processes as nodes and cross-process interactions (e.g., SetWindowLongPtr) as edges,
+    does a graph model trained on benign interaction graphs flag a new structural edge from a script host
+    to a browser or office process as anomalous?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Cross-process
+    window-procedure manipulation creates edges in a process-interaction graph that simply do not exist
+    in benign baselines. Train on benign interaction graphs and flag new structural edges — especially
+    from a script host to a browser/office process — with node-level attribution for triage (ThreaTrace/KAIROS).
+    A positive result surfaces a novel injection relationship even when individual API calls look superficially
+    valid; the attribution points the analyst directly at the offending node. Established benign edges
+    score as expected.
+  answer_sources:
+  - etw:Microsoft-Windows-Win32k
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Sysmon Event ID 25 (Process Tampering)
+  - 'NAI: User Workstations, Application Servers with GUI components, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = build_graph(nodes=processes, edges=cross_process_interactions e.g. SetWindowLongPtr)
+
+      model = train_graph_anomaly(benign G)
+
+      alert when new_edge(script_host -> browser/office) flagged anomalous
+
+      report node-level attribution'
+- question: Did an injection-target user application (chrome.exe, winword.exe, outlook.exe) communicate
+    with an IP/domain listed on a threat-intel feed, or connect to known C2 ports such as 4444 or 8443,
+    in Zeek conn.log?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injected C2 code
+    often rides a trusted user application, so its egress appears to come from chrome.exe, outlook.exe,
+    or winword.exe. Join Zeek conn.log against a threat-intel feed and alert when these processes contact
+    listed infrastructure or known C2 ports. The first-party rule also works on internal Zeek/firewall
+    logs without mandatory external lookups by matching the suspicious-port set. A positive result is
+    a strong injected-C2 lead; a negative result does not clear the host, since attackers may use unflagged
+    infrastructure and non-standard ports, so pair with the statistical and ML methods.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'alert = conn.log where image in (chrome.exe,winword.exe,outlook.exe) AND (resp_h in ti_feed
+      OR resp_p in (4444,8443))
+
+      output image, resp_h, resp_p, ti_match'
+- question: Do any user applications present JA3/JA4 client TLS fingerprints or use destination ports
+    below the 1st percentile of that application's own history (suggesting a non-standard TLS library
+    used by injected code), accompanied by spikes in NXDOMAIN/failed resolutions and blocked connections?
+  context: 'In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injected code
+    frequently uses a different TLS stack than its host application, producing anomalous JA3/JA4 fingerprints,
+    and reaches unusual destinations. Baseline per-application JA3/JA4 hashes and destination ports from
+    Zeek ssl.log and alert on values below the 1st percentile of that app''s history. Track failure state:
+    spikes in NXDOMAIN/failed resolutions and blocked connections from the app are distinct corroborating
+    signals. A positive result indicates the app is speaking TLS in a way it never has, consistent with
+    injected C2; familiar fingerprints and ports are normal.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days; fingerprint/port baselines over 30 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'baseline = per app: dist(ja3/ja4), dist(dst_port) from ssl.log over 30d
+
+      alert when ja3/ja4 OR dst_port below 1st percentile for that app
+
+      corroborate with NXDOMAIN/failed-resolution and blocked-connection spikes
+
+      output app, ja3, dst_port'
+- question: Does an LSTM autoencoder trained on benign per-application traffic (connection frequency,
+    duration, byte volume, inter-arrival jitter) flag highly regular, small fixed-size beacons from a
+    user application as anomalous?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Beaconing C2
+    produces traffic that is too regular and too uniform compared with the bursty, variable traffic of
+    genuine user activity. Train an LSTM autoencoder on benign per-app traffic and flag flows with high
+    reconstruction error — especially highly regular small fixed-size beacons. Surface the top-3 deviating
+    features (periodicity, payload size, rare port) in the alert via SHAP/LIME. A positive result is a
+    strong indication of injected beaconing riding a trusted app; normal interactive traffic reconstructs
+    with low error.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 5156
+  - 'NAI: Network Egress Points, DNS Servers, Web Proxies, Endpoint devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = LSTM_autoencoder.train(benign per-app traffic: conn_freq,duration,byte_vol,inter_arrival_jitter)
+
+      alert when reconstruction_error(flow) > threshold AND pattern == regular_small_fixed_beacon
+
+      explain top3 deviating features (periodicity,payload_size,rare_port)'
+- question: Did a GUI parent application (winword.exe, excel.exe, acrord32.exe) spawn a command interpreter
+    or LOLBin (cmd.exe, powershell.exe, rundll32.exe)?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. A GUI document
+    application spawning a shell or rundll32 is one of the highest-fidelity injection/exploitation lineages
+    available, because office and PDF readers have no legitimate reason to launch interpreters during
+    normal use. Alert on any such parent-child relationship. A positive result warrants immediate triage
+    of the child's command line and subsequent network activity (a powershell.exe with an encoded command
+    then connecting out is the classic macro/injection follow-on). This is a deterministic floor that
+    benefits from being paired with the entropy and graph methods below.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert = proc_create(EID 4688/Sysmon 1) where parent_image in (winword.exe,excel.exe,acrord32.exe)
+      AND child_image in (cmd.exe,powershell.exe,rundll32.exe)
+
+      output parent_image, child_image, command_line'
+- question: Per GUI parent application, does a spawned child process fall in the bottom 0.5% of that parent's
+    historical child distribution, or does the child command line exceed the 98th percentile of Shannon
+    entropy/length for that parent-child pair (catching encoded commands)?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Even when a GUI
+    parent does occasionally spawn helpers, malicious children are rare and their command lines are often
+    encoded. Build per-parent child-process frequency distributions and alert on children below the 0.5%
+    threshold; additionally compute Shannon entropy/length of the child command line and flag values above
+    the 98th percentile for that parent-child pair, using approximate sequence matching to resist evasion.
+    A positive result flags either a rare child or an obfuscated command from a trusted GUI app, consistent
+    with injection follow-on; common children with readable command lines are normal.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days; baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(child | gui_parent), dist(entropy/len of cmdline | parent,child) over 30d
+
+      alert when freq(child|parent) < 0.5% OR cmdline_entropy/len > p98 for (parent,child)
+
+      output parent_image, child_image, freq, cmd_entropy'
+- question: Does a provenance-graph model trained on benign process trees flag an unseen subgraph such
+    as acrord32.exe -> powershell.exe -> external_ip as anomalous, with subgraph reconstruction provided
+    for triage?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injection follow-on
+    activity forms process-tree subgraphs that never appear in benign baselines. Train a provenance-graph
+    model (KAIROS/ThreaTrace) on benign process trees and flag unseen subgraphs — e.g., a PDF reader spawning
+    PowerShell that then connects to an external IP — reconstructing the subgraph for analyst triage.
+    A positive result delivers the full malicious lineage rather than an isolated event, which is far
+    more defensible and actionable; familiar process trees score as benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Application Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = provenance_graph.train(benign process trees)
+
+      alert when subgraph (e.g., acrord32.exe -> powershell.exe -> external_ip) is unseen/anomalous
+
+      reconstruct subgraph for triage'
+- question: Did any process on the explicit list of non-networking GUI applications (notepad.exe, calc.exe,
+    mspaint.exe) generate an outbound network connection (EID 5156 / Zeek conn.log), for example over
+    port 53 for DNS tunneling?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Applications
+    like Notepad, Calculator, and Paint never legitimately initiate network connections, so any egress
+    from them is a near-certain sign of injected code using them as a host. Maintain an explicit allowlist-by-exception
+    of non-networking GUI apps and raise a high-severity alert on any outbound connection they generate.
+    A positive result is a high-confidence injection finding requiring immediate response; there is essentially
+    no benign explanation, which makes this a low-false-positive deterministic floor.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'non_net_apps = [notepad.exe,calc.exe,mspaint.exe]
+
+      alert = (EID 5156 OR Zeek conn.log) where image in non_net_apps AND direction == outbound
+
+      output image, resp_h, resp_p'
+- question: For network-capable applications, do any connections use destination ports outside the top
+    99% of that app's historical ports (e.g., chrome.exe -> 6667/IRC) or transfer byte volume more than
+    3 standard deviations above the per-hour mean, with corresponding failed/blocked connection or NXDOMAIN
+    bursts?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Network-capable
+    apps have a stable port and volume profile; injected code drifts outside it. Baseline destination
+    ports and byte volume per app and alert on connections outside the top 99% of ports or volume beyond
+    3 sigma of the hourly mean. Track failure state — failed/blocked connection and NXDOMAIN bursts are
+    distinct corroborating signals. A positive result (e.g., a browser suddenly speaking IRC) is a strong
+    drift anomaly consistent with injected C2; normal ports and volumes for the app score as benign.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days; baselines over 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per app: ports@top99, mean/std(byte_vol per hour) over 30d
+
+      alert when dst_port NOT IN ports@top99 OR byte_vol > mean + 3*std
+
+      corroborate failed/blocked + NXDOMAIN bursts
+
+      output app, dst_port, byte_vol'
+- question: Does DBSCAN clustering of processes by network-behavior features (ports, protocols, byte volume,
+    destination ASN) reveal a process that has shifted from an 'internal services' cluster to an 'external
+    C2' cluster, with the contributing features reported?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Processes naturally
+    group by network behavior; injection moves a process from its benign cluster into one characteristic
+    of external C2. Cluster processes with DBSCAN on ports/protocols/byte-volume/destination-ASN features
+    and flag any process whose membership shifts toward an external-C2 cluster, reporting the contributing
+    features via SHAP/LIME. A positive result captures a behavioral migration that single-event rules
+    miss; processes that remain in their expected cluster are normal.
+  answer_sources:
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [dst_ports, protocols, byte_volume, dst_asn]
+
+      clusters = DBSCAN.fit(per-process features)
+
+      alert when process membership shifts from internal_services_cluster -> external_c2_cluster
+
+      report contributing features'
+- question: Did a process generate more than 5 application-crash events (EID 1000) within 10 minutes,
+    correlated with connections to newly-registered (<30 days old) domains or other external egress?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Injected code
+    is often unstable and destabilizes its host process, so a cluster of application crashes coinciding
+    with suspicious egress is a meaningful failure-mode signal. Alert when a process emits more than 5
+    EID 1000 crash events in 10 minutes correlated with connections to newly-registered domains or external
+    destinations. A positive result links instability with covert communication, consistent with injection/exfiltration;
+    isolated crashes without egress, or normal egress without crash clustering, are weaker individually.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days; crash burst within a 10-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'crashes = count(EID 1000 by process) within 10m
+
+      egress = conn.log/EID 5156 to (newly_registered_domain age<30d OR external)
+
+      alert when crashes > 5 AND egress correlated for same process
+
+      output process, crash_count, resp_h, domain_age'
+- question: For each major user application, does current outbound byte volume per hour exceed 3 standard
+    deviations over the moving average for that hour-of-day/day-of-week, or does the crash rate exceed
+    its historical 99th percentile?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. Exfiltration
+    via injected code produces volume and crash anomalies relative to seasonal baselines. Build a per-app
+    time-series baseline of network byte volume per hour and crash frequency, accounting for hour-of-day
+    and day-of-week, and alert when current volume exceeds 3 sigma over the moving average or the crash
+    rate exceeds the 99th percentile, deriving thresholds per host from 30 days of data. A positive result
+    is a seasonally-adjusted volumetric/stability anomaly consistent with injection-driven exfiltration;
+    traffic within seasonal norms is benign.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days; thresholds from 30 days, seasonally adjusted
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per app: moving_avg/std(byte_vol) by hour_of_day/day_of_week, p99(crash_rate) over
+      30d
+
+      alert when byte_vol > avg + 3*std OR crash_rate > p99
+
+      output app, byte_vol, avg, std, crash_rate'
+- question: Does multivariate change-point detection across a process's streams (connections/min, byte
+    volume, errors/min) identify a simultaneous significant change-point across streams, indicating a
+    behavioral shift consistent with injection/compromise?
+  context: In the Privilege Escalation context, EWM injection can run code in a higher-privilege GUI/system
+    process to gain elevated permissions; this method helps reveal that privilege abuse. A genuine compromise
+    shifts several behavioral signals at once. Run multivariate change-point detection over per-process
+    connections/min, byte volume, and errors/min and alert when a significant change-point occurs simultaneously
+    across streams. Provenance modeling (KAIROS) adds causal context and reconstructs the change window
+    for triage. A positive result captures the moment of behavioral transition that single-metric thresholds
+    may miss, providing a defensible incident timeline; steady multivariate behavior is normal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 1000
+  - Sysmon Event ID 3
+  - 'NAI: Endpoint devices, Network Egress Points, Mail Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'streams = per process: [connections_per_min, byte_volume, errors_per_min]
+
+      alert when multivariate_change_point(streams) is simultaneous AND significant
+
+      augment provenance.reconstruct(change_window)'
