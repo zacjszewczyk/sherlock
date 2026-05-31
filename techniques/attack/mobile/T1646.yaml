@@ -1,0 +1,379 @@
+name: 'T1646: Exfiltration Over C2 Channel'
+id: 0b13643c-beec-409f-8012-2444f5c41b2e
+description: Investigate whether an adversary is stealing data from managed mobile devices (Android and
+  iOS) by tunneling it out over an existing command-and-control (C2) channel, where the stolen data is
+  encoded into the same protocol used for C2 so it blends into normal-looking traffic. Because exfiltration
+  over C2 is intentionally hard to detect at the payload layer, this playbook focuses on the observable
+  network egress where mobile traffic is visible — corporate Wi-Fi gateways, VPN concentrators, per-app
+  VPN / secure web gateways, CASB egress points, UEM/EMM proxies, and network TAPs / VPC mirroring. It
+  helps an analyst hunt for anomalously large or long outbound flows, per-destination and per-device volume
+  spikes against a rolling baseline, regular C2 beaconing that also carries above-baseline outbound bytes,
+  abnormal HTTP POST/PUT-to-GET ratios with oversized request bodies, content-type distribution shifts
+  toward opaque/binary payloads, high-entropy compressed/encrypted payloads to low-reputation destinations,
+  archive uploads to unapproved destinations, and covert low-volume DNS tunneling. It pairs deterministic
+  threat-intelligence and TLS-fingerprint (JA3/JA3S) matching with statistical baselining (per-destination
+  bytes/duration percentiles, POST:GET ratios, entropy, beacon periodicity, failure-rate bursts) and machine-learning
+  models (time-series forecasting, DBSCAN clustering, Isolation Forest on DNS lexical features, and supervised
+  flow classification with explainable feature attribution) so the analyst can confirm or rule out exfiltration
+  multiplexed onto a mobile C2 channel.
+type: technique
+related:
+- tactic_id: TA0036
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any mobile devices making outbound connections to IPs on a C2 threat-intelligence feed,
+    negotiating TLS handshakes whose JA3/JA3S fingerprint matches a known-malicious watchlist, transferring
+    more than a large static byte threshold (for example, 25 MB of orig_bytes) to a single destination
+    in one connection, or holding a single connection open beyond an operational long-connection threshold
+    (for example, more than one hour)?
+  context: Under the Exfiltration tactic, an adversary multiplexes stolen data onto the same channel used
+    for command and control, so the surest deterministic signals are the destination itself and the TLS
+    stack used to reach it. Non-browser mobile C2 implants negotiate idiosyncratic TLS stacks that fingerprint
+    distinctly via JA3/JA3S, so matching the client hash against a malicious watchlist catches implants
+    even when the payload is encrypted. Pair this with threat-intel destination matching and with crude
+    volume/duration gates (very large single-connection orig_bytes, or unusually long-lived connections
+    per RITA long-connection logic) that catch bulk transfer regardless of fingerprint. In managed fleets,
+    scope these gates to per-app VPN / secure-web-gateway and CASB egress points where mobile traffic
+    is actually observable. A positive hit on a feed or fingerprint is a high-confidence lead; volume/duration
+    hits alone warrant correlation with the other statistical questions before escalation.
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Network gateways for corporate Wi-Fi, VPN concentrators, Cloud Access Security Broker (CASB)
+    egress points, and other network egress points monitoring mobile device traffic.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM zeek.conn JOIN zeek.ssl ON uid
+
+      LET src IN mobile_ip_ranges
+
+      ALERT IF dst_ip IN c2_threat_intel_feed
+
+      OR ALERT IF ja3 IN malicious_ja3_watchlist OR ja3s IN malicious_ja3s_watchlist
+
+      OR ALERT IF orig_bytes > 25_000_000 AND count_distinct(dst_ip)==1 within single uid
+
+      OR ALERT IF conn_duration > 3600s
+
+      // scope src to per-app VPN / SWG / CASB egress points'
+- question: For each mobile device, does a new outbound connection's bytes sent (orig_bytes) or connection
+    duration to a given destination exceed the 99th percentile of that device's own 30-day rolling baseline
+    for that specific source-destination pair, especially when the outbound-to-inbound byte ratio is heavily
+    skewed toward outbound?
+  context: 'Exfiltration over C2 is outbound-heavy by nature: the device sends far more than it receives.
+    By building a 30-day rolling per-destination baseline of orig_bytes and duration for each device and
+    computing the 99th percentile of each, you can flag the connection that breaks a destination-specific
+    norm rather than a fleet-wide one, which dramatically cuts false positives from legitimately chatty
+    apps. Prefer a high orig_bytes:resp_bytes ratio as a corroborating exfil-direction signal. Derive
+    the percentile cutoffs from your own fleet egress data. A positive result is a per-pair statistical
+    break consistent with a sudden bulk upload; a negative result means the transfer is within that device''s
+    historical norm for that destination.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM zeek.conn WHERE src IN mobile_ip_ranges\nBASELINE per (src, dst_ip) OVER last 30d: p99_bytes\
+      \ = pct(orig_bytes,99), p99_dur = pct(duration,99)\nALERT IF orig_bytes > p99_bytes OR duration\
+      \ > p99_dur\n  AND orig_bytes/(resp_bytes+1) > outbound_ratio_threshold"
+- question: Does any mobile device's total daily outbound byte volume across all destinations exceed the
+    99th percentile of its own 30-day baseline, with the top contributing destination being newly observed
+    in the last 7 days, or is a device generating an abnormal burst of blocked/RST connections and NXDOMAIN
+    responses?
+  context: This question rolls volume up to the whole device per day, catching exfil that is spread across
+    a destination to stay under any single-connection gate. Alerting when daily outbound volume crosses
+    the device's 99th-percentile baseline and the dominant destination is brand-new (seen only in the
+    last 7 days) ties the volume spike to a fresh, suspicious endpoint. Separately, profiling egress failure
+    state — counts of blocked/RST connections and NXDOMAIN responses per device — surfaces a distinct
+    staging signal, because exfil attempts frequently probe failing or blocked destinations before they
+    succeed. A positive result is a device whose day-over-day egress jumped to a new destination; failure-state
+    bursts are an early-warning corroborator.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM zeek.conn, zeek.dns WHERE src IN mobile_ip_ranges
+
+      BASELINE per src OVER 30d: p99_daily = pct(sum_daily(orig_bytes),99)
+
+      ALERT IF sum_daily(orig_bytes) > p99_daily AND top_dst FIRST_SEEN within last 7d
+
+      ALSO ALERT IF count_daily(conn_state IN {REJ,RSTO,RSTR}) OR count_daily(dns_rcode==NXDOMAIN) > device_baseline
+      + 3*stddev'
+- question: For each mobile source-destination pair, do connections show highly regular timing (low coefficient
+    of variation in inter-arrival times), consistent data sizes, and a strong FFT-based periodicity score,
+    while also carrying above-baseline outbound bytes?
+  context: Beaconing regularity is the hallmark of automated C2, and exfil multiplexed onto that beacon
+    will ride the same cadence. Computing inter-arrival-time regularity (low CoV), data-size consistency,
+    and an FFT-based periodicity score per source-destination pair (per RITA logic) isolates machine-driven
+    callbacks from human browsing. The key discriminator for exfiltration specifically is a regular beacon
+    that ALSO carries above-baseline outbound bytes — the beacon is not just checking in, it is shipping
+    data — and this holds regardless of whether the payload is encrypted. A positive result is a periodic,
+    size-consistent channel with elevated egress; a negative result is irregular or low-volume traffic.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM zeek.conn WHERE src IN mobile_ip_ranges\nGROUP BY (src, dst_ip)\nCOMPUTE iat_cov = stddev(delta_ts)/mean(delta_ts),\
+      \ size_consistency, fft_periodicity_score\nALERT IF iat_cov < cov_threshold AND fft_periodicity_score\
+      \ > p_threshold\n  AND mean(orig_bytes) > per_pair_baseline_bytes"
+- question: When you forecast each device-to-destination pair's expected aggregate daily outbound volume
+    with a time-series model, does the observed daily volume exceed the model's 95% prediction interval,
+    and which factors (destination, observed-vs-forecast bytes, day-of-week deviation) drive the anomaly?
+  context: Static percentiles miss seasonality and trend; a time-series forecasting model (Prophet, ARIMA/SARIMA,
+    or LSTM) trained on at least 90 days of conn.log history learns each device-to-destination pair's
+    normal rhythm, including weekday/weekend patterns, and flags only the days that genuinely break the
+    expected envelope. Alerting when observed daily volume exceeds the 95% prediction interval, and surfacing
+    the top-3 contributing factors (destination, observed-vs-forecast bytes, day-of-week deviation), gives
+    the analyst an explainable lead rather than a bare anomaly. Monitor for concept drift and retrain
+    on a rolling window so legitimate usage changes do not generate persistent false positives. A positive
+    result is a day that exceeds the forecast envelope toward a specific destination.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Python/ML pseudocode
+    query: "model = Prophet|SARIMA|LSTM\nFOR each (device, dst) pair:\n  train on >=90d daily sum(orig_bytes)\
+      \ from zeek.conn\n  yhat, yhat_upper = model.predict(today)\n  IF observed_daily_bytes > yhat_upper\
+      \ (95% PI): ALERT\n  report top3 drivers: destination, observed_vs_forecast, day_of_week_deviation\n\
+      \  monitor drift; retrain on rolling window"
+- question: Are mobile devices querying domains on C2 blocklists or domains with high subdomain character
+    count / high label entropy, and then sending HTTP POST/PUT requests to those domains with request_body_len
+    above a static threshold (for example, 1 MB), or using known-malicious User-Agent strings or a Content-Type
+    of application/octet-stream to a destination not on the EMM-approved file-sharing allowlist?
+  context: Within the Exfiltration tactic this targets the HTTP(S) upload path. High subdomain character
+    count and high label entropy in DNS are the content-blind floor for DNS-based covert channels, so
+    identifying those queries (or hits on a C2 blocklist) first narrows the field. Correlating those domains
+    with http.log and flagging large-bodied POST/PUT requests catches the actual data push, while malicious
+    User-Agent strings and a generic application/octet-stream Content-Type to a non-allowlisted destination
+    indicate an app shipping opaque blobs rather than normal web activity. A positive result is a large
+    upload to a suspicious or high-entropy domain; a negative result is uploads confined to EMM-approved
+    file-sharing services.
+  answer_sources: &id002
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internet-facing web proxies, DNS resolvers used by mobile devices, and Unified Endpoint Management
+    (UEM) proxy logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM zeek.dns WHERE src IN mobile_ip_ranges
+
+      FLAG domains IN c2_blocklist OR subdomain_len > N OR label_entropy > E
+
+      JOIN zeek.http ON src,domain
+
+      ALERT IF method IN {POST,PUT} AND request_body_len > 1_000_000
+
+      OR ALERT IF user_agent IN malicious_ua OR (content_type==''application/octet-stream'' AND host NOT
+      IN emm_filesharing_allowlist)'
+- question: For each mobile source and destination host, does the daily HTTP POST:GET request ratio exceed
+    a high threshold (for example, 10:1), or does the 24-hour average POST request_body_len exceed the
+    destination baseline by more than 3 standard deviations, or is the 4xx/404 failure rate to a destination
+    rising?
+  context: Normal web browsing is GET-dominated; a sustained, lopsided POST:GET ratio toward one host
+    is characteristic of a device pushing data out rather than fetching it. Baselining the POST:GET ratio
+    and the mean/standard-deviation of POST request_body_len per source-destination over 30 days lets
+    you alert on a daily ratio over 10:1 or an average body size more than 3 standard deviations above
+    baseline — the signature of bulk upload. Additionally baselining the HTTP response status distribution
+    and alerting on a rising 4xx/404 failure rate to a destination exposes automated probing and exfil
+    staging. A positive result is a destination receiving abnormally many or abnormally large POSTs; a
+    negative result is balanced, baseline-consistent request behavior.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM zeek.http WHERE src IN mobile_ip_ranges
+
+      GROUP BY (src, host) per day
+
+      BASELINE OVER 30d: postget_norm, mean_body, std_body, status_dist
+
+      ALERT IF post_count/(get_count+1) > 10
+
+      OR ALERT IF avg(request_body_len 24h) > mean_body + 3*std_body
+
+      OR ALERT IF rate(status 4xx/404) rising vs status_dist'
+- question: Has the distribution of HTTP Content-Type headers for any device-destination pair shifted
+    suddenly toward binary or generic types (for example, application/octet-stream) beyond the 99th percentile
+    of its prior 30-day proportions, and do the flow time-related features (inter-arrival times, bytes/sec,
+    active/idle durations) indicate bulk transfer?
+  context: A device-destination pair that historically exchanged structured web content (JSON, HTML, images)
+    suddenly shifting to opaque binary/generic Content-Types is a behavioral tell of data being packaged
+    and shipped. Tracking the Content-Type distribution per pair over 30 days and alerting when the proportion
+    of binary/generic types exceeds the 99th percentile of prior proportions catches that shift even when
+    bodies are unreadable. Pairing it with flow time-related features (inter-arrival times, bytes/sec,
+    active/idle durations) that characterize bulk-transfer behavior strengthens the case when the payload
+    itself is opaque. A positive result is a sustained, anomalous content-type shift with bulk-transfer
+    flow shape.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM zeek.http, zeek.dns WHERE src IN mobile_ip_ranges
+
+      GROUP BY (device, dst)
+
+      BASELINE OVER 30d: content_type_proportions
+
+      ALERT IF proportion(binary/generic types e.g. application/octet-stream) > p99(prior_proportions)
+
+      CORROBORATE with flow features: inter_arrival, bytes_per_sec, active/idle_durations -> bulk_transfer_shape'
+- question: When you apply DBSCAN to hourly aggregated HTTP session data per source-destination pair using
+    features like request/response size ratio, POST/GET ratio, user-agent entropy, URI path entropy, Content-Type
+    distribution, and 4xx failure rate, do any outlier clusters emerge that represent anomalous exfiltration
+    behavior, and which features deviate most?
+  context: Unsupervised clustering finds exfil patterns you did not pre-define. Engineering per source-destination
+    features from http.log — request/response size ratio, POST/GET ratio, user-agent entropy, URI path
+    entropy, Content-Type distribution, and 4xx failure rate — and running DBSCAN on hourly aggregates
+    groups normal behavior densely while leaving exfil-like sessions as low-density outliers. Investigating
+    outlier clusters and reporting the top-3 deviating features per cluster gives triage-ready context.
+    For encrypted/opaque mobile flows a supervised RF/XGBoost over flow-statistical and TLS handshake-metadata
+    features complements this; monitor both for drift. A positive result is an outlier cluster whose deviating
+    features match exfil (high POST ratio, high entropy, large size ratio).
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: Python/ML pseudocode
+    query: "features per (src,dst) hourly from zeek.http:\n  req_resp_size_ratio, post_get_ratio, ua_entropy,\
+      \ uri_path_entropy, content_type_dist, rate_4xx\nmodel = DBSCAN(eps, min_samples)\nlabels = model.fit_predict(scaled_features)\n\
+      INVESTIGATE outlier/noise clusters; report top3 deviating features\n# optional supervised: RF/XGBoost\
+      \ over flow-stats + TLS handshake metadata; monitor drift"
+- question: On managed Android fleets, do any installed apps score as likely C2/exfil-capable under an
+    explainable static classifier (linear SVM over permissions, restricted/suspicious APIs, and network-host
+    features), and does the responsible app's profile corroborate a network exfiltration alert?
+  context: Network anomalies are far more actionable when tied to the app responsible. Scoring installed
+    apps with an explainable static classifier — a linear SVM over requested permissions, use of restricted/suspicious
+    APIs, and network-host features (the Drebin approach) — produces a per-app C2/exfil capability profile
+    whose linear weights surface the top contributing features directly in the alert. When a network exfil
+    alert from the other questions maps to an app whose static profile already indicates C2/exfil capability,
+    the two corroborate into a high-confidence finding. A positive result is a high-scoring app responsible
+    for anomalous egress; the feature weights tell the analyst exactly why it scored high.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: Python/ML pseudocode
+    query: 'model = LinearSVM (Drebin-style)
+
+      features per app: requested_permissions, restricted_suspicious_APIs, network_hosts
+
+      score = model.decision_function(app_features)
+
+      IF score > threshold AND app maps to a network exfil alert: CORROBORATE -> high confidence
+
+      report top contributing features via linear weights'
+- question: Over unencrypted protocols (HTTP, FTP) from mobile devices, are any files extracted by Zeek
+    whose mime_type is an archive format (application/zip or application/x-rar-compressed) being sent
+    to a destination IP that is not on the EMM-approved corporate cloud-service allowlist?
+  context: When mobile traffic is unencrypted, Zeek's file-extraction framework can directly recover the
+    objects being transferred, removing the guesswork. Monitoring files.log for extracted archive mime_types
+    (application/zip, application/x-rar-compressed), correlating the connection UID back to conn.log,
+    and alerting when the destination is not on the EMM-approved corporate cloud-service allowlist is
+    a precise deterministic signal of collected data being packaged and shipped off-device to an unapproved
+    endpoint. A positive result is an archive upload to a non-allowlisted destination — a strong exfil
+    indicator; a negative result means archive transfers are confined to sanctioned services.
+  answer_sources: &id003
+  - Zeek files.log
+  - Zeek conn.log
+  - PCAP
+  - 'NAI: Network TAPs capturing traffic from mobile subnets, Virtual Private Cloud (VPC) traffic mirroring,
+    and Wi-Fi access points configured for full packet capture.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM zeek.files WHERE tx_hosts IN mobile_ip_ranges AND source IN {HTTP,FTP}\nJOIN zeek.conn\
+      \ ON uid\nALERT IF mime_type IN {application/zip, application/x-rar-compressed}\n  AND dst_ip NOT\
+      \ IN emm_cloud_service_allowlist"
+- question: Do unencrypted TCP/UDP flows from mobile devices to non-allowlisted destinations exhibit Shannon
+    entropy consistently above the encrypted/compressed reference range (for example, more than 7.2-7.5
+    bits/byte), indicating the payload is encrypted or packed rather than native data?
+  context: High Shannon entropy empirically distinguishes encrypted or compressed/packed content from
+    native, structured data. Using a Zeek script to compute per-flow Shannon entropy for unencrypted mobile
+    flows to non-allowlisted destinations, establishing a baseline for known-good traffic, and alerting
+    when a flow's entropy consistently exceeds roughly 7.2-7.5 bits/byte flags traffic that looks like
+    custom-encrypted or compressed exfil hiding inside a cleartext protocol. The 'consistently' qualifier
+    matters — sustained high entropy across the flow, not a single packet — to avoid flagging incidental
+    compressed assets. A positive result is a sustained high-entropy cleartext-protocol flow to an unapproved
+    destination.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Zeek script per flow, src IN mobile_ip_ranges, dst NOT IN allowlist, proto unencrypted
+
+      compute shannon_entropy(payload_bytes) sampled across flow
+
+      BASELINE known_good_entropy
+
+      ALERT IF sustained entropy > 7.2-7.5 bits/byte over the flow'
+- question: For high-entropy payload flows, is the destination one that this device has never contacted
+    before, or one seen in fewer than 1% of fleet devices, and do the responsible app's API-call transition
+    probabilities (e.g., callback to file-read to network-send) look rare or abnormal?
+  context: High entropy alone is common; high entropy to a rare destination is suspicious. Maintaining
+    a 30-day per-device baseline of destination prevalence for high-entropy payloads and alerting when
+    such a flow targets a never-before-seen destination for that device, or a destination present on fewer
+    than 1% of fleet devices, isolates the genuinely anomalous covert channel from routine encrypted services
+    everyone uses. Treating rare or abnormal app API-call transition probabilities (callback to file-read
+    to network-send, per a MaMaDroid-style Markov model) as a corroborating on-device deviation signal
+    links the network rarity to suspicious app behavior. A positive result is encrypted/packed egress
+    to a destination that is rare for both the device and the fleet.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM high_entropy_flows (see entropy detector)
+
+      BASELINE per device OVER 30d: destination_prevalence
+
+      ALERT IF dst NEVER_SEEN for device OR dst seen in <1% of fleet devices
+
+      CORROBORATE: app API-call transition prob (Markov) rare for sequence callback->file_read->network_send'
+- question: When an Isolation Forest trained on benign DNS lexical features (subdomain Shannon entropy,
+    total/subdomain character counts, label and numeric/uppercase counts) scores live mobile DNS in real
+    time, do any queries score as anomalous, indicating low-volume DNS exfiltration or tunneling that
+    evades byte-volume gates?
+  context: Byte-volume gates miss exfil that trickles out a few bytes per DNS query. Training an unsupervised
+    Isolation Forest on benign DNS lexical features — subdomain Shannon entropy, total and subdomain character
+    counts, label counts, and numeric/uppercase character counts — and scoring live mobile DNS in real
+    time catches the long, high-entropy, encoded subdomains characteristic of DNS tunneling without needing
+    a signature. Surfacing the top contributing lexical features per alert tells the analyst why a query
+    looked encoded. This complements every volume-based question by covering the low-and-slow covert channel.
+    A positive result is anomalously structured DNS traffic from a device, consistent with tunneling/exfil.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Python/ML pseudocode
+    query: 'model = IsolationForest(trained on benign DNS lexical features)
+
+      features per query from zeek.dns: subdomain_entropy, total_char_count, subdomain_char_count, label_count,
+      numeric_count, upper_count
+
+      score = model.decision_function(live_mobile_dns)
+
+      ALERT IF anomaly_score beyond threshold; surface top contributing lexical features'
+- question: Does a supervised binary classifier (Random Forest or Gradient Boosting) trained on flow features
+    — payload entropy, protocol, destination port, duration, orig_bytes, resp_bytes, orig:resp byte ratio,
+    packet size and inter-arrival-time distributions, and a threat-intel destination flag — label any
+    mobile flow as potential exfiltration, and what are the top-3 SHAP features driving that label?
+  context: A supervised model fuses the many weak signals from the other questions into a single calibrated
+    decision. Training a Random Forest or Gradient Boosting classifier to label flows benign vs. potential
+    exfiltration using features from conn.log and payload/flow analysis — payload entropy, protocol, destination
+    port, duration, orig_bytes, resp_bytes, the orig:resp byte ratio, packet-size and inter-arrival-time
+    distributions, and a threat-intel destination flag — captures exfil patterns that no single rule catches.
+    Deriving and validating thresholds on mobile captures such as CICAndMal2017 keeps it grounded in mobile
+    traffic, and reporting the top-3 SHAP features in each alert makes the decision explainable and triage-ready.
+    A positive result is a flow the model labels as exfil with interpretable supporting features.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Python/ML pseudocode
+    query: "model = RandomForest|GradientBoosting (binary: benign vs exfil)\nfeatures from zeek.conn +\
+      \ payload analysis: payload_entropy, proto, dst_port, duration, orig_bytes, resp_bytes,\n  orig_resp_ratio,\
+      \ pkt_size_dist, iat_dist, threat_intel_dst_flag\nvalidate thresholds on CICAndMal2017\nALERT IF\
+      \ predict==exfil; report top3 SHAP features"
