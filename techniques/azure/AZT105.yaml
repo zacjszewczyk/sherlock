@@ -1,0 +1,251 @@
+name: 'AZT105: Gather Application Information'
+id: 3d219a07-58da-48e4-b838-bdcb1879d379
+description: Investigate adversary reconnaissance of Azure Active Directory (Entra ID) application and
+  service-principal objects under AZT105. This playbook helps an analyst determine whether a principal
+  is enumerating applications and service principals to collect metadata such as app identifiers, owners,
+  reply URLs, credentials, delegated permissions, and tenant-wide role assignments, thereby building a
+  map of application trust relationships and access paths. It covers bulk application object reads, the
+  canonical trust-path expansion chain used by tools such as AzureHound and ROADtools, enumeration failure-rate
+  spikes that reveal permission probing, statistical deviation in read volume and breadth, Graph request
+  profiling, and sequence/graph machine-learning models. It further covers the narrowing phase in which
+  enumeration converges on apps with privileged Graph permissions, certificate credentials, writeable
+  owners, or high-value ownership paths that could enable later persistence, credential access, or privilege
+  escalation.
+type: technique
+related:
+- tactic_id: TA0043
+  tactic_name: Reconnaissance
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is any single principal, OAuth token, or service principal reading an unusually large number
+    of distinct Azure AD application or service-principal objects and their owner, credential, app-role,
+    and OAuth permission-grant sub-resources within a short window?
+  context: This is the foundational reconnaissance signal for AZT105. Using the Microsoft Graph activity
+    log schema (requestUri, requestMethod, responseStatusCode, userId/servicePrincipalId, appId, ipAddress,
+    user-agent), look for GET requests against application and service-principal endpoints and their relationship/credential
+    sub-resources such as /applications, /servicePrincipals, /applications/{id}/owners, /appRoleAssignments,
+    and /oauth2PermissionGrants, plus the equivalent Get-AzADApplication and 'az ad app show' patterns
+    visible in PowerShell and proxy logs. Alert when one principal or token reads roughly 25-50 distinct
+    application objects per hour (tune per tenant) or walks paged listings, which matches scripted collectors
+    like AzureHound and ROADrecon. Maintain an allowlist of known automation appIds/service principals
+    so routine inventory jobs do not generate noise. A positive result means an identity is bulk-collecting
+    application metadata to map trust relationships and access paths during the Reconnaissance phase;
+    a negative result narrows the investigation to targeted rather than broad enumeration.
+  answer_sources: &id001
+  - MicrosoftGraphActivityLogs
+  - Entra ID SignInLogs
+  - Entra ID AuditLogs
+  - Windows Event ID 4688
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Endpoints administering Entra applications, Graph access to application and service principal
+    objects, and tenants with sensitive automation or third-party integrations'
+  range: Last 90 days, with rolling 1-hour read-volume windows per principal.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FILTER MicrosoftGraphActivityLogs WHERE requestMethod='GET' AND requestUri MATCHES [/applications,/servicePrincipals,/applications/*/owners,/appRoleAssignments,/oauth2PermissionGrants];
+      GROUP BY principal_id,1h => distinct_app_objects; ALERT when distinct_app_objects>=25 AND principal
+      NOT IN automation_allowlist; OUTPUT principal, appId, ipAddress, user_agent, object_count.
+- question: Does a single session pivot through the canonical trust-mapping chain of app listing, then
+    owner lookups, then service-principal enumeration, then credential metadata inspection, then permission-grant
+    review?
+  context: 'Adversaries using AzureHound and ROADtools map how application trust can be abused by walking
+    a predictable progression: list applications, look up their owners, enumerate the associated service
+    principals, inspect credential metadata, and review OAuth permission grants. Detecting this ordered
+    pivot within one session is a higher-confidence indicator than any single read because it reveals
+    deliberate attack-path discovery (aligned with Cloud Service Discovery T1526) rather than incidental
+    administration. Reconstruct each principal''s ordered Graph operations and flag sessions that traverse
+    all or most of these stages. A positive result strongly suggests an actor is building a trust/attack-path
+    map of the tenant; a negative result suggests isolated, non-sequential reads more consistent with
+    normal admin work.'
+  answer_sources: *id001
+  range: Last 90 days, reconstructing per-session operation order.
+  queries:
+  - technology: SIEM/Sequence pseudocode
+    query: ORDER MicrosoftGraphActivityLogs BY principal,session,time; DETECT sequence [list_applications
+      -> get_owners -> list_servicePrincipals -> read_credentials -> read_oauth2PermissionGrants]; ALERT
+      when session covers >=4 of 5 stages; OUTPUT principal, session_id, stage_order, timestamps.
+- question: Is there a burst of Graph 403/404 responses for application or service-principal reads from
+    a single principal, and is the failed-over-total ratio for that principal abnormally high?
+  context: Failure is a distinct and valuable enumeration signal. When an actor probes for accessible
+    application and service-principal objects, they generate bursts of permission-denied (403) and not-found
+    (404) responses as they test what their token can reach. Track both absolute bursts and the failed-over-total
+    ratio per principal per hour, because a high failure ratio is a stronger indicator of permission probing
+    than raw counts alone (aligned with Cloud Service Discovery T1526 and Microsoft Sentinel anomalies
+    reference). A positive result indicates an identity is systematically discovering the boundaries of
+    its access during reconnaissance; a negative result suggests reads are largely authorized and routine.
+  answer_sources: *id001
+  range: Last 90 days, with hourly failure-ratio windows per principal.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: FILTER MicrosoftGraphActivityLogs WHERE requestUri MATCHES [/applications,/servicePrincipals];
+      GROUP BY principal,1h => failures=count(responseStatusCode IN [403,404]), total=count(*), ratio=failures/total;
+      ALERT when failures>mean+3sigma OR (ratio>=0.3 AND total>=20); OUTPUT principal, failures, total,
+      ratio.
+- question: Does the volume of application/service-principal reads, the percentage involving privileged
+    apps, or the frequency of owner/permission inspection deviate sharply from a principal's own baseline
+    or its peer group?
+  context: Baseline per principal and per time bucket the volume of application and service-principal
+    reads, the share involving privileged apps, and how often owners and permissions are inspected. Use
+    a robust median + MAD modified Z-score (alert when |score| > 3.5) so short automation bursts do not
+    inflate the mean. Compare against peer-group baselines (Microsoft Sentinel UEBA) to catch new principals
+    suddenly performing app inventory or broad cross-tenant review. A positive result flags an identity
+    whose application-enumeration behavior is statistically anomalous for itself or its role cohort during
+    the Reconnaissance phase; a negative result indicates the activity falls within expected variation.
+  answer_sources: *id001
+  range: Last 90 days, with per-principal and peer-group baselines and hourly buckets.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline per principal+hour_bucket for app_read_volume, pct_privileged_apps, owner_perm_inspection_rate;
+      score = modified_zscore(value, median, MAD); ALERT when |score|>3.5 OR principal first-seen performing
+      app_inventory; COMPARE to peer_group baseline; OUTPUT principal, feature, score.
+- question: Does a single session touch a number of distinct owners, service principals, OAuth scopes,
+    and app roles, or generate first-time/new-edge accesses, that materially exceeds the principal's normal
+    administrative scope?
+  context: 'Measure the breadth of each session: how many distinct owners, service principals, scopes,
+    and app roles are touched, and how many of those are first-time or new-edge accesses for that principal.
+    Sessions whose breadth far exceeds the operator''s normal administrative scope are suspicious because
+    legitimate admins typically work within a stable, narrow set of applications, whereas reconnaissance
+    fans out broadly (Microsoft Sentinel UEBA). The new-edge and per-entity volume methodology is validated
+    on enterprise identity/host telemetry. A positive result indicates an actor is inventorying relationships
+    well beyond their routine remit; a negative result confirms the session stayed within familiar objects.'
+  answer_sources: *id001
+  range: Last 90 days, with per-principal new-edge tracking.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each principal session: count distinct_owners, distinct_sps, distinct_scopes, distinct_app_roles,
+      new_edges (not in principal prior_90d_set); ALERT when breadth>principal_baseline_p99 OR new_edge_count>=10;
+      OUTPUT principal, session_id, breadth_metrics, new_edges.'
+- question: Do a principal's Graph requests deviate across request-path frequency, parameter/value distributions,
+    per-session request counts, or access order in a way that yields explainable per-feature anomaly scores?
+  context: 'Build multi-model profiles of each principal''s Graph requests: request-path frequency, parameter
+    and value distributions (chi-square against expected), per-session request counts, and access order.
+    This transfers the web-request anomaly approach of Kruegel & Vigna to application enumeration, producing
+    per-feature, explainable anomaly scores rather than a single opaque number. The benefit is that an
+    analyst can see exactly which dimension (an unusual path, an out-of-range parameter, an atypical request
+    count, or a strange ordering) drove the alert. A positive result surfaces a principal whose Graph
+    behavior diverges from its learned profile during reconnaissance; a negative result indicates request
+    structure matches expectation.'
+  answer_sources: *id001
+  range: Last 90 days for profile training, with current sessions scored continuously.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'MODEL per principal: path_frequency, param_value_dist (chi_square vs expected), session_request_count,
+      access_order; score each feature; ALERT when any feature_score exceeds learned threshold; OUTPUT
+      principal, anomalous_feature, expected_vs_observed.'
+- question: Does a sequence model of a principal's ordered Graph operations flag an out-of-distribution
+    enumeration chain, and can it identify the top contributing steps?
+  context: 'Treat each principal''s ordered Graph operations as a log-key sequence and use LSTM next-event
+    prediction (DeepLog) to flag out-of-distribution enumeration chains with per-step diagnosis, augmented
+    with attention-based RNNs (Brown et al.) so the alert surfaces the top contributing events. Train
+    on benign administration baselines per the per-user/sequence guidance in Yuan & Wu. The model must
+    emit the top-3 contributing features: read-volume z-score, distinct-object breadth, and failure rate.
+    This catches subtle reconnaissance chains that do not cross any single threshold but are collectively
+    improbable. A positive result identifies an anomalous enumeration sequence with explainable drivers;
+    a negative result indicates the operation order matches learned benign administration.'
+  answer_sources: *id001
+  range: Last 90 days for training, with current operation sequences scored per session.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: seq = build_graph_logkey_sequence(principal, ordered_operations); pred = lstm_deeplog.next_event(seq);
+      ALERT when observed_event NOT IN top_k_predicted; emit top_3_features=[read_volume_z, distinct_object_breadth,
+      failure_rate]; OUTPUT principal, anomalous_step, attention_weights.
+- question: Does enumeration emphasize applications with high-risk Graph permissions (mail, files, directory,
+    role-management), certificate credentials, writeable owners, or elevated directory roles, and does
+    the same actor later touch consent, credential, or ownership modification workflows for those apps?
+  context: As reconnaissance narrows toward exploitable targets, watch for enumeration that focuses on
+    apps with high-risk Graph permissions (mail, files, directory, role-management), certificate-based
+    credentials, writeable owners, or elevated directory roles. Raise severity sharply if the same actor
+    subsequently performs modification workflows such as 'Add service principal credentials', 'Consent
+    to application', or 'Add app role assignment grant' against those same apps, because that progression
+    from discovery to abuse is the backdoor pattern documented by Mandiant. A positive result indicates
+    an actor is selecting high-value applications for persistence, credential access, or privilege escalation;
+    a negative result shows enumeration is not converging on sensitive targets.
+  answer_sources: &id002
+  - MicrosoftGraphActivityLogs
+  - Entra ID SignInLogs
+  - Entra ID AuditLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Privileged application registrations, service principals with tenant-wide scopes, automation
+    identities, and apps owned by admins or high-value business units'
+  range: Last 90 days, correlating enumeration with later modification events within 7 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FLAG principal reads of apps WHERE app has high_risk_permissions IN [Mail.*,Files.*,Directory.*,RoleManagement.*]
+      OR cert_credentials OR writeable_owners OR elevated_directory_role; RAISE severity when same principal
+      later emits AuditLog action IN ['Add service principal credentials','Consent to application','Add
+      app role assignment grant'] for same app within 7d; OUTPUT principal, app, permission, follow_on_action.
+- question: Are there sessions that specifically collect delegated or application permissions such as
+    Graph mail, files, directory, or role-management scopes across a narrowed set of service principals
+    and app registrations?
+  context: 'Detect sessions that deliberately gather delegated or application permission details (Graph
+    mail, files, directory, or role-management scopes) across a focused subset of service principals and
+    app registrations. This high-value targeting is the reconnaissance step that precedes abuse: the actor
+    is identifying exactly which applications already hold the powerful scopes they want to inherit (aligned
+    with Cloud Service Discovery T1526 and AzureHound collection behavior). A positive result means an
+    actor is cataloging permission-rich applications as candidate targets; a negative result indicates
+    permission collection is broad and undirected rather than focused on sensitive scopes.'
+  answer_sources: *id002
+  range: Last 90 days, per-session scope-collection analysis.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: DETECT sessions reading oauth2PermissionGrants/appRoleAssignments WHERE collected_scopes INTERSECT
+      [Mail.*,Files.*,Directory.*,RoleManagement.*] across narrowed set_of_apps (count<=threshold); ALERT
+      when session focuses on high_value_scopes; OUTPUT principal, target_apps, scopes_collected.
+- question: Is the fraction of reviewed applications that possess tenant-wide or data-rich permissions
+    unusually high compared with the actor's own behavior and peer cohort?
+  context: Compare the share of reviewed applications holding tenant-wide or data-rich permissions against
+    the actor's normal behavior and peer cohort, using robust modified Z-score thresholds (alert when
+    |score| > 3.5). A session with an unusually strong bias toward high-impact applications stands out
+    even if the absolute number of reads is modest, because legitimate administration is rarely so concentrated
+    on the most sensitive apps (Microsoft Sentinel UEBA). A positive result flags an actor disproportionately
+    interested in powerful applications during reconnaissance; a negative result indicates a normal mix
+    of high- and low-privilege apps.
+  answer_sources: *id002
+  range: Last 90 days, with per-actor and peer-cohort baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each session: privileged_fraction = reviewed_privileged_apps / reviewed_apps; score =
+      modified_zscore(privileged_fraction, actor_median, MAD); COMPARE to peer_cohort; ALERT when |score|>3.5;
+      OUTPUT principal, privileged_fraction, score, cohort_baseline.'
+- question: Are the applications a principal reviews disproportionately owned by privileged identities,
+    automation teams, or shared admin groups relative to that principal's normal app-administration work?
+  context: Score whether reviewed applications are disproportionately owned by privileged identities,
+    automation teams, or shared admin groups. Over-indexing on those ownership paths versus normal app-administration
+    work is anomalous because it suggests the actor is hunting for applications whose owners offer privilege-escalation
+    or persistence opportunities (Microsoft Sentinel UEBA; Kruegel & Vigna). A positive result indicates
+    the actor is centering reconnaissance on apps with high-value ownership links; a negative result shows
+    ownership of reviewed apps is consistent with routine work.
+  answer_sources: *id002
+  range: Last 90 days, with per-principal ownership-path baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each session: privileged_owner_fraction = apps_owned_by[privileged_id,automation_team,shared_admin]
+      / reviewed_apps; ALERT when privileged_owner_fraction > principal_baseline_p99; OUTPUT principal,
+      owner_centrality, reviewed_apps, high_value_owner_count.'
+- question: Does a graph model of IAM audit trails indicate the actor is mapping application-based privilege
+    paths through improbable read edges, and can it surface owner centrality, permission sensitivity,
+    and new-edge count as drivers?
+  context: 'Model IAM audit trails as a heterogeneous/dynamic graph (user-role-resource-application) and
+    use attention-based GNNs to score whether the actor is mapping application-based privilege paths via
+    improbable read edges, considering owner centrality, permission sensitivity, relationship depth, and
+    sequencing toward modification, with attention weights providing per-edge attribution (GNN for Cloud
+    IAM Logs). Use a time-based dynamic-graph GNN (CS-GAD) to score per-interaction and detect the enumerate-then-bulk-read
+    pattern early. The alert must surface the top-3 contributing features: owner centrality, permission
+    sensitivity, and new-edge count. A positive result identifies an actor tracing privilege paths through
+    the application graph during reconnaissance; a negative result indicates read edges align with normal
+    IAM relationships.'
+  answer_sources: *id002
+  range: Last 90 days for graph training, with per-interaction dynamic scoring.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'G = build_dynamic_graph(IAM_audit: user-role-resource-application); score = attention_gnn.score_edges(G,
+      features=[owner_centrality, permission_sensitivity, relationship_depth, modification_sequencing]);
+      ALERT when improbable_read_edge_score>threshold OR enumerate_then_bulk_read detected; emit top_3_features=[owner_centrality,
+      permission_sensitivity, new_edge_count]; OUTPUT principal, edge, attention_weights.'
