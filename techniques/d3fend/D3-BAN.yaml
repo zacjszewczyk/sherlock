@@ -1,0 +1,282 @@
+name: 'D3-BAN: Biometric Authentication'
+id: 5edf89a2-3a66-44d7-b958-b80c77205bf5
+description: Investigate the deployment, enrollment, and operational effectiveness of biometric authentication
+  across the enterprise to confirm it is genuinely hardening access to critical assets. This playbook
+  helps an analyst enumerate biometric enrollment coverage and find privileged or sensitive accounts/devices
+  lacking biometrics or presentation-attack detection; verify that biometric logons performed genuine
+  local user verification (UV flag set, hardware/TPM-backed attestation, monotonic signature counter)
+  rather than silently downgrading to a password/PIN fallback; baseline biometric utilization, failure,
+  and fallback rates and detect anomalous drops or spikes that signal sensor outages, policy regressions,
+  template aging, or active spoofing campaigns; and monitor presentation-attack-detection (liveness) subsystem
+  health via ISO/IEC 30107-3 metrics. Findings highlight hardening gaps an adversary could exploit to
+  bypass strong authentication and reach sensitive data.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which privileged or sensitive users and in-scope devices do NOT have biometric (Windows Hello
+    for Business) enrollment enabled, and how does enrollment coverage compare against the active user/device
+    roster?
+  context: In the Harden tactic, biometric enrollment is the precondition for any biometric hardening
+    to take effect. Query Windows Hello for Business logs and Active Directory to list enrolled users/devices,
+    then diff against the authoritative active roster to enumerate non-enrolled accounts and unmanaged
+    in-scope devices. Per NIST SP 800-63B, any privileged or sensitive account without enrollment is a
+    deterministic hardening gap. A positive result (gaps found) means those identities still rely on weaker
+    factors an adversary can phish or replay; a clean result confirms full coverage of the protected population.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=hfb OR index=ad
+      | stats values(enrolled) as bio_enrolled by user, device
+      | join type=left user [ inputlookup active_roster ]
+      | eval gap=if(isnull(bio_enrolled) OR bio_enrolled!="true","NON_ENROLLED","ok")
+      | where gap="NON_ENROLLED" AND (privileged="true" OR sensitive="true")
+      | table user, device, privileged, sensitive, gap
+- question: For each logon claimed as biometric, did the authenticator actually perform genuine local
+    user verification (UV flag set, hardware/TPM-backed attestation present, monotonically increasing
+    signature counter), or did it silently downgrade to a password/PIN provider?
+  context: 'A core Harden objective is ensuring biometric logons are real and not silently downgraded.
+    Parse WebAuthn/FIDO2 authenticator data and Windows credential-provider GUIDs (WebAuthn/FIDO2 Level
+    2) to confirm UV=1, that an attestation statement proves a hardware/TPM-backed authenticator, and
+    that the assertion signature counter increases monotonically. Deterministically alert when a logon
+    shows UV=0, missing/absent attestation, a counter regression (indicating a cloned or replayed credential),
+    or a fallback to a password provider. Also enforce the NIST SP 800-63B floor: biometrics bound to
+    a possession factor and no more than 5 consecutive failed attempts before requiring an alternate factor.
+    A positive finding indicates the biometric control is not actually being exercised and may be bypassed.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=auth (EventID=4624 OR sourcetype=webauthn)
+      | eval claimed_biometric=if(LogonType IN (2,11) AND auth_method=="biometric",1,0)
+      | where claimed_biometric==1
+      | eval bad = (UV_flag==0) OR isnull(attestation) OR (sig_counter<=prev_sig_counter) OR (cred_provider=="password")
+      | where bad==1
+      | table _time, user, device, UV_flag, attestation, sig_counter, prev_sig_counter, cred_provider
+- question: What is each user's and device's biometric utilization ratio (successful biometric logons
+    / total successful logons), logon frequency, and success/fail state, and which accounts fall in the
+    bottom decile of their peer group?
+  context: 'Baselining utilization tells the Harden analyst whether deployed biometrics are actually used.
+    Compute Volume, Frequency, and State metrics from Windows Event ID 4624/4625 per user and per device:
+    utilization ratio, biometric logons per day, and success/fail ratio. Correlate with Zeek conn.log
+    session volume to confirm expected post-login activity. Flag accounts whose biometric utilization
+    falls in the bottom decile of their peer group, applying FAR/FRR/EER decision-threshold reasoning.
+    Low utilization among protected identities means the hardening control is effectively dormant for
+    them.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=auth (EventID=4624 OR EventID=4625)
+      | stats count(eval(auth_method=="biometric" AND status=="success")) as bio_ok,
+              count(eval(status=="success")) as total_ok,
+              count(eval(status=="fail")) as fails by user, device
+      | eval util_ratio = bio_ok/total_ok, fail_ratio = fails/(total_ok+fails)
+      | eventstats perc10(util_ratio) as p10 by peer_group
+      | where util_ratio <= p10
+      | table user, device, util_ratio, fail_ratio, peer_group
+- question: Are biometric failure-mode signals -- failed matches, presentation-attack-detection (PAD)
+    rejections, account lockouts, and fallback-to-password events -- spiking beyond a rolling per-asset
+    baseline?
+  context: Failure and fallback telemetry distinguishes a healthy hardening deployment from one under
+    stress or attack. Profile counts of failed biometric matches, PAD rejections, lockouts, and fallback-to-password
+    events (Event ID 4625 and credential-provider changes) as distinct telemetry. Derive per-asset thresholds
+    from a rolling baseline (e.g., alert when daily failed-biometric count exceeds mean + 3 sigma); the
+    CMU Keystroke Dynamics Benchmark gives reference EER baselines (~0.10 EER for scaled-Manhattan distance).
+    A sustained spike indicates sensor outage, template aging, policy regression, or an active spoofing
+    campaign -- each requiring different response.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=auth (EventID=4625 OR event=pad_reject OR event=lockout OR event=fallback_password)
+      | bin _time span=1d
+      | stats count as daily_failures by _time, asset, event
+      | eventstats avg(daily_failures) as mu, stdev(daily_failures) as sd by asset, event
+      | eval threshold = mu + 3*sd
+      | where daily_failures > threshold
+      | table _time, asset, event, daily_failures, threshold
+- question: Does the forecasted daily volume of biometric authentications and enrollment changes deviate
+    anomalously (especially sudden drops), and which OU/device group, logon-type shift, or fallback-rate
+    increase is driving the anomaly?
+  context: Time-series anomaly detection surfaces erosion of the biometric hardening posture before it
+    becomes a widespread gap. Train a model on daily counts of biometric authentications and enrollment
+    changes to forecast expected usage and alert on anomalous drops that may indicate enrollment failures,
+    policy regressions, or sensor outages. Crucially, surface the top-3 contributing features (affected
+    OU/device group, logon-type shift, fallback-rate increase) in the alert text for triage rather than
+    emitting only an anomaly score, supporting interpretability. A confirmed anomalous drop means protected
+    identities have quietly reverted to weaker authentication.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      index=auth auth_method=biometric
+      | bin _time span=1d
+      | stats count as bio_count, count(eval(event=="enroll_change")) as enroll_chg by _time, ou, device_group
+      | predict bio_count as forecast upper95=u lower95=l
+      | eval anomaly_drop = if(bio_count < l, 1, 0)
+      | where anomaly_drop==1
+      | eval top_features = top3_contrib(ou, logon_type_shift, fallback_rate)
+      | table _time, ou, device_group, bio_count, forecast, top_features
+- question: For deployed face, fingerprint, or voice biometrics, are the presentation-attack-detection
+    (liveness) ISO/IEC 30107-3 metrics (APCER/BPCER/ACER, voice t-DCF/EER, fingerprint liveness accuracy)
+    drifting from their operating points or showing a rise in liveness rejections?
+  context: Liveness/PAD subsystem health determines whether biometrics genuinely resist spoofing -- central
+    to the Harden goal. Where face, fingerprint, or voice biometrics are deployed, ingest PAD/liveness
+    telemetry and track ISO/IEC 30107-3 metrics at fixed operating points (e.g., BPCER@APCER=5%), voice
+    t-DCF/EER, and fingerprint liveness accuracy. Alert on metric drift or a rise in liveness rejections.
+    Because deep PAD models generalize poorly to unseen attacks/sensors, keep the deterministic UV/attestation
+    floor running in parallel and report the top contributing liveness cues (depth, rPPG pulse, material/spectral
+    features). Drift may indicate sensor degradation or an evolving presentation-attack campaign.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Hello for Business Event Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Active Directory Logs
+  - Zeek conn.log
+  - 'NAI: All enterprise endpoints (laptops, desktops), Domain Controllers, and servers hosting critical
+    applications.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      index=biometric_pad
+      | stats latest(APCER) as APCER, latest(BPCER) as BPCER, latest(ACER) as ACER,
+              latest(tDCF) as tDCF, latest(fp_liveness_acc) as fp_acc by modality, sensor
+      | eventstats avg(ACER) as base_acer, stdev(ACER) as sd_acer by modality
+      | eval drift = if(ACER > base_acer + 2*sd_acer OR BPCER > 0.05, 1, 0)
+      | where drift==1
+      | table modality, sensor, APCER, BPCER, ACER, tDCF, fp_acc
+- question: Which members of privileged Active Directory groups lack biometric (Windows Hello for Business)
+    enrollment entirely, or have logons that never show the WebAuthn User-Verified flag?
+  context: This question hardens the highest-value accounts. Enumerate privileged AD group members and
+    cross-reference with Windows Hello for Business enrollment status and WebAuthn user-verification evidence
+    (WebAuthn/FIDO2 Level 2). Flag any privileged account without biometric enrollment, or whose logons
+    never show UV=1, as a hardening gap that violates the second-factor binding requirement of NIST SP
+    800-63B. A positive result identifies privileged identities a sophisticated actor could compromise
+    with credential theft alone, bypassing biometrics.
+  answer_sources:
+  - Windows Event ID 4624
+  - Active Directory Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Asset Inventory/CMDB
+  - 'NAI: Asset management systems, Domain Controllers, and privileged access workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=ad (EventID=4728 OR sourcetype=ad_group_membership) group IN (privileged_groups)
+      | stats values(member) as priv_members
+      | mvexpand priv_members
+      | join type=left priv_members [ search index=hfb | stats values(enrolled) as enrolled, max(UV_flag) as ever_uv by user | rename user as priv_members ]
+      | eval gap = if(isnull(enrolled) OR enrolled!="true" OR ever_uv==0, "PRIV_NO_BIO", "ok")
+      | where gap=="PRIV_NO_BIO"
+      | table priv_members, enrolled, ever_uv, gap
+- question: Which non-biometric (password/PIN provider) logons belong to users in the top 95th percentile
+    of access-sensitivity, weighted by data classification, asset criticality, and access frequency?
+  context: This scores residual risk where the most sensitive access is not protected by biometrics. For
+    non-biometric logons (Event ID 4624 with password/PIN providers), calculate a user access-sensitivity
+    percentile from data-classification mappings and asset criticality, incorporating access frequency
+    (sessions/day) and success/fail state. Alert on users in the top 95th percentile of sensitivity who
+    authenticate without biometrics, weighting the security/usability trade-off. These users represent
+    the highest-impact hardening gaps to remediate first.
+  answer_sources:
+  - Windows Event ID 4624
+  - Active Directory Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Asset Inventory/CMDB
+  - 'NAI: Asset management systems, Domain Controllers, and privileged access workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=auth EventID=4624 cred_provider IN ("password","pin")
+      | lookup data_classification user OUTPUT sensitivity_score
+      | lookup asset_criticality device OUTPUT crit_score
+      | stats sum(sensitivity_score) as sens, avg(crit_score) as crit, count as sessions,
+              count(eval(status=="fail")) as fails by user
+      | eval risk = sens*crit*(sessions/30)
+      | eventstats perc95(risk) as p95
+      | where risk >= p95
+      | table user, risk, sens, crit, sessions, fails
+- question: Based on CMDB criticality, user role, privileged-group membership, and historical access patterns,
+    which accounts and devices SHOULD have biometric enforcement but currently do not, and what features
+    drive each prediction?
+  context: A predictive model prioritizes biometric enforcement rollout for the Harden tactic. Train a
+    classification model (logistic regression or gradient-boosted trees) on CMDB criticality, user role,
+    privileged-group membership, and historical access patterns to predict which accounts/devices should
+    have biometric enforcement, then identify cases where predicted enforcement is missing. Output the
+    top-3 features driving each prediction (privileged group, asset criticality tier, sensitive-data access
+    count) for analyst review, and consider continuous behavioral re-verification for high-risk accounts
+    where physiological enrollment is impractical. Predicted-but-missing enforcement points to systematic
+    coverage gaps.
+  answer_sources:
+  - Windows Event ID 4624
+  - Active Directory Logs
+  - WebAuthn/FIDO2 authenticator attestation logs
+  - Asset Inventory/CMDB
+  - 'NAI: Asset management systems, Domain Controllers, and privileged access workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      | inputlookup account_features.csv
+      | apply biometric_enforcement_model
+      | eval should_enforce = predicted_label
+      | where should_enforce=="enforce" AND current_enforcement!="enabled"
+      | eval top_features = top3_shap(privileged_group, asset_criticality_tier, sensitive_access_count)
+      | table account, device, should_enforce, current_enforcement, top_features
