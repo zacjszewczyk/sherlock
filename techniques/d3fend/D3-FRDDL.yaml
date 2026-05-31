@@ -1,0 +1,244 @@
+name: 'D3-FRDDL: Forward Resolution Domain Denylisting'
+id: ceca0968-714f-467c-821f-4b753ce2e974
+description: 'Investigate the effectiveness of forward-resolution domain denylisting at isolating internal
+  assets from malicious external domains. This playbook helps an analyst confirm that queries to denylisted
+  FQDNs are actually blocked at resolution time (returning a policy block or sinkhole/RPZ response rather
+  than a real A/AAAA answer) and that no successful downstream connection follows. It surfaces enforcement
+  gaps and bypass: residual successful resolutions of denylisted names, post-block outbound connections
+  to denylisted IPs (via hosts file, alternate resolver, DoH/DoT, or cache), bursts of NXDOMAIN failures
+  indicative of DGA activity, and structurally or lexically anomalous domains. It combines deterministic
+  symbolic-logic invariant checks with statistical control-limit and entropy analysis and machine-learning
+  DGA/reputation scoring to recommend new denylist entries before public blocklisting, while keeping all
+  deterministic enforcement rules active in parallel.'
+type: technique
+related:
+- tactic_id: D3-IS
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: For every DNS query observed in Zeek dns.log and Windows DNS Server Analytic Event ID 257,
+    did any FQDN on the managed malicious-domain denylist return a real A/AAAA answer (rcode NoError pointing
+    to a non-sinkhole IP) instead of a policy block or sinkhole/RPZ response?
+  context: 'This is the core enforcement-validation check for the Isolate tactic: domain denylisting only
+    isolates assets if denylisted names never resolve to a usable address. Cross-reference each resolved
+    query against the current denylist. A denylisted FQDN that returns rcode NoError with a routable,
+    non-sinkhole answer IP is by definition an enforcement failure - the control did not fire. A positive
+    result (a real answer for a denylisted name) means the policy is missing, stale, scoped to the wrong
+    resolver, or was bypassed; a negative result (block/NXDOMAIN/sinkhole only) confirms the control held.
+    Report the rcode, answer IP, and the resolver that served the answer so coverage gaps can be traced
+    to a specific server or policy.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from dns_events (zeek_dns.log, win_dns_257)\nwhere query in denylist\n  and rcode == 'NoError'\n\
+      \  and answer_ip not in sinkhole_ips\n  and answer_type in ('A','AAAA')\nalert 'denylist enforcement\
+      \ failure'\n  fields query, rcode, answer_ip, resolver, src_host"
+- question: Does every denylisted domain resolve ONLY to its designated sinkhole IP, or are there deviations
+    - a denylisted name resolving off-sinkhole, or being answered by an unexpected resolver or DoH/DoT
+    endpoint?
+  context: 'This enforces the sinkhole/RPZ allow-vs-deny invariant that underpins isolation: maintain
+    the denylist-to-sinkhole mapping and assert that each denylisted FQDN resolves to exactly its assigned
+    sinkhole address. Any deviation - a denylisted name answered with an off-sinkhole IP, or answered
+    by a resolver or encrypted-DNS (DoH/DoT) endpoint that is not the sanctioned internal resolver - is
+    a blocklist-evasion signal. This is the canonical check motivated by short-lived throw-away C2 domains,
+    where adversaries rotate infrastructure faster than lists update and steer hosts to rogue resolvers.
+    A positive deviation indicates either a misconfigured RPZ entry or active evasion via an alternate
+    resolution path that must be closed.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from dns_events\nwhere query in denylist\n  and (answer_ip != denylist_sinkhole_map[query]\n\
+      \       or resolver not in sanctioned_resolvers)\nalert 'sinkhole invariant violation'\n  fields\
+      \ query, answer_ip, expected_sinkhole, resolver"
+- question: After a denylisted domain was supposedly denied, did any host make a successful outbound connection
+    (orig_bytes>0, resp_bytes>0, established state) in Zeek conn.log to an IP that maps to that denylisted
+    domain?
+  context: 'Resolution-time blocking can be circumvented at the connection layer via a local hosts file,
+    an alternate or rogue resolver, DoH/DoT tunneling, or a cached prior answer. Correlate denylisted-domain
+    DNS events and the IPs those domains are known to resolve to against conn.log. A successful, established
+    session with bytes flowing in both directions to a denylisted-mapped IP after a deny indicates the
+    isolation control was bypassed at runtime - the host reached the malicious infrastructure anyway.
+    Track per-host counts of such post-block connections: even one is a confirmed bypass, and a rising
+    per-host count highlights a compromised or misconfigured endpoint that needs containment. A clean
+    negative (no post-block connections) confirms the denylist achieved isolation.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days; correlate connections within a window following each denylisted-domain DNS event
+  queries:
+  - technology: Zeek/pseudocode
+    query: "denied_ips = resolve_map(domains in denylist)\nfrom conn.log\nwhere resp_h in denied_ips\n\
+      \  and conn_state in ('SF','S1','RSTO')\n  and orig_bytes > 0 and resp_bytes > 0\ngroup by orig_h\n\
+      count post_block_conns\nalert 'post-resolution bypass' when count >= 1"
+- question: Among non-denylisted DNS queries, are there names that violate DNS protocol structural limits
+    (label >63 octets, FQDN >255 octets, subdomain depth above baseline e.g. >5 labels, anomalous NULL/TXT-heavy
+    record mixes) or score below a benign bigram-frequency threshold?
+  context: 'These deterministic structural rules catch tunneling, exfiltration, and machine-generated
+    names that have not yet been denylisted, supporting the Isolate tactic by feeding the denylist with
+    new candidates. Apply hard RFC 1035 limits: any label longer than 63 octets or FQDN over 255 octets
+    is malformed/abusive; excessive subdomain depth and TXT/NULL-record-heavy patterns are classic DNS-tunneling
+    signatures. Additionally apply a Zipfian bigram-match test - score each name against a benign-frequency
+    table and flag names whose bigram score falls below threshold as generated-looking. These rules are
+    deterministic, so a flag is a high-confidence candidate for analyst review and denylist addition rather
+    than a probabilistic guess.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from dns_events\nwhere query not in denylist\n  and (max_label_len(query) > 63\n       or\
+      \ len(query) > 255\n       or label_count(query) > 5\n       or qtype in ('NULL','TXT') ratio >\
+      \ baseline\n       or bigram_score(query, benign_table) < threshold)\nalert 'dns structural/lexical\
+      \ anomaly'\n  fields query, max_label_len, label_count, bigram_score"
+- question: Which internal hosts show a burst of failed (NXDOMAIN) resolutions - a per-host NXDOMAIN count
+    or NXDOMAIN-to-total ratio exceeding their rolling historical control limit (e.g. >3 sigma over a
+    28-day baseline) or a tuned floor of ~50 NXDOMAINs/host/hour?
+  context: Failed resolutions are treated as a first-class signal because domain-generation-algorithm
+    (DGA) malware queries many algorithmically generated names, most of which do not exist and return
+    NXDOMAIN, until it finds a registered rendezvous domain. Compute per-host NXDOMAIN counts and the
+    NXDOMAIN-to-total-query ratio over rolling windows and compare to each host's own baseline. A host
+    that suddenly exceeds its 3-sigma control limit, or crosses an absolute floor, is a strong DGA indicator
+    and likely beaconing to find live C2 - directly relevant to isolation because the eventual successful
+    domain should be denylisted/sinkholed. Derive thresholds per environment from the observed NXDOMAIN
+    distribution to balance sensitivity and false positives.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days; rolling 28-day baseline with hourly evaluation windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from dns_events\nstats count(rcode=='NXDOMAIN') as nx, count(*) as total by src_host, window=1h\n\
+      ratio = nx / total\nbaseline mean,std of nx per host over 28d\nalert when nx > mean + 3*std or nx\
+      \ > 50\n  fields src_host, nx, ratio, baseline_mean"
+- question: Which non-denylisted domains rank in the top 1% for lexical randomness - high Shannon entropy,
+    high Kullback-Leibler divergence from a natural-language character baseline, or high Levenshtein distance
+    from known-good names - marking them as DGA candidates?
+  context: Algorithmically generated domains tend to look random, so lexical scoring discriminates them
+    from human-chosen names and yields new denylist candidates that strengthen isolation. Score each non-denylisted
+    domain with Shannon entropy and Levenshtein distance to a known-good corpus; for short labels prefer
+    Kullback-Leibler divergence against a natural-language character-frequency baseline over raw entropy,
+    which reduces false positives on legitimately short or compressed names. Flag the top 1% of high-entropy
+    / high-KL / high-distance outliers as DGA candidates for review and possible denylist addition. A
+    clustered spike of such outliers from one host corroborates the NXDOMAIN-burst signal.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from dns_events\nwhere query not in denylist\ncompute entropy = shannon(query),\n        kl\
+      \ = kl_divergence(query, nl_char_baseline),\n        lev = min_levenshtein(query, known_good)\n\
+      rank by (entropy, kl, lev)\nflag top 1% as dga_candidate\n  fields query, entropy, kl, lev, src_host"
+- question: On rolling control charts, are denylist hit rate, block-success rate, and newly-observed-domain
+    (NOD) request volume within historical limits - and are any domains exhibiting fast-flux (low average
+    TTL, many distinct ASNs/IPs over time) or high host/requester dispersion in short intervals?
+  context: 'This monitors denylist health and surfaces emerging malicious infrastructure for the Isolate
+    tactic. Track denylist hit rate, the fraction of denylisted queries actually blocked (block-success
+    rate), and NOD request volume on control charts; a drop in block-success rate or a surge in NOD volume
+    signals a coverage gap or campaign onset. Flag domains whose query volume or host-dispersion grows
+    beyond historical limits, especially names suddenly seen across many hosts in short windows. Add fast-flux
+    indicators: low average TTL combined with many distinct ASNs/IPs per domain over time, plus requester-diversity
+    counts. Such domains are prime candidates for proactive denylisting before they cause harm; a stable,
+    in-limits result indicates the denylist is keeping pace.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days; rolling control-chart windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from dns_events\nstats by domain, window:\n  hit_rate, block_success_rate, nod_volume,\n \
+      \ distinct_hosts, distinct_asns, distinct_ips, avg_ttl\ncontrolchart(block_success_rate, nod_volume)\n\
+      alert when block_success_rate below LCL\n   or nod_volume above UCL\n   or (avg_ttl < ttl_floor\
+      \ and distinct_asns > asn_limit)\n   or distinct_hosts spikes over baseline"
+- question: When a character-level LSTM DGA classifier and a per-name NXDOMAIN feature classifier are
+    run inline at the resolver over non-denylisted queries, which domains receive high-confidence malicious
+    predictions - and what top-3 features drive each prediction?
+  context: Inline machine-learning classification scores every non-denylisted query at resolution time
+    with no passive-DNS dependency, catching novel DGA names that lexical rules miss and feeding denylist
+    additions to extend isolation. Run a character-level LSTM per-domain classifier (high AUC with multiclass
+    family attribution) on each query, plus a per-name feature classifier over NXDOMAIN responses to catch
+    previously unseen DGA families. Use high-confidence malicious predictions to recommend denylist additions
+    and accelerate triage. The alert MUST surface the top-3 contributing features (e.g., entropy, label
+    length, n-gram score, NXDOMAIN ratio) alongside the probability so an analyst can validate the verdict
+    rather than trust an opaque score. These ML signals run in parallel with - never replace - the deterministic
+    enforcement and threshold rules above.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days; inline/streaming scoring
+  queries:
+  - technology: ML/pseudocode
+    query: "for each query not in denylist:\n  p_lstm, family = lstm_dga_model.predict(query)\n  p_fanci\
+      \ = nxdomain_feature_model.predict(features(query))\n  if max(p_lstm, p_fanci) >= confidence_threshold:\n\
+      \    feats = top3_feature_contributions(query)\n    recommend_denylist(query, family)\n    alert\
+      \ fields query, p_lstm, family, p_fanci, feats"
+- question: For residual non-denylisted domains, do passive-DNS reputation models (network/zone/evidence
+    features and a 15-feature J48 model) or an unsupervised Isolation Forest over stateless lexical features
+    flag any domain as rare/high-information and reputationally suspicious - warranting a proactive denylist
+    entry?
+  context: This layer proactively recommends denylist entries before domains appear on public blocklists,
+    closing isolation gaps ahead of the threat. Apply passive-DNS reputation scoring using network, zone,
+    and evidence features and a 15-feature J48 model to rate residual domains. Layer an unsupervised Isolation
+    Forest trained only on benign domains' stateless lexical features to flag rare/high-information names
+    at line rate; report the Isolation Forest path-length feature contributions as the top-3 explanation
+    so analysts can judge the flag. A domain that is both reputationally poor and lexically anomalous
+    is a strong candidate for immediate denylisting. All deterministic enforcement and threshold rules
+    remain active in parallel - ML augments but never replaces them.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Windows DNS Server Analytic Event Log ID 257
+  - DNS RPZ/sinkhole logs
+  - Passive DNS / newly-observed-domain feed
+  - 'NAI: Internal DNS resolvers, RPZ/sinkhole, and network egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "for each domain not in denylist:\n  rep = passive_dns_reputation(network,zone,evidence feats)\n\
+      \  j48 = exposure_j48.predict(15_features(domain))\n  iso = isolation_forest.score(lexical_features(domain))\n\
+      \  if rep == malicious or j48 == malicious or iso anomalous:\n    expl = top3_path_length_contributions(domain)\n\
+      \    recommend_denylist(domain)\n    alert fields domain, rep, j48, iso_score, expl"
