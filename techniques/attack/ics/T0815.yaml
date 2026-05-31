@@ -1,0 +1,267 @@
+name: 'T0815: Denial of View'
+id: 6fd144cf-c5bf-44f4-a40a-d58f5cf0dfdf
+description: Investigate suspected Denial of View (T0815) in an ICS environment, where an adversary attempts
+  to disrupt and prevent operator oversight of the industrial process status. This playbook helps an analyst
+  determine whether operators have been deprived of visibility into the process - either by suppressing
+  periodic ICS protocol telemetry between Level 1 field devices (PLCs/RTUs) and Level 2 SCADA/HMI servers,
+  or by terminating critical HMI/EWS application processes on operator workstations. It covers a sustained,
+  anomalous absence of expected polling messages (Modbus, DNP3, EtherNet/IP) that persists beyond 2.5x
+  the normal polling interval and outside maintenance windows, packet/byte-volume collapse and jitter
+  degradation between critical device pairs, communication-failure exception/timeout responses, and unexpected
+  or crash terminations of HMI processes (e.g., ftview.exe, iFIX.exe) confirmed by Windows and Sysmon
+  process events. The guidance combines deterministic specification rules, statistical baselining, and
+  machine-learning anomaly and sequence models so the analyst can distinguish benign maintenance or transient
+  faults from a deliberate, adversarial denial of operator view while the underlying process may still
+  be running in an unintended state.
+type: technique
+related:
+- tactic_id: TA0105
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has an expected periodic ICS protocol message (Modbus, DNP3, or EtherNet/IP) from a specific
+    critical Level 1 PLC/RTU to its Level 2 SCADA/HMI server failed to appear within 2.5x its normal polling
+    interval and outside any documented maintenance window?
+  context: Denial of View frequently manifests as the disappearance of the steady status/data-polling
+    heartbeat between field devices and the control system. Treat documented Level-1<->Level-2 polling
+    pairs and their intervals as the known-good baseline, and encode the legitimate function codes, source/destination
+    relationships, and expected periodicity as specification rules. If an expected message from a known
+    PLC IP does not arrive within 2.5x its normal interval and the gap is not explained by a scheduled
+    maintenance window, the suppressed status-reporting traffic is deterministically flagged. A positive
+    result means operators may be blind to the live process state even though the process may still be
+    running in an adversarial manner; tie this to the Impact tactic, where the goal is to deny operator
+    oversight, so a confirmed polling gap on a critical monitoring channel warrants high severity. A negative
+    result (messages present on cadence) argues against suppression on that channel.
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek modbus.log
+  - Zeek enip.log
+  - Zeek dnp3.log
+  - 'NAI: ICS Level 2 (Control System) network segment, specifically traffic between HMI/SCADA servers
+    and Level 1 (Basic Control) PLCs/RTUs.'
+  range: Last 90 days (evaluate continuously at the polling cadence; alert window = 2.5x the normal interval)
+  queries:
+  - technology: Zeek/pseudocode
+    query: >-
+      from (modbus.log, enip.log, dnp3.log)
+
+      where (src_ip, dst_ip) in critical_polling_pairs
+        and function_code in expected_function_codes[pair]
+      | last_seen = max(ts) per (src_ip, dst_ip)
+
+      | now - last_seen > 2.5 * normal_interval[pair]
+        and now not within maintenance_window[pair]
+      => alert HIGH "Missing PLC->HMI polling message (denial of view)"
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      WATCHLIST pairs = documented Level1<->Level2 polling relations with interval
+
+      FOR each pair: IF no ICS poll event seen in 2.5*interval AND not in maint_window
+        THEN raise high-severity alert with pair, last_seen, expected_interval
+- question: Did the HMI/Server begin returning or logging ICS communication-failure indicators - such
+    as Modbus exception code 0x0B or 0x0A, repeated TCP retransmits/RSTs, or stale-value/timeout flags
+    - in the same time window as a polling gap or packet-volume collapse?
+  context: 'Communication-failure responses are a distinct first-class signal of a denied view: when the
+    control source can no longer reach a field device, it commonly emits gateway/target failure exceptions,
+    retransmits, resets, or marks values stale. Treating these as their own indicator and correlating
+    them with the polling gap raises confidence that the loss of view is real rather than a logging artifact.
+    The analyst looks for Modbus exception 0x0B (''Gateway Target Device Failed to Respond'') or 0x0A,
+    bursts of TCP retransmissions/RSTs, and controller-side timeout/stale-value flags occurring concurrently
+    with the suppressed traffic. Sustained exception/timeout responses paired with a packet-volume collapse
+    should escalate severity. Tie this to Impact: persistent comms failures on a monitoring channel mean
+    operators are seeing stale or no data. A positive correlation strongly supports denial of view; isolated,
+    self-clearing exceptions during a known fault are weaker evidence.'
+  answer_sources: *id001
+  range: Last 90 days (correlate within the same window as any detected polling gap)
+  queries:
+  - technology: Zeek/pseudocode
+    query: >-
+      modbus.log where exception_code in (0x0A, 0x0B)
+
+      UNION conn.log where retransmits high OR conn_state in (RSTO, RSTR, S0)
+
+      | group by (src_ip, dst_ip), 60s bins
+
+      | JOIN polling_gap_events on (pair, time_window)
+
+      => alert: comms-failure responses concurrent with polling gap
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      IF count(modbus_exception 0x0A/0x0B OR tcp_rst OR stale_value_flag) per pair per window > threshold
+        AND same pair has active polling_gap
+        THEN escalate severity (denial of view confirmed by failure responses)
+- question: For each critical PLC-to-HMI pair, have both packet and byte counts dropped below their 1st-percentile
+    baseline for three consecutive intervals, or has polling inter-arrival jitter exceeded 3 standard
+    deviations from its historical mean?
+  context: 'Before a channel fully goes dark, denial of view often presents as a statistical degradation:
+    volume collapses and timing becomes erratic. Using 14-day rolling baselines from Zeek conn.log, compute
+    per-pair packet and byte counts per 60-second interval and their 1st-percentile thresholds (Volume),
+    plus the inter-arrival time of polling messages and its mean/standard deviation (Frequency/jitter).
+    Alert at medium severity when both packet and byte counts fall below their 1st-percentile thresholds
+    for three consecutive intervals, and alert when current jitter exceeds 3 standard deviations from
+    the historical mean - timing degradation often precedes full loss. Also profile the rate of exception/error/timeout
+    responses as a separate State metric. Derive thresholds from each pair''s own traffic so per-site
+    behavior is respected; this also catches flooding that suppresses a view. A positive result indicates
+    the monitoring channel is degrading toward a denied view, supporting the Impact hypothesis; stable
+    volume and jitter argue against it.'
+  answer_sources: *id001
+  range: Last 90 days (14-day rolling baseline; 60-second evaluation intervals)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      baseline[pair] = over last 14d per 60s: p1(packets), p1(bytes), mean(iat), std(iat)
+
+      for current 60s interval per pair:
+        vol_breach = packets < p1_packets AND bytes < p1_bytes
+        if vol_breach for 3 consecutive intervals -> alert MEDIUM (volume collapse)
+        if current_jitter > mean_iat + 3*std_iat -> alert (timing degradation pre-loss)
+  - technology: Zeek/pseudocode
+    query: >-
+      conn.log -> aggregate orig_pkts+resp_pkts, orig_bytes+resp_bytes per (pair, 60s)
+
+      compute inter-arrival of polling msgs; compare to rolling 14d baseline
+
+      emit feature row {pkts, bytes, jitter, exception_rate} for thresholding
+- question: Does a time-series anomaly detector trained on the normal ICS network heartbeat (per-minute
+    packet counts, byte counts, protocol mix, inter-arrival) for critical PLC/RTU-to-HMI channels produce
+    a high reconstruction/prediction error coinciding with a near-zero packet count on that channel?
+  context: 'A denied view produces abrupt gaps or flatlines in the ICS ''heartbeat'' that deterministic
+    rules may miss if intervals drift. Train a time-series model (LSTM autoencoder, 1D-CNN, or seq2seq)
+    on historical per-minute aggregated telemetry from critical PLC/RTU IPs to HMI IPs so it learns the
+    normal cadence; the sudden gaps of a denied view drive large reconstruction/prediction error, and
+    the model can localize the affected channel. Score live telemetry online (e.g., an autoencoder ensemble
+    such as Kitsune), set the threshold from a high percentile of normal-data error, and escalate when
+    the anomaly score is high AND packet count is near zero. Surface the top-3 contributing features (dropped
+    polling count, byte-rate collapse, jitter) via SHAP so analysts triage cause, not just score. Run
+    ML in parallel with - never instead of - the deterministic timeout rule, and explicitly profile false
+    negatives, because industrial IDS accuracy degrades on unseen attacks. Tie to Impact: a high anomaly
+    score with collapsed volume on a monitoring channel is strong evidence operators have lost view.'
+  answer_sources: *id001
+  range: Last 90 days (per-minute aggregation; online scoring with high-percentile threshold)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      features = per-minute [pkt_count, byte_count, proto_mix, inter_arrival] per (PLC_ip->HMI_ip)
+
+      model = LSTM-autoencoder / seq2seq trained on normal heartbeat
+
+      score = reconstruction_error(live_features)
+
+      if score > p99(normal_error) AND pkt_count ~= 0:
+         alert; attach SHAP top-3 features (dropped_polls, byte_collapse, jitter)
+      run alongside deterministic timeout rule; log false negatives
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      ingest model anomaly_score per channel per minute
+
+      alert when anomaly_score high AND packet_count near zero for channel
+- question: Was a critical HMI application (e.g., ftview.exe, iFIX.exe) terminated under anomalous conditions
+    - a non-zero (crash) exit code, an unapproved parent process, or by an unauthorized user outside a
+    maintenance window - as seen in Sysmon Event ID 5 or Windows Event ID 4689?
+  context: Killing the HMI/EWS application directly denies operators the view, even if field telemetry
+    keeps flowing. Trigger on Sysmon Event ID 5 (Process Terminated) or Windows Event ID 4689 for process
+    names on a watchlist of critical HMI applications, then correlate parent-process context from Sysmon
+    Event ID 1 / Windows Event ID 4688. Alert when the parent is not on a pre-defined allowlist of legitimate
+    launchers (explorer.exe, the HMI management service) OR the exit code is non-zero (crash) OR the action
+    falls outside an authorized maintenance window/account - consistent with restricting HMI/EWS actions
+    to authorized accounts and approved windows. A positive result means an operator console likely went
+    blank or unresponsive; tie this to Impact, where removing the operator interface is a direct denial
+    of view. A clean, user-initiated exit by an authorized account during a known window is benign.
+  answer_sources: &id002
+  - Windows Event ID 4689
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon Process Create)
+  - Windows Event ID 5 (Sysmon Process Terminate)
+  - 'NAI: ICS Level 2 (Control System) HMI Workstations and Engineering Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      WATCHLIST hmi_procs = {ftview.exe, iFIX.exe, ...}
+
+      on (Sysmon EID 5 OR Windows EID 4689) where image in hmi_procs:
+        join parent from (Sysmon EID 1 / Windows EID 4688)
+        if parent NOT in allowlist {explorer.exe, hmi_mgmt_service}
+           OR exit_code != 0
+           OR user not authorized OR time outside maintenance_window
+        then alert HIGH "Anomalous HMI process termination"
+- question: Did hourly termination counts for a critical HMI process exceed its 30-day role-aware baseline
+    (mean + N standard deviations or the 99th percentile), or did the process exit with an exit code that
+    is unseen in 90 days or statistically rare (<0.1% of historical terminations)?
+  context: Repeated or unusual HMI terminations can indicate an adversary forcing the operator interface
+    down, or instability induced as cover for Impact. Establish a 30-day role-aware baseline of hourly
+    termination counts (Sysmon Event ID 5) per critical HMI process and alert when an hour exceeds the
+    mean by a configured number of standard deviations or breaches the 99th percentile. Separately profile
+    the historical distribution of exit codes per HMI process (State) and flag any exit code unseen in
+    90 days or statistically rare (<0.1% of historical terminations), treating crash/abnormal exit codes
+    as a distinct failure-mode signal. A spike in terminations or a novel crash code suggests deliberate
+    or induced loss of view; counts and exit codes within normal ranges argue against it. This statistical
+    layer complements the deterministic rule by catching slow or distributed termination patterns tied
+    to the Impact objective.
+  answer_sources: *id002
+  range: Last 90 days (30-day rolling baseline for counts; 90-day window for exit-code rarity)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      baseline[proc] = over 30d: mean(hourly_term_count), std, p99
+
+      for current hour per critical hmi proc:
+        if term_count > mean + N*std OR term_count > p99 -> alert (termination spike)
+      exit_code_dist[proc] = freq over 90d
+        if exit_code unseen_in_90d OR freq < 0.001 -> alert (rare/crash exit code)
+- question: Does a supervised classifier scoring HMI termination events (using process name, parent process,
+    user context, time-of-day, day-of-week, command-line) label a given termination as malicious, and
+    what top-3 features drove that decision?
+  context: Many HMI terminations are benign, so a model that weighs multiple features helps separate normal
+    operator exits from suspicious kills. Train a supervised classifier (e.g., Random Forest) on historical
+    HMI termination events with features such as process name, parent process name, user context (system/admin/user),
+    time-of-day, day-of-week, and command-line arguments, labeling benign (clean/user-initiated exit)
+    versus malicious (crash, terminated by a suspicious parent). Score new events in real time and surface
+    the top-3 contributing features (e.g., unexpected parent, off-hours, non-zero exit) in the alert via
+    Random-Forest feature importance for explainable triage. A 'malicious' classification with intuitive
+    drivers (off-hours kill by an unusual parent) is strong evidence of a deliberate denial of view under
+    the Impact tactic; a 'benign' label on a routine daytime user exit is reassuring. Use this alongside
+    the deterministic rule and statistical baseline rather than as a sole arbiter.
+  answer_sources: *id002
+  range: Last 90 days (train on historical labeled terminations; score in real time)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      features = [image, parent_image, user_context, hour, dow, cmdline_tokens]
+
+      model = RandomForest trained on labeled benign/malicious HMI terminations
+
+      for each new termination event:
+        p = model.predict_proba(features)
+        if p(malicious) > threshold:
+           alert with top-3 feature_importances (e.g., unexpected_parent, off_hours, nonzero_exit)
+- question: Does an LSTM log-sequence model of each HMI/EWS host's normal Windows event stream (logon
+    -> process create -> process terminate, plus service and network events) flag an out-of-sequence or
+    low-probability next-event prediction around an HMI process termination?
+  context: A forced HMI kill disturbs the normal ordered flow of host events, which a sequence model can
+    detect even when individual events look ordinary. Train an LSTM log-sequence model (e.g., DeepLog-style)
+    on the normal ordered Windows event stream of each HMI/EWS host; an abnormal termination produces
+    an out-of-sequence or low-probability next-event prediction, yielding a high anomaly score with per-event
+    diagnosis for triage. The analyst examines the flagged sequence to see whether the HMI process died
+    without the usual preceding/following events (e.g., a kill with no clean shutdown sequence), which
+    supports the Impact hypothesis of a deliberately denied view. Layer this in parallel with the deterministic
+    parent-process/exit-code rule and measure false negatives, since ML detection degrades on unseen behavior.
+    A normal, expected event ordering around the termination argues against malicious denial of view.
+  answer_sources: *id002
+  range: Last 90 days (model trained per host on normal event ordering; score live)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      seq = ordered Windows/Sysmon event IDs per HMI/EWS host (logon, proc_create, proc_term, svc, net)
+
+      model = LSTM (DeepLog-style) next-event predictor on normal sequences
+
+      for live stream:
+        if observed_next_event not in top-k predicted OR low probability:
+           anomaly_score high -> alert with per-event diagnosis (which event broke sequence)
+      run parallel to deterministic parent/exit-code rule; track false negatives
