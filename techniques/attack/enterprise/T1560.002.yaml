@@ -1,0 +1,392 @@
+name: 'T1560.002: Archive via Library'
+id: dced5840-443d-4b58-ae3c-9eb5161ad185
+description: Investigate whether an adversary has staged collected data for exfiltration by compressing
+  or encrypting it in-process using a third-party or system archival library (e.g., zlib, libzip, libbz2,
+  libarchive, System.IO.Compression, Python zipfile/rarfile, PowerShell Compress-Archive) rather than
+  by spawning a standalone archive utility. This playbook helps an analyst distinguish library-backed
+  archiving from utility-based archiving by centering on module-load telemetry (Sysmon Event ID 7 / auditd
+  MMAP / macOS unified log) correlated with process execution (Event ID 4688 / auditd execve) and archive
+  file creation (Event ID 4663 / Sysmon Event ID 11). It guides the analyst through hash and library allowlist
+  matching, interpreter keyword and encryption-flag detection, prevalence and entropy outlier analysis,
+  anomalous read-fan-out to archive-write chains, non-interactive service processes producing archives,
+  and archive-creation followed by suspicious outbound transfers. Symbolic-logic floors are paired with
+  statistical baselining and machine-learning models to surface the most defensible, actionable leads.
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process execute whose executable file hash (MD5 or SHA256) matches a threat-intelligence
+    list of known malicious archiver, packer, or staging binaries?
+  context: 'Collection-stage adversaries frequently reuse known archiving/packing tools to bundle stolen
+    data before exfiltration. Joining process-creation hashes (Event ID 4688) against curated CTI feeds
+    of malicious archiver/packer binaries provides a hard, deterministic detection floor: an exact hash
+    match is high-confidence and should be triaged immediately. This runs in parallel with module-load
+    logic so that both file-identity and in-process library use are covered. A positive result means a
+    known-bad archiver ran on a sensitive host; a negative result does not clear the host, since adversaries
+    can recompile or use living-off-the-land libraries — so always pair this with the library-load analytics
+    below.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:MMAP
+  - 'NAI: Domain Controllers, File Servers, Critical Application Servers, Developer Workstations, Executive
+    Laptops'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  EventCode=4688\n  | eval h=lower(coalesce(Hashes_SHA256, SHA256, MD5))\n  | lookup cti_malicious_archivers\
+      \ hash AS h OUTPUT threat_name\n  | where isnotnull(threat_name)\n  | table _time, host, NewProcessName,\
+      \ h, threat_name, ParentProcessName, SubjectUserName"
+- question: Was a compression or archival library module (e.g., zlib1.dll, System.IO.Compression*, libzip,
+    libbz2.so/.dylib, libarchive, libz.dylib) loaded by a process that is NOT on the allowlist of legitimate
+    archivers, installers, or backup tools?
+  context: The defining signal of T1560.002 is archiving performed in-process via a loaded library, not
+    via a spawned archive utility. Module-load telemetry (Sysmon Event ID 7 on Windows, auditd MMAP on
+    Linux, unified-log dylib loads on macOS) is therefore the primary evidence. By alerting when one of
+    these compression libraries is loaded by a process outside an allowlist of known-good archivers/installers,
+    the analyst catches scripts, web-server worker processes, or custom binaries that have no legitimate
+    reason to archive data. A positive result points to potential staging; investigate the process lineage,
+    the files it touched, and any subsequent archive writes. Tune the allowlist to your environment's
+    legitimate backup/installer software to reduce noise.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:MMAP
+  - 'NAI: Domain Controllers, File Servers, Critical Application Servers, Developer Workstations, Executive
+    Laptops'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventCode=7 OR source=auditd type=MMAP)\n  | eval lib=lower(ImageLoaded)\n  | where\
+      \ like(lib,\"%zlib1.dll%\") OR like(lib,\"%system.io.compression%\")\n      OR like(lib,\"%libzip%\"\
+      ) OR like(lib,\"%libbz2%\")\n      OR like(lib,\"%libarchive%\") OR like(lib,\"%libz.%\")\n  | search\
+      \ NOT [| inputlookup archiver_allowlist.csv | fields Image]\n  | table _time, host, Image, lib,\
+      \ ProcessId, ParentImage"
+- question: Which process hashes and loaded compression modules are rare across the enterprise fleet (present
+    on fewer than 0.5% of hosts, or loaded by a process that has never previously loaded that module)?
+  context: Rarity is a strong indicator of malicious staging because legitimate archiving is dominated
+    by a small set of common tools and libraries that appear widely. Using a fleet-wide prevalence computation
+    (Microsoft's frequency-analysis approach), the analyst computes how many distinct hosts have ever
+    run each process hash and loaded each compression module. Library loads occurring on <0.5% of hosts,
+    or the first-ever load of a compression module by a given process, surface novel or targeted tooling.
+    A positive result (very low prevalence) warrants enrichment with CTI and lineage review; high prevalence
+    likely reflects normal software and can be deprioritized.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:MMAP
+  - 'NAI: Domain Controllers, File Servers, Critical Application Servers, Developer Workstations, Executive
+    Laptops'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  (EventCode=7 OR EventCode=4688)\n  | eval key=coalesce(ImageLoaded, NewProcessName)\n\
+      \  | stats dc(host) AS host_count, values(Image) AS loaders BY key\n  | eventstats dc(host) AS fleet\n\
+      \  | eval prevalence=host_count/fleet\n  | where prevalence < 0.005\n  | sort prevalence"
+- question: When each process event is scored by an anomaly model over hash prevalence, module-load rarity,
+    parent lineage rarity, argument count, and name length, which processes rank as the strongest archiving-via-library
+    outliers?
+  context: A multi-feature unsupervised model captures suspicious archiving that no single rule catches.
+    An Isolation Forest scored over {hash prevalence, module-load rarity, parent lineage rarity, argument
+    count, name length}, augmented with ProblemChild-style lineage features, ranks processes by how anomalous
+    their archiving behavior is. The model should emit the top-3 contributing features (for example 'module
+    zlib1.dll prevalence=0.1%', 'parent=w3wp.exe rare', 'hash unseen') so the analyst can rapidly judge
+    the lead. This is most useful for triaging high volumes of library-load events; a high anomaly score
+    with rare lineage and unseen hash is a priority Collection-stage lead, while common, well-parented
+    processes score low.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:MMAP
+  - 'NAI: Domain Controllers, File Servers, Critical Application Servers, Developer Workstations, Executive
+    Laptops'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = per_process(hash_prevalence, module_load_rarity, parent_lineage_rarity, arg_count,\
+      \ name_length)\n  model = IsolationForest(n_estimators=200, contamination=0.01).fit(features_baseline)\n\
+      \  score = model.decision_function(features_today)\n  emit top_anomalies with top3 SHAP-style contributing\
+      \ features"
+- question: Did a scripting interpreter (python.exe, pwsh.exe, perl) or a compiled binary execute with
+    command-line arguments that invoke archive APIs (zipfile, rarfile, gzip, Compress-Archive, System.IO.Compression,
+    zlib), especially with password/encryption switches such as -p, -hp, or ZipCryptography, against sensitive
+    directories?
+  context: Adversaries often script their archiving so they can compress and optionally encrypt collected
+    data in one step. Watching Event ID 4688 / auditd execve for interpreters or binaries that reference
+    archive APIs — particularly when combined with password or encryption flags and a sensitive target
+    path — extends the SigmaHQ 7-Zip password-compression pattern to the library-invocation case. The
+    encryption switches are a strong signal because encrypted archives are a common precursor to exfiltration
+    and defeat content inspection. A positive result means data was likely compressed/encrypted for staging;
+    capture the target path and resulting archive, and pivot to file-creation and network telemetry to
+    confirm scope.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Web Servers, Application Servers, CI/CD Build Servers, Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventCode=4688 OR source=auditd type=SYSCALL syscall=execve)\n  | eval cmd=lower(CommandLine)\n\
+      \  | where match(NewProcessName,\"(python|pwsh|powershell|perl)\")\n  | where like(cmd,\"%zipfile%\"\
+      ) OR like(cmd,\"%rarfile%\") OR like(cmd,\"%gzip%\")\n      OR like(cmd,\"%compress-archive%\")\
+      \ OR like(cmd,\"%system.io.compression%\") OR like(cmd,\"%zlib%\")\n  | eval encrypted=if(match(cmd,\"\
+      (-p |-hp |zipcryptography|password)\"),1,0)\n  | table _time, host, NewProcessName, CommandLine,\
+      \ encrypted"
+- question: Which archive-related interpreter executions have command-line length or Shannon entropy above
+    the 95th percentile or more than 3 standard deviations from the user's or host's baseline?
+  context: Obfuscated or encoded archiving commands, long inline scripts, and embedded encryption keys
+    inflate command-line length and entropy. By baselining command-line length and Shannon entropy per
+    user/host for matching executions and flagging steps above the 95th percentile (or >3σ), the analyst
+    surfaces unusual, possibly obfuscated archiving activity. Entropy bands should be calibrated against
+    the encrypted/compressed thresholds (>7.0–7.2) from Lyda and Hamrock. A positive result indicates
+    an atypically complex command worth manual review; a normal-entropy, short command is more likely
+    routine scripted archiving.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Web Servers, Application Servers, CI/CD Build Servers, Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  <archive_interpreter_filter>\n  | eval len=len(CommandLine), ent=shannon_entropy(CommandLine)\n\
+      \  | eventstats avg(len) AS mlen, stdev(len) AS slen, perc95(ent) AS p95ent BY SubjectUserName\n\
+      \  | where len > mlen+3*slen OR ent > p95ent OR ent > 7.0\n  | table _time, host, SubjectUserName,\
+      \ CommandLine, len, ent"
+- question: When archive-related command lines are tokenized and clustered, which form isolated/novel
+    clusters, and which event-parameter sequences deviate from the normal start->module-load->read->archive
+    workflow?
+  context: Novel adversary commands cluster separately from the bulk of routine scripted archiving. Tokenizing
+    command lines (TF-IDF) and clustering with DBSCAN exposes isolated clusters representing rare, possibly
+    hand-crafted commands, while a DeepLog-style LSTM models the expected event/parameter sequence (process
+    start -> compression module load -> file reads -> archive write) and flags executions that deviate.
+    Surfacing the top-3 deviating tokens/events tells the analyst exactly why the command is novel. This
+    is valuable for catching bespoke staging scripts that evade keyword rules; an isolated cluster combined
+    with an out-of-order event sequence is a strong Collection-stage lead.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Web Servers, Application Servers, CI/CD Build Servers, Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = tfidf(tokenize(command_lines))\n  clusters = DBSCAN(eps=0.5, min_samples=5).fit(X)\n\
+      \  novel = points labeled -1 or in singleton clusters\n  seq_model = DeepLog_LSTM.train(event_sequences=start->module_load->read->archive)\n\
+      \  anomalies = seq_model.score(today_sequences)\n  emit novel + anomalies with top3 deviating tokens/events"
+- question: Did a non-interactive service or application process (e.g., w3wp.exe, sqlservr.exe, lsass.exe,
+    svchost.exe) both load an archival library and create an archive file (.zip, .rar, .7z, .tar.gz)?
+  context: Service and daemon processes such as IIS workers, SQL Server, or svchost have well-defined
+    behavior and almost never legitimately archive data. Correlating Sysmon Event ID 7 compression-library
+    loads with Event ID 4663 / Sysmon Event ID 11 archive-file creation and Event ID 4688 process context,
+    then alerting when a non-interactive service process does both, applies the Palantir unexpected-host-process
+    pattern to archiving. This is a powerful signal for webshell or post-exploitation staging on internet-facing
+    and database hosts. A positive result — for example w3wp.exe loading libzip and writing a .zip in
+    a temp directory — is a high-priority lead; legitimate backup services should be allowlisted.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Web Application Servers (DMZ), Database Servers, Internal File Shares, System Temporary Directories
+    (e.g., C:\Windows\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  | eval svc=lower(Image)\n  | where match(svc,\"(w3wp|sqlservr|lsass|svchost)\\\\.exe\"\
+      )\n  | join ProcessGuid [\n      search EventCode=7 (ImageLoaded=*zlib* OR ImageLoaded=*compression*\
+      \ OR ImageLoaded=*libzip* OR ImageLoaded=*libarchive*) ]\n  | join ProcessGuid [\n      search (EventCode=11\
+      \ OR EventCode=4663) (TargetFilename=*.zip OR *.rar OR *.7z OR *.tar.gz) ]\n  | table _time, host,\
+      \ Image, ImageLoaded, TargetFilename"
+- question: For each process, what is the conditional probability of it creating an archive-extension
+    file or loading a compression module, and which observed events have probability zero or below 0.01?
+  context: Process behavior is highly stereotyped, so the probability that a given process produces an
+    archive or loads a compression library is a sharp discriminator. Baselining P(archive-extension |
+    process_name) and P(compression-module | process_name) across the fleet (Microsoft frequency analysis)
+    lets the analyst flag archive creations or library loads whose conditional probability is zero (never
+    seen for that process) or below 0.01 (extremely rare). A near-zero probability — e.g., sqlservr.exe
+    writing a .rar — is a strong anomaly indicating possible staging via library. High-probability behavior
+    reflects expected archiving tools and can be deprioritized.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Web Application Servers (DMZ), Database Servers, Internal File Shares, System Temporary Directories
+    (e.g., C:\Windows\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  (EventCode=11 OR EventCode=4663 OR EventCode=7)\n  | eval evt=if(EventCode=7,\"module:\"\
+      .ImageLoaded,\"ext:\".file_ext(TargetFilename))\n  | stats count BY Image evt\n  | eventstats sum(count)\
+      \ AS total BY Image\n  | eval p=count/total\n  | where p < 0.01\n  | table Image, evt, p, count"
+- question: When a model is trained on file-creation features (process, parent, path, extension, output
+    entropy, module-load rarity), which archive creations are outliers, and does the archive output entropy
+    exceed the >7.0 compression threshold?
+  context: An anomaly model over file-creation context catches service processes writing archives in unexpected
+    places. Training an Isolation Forest / One-Class SVM / autoencoder on {process, parent, path, extension,
+    output entropy, module-load rarity} detects outliers such as svchost.exe loading libzip and writing
+    a .zip into C:\Perflogs. Verifying the output file's entropy against the >7.0 archive threshold (Lyda
+    and Hamrock) confirms the file is genuinely compressed/encrypted rather than a misnamed plaintext
+    file. The model should emit the top-3 contributing features. A high anomaly score plus high output
+    entropy from a non-interactive process is a priority Collection-stage detection.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Web Application Servers (DMZ), Database Servers, Internal File Shares, System Temporary Directories
+    (e.g., C:\Windows\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = per_filecreate(process, parent, path, extension, output_entropy, module_load_rarity)\n\
+      \  model = IsolationForest().fit(baseline_filecreates)\n  out = model.predict(today_filecreates)\n\
+      \  flag where out==anomaly AND output_entropy > 7.0\n  emit top3 contributing features"
+- question: Did a single process read an anomalously large number of files across many unique directories
+    in a short window (e.g., >200 reads across >10 directories in 60 seconds) and then write a high-entropy
+    archive file within the same process tree?
+  context: Mass collection immediately followed by archiving is the core staging behavior of T1560.002.
+    Alerting when one PID logs over 200 Event ID 4663 reads across more than 10 unique directories within
+    60 seconds and then writes a high-entropy archive (.zip/.rar/.7z/.gz/.bz2) in the same process tree
+    captures the read-fan-out-then-archive chain. This combines the mass-file-touch union indicators from
+    CryptoLock/Drop-It with KAIROS-style provenance reconstruction (read -> load-library -> write-archive).
+    Thresholds should be derived from a 30-day per-host baseline. A positive result strongly indicates
+    active data staging; tune read/directory thresholds to avoid catching legitimate bulk operations like
+    indexing or backup.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Profile Directories (Documents, Desktop), Network-mapped Drives, SharePoint Sites, Source
+    Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  EventCode=4663 accesses=read\n  | bin _time span=60s\n  | stats count AS reads dc(dir(ObjectName))\
+      \ AS dirs values(ProcessId) AS pid BY _time, host, ProcessId\n  | where reads>200 AND dirs>10\n\
+      \  | join ProcessId [ search (EventCode=11 OR EventCode=4663) TargetFilename IN (*.zip,*.rar,*.7z,*.gz,*.bz2)\
+      \ entropy>7.0 ]\n  | table _time, host, ProcessId, reads, dirs, TargetFilename"
+- question: Which processes show 95th-percentile or 3-sigma spikes in I/O metrics (files read, read fan-out,
+    write/read ratio, write entropy) that precede archive creation, and are there bursts of access-denied
+    (4663) failed reads?
+  context: Sophisticated collection produces measurable I/O anomalies before the archive appears. Maintaining
+    multi-time-scale per-process I/O baselines (files read, read fan-out, write/read ratio, Shannon write-entropy)
+    as in ShieldFS and flagging 95th-percentile/3σ spikes that precede archive creation surfaces staging
+    that single thresholds miss. Tracking failed reads (4663 access-denied) separately captures opportunistic
+    collection where the adversary probes directories they cannot fully access — a distinct 'State' signal.
+    A positive result (spiking read fan-out and write entropy just before an archive write) is high-confidence
+    staging; isolated failed reads may indicate reconnaissance or misconfiguration.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Profile Directories (Documents, Desktop), Network-mapped Drives, SharePoint Sites, Source
+    Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  EventCode=4663\n  | stats count AS reads dc(ObjectName) AS uniq sum(eval(Accesses=\"\
+      DELETE/READ denied\")) AS denied BY ProcessId, host, bin(_time,5m)\n  | eventstats perc95(reads)\
+      \ AS p95, avg(reads) AS m, stdev(reads) AS s BY host\n  | where reads>p95 OR reads>m+3*s OR denied>20\n\
+      \  | table _time, host, ProcessId, reads, uniq, denied"
+- question: When per-process read volumes are forecast and scored by an anomaly model over {unique files
+    read, directory fan-out, read/write ratio, output entropy}, which archiving sessions are anomalous,
+    and where do they localize in the provenance graph?
+  context: Forecasting expected read volumes and scoring deviations isolates anomalous archiving sessions
+    that static thresholds cannot tune for. An Isolation Forest over {unique files read, directory fan-out,
+    read/write ratio, output entropy} flags sessions where a process aggregates far more data than its
+    norm before archiving, while ThreaTrace localizes the offending process/file nodes within the provenance
+    graph so the analyst can see exactly which files were gathered. The model should surface the top-3
+    contributing features. A high anomaly score with a tight provenance subgraph linking many reads to
+    one archive write is a strong, explainable Collection lead.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - auditd:SYSCALL
+  - 'NAI: User Profile Directories (Documents, Desktop), Network-mapped Drives, SharePoint Sites, Source
+    Code Repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = per_process_session(unique_files_read, dir_fanout, read_write_ratio, output_entropy)\n\
+      \  model = IsolationForest().fit(baseline_sessions)\n  anomalies = model.score(today_sessions)\n\
+      \  graph = provenance(reads, module_loads, archive_writes)\n  localize offending nodes with ThreaTrace(graph)\n\
+      \  emit anomalies with top3 features + provenance subgraph"
+- question: Was a high-entropy archive file created on a host and then, within ~5 minutes, an outbound
+    connection made from that host (Zeek conn.log) to a watchlisted, low-reputation, or rare external
+    destination?
+  context: The clearest exfiltration precursor is an archive being created and then immediately leaving
+    the network. Correlating Event ID 4663 / Sysmon Event ID 11 archive creation (verified high-entropy
+    per Lyda and Hamrock) with Zeek conn.log connections within 5 minutes to watchlisted or rare external
+    IPs reconstructs the archive->transfer chain with KAIROS-style provenance edges. This tight temporal
+    join is high-confidence because few benign workflows archive then immediately upload to a rare external
+    host. A positive result is a likely exfiltration event and should be escalated; capture the destination,
+    byte counts, and the staged archive for incident response.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days. Center correlation on each archive-creation event and look 5 minutes forward in
+    network logs.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  search (EventCode=11 OR EventCode=4663) TargetFilename IN (*.zip,*.rar,*.7z,*.gz) entropy>7.0\n\
+      \  | eval w_start=_time, w_end=_time+300\n  | join host [ search source=zeek conn.log\n      [|\
+      \ inputlookup watchlist_or_rare_ips.csv | fields id.resp_h] ]\n  | where ts>=w_start AND ts<=w_end\n\
+      \  | table _time, host, TargetFilename, id.resp_h, resp_bytes"
+- question: After an archive is created on a host, which outbound transfers go to new ASNs or exceed the
+    98th percentile of that host's resp_bytes/orig_bytes baseline, and were any egress attempts blocked
+    (firewall 5157 / proxy deny)?
+  context: Exfiltration of staged archives shows up as unusually large transfers to destinations the host
+    has never contacted. Baselining each host's destination ASNs and resp_bytes/orig_bytes percentiles
+    (CyberGraph) and flagging >98th-percentile transfers to new ASNs following archive creation surfaces
+    likely data theft. Tracking blocked egress (firewall Event ID 5157 / proxy denies) as a separate failure-mode
+    'State' signal catches adversaries whose first exfiltration attempts were stopped — still a strong
+    indicator of intent. A positive result (large transfer to a brand-new ASN right after archiving) is
+    a priority exfiltration lead; blocked attempts warrant hunting for an alternate successful channel.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days. Pivot from archive-creation timestamps to subsequent egress.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=zeek conn.log\n  | iplocation id.resp_h | eval asn=autonomous_system\n  | stats\
+      \ sum(orig_bytes) AS up sum(resp_bytes) AS down values(asn) AS asns BY host, bin(_time,5m)\n  |\
+      \ eventstats perc98(up) AS p98 dc(asn) AS known_asns BY host\n  | where up>p98 AND NOT (asn IN known_baseline_asns)\n\
+      \  | append [ search EventCode=5157 action=blocked | stats count BY host ]\n  | table _time, host,\
+      \ asn, up, down"
+- question: When host-IP communication graphs are built and per-flow anomaly models scored after archive
+    creation, which hosts connect to low-reputation communities or emerging consolidation hubs, and which
+    transfer flows are anomalous?
+  context: Graph-based and flow-based models reveal exfiltration patterns that point detections miss.
+    Building host-IP communication graphs and raising a host's risk after archive creation (CyberGraph)
+    flags connections to low-reputation communities or emerging consolidation hubs where multiple compromised
+    hosts funnel data. Scoring the actual transfer flow with the Kitsune online autoencoder ensemble,
+    and modeling per-user file-aggregation anomalies with the Tuor decomposable autoencoder, adds behavioral
+    confirmation. Surfacing the top-3 contributing features makes the lead explainable. A high graph-risk
+    host transferring an anomalous flow to a low-reputation community shortly after archiving is a strong,
+    corroborated exfiltration finding.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days. Center scoring on the post-archive transfer window.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = build_host_ip_graph(zeek_conn)\n  risk = CyberGraph.score(G, boost=hosts_with_recent_archive_creation)\n\
+      \  flow_anom = Kitsune.score(transfer_flows)\n  user_anom = Tuor_autoencoder.score(per_user_file_aggregation)\n\
+      \  emit hosts where risk high AND flow_anom high to low_reputation_community\n  with top3 contributing\
+      \ features"
