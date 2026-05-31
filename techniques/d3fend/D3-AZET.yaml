@@ -1,0 +1,453 @@
+name: 'D3-AZET: Authorization Event Thresholding'
+id: 33edf915-2e05-4a15-bf0c-cbf9b8b8bdf4
+description: 'Investigate whether an identity''s authorization and authentication behavior deviates from
+  established individual and peer-group baselines, indicating credential compromise, privilege abuse,
+  unauthorized discovery, collection, or lateral movement. This playbook helps an analyst characterize
+  normal user authorization activity and detect deviations across two evidence vectors: (1) authorization
+  telemetry showing a user accessing resources, objects, or shares outside expected scope, timing, and
+  volume (Windows Event ID 4663/4670, Zeek smb_files.log and dce_rpc.log) including canary/honeytoken
+  access, suspicious permission changes, abnormal access volume, peer-group deviation, authorization-rate
+  change-points, and access-denied probing; and (2) authentication telemetry showing an account authorizing
+  to hosts, shares, or services outside its established access graph or with elevated failure rates (Windows
+  Event ID 4624/4625/4769, Zeek logs) including account-to-host fan-out, SMB session-setup pairings, credential-switch
+  to new systems, failed-logon spikes and password spray, rare new authentication edges, logon-volume
+  change-points, and graph/sequence-model anomalies. Deterministic rules, statistical thresholds (modified
+  Z-score, peer-group control limits, change-point detection), and interpretable machine-learning models
+  run in parallel so analysts get granular, defensible, explainable detections.'
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any non-approved identity successfully or unsuccessfully accessed canary/honeytoken files,
+    privileged shares, or restricted directories, and what operation (read vs. write/delete/permission-change)
+    did the AccessMask indicate?
+  context: Canary and restricted objects have a zero or near-zero legitimate-access baseline, so any touch
+    by an unapproved identity is high-fidelity evidence of unauthorized discovery or collection supporting
+    the Detect tactic. Monitor Windows Event ID 4663 for these objects and parse the AccessMask to distinguish
+    read (0x1) from write/append, delete, and change-permissions (0x2/0x10000/0x40000) as distinct state
+    signals, consistent with MITRE CAR-2013-09-003. A positive result (any non-approved principal touching
+    a canary object) should escalate immediately; a negative result confirms the decoy/restricted assets
+    remain untouched.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog EventCode=4663
+
+      | where ObjectName IN (canary_objects, privileged_shares, restricted_dirs)
+
+      | where SubjectUserName NOT IN (approved_identities[ObjectName])
+
+      | eval op=case(AccessMask="0x1","read", AccessMask IN ("0x2","0x10000","0x40000"),"write_delete_perm",
+      true(),"other")
+
+      | alert severity=critical fields(SubjectUserName, ComputerName, ObjectName, op, AccessMask)'
+- question: Did a user change permissions on an object (Event ID 4670) and then, within a short window,
+    read or access an unusually large number of distinct objects, and is that (user-group, object-group)
+    change/access pattern previously unseen?
+  context: Attackers and abusive insiders often grant themselves rights and then immediately harvest data,
+    so correlating 4670 permission-change events with nearby 4663 object-access events for the same user/host
+    within ~10 minutes surfaces privilege-abuse sequences relevant to detecting deviations from baseline
+    authorization. Flag change-then-bulk-read sequences where a permission change is followed by access
+    to more than N distinct objects. Mine and whitelist frequent benign (user-group, object-group) patterns
+    so only novel change/access structures alert. A positive result is a permission change tightly coupled
+    to broad new access; routine administrative permission tuning without subsequent bulk access is the
+    negative case.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog EventCode IN (4670,4663)
+
+      | transaction SubjectUserName, ComputerName maxspan=10m
+
+      | where eventcount_4670>=1 AND distinct_count(ObjectName where EventCode=4663) > N
+
+      | lookup benign_change_access user_group, object_group OUTPUT is_known
+
+      | where is_known!="true"
+
+      | alert fields(SubjectUserName, ComputerName, changed_object, distinct_objects_accessed)'
+- question: Does a user's hourly file/share access count, byte volume, or unique-object count exceed their
+    own 30-day baseline using a robust modified Z-score, with thresholds derived per data source?
+  context: Sudden surges in how much a user accesses are a core signal that authorization activity has
+    deviated from baseline (mass collection, staging, or automated harvesting). Compute hourly access
+    counts, byte volume, and unique-object counts per user from Windows Event ID 4663 and Zeek smb_files.log
+    over a 30-day rolling window. Flag using the MAD-based modified Z-score (|0.6745*(x-median)/MAD| >
+    3.5) combined with the per-user 99th percentile so legitimate batch jobs do not distort the threshold,
+    and derive thresholds separately for each data source. A positive result is a robust spike above both
+    gates; a negative result is volume within normal robust limits.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (WinEventLog:4663, zeek:smb_files) earliest=-30d
+
+      | bin _time span=1h | stats count AS accesses, sum(bytes) AS vol, dc(ObjectName) AS uniq BY user,
+      source, _time
+
+      | eventstats median(accesses) AS med, median(abs(accesses-med)) AS mad, perc99(accesses) AS p99
+      BY user, source
+
+      | eval mz=abs(0.6745*(accesses-med)/mad)
+
+      | where mz>3.5 AND accesses>p99
+
+      | alert fields(user, source, accesses, vol, uniq, mz)'
+- question: Has a user exited their peer-group control limits for read/write ratio, unique-object count,
+    or off-hours activity for two consecutive periods, and what factors contributed?
+  context: Comparing a user against statistically similar peers (role/department) catches deviations an
+    individual baseline misses, e.g. an account that suddenly behaves unlike everyone in its cohort, supporting
+    detection of anomalous authorization. Build peer-group distributions for read/write ratio, unique-object
+    count, and off-hours activity. Trigger an alert when a user leaves peer-group control limits for two
+    consecutive periods, attaching an investigation-priority score and the contributing factors. Requiring
+    two consecutive periods reduces false positives from one-off bursts. A positive result is sustained
+    peer-group divergence; transient or single-period excursions are negative.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (WinEventLog:4663, zeek:smb_files) earliest=-30d
+
+      | stats rw_ratio, dc(ObjectName) AS uniq, offhours_count BY user, peer_group, period
+
+      | eventstats mean(*) AS mean_*, stdev(*) AS sd_* BY peer_group, period
+
+      | eval out = (rw_ratio>mean_rw_ratio+3*sd_rw_ratio) OR (uniq>mean_uniq+3*sd_uniq) OR (offhours_count>mean_offhours_count+3*sd_offhours_count)
+
+      | streamstats window=2 sum(out) AS consec BY user
+
+      | where consec=2
+
+      | eval priority=score(factors) | alert fields(user, peer_group, factors, priority)'
+- question: Does a user's authorization-event time series show a sustained step-change (a new persistent
+    daily floor of file reads/accesses) rather than a transient spike?
+  context: Account takeover or slow data harvesting often manifests as a durable regime shift in activity
+    rather than a single spike that simple thresholds catch. Apply change-point detection (CUSUM, PELT,
+    or Bayesian online) to each user's authorization-event time series to identify sustained step-changes,
+    and alert only when the new regime persists beyond the prior segment mean. This is directly aligned
+    with detecting deviations from a baseline. A positive result is a confirmed persistent shift in the
+    authorization rate; brief transients that revert are negative and suppressed.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (WinEventLog:4663, zeek:smb_files) earliest=-90d
+
+      | bin _time span=1d | stats count AS events BY user, _time
+
+      | sort user, _time
+
+      | changepoint algo=PELT|CUSUM on=events by=user -> segments
+
+      | where new_segment_mean > prior_segment_mean AND segment_duration_days >= 3
+
+      | alert fields(user, changepoint_time, prior_mean, new_mean)'
+- question: Is a user's or host's access-denied rate (failed 4663 attempts) or failure-to-success ratio
+    spiking above baseline in a way consistent with permission probing or data discovery?
+  context: Reconnaissance and discovery often generate elevated access-denied events as an actor probes
+    objects they lack rights to, a signal distinct from successful-access volume. Baseline each user's
+    and host's access-denied rate from Windows Event ID 4663 failed-access entries and treat failure volume
+    and the failure-to-success ratio as separate signals from success volume. Alert on modified-Z-score
+    spikes in denied attempts. A positive result is an anomalous burst of denials (probing/enumeration);
+    steady low denial rates within baseline are negative.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog EventCode=4663 earliest=-30d
+
+      | eval denied=if(status="failure",1,0)
+
+      | bin _time span=1h | stats sum(denied) AS denials, count AS total BY user, ComputerName, _time
+
+      | eval fail_ratio=denials/total
+
+      | eventstats median(denials) AS med, median(abs(denials-med)) AS mad BY user
+
+      | eval mz=abs(0.6745*(denials-med)/mad)
+
+      | where mz>3.5
+
+      | alert fields(user, ComputerName, denials, fail_ratio, mz)'
+- question: Does an unsupervised model (graph/link-prediction or autoencoder) flag a user's authorization
+    session as an outlier across object rarity, operation type, host diversity, time profile, and byte
+    volume, and what top-3 features drove the score?
+  context: Multivariate anomalies (unusual combinations of object rarity, operation mix, host diversity,
+    timing, and volume) evade single-feature rules, so an unsupervised model trained on 4663, smb_files.log,
+    and dce_rpc.log features can surface novel unauthorized discovery or collection sessions in support
+    of the Detect tactic. Flag outlier sessions and ALWAYS emit the top-3 contributing features so analysts
+    can triage. This model runs in parallel with the deterministic and statistical rules and never replaces
+    them. A positive result is a high-reconstruction-error / low-likelihood session with explainable drivers;
+    in-distribution sessions are negative.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - Windows Event ID 4670
+  - 'NAI: Critical file servers, Domain Controllers, and servers hosting sensitive applications'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = build(user_session, from=[WinEventLog:4663, zeek:smb_files, zeek:dce_rpc],\n  \
+      \               cols=[object_rarity, new_edge, op_type, host_diversity, time_profile, byte_volume])\n\
+      model = autoencoder|graph_link_prediction(trained_on=baseline_sessions)\nscore = model.anomaly_score(features)\n\
+      if score > threshold:\n    emit_alert(user, session_id, anomaly_score=score, top3_features=model.explain(features)[:3])"
+- question: Did a single account authenticate (Event ID 4624 logon type 3/10) to more than N distinct
+    destination hosts within a short window, excluding whitelisted admin/service accounts?
+  context: Lateral movement and credential abuse produce abnormal account-to-host fan-out, where one identity
+    touches many machines in a short time, a classic deviation from the one-or-two-machine norm per MITRE
+    CAR-2013-02-012. Alert when an account makes network/RDP logons (type 3/10) to more than N distinct
+    destinations within a tuned window (e.g. >10 hosts/hour for standard users), and whitelist admin and
+    service accounts that legitimately span hosts. A positive result is a non-privileged account suddenly
+    fanning out; tuning N and the whitelist controls false positives.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog EventCode=4624 LogonType IN (3,10) earliest=-1h
+
+      | where TargetUserName NOT IN (admin_accounts, service_accounts)
+
+      | stats dc(ComputerName) AS hosts values(ComputerName) AS host_list BY TargetUserName
+
+      | where hosts > N
+
+      | alert fields(TargetUserName, hosts, host_list)'
+- question: Are there unexpected account-to-host pairings in SMB session setups that suggest credential
+    reuse or a compromised account?
+  context: Mapping which accounts authenticate to which hosts via SMB session setups reveals credential-reuse
+    and compromise patterns, per MITRE CAR-2013-09-003, supporting detection of authentication outside
+    an account's established access graph. Monitor SMB session setups (Zeek dce_rpc.log/smb and Event
+    ID 4624 type 3) and flag account-to-host pairings not seen in the historical baseline. A positive
+    result is a previously-unobserved account/host SMB pairing reaching sensitive servers; pairings within
+    the known access graph are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (zeek:dce_rpc, zeek:smb_files, WinEventLog:4624 LogonType=3)
+
+      | stats values(dest_host) AS hosts BY account
+
+      | lookup baseline_account_hosts account OUTPUT known_hosts
+
+      | mvexpand hosts | where NOT match(hosts, known_hosts)
+
+      | alert fields(account, hosts AS new_host)'
+- question: Does a login path show a switch of credentials combined with movement to a system the new
+    credential has never previously accessed, especially when it reaches sensitive servers?
+  context: A hallmark of lateral movement is acquiring a new credential and using it to reach a system
+    that credential never legitimately touched. Encode a deterministic predicate that fires when a session
+    shows a credential switch followed by access to a host the new credential has no history with, prioritizing
+    paths terminating at sensitive servers, per the Hopper lateral-movement model. This directly supports
+    detecting authentication outside an account's established access graph. A positive result is a credential-switch-to-novel-host
+    path toward crown-jewel assets; switches to already-known hosts are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog EventCode=4624 LogonType IN (3,9,10)
+
+      | build_login_paths(by=session, src_account, dst_account, dst_host)
+
+      | where src_account != dst_account            // credential switch
+
+      | lookup history_account_hosts dst_account OUTPUT seen_hosts
+
+      | where NOT match(dst_host, seen_hosts)        // new system for new credential
+
+      | eval priority=if(dst_host IN sensitive_servers,"high","medium")
+
+      | alert fields(src_account, dst_account, dst_host, priority)'
+- question: Is a per-account or per-host failed-logon count (Event ID 4625) or failed-to-successful ratio
+    spiking, or is there a low-and-slow password-spray pattern (many accounts, few attempts each, from
+    one source)?
+  context: Brute-force and password-spray attacks deviate from baseline authentication failure rates,
+    and spray in particular hides as low per-account volume across many accounts from a single source.
+    Baseline per-account and per-host failed-logon counts and the failed-to-successful ratio over 30 days,
+    flag modified-Z-score spikes, and separately model the spray pattern as a distinct failure-mode. A
+    positive result is either a robust failure spike or a fan-out of few-attempts-per-account from one
+    origin; routine occasional mistypes are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog EventCode=4625 earliest=-30d
+
+      | bin _time span=1h | stats count AS fails dc(TargetUserName) AS accts BY IpAddress, TargetUserName,
+      _time
+
+      | eventstats median(fails) AS med, median(abs(fails-med)) AS mad BY TargetUserName
+
+      | eval mz=abs(0.6745*(fails-med)/mad)
+
+      | eval spray=if(accts>spray_acct_threshold AND fails_per_acct<=spray_attempt_threshold,1,0)
+
+      | where mz>3.5 OR spray=1
+
+      | alert fields(TargetUserName, IpAddress, fails, accts, mz, spray)'
+- question: Is a user creating first-time or rare user-to-host or user-to-service authentication edges
+    with low historical probability, especially off-hours?
+  context: An account authenticating to a host or service it has never reached before is a structural
+    anomaly indicative of compromise or lateral movement, supporting detection of activity outside the
+    established access graph. Maintain each account's historical authentication graph, assign a rarity
+    prior to first-time user-to-host and user-to-service (Event ID 4769) edges, and alert on low-probability
+    new structures, mining frequent benign login structures to suppress noise. A positive result is a
+    rare/novel edge, weighted higher off-hours; well-established edges are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (WinEventLog:4624, WinEventLog:4769) earliest=-90d
+
+      | eval edge=user."->".coalesce(dest_host, service_name)
+
+      | stats count AS seen earliest(_time) AS first_seen BY user, edge
+
+      | eval rarity=1/(seen+1), is_new=if(now()-first_seen < 86400,1,0)
+
+      | lookup benign_login_structures edge OUTPUT is_benign
+
+      | where is_benign!="true" AND (is_new=1 OR rarity>rarity_threshold)
+
+      | eval boost=if(offhours,1.5,1.0) | alert fields(user, edge, rarity, is_new, boost)'
+- question: Does a per-account daily logon count or distinct-host count show a sustained change-point
+    shift consistent with account takeover rather than a transient spike?
+  context: Account takeover frequently produces a durable shift in how often and how widely an account
+    logs on, which change-point detection surfaces better than spike thresholds. Apply CUSUM/PELT to per-account
+    daily logon counts and distinct-host counts to find sustained regime shifts, supporting detection
+    of authentication deviation from baseline. A positive result is a persistent step-up in logon volume
+    or host breadth; transient day-to-day variation is negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog EventCode=4624 earliest=-90d
+
+      | bin _time span=1d | stats count AS logons dc(ComputerName) AS hosts BY TargetUserName, _time
+
+      | sort TargetUserName, _time
+
+      | changepoint algo=PELT|CUSUM on=logons,hosts by=TargetUserName -> segments
+
+      | where new_segment_mean > prior_segment_mean AND segment_duration_days >= 3
+
+      | alert fields(TargetUserName, changepoint_time, metric, prior_mean, new_mean)'
+- question: Does a temporal GNN+RNN link-prediction model score a new authentication edge as structurally
+    and temporally surprising, and what top-3 features (edge rarity, time-of-day, peer deviation) explain
+    it?
+  context: Lateral movement creates authentication edges that are improbable given the graph's structure
+    and timing; a temporal graph neural network combined with an RNN can score each new edge by surprise
+    and catch patterns rule-based fan-out checks miss. Surface the top-3 contributing features in the
+    alert and run it in parallel with the fan-out and credential-switch rules, never replacing them, supporting
+    the Detect tactic. A positive result is a high-surprise new edge with explainable drivers; edges consistent
+    with learned structure are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "G = build_temporal_auth_graph(WinEventLog:4624, edges=user->host, time=_time)\nmodel = TemporalGNN\
+      \ + RNN (trained_on=baseline_window)\nfor edge in new_edges:\n    surprise = model.score(edge) \
+      \           // structural + timing\n    if surprise > threshold:\n        emit_alert(edge, surprise=surprise,\n\
+      \                   top3=model.explain(edge)[:3])  // edge_rarity, time_of_day, peer_deviation"
+- question: Does an LSTM/attention model over a per-account authentication event sequence flag an event
+    outside the top-g predicted next-events, and which attention weights explain the deviation?
+  context: Authentication behavior is sequential, and an account's event stream that diverges from its
+    learned pattern signals compromise. Apply an LSTM/attention language model over per-account authentication
+    sequences, flag events outside the top-g predicted next-events, expose attention weights for analyst
+    triage, and update the model online from analyst feedback. This complements the statistical and graph
+    methods in detecting authentication deviation from baseline. A positive result is an unpredicted next-event
+    with interpretable attention; sequences matching learned behavior are negative.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4769
+  - Zeek smb_files.log
+  - Zeek dce_rpc.log
+  - 'NAI: Domain Controllers, authentication servers, and critical application/file servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seqs = sequence_per_account(WinEventLog:4624,4625,4769, order_by=_time)\nmodel = LSTM_attention(trained_on=baseline_sequences,\
+      \ online_update=analyst_feedback)\nfor acct, seq in seqs:\n    pred = model.predict_next(seq[:-1])\n\
+      \    if seq[-1] NOT IN pred.top_g:\n        emit_alert(acct, event=seq[-1], attention=model.attention_weights(seq))"
