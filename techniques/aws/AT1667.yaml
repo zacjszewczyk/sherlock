@@ -1,0 +1,378 @@
+name: 'AT1667: Application API Abuse'
+id: a4c4cf5d-54da-491b-ab1b-358294fcdb42
+description: Investigate suspected abuse of internet-exposed AWS application APIs to gain an initial foothold.
+  This playbook helps an analyst determine whether an external caller abused exposed application API methods
+  in a manner deviating from normal consumer behavior — for example, repeated authentication/authorization
+  failures followed by successful invocation of high-risk administrative, data-access, or account-management
+  functions from the same source infrastructure, user-agent family, or token context. It further guides
+  the analyst to confirm whether the API was used as a pivot to reach protected data or downstream services,
+  evidenced by successful calls to rarely used or newly observed endpoints followed by abnormal backend
+  access, large object retrieval, SSRF-to-metadata/credential theft, or credential-bearing service calls
+  inconsistent with the caller's historical scope. The playbook combines symbolic logic (deny-then-allow
+  correlation, WAF/CRS scoring, first-seen role/action detection, metadata-access correlation), statistical
+  profiling (median/MAD modified Z-scores, seasonal forecast residuals, byte-distribution outliers), and
+  machine-learning sequence/compromise models across API Gateway, CloudTrail, WAF, ALB/CloudFront, VPC
+  Flow, and S3 access logs.
+type: technique
+related:
+- tactic_id: TA0001
+  tactic_name: Initial Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any single source (IP, API key, bearer-token subject, or user-agent) generate a burst
+    of authentication/authorization failures (401/403 or explicit authorization-denied) and then, within
+    roughly 30 minutes, succeed (200/201) against a high-risk administrative, data-access, or account-management
+    API endpoint?
+  context: This identifies the classic deny-then-allow abuse pattern that signals credential brute-forcing,
+    token replay, or authorization bypass against an internet-facing API used for Initial Access. Set
+    a concrete denial floor (e.g., >=10 failed/denied calls in 5 minutes from one principal/source) before
+    the success, mirroring IAM AccessDenied enumeration bursts. Escalate when the successful call is preceded
+    by method/path probing across multiple resources, or when CloudTrail shows related identity-management
+    or policy-read activity from the same principal. A positive result — a rapid denied->success transition
+    to a privileged operation — strongly suggests a successful compromise of the API boundary; a negative
+    result (failures without subsequent privileged success) more likely reflects misconfiguration or benign
+    retries.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days; pivot to a 30-minute event-centered window around the first success
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=apigw OR index=cloudtrail\n| bin _time span=5m\n| stats sum(eval(status IN (401,403)\
+      \ OR errorCode=\"AccessDenied\")) as denials,\n        latest(eval(status IN (200,201) AND path\
+      \ IN (admin_paths))) as priv_success,\n        values(path) as paths by principal, src_ip, _time\n\
+      | where denials>=10\n| transaction principal maxspan=30m\n| where denials>=10 AND priv_success=1\n\
+      | eval verdict=\"deny-then-allow to privileged endpoint\""
+- question: Are any inbound API Gateway, ALB, or CloudFront requests carrying crafted-input attack payloads
+    — SQLi, XSS, path traversal, SSRF, deserialization, oversized URIs (>2KB), or forbidden HTTP methods
+    — as scored by OWASP Core Rule Set anomaly scoring and per-parameter grammar/length baselines?
+  context: Exploiting a public-facing application API often begins with malicious input designed to trigger
+    injection, deserialization, or SSRF flaws. Run inline WAF anomaly scoring using the OWASP Core Rule
+    Set (severity-weighted cumulative score, default inbound threshold 5; tune paranoia level per app)
+    to deterministically catch known payload classes, then layer per-parameter length, character-distribution,
+    and value-grammar baselines (Kruegel & Vigna) to flag crafted inputs that signatures miss. Keep concrete
+    blocklists (forbidden methods, oversized URIs) as a non-ML floor. A hit indicates an active exploitation
+    attempt against the API; correlate with subsequent error spikes and post-exploit process/egress behavior
+    to confirm success.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=waf OR index=apigw OR index=cloudfront
+
+      | eval crs_score = owasp_crs_anomaly_score(request)
+
+      | eval forbidden = if(method IN forbidden_methods OR len(uri)>2048, 1, 0)
+
+      | eval grammar_dev = param_grammar_zscore(parameters)   /* Kruegel-Vigna per-param baselines */
+
+      | where crs_score>=5 OR forbidden=1 OR grammar_dev>3.5
+
+      | table _time src_ip principal uri method crs_score grammar_dev'
+- question: Has any principal (AssumedRole) invoked a high-risk API action or path for the FIRST time
+    relative to its 30-90 day history of observed (role, action) pairs?
+  context: Adversaries who gain access through an API frequently perform actions the legitimate identity
+    has never used. Maintain a per-principal set of previously observed (AssumedRole, eventName/API path)
+    pairs over a 30-90 day lookback and alert when a high-risk action appears for the first time. Surface
+    the novel role and action in the alert text. This works on first-party CloudTrail/API Gateway logs
+    without external lookups. A first-seen privileged action — especially right after suspicious request
+    bursts — is a strong indicator of abuse, though legitimate operational changes can also trigger it,
+    so corroborate with denial bursts and source novelty.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days (with 30-90 day baseline lookback)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=cloudtrail OR index=apigw earliest=-90d
+
+      | eval pair=principal."|".coalesce(eventName,path)
+
+      | eventstats values(eval(if(_time<relative_time(now(),"-1d"),pair,null()))) as seen_pairs by principal
+
+      | where high_risk_action(eventName,path) AND NOT pair IN seen_pairs
+
+      | eval alert="first-seen high-risk (role,action): ".pair'
+- question: Does any principal or source show an abrupt change in its success/failure profile — a sharp
+    drop in the 4xx/5xx (and CloudTrail AccessDenied) failure ratio indicating a denied->success transition,
+    or a sudden denial spike — relative to its robust baseline?
+  context: Treating the failure rate as a first-class signal (not only successful traffic) captures the
+    moment an attacker transitions from enumeration/brute force to successful access. Track per-principal
+    and per-source counts and the ratio of 2xx vs 4xx/5xx (and AccessDenied) per minute, then flag sharp
+    ratio drops or denial spikes using robust median/MAD modified Z-scores (threshold |3.5|). A modeled
+    denied->success transition is a high-fidelity Initial Access signal; a denial-only spike may indicate
+    active enumeration or scanning still in progress.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days; per-minute aggregation
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=apigw OR index=cloudtrail
+
+      | bin _time span=1m
+
+      | stats count(eval(status<400)) as ok, count(eval(status>=400 OR errorCode="AccessDenied")) as fail
+      by principal,src_ip,_time
+
+      | eval fail_ratio = fail/(ok+fail)
+
+      | streamstats median(fail_ratio) as med, p50(abs(fail_ratio-med)) as mad by principal
+
+      | eval mz = 0.6745*(fail_ratio-med)/mad
+
+      | where abs(mz)>3.5   /* denial spike or sharp denied->success drop */'
+- question: Has a caller's behavior drifted significantly from its own baseline for request rate, endpoint
+    diversity, HTTP verb mix, status-code distribution, or byte volume — beyond its 95th percentile or
+    a 30-day seasonal (hour-of-day/day-of-week) forecast?
+  context: Legitimate API consumers exhibit stable behavioral profiles; abusive use shows up as drift
+    across multiple dimensions. Build per-principal and per-source baselines for request rate, endpoint
+    diversity, verb mix, status-code distribution, and byte volume, scoring deviations with median/MAD
+    modified Z-scores and seasonal forecast residuals via Prophet-style prediction intervals. Flag sessions
+    whose endpoint diversity, 4xx-to-2xx transition rate, or administrative-path usage exceeds the caller's
+    95th percentile or 30-day seasonal baseline. Multi-dimensional drift coinciding with privileged access
+    strengthens the Initial Access hypothesis; isolated drift may reflect a legitimate workload change.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days; compare against 30-day seasonal baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=apigw earliest=-90d\n| stats count as req, dc(path) as endpoint_div, dc(method) as verbs,\n\
+      \        sum(bytes) as vol, count(eval(status>=400)) as e4xx by principal, bin(_time,1h)\n| eval\
+      \ transition_rate=e4xx/req\n| `modified_zscore(req,principal)` , `modified_zscore(endpoint_div,principal)`\n\
+      | `seasonal_residual(req, hour_of_day, day_of_week)`\n| where mz_endpoint_div>3.5 OR transition_rate>p95(transition_rate)\
+      \ OR seasonal_resid_outlier=1"
+- question: When ordered API sessions (paths, verbs, response codes, caller attributes) are modeled with
+    variable-order Markov chains and unsupervised rare-function scoring, which sessions are implausible
+    for the principal — especially those with rapid denied->success transitions to privileged operations?
+  context: Sequence learning captures abuse that per-event rules miss by judging whether the ORDER of
+    API calls is plausible for a given caller. Model ordered API sessions with variable-order Markov chains
+    and Bayesian credible intervals to score sequence plausibility, and combine with unsupervised rare-function/population
+    scoring over CloudTrail. Prioritize sessions showing rapid denied->success transitions to privileged
+    operations, and emit the top-3 contributing features (new source, denied-burst, unusual path) in the
+    alert for analyst explainability. High anomaly scores on privilege-reaching sequences are strong leads;
+    use the surfaced drivers to separate abusive automation from legitimate bursts.
+  answer_sources:
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudTrail
+  - AWS WAF logs
+  - Application load balancer access logs
+  - CloudFront access logs
+  - CloudWatch application logs
+  - 'NAI: Internet-facing API Gateway stages, public application endpoints behind load balancers, CloudFront
+    distributions serving API traffic, and CloudWatch log groups for authentication and authorization
+    decisions'
+  range: Last 90 days; session-windowed
+  queries:
+  - technology: ML/pseudocode
+    query: "model = VariableOrderMarkov(order_max=5)            # per-principal session sequences\nmodel.fit(history_sessions[principal])\n\
+      for s in todays_sessions:\n    p = model.sequence_prob(s.tokens)                  # paths|verbs|status|attrs\n\
+      \    rare = unsupervised_rare_function_score(s, cloudtrail_pop)\n    if p < bayes_lower_credible_interval\
+      \ or rare_high:\n        drivers = top3_features(s)                      # new_source, denied_burst,\
+      \ unusual_path\n        alert(principal, s, drivers, priority=denied_to_success_priv(s))"
+- question: Was a successful request to a privileged or low-volume API path immediately (<5 min) followed
+    by backend access to sensitive resources — new S3 object reads, Secrets Manager/SSM Parameter retrieval,
+    SSM SendCommand/StartSession, or app-tier connections to private services that endpoint does not normally
+    touch?
+  context: After breaching the API boundary, an adversary pivots to back-end data and control-plane services.
+    Alert when a successful call to a privileged or rare API path is immediately followed by sensitive
+    backend access — new S3 reads, secret/parameter retrieval, or app-tier connections to private services
+    atypical for that endpoint. Match cloud-control-plane abuse such as SSM SendCommand/StartSession (Sigma
+    AWS SSM malicious usage). Require temporal proximity (<5 min) and shared request/trace identifiers
+    where available. A confirmed API-to-backend pivot indicates the foothold has been leveraged to reach
+    protected data; absence of the backend leg suggests the request was benign.
+  answer_sources:
+  - API Gateway access logs
+  - CloudTrail
+  - CloudWatch application logs
+  - AWS WAF logs
+  - VPC Flow Logs
+  - S3 server access logs
+  - 'NAI: API backends connected to sensitive data stores, VPC endpoints serving private application dependencies,
+    and logging locations for object retrieval, backend service invocation, and application-session context'
+  range: Last 90 days; 5-minute correlation window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=apigw (path IN privileged_or_rare_paths AND status IN (200,201))\n| join type=inner\
+      \ principal, trace_id [\n    search index=cloudtrail (eventName IN (\"GetObject\",\"GetSecretValue\"\
+      ,\"GetParameter\",\"SendCommand\",\"StartSession\")\n        OR app_tier_conn_to_private_service)\n\
+      \  ]\n| eval dt = backend_time - api_time\n| where dt>=0 AND dt<300   /* <5 min pivot */\n| table\
+      \ _time principal path eventName resource dt"
+- question: Did any application workload begin querying the instance metadata service (169.254.169.254
+    / IMDS) or retrieve role credentials shortly after receiving an inbound API request, and were those
+    credentials then used in CloudTrail?
+  context: This detects the SSRF-to-credential-theft chain in which an API request coerces a workload
+    into reaching IMDS to steal IAM role credentials. Flag any application workload that begins querying
+    IMDS or retrieving role credentials shortly after an inbound API request, then pair VPC Flow Logs
+    to IMDS/egress with the preceding API Gateway request AND the subsequent CloudTrail use of the exfiltrated
+    role. This relies on first-party telemetry only. The full chain (inbound request -> IMDS access ->
+    role credential use elsewhere) is high-fidelity evidence of compromise; an isolated IMDS query may
+    be normal SDK behavior, so require the temporal linkage.
+  answer_sources:
+  - API Gateway access logs
+  - CloudTrail
+  - CloudWatch application logs
+  - AWS WAF logs
+  - VPC Flow Logs
+  - S3 server access logs
+  - 'NAI: API backends connected to sensitive data stores, VPC endpoints serving private application dependencies,
+    and logging locations for object retrieval, backend service invocation, and application-session context'
+  range: Last 90 days; correlate request -> IMDS -> credential use
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '/* 1: inbound API request */ A=search index=apigw status IN (200,201)
+
+      /* 2: workload -> IMDS shortly after */ B=search index=vpcflow dstaddr=169.254.169.254
+
+      /* 3: stolen role used elsewhere */ C=search index=cloudtrail userIdentity.type=AssumedRole
+
+      | transaction host,principal maxspan=15m with A then B
+
+      | join role [search C]
+
+      | where imds_time>api_time AND credential_use_time>imds_time
+
+      | eval verdict="SSRF->IMDS->credential reuse"'
+- question: For rarely used endpoints, has there been a sudden increase in successful calls, backend resource
+    access count, or returned data volume beyond the endpoint's trailing 30-day median — or per-(endpoint,length)
+    byte-distribution anomalies indicating abnormal large-object retrieval or crafted payloads?
+  context: Rare endpoints abused for data access stand out as statistical outliers. Measure per-endpoint
+    call counts, caller entropy, downstream resource fan-out, and bytes transferred, then flag sessions
+    where a rare endpoint shows a sudden jump in successful calls, backend resource access count, or returned
+    volume beyond its trailing 30-day median using median/MAD modified Z-scores (|3.5|). Add per-(endpoint,length)
+    byte-distribution profiling with Mahalanobis distance (PAYL) to catch abnormal large-object retrieval
+    and crafted payloads. Outlier volume or byte distribution on a normally-quiet endpoint is a strong
+    data-exfiltration/abuse indicator.
+  answer_sources:
+  - API Gateway access logs
+  - CloudTrail
+  - CloudWatch application logs
+  - AWS WAF logs
+  - VPC Flow Logs
+  - S3 server access logs
+  - 'NAI: API backends connected to sensitive data stores, VPC endpoints serving private application dependencies,
+    and logging locations for object retrieval, backend service invocation, and application-session context'
+  range: Last 90 days; trailing 30-day median baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=apigw OR index=s3access OR index=cloudtrail earliest=-30d
+
+      | stats count as calls, dc(resource) as fanout, sum(bytes) as vol by endpoint, bin(_time,1h)
+
+      | where endpoint IN rare_endpoints
+
+      | streamstats median(vol) as med, p50(abs(vol-med)) as mad by endpoint
+
+      | eval mz=0.6745*(vol-med)/mad
+
+      | eval mahal = payl_byte_dist_mahalanobis(endpoint, response_len, byte_hist)
+
+      | where abs(mz)>3.5 OR mahal>payl_threshold'
+- question: Which CloudTrail API actions have never previously been observed for a given identity over
+    the lookback window, and do any first-seen actions coincide with a volume spike?
+  context: Per-identity first-seen action baselining flags adversary actions that legitimate identities
+    never perform. Baseline CloudTrail API actions per principal over a lookback window and report actions
+    never previously seen for that identity, naming the novel action(s) and resource(s) for triage. Combine
+    with seasonal volume forecasting so first-seen plus volume-spike together raise fidelity. A novel
+    action paired with an abnormal volume spike is a high-confidence lead that the API foothold is being
+    used to reach new resources; a lone first-seen action may be routine and warrants corroboration.
+  answer_sources:
+  - API Gateway access logs
+  - CloudTrail
+  - CloudWatch application logs
+  - AWS WAF logs
+  - VPC Flow Logs
+  - S3 server access logs
+  - 'NAI: API backends connected to sensitive data stores, VPC endpoints serving private application dependencies,
+    and logging locations for object retrieval, backend service invocation, and application-session context'
+  range: Last 90 days (with per-identity lookback baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=cloudtrail earliest=-90d
+
+      | eventstats values(eval(if(_time<relative_time(now(),"-1d"),eventName,null()))) as seen by userIdentity.arn
+
+      | where NOT eventName IN seen
+
+      | `seasonal_volume_forecast(eventName, userIdentity.arn)`
+
+      | eval fidelity=if(volume_spike=1,"high","medium")
+
+      | table _time userIdentity.arn eventName resource fidelity'
+- question: When a classifier built from endpoint rarity, response-code transitions, backend fan-out,
+    source reputation, token age, and returned-byte volume (plus unsupervised CloudTrail rare-function/user-command-pair
+    scoring and IAM principal-role-resource-action graph models) is applied, which sessions score as compromised,
+    and what are the top-3 drivers?
+  context: A supervised/semi-supervised compromise classifier fuses many weak signals into a high-fidelity
+    verdict that distinguishes abusive automation from legitimate bursts. Fit a model using endpoint rarity,
+    response-code transitions, backend fan-out, source reputation, token age, and returned-byte volume;
+    complement with unsupervised CloudTrail rare-function and rare user-command-pair scoring and graph
+    models over IAM principal-role-resource-action relations to capture anomalous fan-out. Surface the
+    top-3 drivers per alert (xNIDS-style) so analysts can validate quickly. High-scoring sessions with
+    explanatory drivers pointing to privileged backend fan-out are prime escalation candidates.
+  answer_sources:
+  - API Gateway access logs
+  - CloudTrail
+  - CloudWatch application logs
+  - AWS WAF logs
+  - VPC Flow Logs
+  - S3 server access logs
+  - 'NAI: API backends connected to sensitive data stores, VPC endpoints serving private application dependencies,
+    and logging locations for object retrieval, backend service invocation, and application-session context'
+  range: Last 90 days; session-windowed
+  queries:
+  - technology: ML/pseudocode
+    query: "X = features(endpoint_rarity, status_transitions, backend_fanout,\n              source_reputation,\
+      \ token_age, returned_bytes)\nscore = compromise_classifier.predict_proba(X)               # supervised/semi-supervised\n\
+      unsup = cloudtrail_rare_function_and_cmd_pair_score(session)\ngraph = iam_graph_anomaly(principal_role_resource_action)\
+      \      # GNN fan-out\nif combine(score, unsup, graph) > threshold:\n    drivers = top3_features(X)\
+      \                                 # xNIDS-style explanation\n    alert(session, drivers)"
