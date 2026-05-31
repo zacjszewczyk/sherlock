@@ -1,0 +1,485 @@
+name: 'T1098.A006: Cognito Refresh Token Abuse'
+id: 2475ed2e-ab7a-449f-8c34-c7e86137ac55
+description: Investigate whether an adversary is abusing Amazon Cognito refresh tokens to escalate privileges
+  and maintain persistent, authenticated access to an application or its downstream AWS resources. This
+  playbook helps an analyst determine if stolen or replayed refresh tokens are being exchanged from unfamiliar
+  infrastructure, user agents, device identifiers, or app clients to mint new sessions that map to privileged
+  application roles, groups, or AWS permissions without a fresh interactive authentication event. It correlates
+  Cognito user-pool advanced security and adaptive-authentication risk events with CloudTrail management
+  events and application/API/WAF/load-balancer access logs to surface privileged token refreshes from
+  anomalous client context, rotated-token replay, sessions that survive password resets, MFA changes,
+  global sign-outs, and token revocations (the 'revocation gap'), and post-revocation AccessDenied bursts
+  that betray a stolen session probing its remaining access. Methods span symbolic-logic detections, statistical
+  baselining (modified Z-score/MAD, first-seen profiling, decay-curve and burst analysis), and machine-learning
+  models (clustering, sequence/Markov, and graph-based scoring) to give the SOC granular, defensible coverage
+  of Cognito refresh-token abuse for privilege escalation and persistence.
+type: technique
+related:
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are Cognito refresh-token exchanges (InitiateAuth/AdminInitiateAuth with REFRESH_TOKEN_AUTH,
+    or GetTokensFromRefreshToken) occurring for a user from a source IP, ASN, country, user agent, device
+    identifier, or app client ID that is new or inconsistent with that user's established profile, and
+    does the resulting session immediately reach a privileged role, group, or admin path?
+  context: Under Privilege Escalation, an adversary who holds a stolen Cognito refresh token can silently
+    mint fresh access tokens without any interactive logon, often from infrastructure that does not match
+    the legitimate user. Detect repeated refresh calls for the same Cognito user where the client context
+    (source IP, ASN, country, user agent, device id, or app client ID) diverges from the user's history
+    and the refreshed claims/groups/mapped roles grant elevated access. As a concrete floor, alert on
+    ANY refresh from a source IP on the Cognito threat-protection 'Always block' list or from an ASN/country
+    never seen for that user in 30 days, and escalate when the refreshed session immediately reaches an
+    admin role or path. Treat refreshes that appear after password resets, MFA re-registration, or long
+    idle periods (which should have disrupted normal access) as high-confidence. A positive result indicates
+    token theft used to regain elevated access; a negative result reflects the user refreshing from familiar
+    infrastructure.
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (baseline client context over 30 days; evaluate per refresh)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (eventName="InitiateAuth" OR eventName="AdminInitiateAuth" OR eventName="GetTokensFromRefreshToken")
+
+      | where authFlow="REFRESH_TOKEN_AUTH" OR eventName="GetTokensFromRefreshToken"
+
+      | lookup user_client_baseline cognito_user OUTPUT known_asn, known_country, known_devices, known_appclients
+
+      | eval new_ctx=if(NOT(sourceASN in known_asn) OR NOT(country in known_country) OR NOT(deviceId in
+      known_devices) OR NOT(appClientId in known_appclients),1,0)
+
+      | eval blocklisted=if(sourceIPAddress in cognito_always_block,1,0)
+
+      | join type=left cognito_user [ search source=app_logs privileged_path=1 earliest=0 latest=+5m ]
+
+      | where blocklisted=1 OR (new_ctx=1 AND resulting_role IN privileged_roles)
+
+      | alert'
+- question: With refresh-token rotation enabled, has an already-rotated or invalidated Cognito refresh
+    token been presented again, or does a sender-constrained (DPoP) token show a proof-key/jkt thumbprint
+    mismatch between the bound token and the presenting client?
+  context: 'OAuth treats presentation of an already-rotated/invalidated refresh token as unambiguous theft
+    (RFC 9700 4.14): the legitimate client only ever holds the newest token in a rotation family, so a
+    replay of an old one means an attacker copied it. The deterministic response is to revoke the entire
+    token family. Where sender-constrained tokens are used, a DPoP proof-key or jkt thumbprint that does
+    not match the bound token likewise proves the presenter is not the legitimate holder. This is a high-fidelity
+    Privilege Escalation signal because the replayed/mismatched token is being used to assert a privileged
+    identity the attacker does not own. Surface the token family ID, the original versus replay source
+    IP/ASN, and the time delta between rotation and replay so responders can scope the compromise. A positive
+    result mandates family revocation and session hunting; a negative result means tokens are being presented
+    by their rightful holders.'
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (evaluate per refresh; correlate within token-family lifetime)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cognito_advanced_security event=token_refresh
+
+      | eval rotated_already=if(refresh_token_state="rotated" OR refresh_token_state="invalidated",1,0)
+
+      | eval dpop_mismatch=if(isnotnull(dpop_jkt) AND dpop_jkt!=bound_token_jkt,1,0)
+
+      | where rotated_already=1 OR dpop_mismatch=1
+
+      | stats values(sourceIPAddress) as src_ips values(sourceASN) as asns min(rotation_time) as t_rotate
+      max(_time) as t_replay by token_family_id, cognito_user
+
+      | eval replay_delta=t_replay-t_rotate
+
+      | eval action="revoke_token_family"
+
+      | alert'
+- question: Does a Cognito user or app-client exceed its 30-day baseline for refresh frequency, distinct
+    source IPs/ASNs/countries per day, count of privileged endpoints touched, failed-refresh/AccessDenied
+    rate, or hour-of-day distribution, when measured with a robust modified Z-score against the same app-client
+    population?
+  context: Statistical baselining catches refresh-token abuse that individually looks valid but, in aggregate,
+    deviates from how an identity normally behaves. Baseline per-user and per-app-client Frequency (refreshes
+    per minute and per hour), Volume (distinct source IPs/ASNs/countries per day and number of privileged
+    endpoints touched), State (failed-refresh and AccessDenied rate), hour-of-day distribution, and the
+    privilege level of refreshed sessions over a rolling 30-day window. Flag accounts that exceed the
+    95th percentile of their app-client peer population, using median-absolute-deviation / modified Z-score
+    so that legitimate batch or automation bursts do not distort thresholds. Apply CloudWatch metric-filter
+    confidence bands to per-principal refresh volume and failed-refresh counts for time-series alarms.
+    Alert text should name the metric, the baseline, and the observed value. A positive result means an
+    identity is refreshing unlike itself and its peers; a negative result indicates volumes within normal
+    operating range.
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (rolling 30-day baseline; evaluate per principal/app-client)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail (eventName="InitiateAuth" OR eventName="AdminInitiateAuth" OR eventName="GetTokensFromRefreshToken")
+      earliest=-30d
+
+      | bin _time span=1h
+
+      | stats count as refreshes dc(sourceIPAddress) as ips dc(sourceASN) as asns dc(country) as countries
+      dc(privileged_endpoint) as priv_eps sum(failed) as failed_refresh by cognito_user, appClientId,
+      _time
+
+      | eventstats median(refreshes) as med p95(refreshes) as p95 by appClientId
+
+      | eval mad=abs(refreshes-med)
+
+      | eventstats median(mad) as mad_med by appClientId
+
+      | eval mod_z=0.6745*(refreshes-med)/mad_med
+
+      | where mod_z>3.5 OR refreshes>p95
+
+      | alert'
+- question: Has a Cognito principal performed a refresh, or made a follow-on privileged API call, from
+    a source IP/ASN/country, app client ID, or downstream API action that has never been observed for
+    that identity in the lookback window, and is there an accompanying burst of post-refresh AccessDenied/error
+    responses?
+  context: 'First-seen analysis is one of the strongest signals of credential or token theft: an attacker
+    almost always introduces something new (infrastructure, client, or action) the legitimate identity
+    has never used. Maintain a first-seen baseline per principal of source IP/ASN/country, app client
+    ID, and downstream API actions, and alert when a refresh or its follow-on privileged call uses a source
+    or action never seen before for that identity. In the Privilege Escalation context, also treat a spike
+    of post-refresh AccessDenied/error responses as a distinct failure-mode signal: a stolen session frequently
+    probes what privileges it has, generating denied calls before finding what it can reach. A positive
+    result indicates a novel, likely-malicious use of a refreshed session; a negative result means the
+    activity matches the identity''s established footprint.'
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (first-seen lookback 90 days; evaluate per principal)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail principal=* earliest=-90d
+
+      | stats earliest(_time) as first_seen by cognito_user, sourceIPAddress, sourceASN, country, appClientId,
+      eventName
+
+      | eval is_first_seen=if(first_seen>relative_time(now(),"-1d"),1,0)
+
+      | append [ search source=cloudtrail errorCode="AccessDenied" | bin _time span=5m | stats count as
+      denied by cognito_user, _time | eventstats p99(denied) as p99 by cognito_user | where denied>p99
+      ]
+
+      | where is_first_seen=1 OR denied>p99
+
+      | alert'
+- question: When Cognito refresh events are clustered or scored by device fingerprint, user-agent family,
+    IP reputation, app client, geography, and resulting claims, do any refreshes fall into rare, low-population
+    token-use contexts (for example a new ASN combined with a new device and a claim change)?
+  context: Machine-learning clustering and rare-function/population analysis isolate refresh contexts
+    that are statistically unusual without requiring a hand-written rule for every scenario. Cluster or
+    score refresh events across device fingerprint, user-agent family, IP reputation, app client, geography,
+    and resulting claims over CloudTrail and Cognito risk events, and reuse UEBA impossible-travel / unfamiliar-IP
+    anomalies as features. Rare clusters that also carry a claim or group change are strong candidates
+    for refresh-token abuse driving privilege escalation. Critically, alerts must surface the top-3 contributing
+    features (e.g., new ASN, new device, claim change) in the alert text, not just an opaque score, so
+    analysts can triage quickly. A positive result flags a refresh occurring in a context almost never
+    seen for the population; a negative result places the refresh inside a dense, well-established cluster.
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (train on 30-90 days; score per refresh)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'source=cloudtrail+cognito_risk_events refresh_event=1 earliest=-90d
+
+      | eval features=[device_fp, ua_family, ip_reputation, appClientId, geo, resulting_claims, impossible_travel,
+      unfamiliar_ip]
+
+      | cluster method=density features=features
+
+      | eval rarity=population_share(cluster_id)
+
+      | where rarity < 0.01
+
+      | eval top3=top_contributing_features(features,3)
+
+      | table cognito_user, cluster_id, rarity, top3
+
+      | alert'
+- question: Does a supervised or graph-based model over refresh events and downstream application use
+    score a session as a likely compromised, elevated-access session based on refresh-interval regularity,
+    device inconsistency, IP reputation, claim changes, session age, and divergence from interactive-login
+    history?
+  context: A trained model can ensemble many weak signals into a high-confidence judgment that a refreshed
+    session is a stolen one re-establishing elevated access. Train over refresh events and downstream
+    application use using features such as refresh-interval regularity (automation often refreshes too
+    cleanly), device inconsistency, IP reputation, claim changes, session age, and divergence between
+    refresh behavior and the user's interactive-login history. Cognito adaptive authentication already
+    produces a per-event risk score from location/device features that can be ingested or ensembled. Heterogeneous-graph
+    models additionally capture suspicious refresh-to-privileged-action edges with attention-based explainability.
+    Emit the top-3 contributing features per alert so analysts understand the verdict. A positive result
+    identifies a session whose refresh/behavior profile matches token abuse; a negative result aligns
+    with the legitimate user's pattern.
+  answer_sources:
+  - CloudTrail management events
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - Application Load Balancer access logs
+  - CloudFront access logs
+  - API Gateway access logs
+  - 'NAI: Cognito user pools protecting internet-facing applications, token-refresh endpoints exposed
+    through load balancers or CloudFront, and application logs that bind refreshed sessions to user identifiers
+    and client metadata'
+  range: Last 90 days (train on 90 days; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'source=cognito+app_logs session=* earliest=-90d
+
+      | eval feats=[refresh_interval_regularity, device_inconsistency, ip_reputation, claim_change, session_age,
+      login_history_divergence, cognito_adaptive_risk]
+
+      | score model=token_abuse_privilege_model input=feats
+
+      | eval graph_edge=score_refresh_to_privileged_action_edge(cognito_user)
+
+      | where model_score>0.85 OR graph_edge_anomaly=1
+
+      | eval top3=top_contributing_features(feats,3)
+
+      | alert'
+- question: After a Cognito user undergoes a RevokeToken, global sign-out, password reset, MFA change,
+    account disablement, or account-recovery action, do refreshed sessions from the same principal continue
+    reaching protected APIs or sensitive pages, or do privileged calls arrive bearing an access token
+    issued before the auth-state change?
+  context: This is the 'revocation gap' at the heart of refresh-token abuse for persistence and privilege
+    escalation. Revoking a refresh token invalidates derived access tokens, so any successful refresh
+    after a revocation/reset is anomalous and indicates the attacker still controls token material. Remember
+    that already-issued access tokens live until their expiry, so also alert on privileged calls bearing
+    a token issued before the auth-state change, even without a new refresh. Alert when a user experiences
+    RevokeToken, global sign-out, password reset, MFA change, account disablement, or account recovery
+    and yet refreshed sessions from that principal keep reaching protected APIs or sensitive pages afterward.
+    Increase severity when those sessions touch admin endpoints, elevate app roles, export data, or modify
+    account settings; corroborate with OAuth replay expectations. A positive result is strong evidence
+    of a stolen token surviving remediation; a negative result confirms revocation propagated correctly.
+  answer_sources:
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - CloudTrail management events
+  - API Gateway access logs
+  - AWS WAF logs
+  - 'NAI: Administrative and data-sensitive application paths protected by Cognito, logs capturing password
+    resets and token revocation workflows, and API endpoints used immediately after refreshed sessions
+    are issued'
+  range: 'Last 90 days (event-centered: from each auth-state change forward)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cognito_logs (eventName="RevokeToken" OR eventName="GlobalSignOut" OR action IN ("password_reset","mfa_change","account_disable","account_recovery"))
+
+      | eval t_change=_time
+
+      | join cognito_user [ search source=app_logs (protected_api=1 OR sensitive_page=1) ]
+
+      | where app_request_time > t_change OR access_token_issued_at < t_change
+
+      | eval severity=case(admin_endpoint=1 OR role_elevated=1 OR data_export=1 OR settings_modified=1,"high",1==1,"medium")
+
+      | alert'
+- question: After password resets, sign-outs, or token-revocation events, does a user's post-change request
+    volume, privileged-endpoint access, or session continuity materially exceed the normal activity decay
+    curve observed for similar accounts?
+  context: Legitimate users go quiet after a password reset, sign-out, or revocation; their activity decays
+    predictably. A stolen token instead keeps working, so the compromised principal's activity stays elevated
+    against the expected decay curve. Measure the normal drop-off in application activity following these
+    auth-state changes for comparable accounts, then flag users whose post-change request volume, privileged-endpoint
+    access, or session continuity is materially higher than the expected decay. Use modified Z-score /
+    MAD thresholds so that automation-driven traffic does not skew the baseline. This complements the
+    deterministic revocation-gap rule by catching slower or partial bypasses where some access persists.
+    A positive result indicates a session that should have been cut off but persists; a negative result
+    shows activity decaying as expected after the change.
+  answer_sources:
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - CloudTrail management events
+  - API Gateway access logs
+  - AWS WAF logs
+  - 'NAI: Administrative and data-sensitive application paths protected by Cognito, logs capturing password
+    resets and token revocation workflows, and API endpoints used immediately after refreshed sessions
+    are issued'
+  range: Last 90 days (event-centered decay window after each auth-state change)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cognito_logs auth_state_change=1
+
+      | map search="source=app_logs cognito_user=$cognito_user$ earliest=$t_change$ latest=+24h"
+
+      | bin _time span=1h | stats count as reqs sum(privileged) as priv by cognito_user, hours_since_change
+
+      | eventstats median(reqs) as expected mad(reqs) as mad by hours_since_change
+
+      | eval mod_z=0.6745*(reqs-expected)/mad
+
+      | where mod_z>3.5
+
+      | alert'
+- question: What is the time gap and request count between an authentication-state change and the final
+    privileged request made with a refreshed session, and do any principals' supposedly revoked sessions
+    operate materially longer than the application's normal revocation-propagation envelope?
+  context: Even correctly configured revocation takes a finite, measurable time to propagate. Establishing
+    that normal envelope lets you flag sessions that operate well beyond it. Compute the time gap (and
+    request count) between an authentication-state change and the last privileged request made with a
+    refreshed session, then escalate users whose supposedly revoked sessions keep operating materially
+    longer than the application's normal revocation-propagation envelope. Build the envelope and per-principal
+    alarms from CloudWatch metric filters / Contributor Insights with confidence bands. In a Privilege
+    Escalation context, a long tail of privileged activity after revocation is a clear marker that the
+    attacker's token is not bound by the platform's revocation mechanism. A positive result identifies
+    a session outliving its expected revocation envelope; a negative result shows revocation completed
+    within the normal window.
+  answer_sources:
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - CloudTrail management events
+  - API Gateway access logs
+  - AWS WAF logs
+  - 'NAI: Administrative and data-sensitive application paths protected by Cognito, logs capturing password
+    resets and token revocation workflows, and API endpoints used immediately after refreshed sessions
+    are issued'
+  range: Last 90 days (event-centered from each revocation/reset)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cognito_logs auth_state_change=1
+
+      | eval t_change=_time
+
+      | join cognito_user [ search source=app_logs privileged=1 ]
+
+      | where app_time>t_change
+
+      | stats max(app_time) as last_priv count as priv_reqs by cognito_user, t_change
+
+      | eval gap=last_priv-t_change
+
+      | eventstats p95(gap) as envelope_p95
+
+      | where gap>envelope_p95
+
+      | alert'
+- question: Shortly after a revocation or reset for a Cognito principal, is there a spike in AccessDenied
+    or failed-refresh responses that exceeds the principal's rolling 99th percentile, indicating a stolen
+    session probing what access remains?
+  context: Failed and denied calls are a distinct State signal. When a token is partially curtailed by
+    a revocation or reset, an attacker holding it tends to probe aggressively to learn what access still
+    works, generating a burst of AccessDenied or failed-refresh responses. Profile these denied/failed
+    calls per principal and alert when the AccessDenied count per minute after an auth-state change exceeds
+    the principal's rolling 99th percentile. This catches the noisy, exploratory phase of post-remediation
+    token abuse even when individual successful calls are hard to distinguish from legitimate traffic.
+    A positive result indicates a session probing its residual privileges after remediation; a negative
+    result shows no abnormal denial activity following the change.
+  answer_sources:
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - CloudTrail management events
+  - API Gateway access logs
+  - AWS WAF logs
+  - 'NAI: Administrative and data-sensitive application paths protected by Cognito, logs capturing password
+    resets and token revocation workflows, and API endpoints used immediately after refreshed sessions
+    are issued'
+  range: Last 90 days (event-centered minutes-to-hours after each change)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cognito_logs auth_state_change=1 | eval t_change=_time
+
+      | join cognito_user [ search source=cloudtrail (errorCode="AccessDenied" OR refresh_failed=1) ]
+
+      | where _time>t_change AND _time<t_change+3600
+
+      | bin _time span=1m | stats count as denied by cognito_user, _time
+
+      | eventstats p99(denied) as p99 by cognito_user
+
+      | where denied>p99
+
+      | alert'
+- question: Do event-sequence models (LSTM log-key sequencing, variable-order Markov, or graph models)
+    across Cognito, application, and API logs identify refreshed sessions that remain active despite auth-state
+    changes and are then driven through privileged workflows?
+  context: 'Some token-abuse-for-privilege patterns only emerge as an ordered sequence of events rather
+    than any single suspicious call. Use event-sequence modeling across Cognito, application, and API
+    logs: LSTM log-key sequence modeling (with per-event diagnosis) to learn the normal ordering of operations
+    and flag sessions that deviate, and a variable-order Markov model to score whether the ordered post-reset
+    request sequence is plausible for the user. Graph models contextualize the regained-privilege edge
+    and the follow-on actions. Weight path sensitivity, revocation timing, client novelty, claim changes,
+    and post-reset action diversity in the score, and surface the top-3 contributing features per alert.
+    This captures refreshed sessions that survive an auth-state change and are then used for privileged
+    workflows. A positive result flags an implausible privilege-regain sequence; a negative result matches
+    the user''s normal operational ordering.'
+  answer_sources:
+  - Cognito user pool advanced security logs
+  - Cognito threat protection (adaptive authentication) risk events
+  - CloudWatch application logs
+  - CloudTrail management events
+  - API Gateway access logs
+  - AWS WAF logs
+  - 'NAI: Administrative and data-sensitive application paths protected by Cognito, logs capturing password
+    resets and token revocation workflows, and API endpoints used immediately after refreshed sessions
+    are issued'
+  range: Last 90 days (train on 90 days; score per session/sequence)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'source=cognito+app+api_logs session=* earliest=-90d
+
+      | transaction cognito_user maxpause=30m | eval seq=event_key_sequence
+
+      | score model=deeplog_lstm input=seq output=seq_anomaly
+
+      | eval markov_score=vomm_sequence_likelihood(seq, user_profile)
+
+      | eval graph_edge=score_regained_privilege_edge(cognito_user)
+
+      | where seq_anomaly=1 OR markov_score<0.01 OR graph_edge_anomaly=1
+
+      | eval top3=top_contributing_features([path_sensitivity,revocation_timing,client_novelty,claim_change,post_reset_action_diversity],3)
+
+      | alert'
