@@ -1,0 +1,874 @@
+name: 'T1649: Steal or Forge Authentication Certificates'
+id: d9744172-8c10-447c-87a3-a97bbb9074f6
+description: 'This playbook helps an analyst investigate whether an adversary has accessed credentials
+  by stealing or forging authentication certificates (MITRE ATT&CK T1649, Steal or Forge Authentication
+  Certificates) under the Credential Access tactic. Digital certificates bind to an identity and can be
+  used as durable authentication material; Active Directory Certificate Services (AD CS) certificates
+  and Entra ID device certificates can serve as credentials for domain or machine accounts. Adversaries
+  steal certificates from the Windows certificate store, the registry, files, Linux key directories (/etc/ssl,
+  /etc/pki, ~/.pki/nssdb), and macOS Keychains, or they abuse certificate enrollment (ESC1-ESC8 misconfigurations,
+  SAN abuse, NTLM relay to the web-enrollment endpoint) to request authentication-capable certificates,
+  and may forge ''golden'' certificates with a stolen CA private key. The hunt spans Windows, Linux, macOS,
+  and identity-provider telemetry and pursues the behavior from several complementary angles: process
+  executions and TLS thumbprints matching known certificate-abuse tooling (Certipy, Certify/ForgeCert,
+  Mimikatz crypto::, Rubeus); command-line and PowerShell script-block patterns of certificate enumeration,
+  request, export, and theft; suspicious CA enrollment requests where the requester, template, or Subject
+  Alternative Name violates policy; private-key export and key-store access by non-allow-listed processes;
+  anomalous certificate-based logons (Kerberos PKINIT / Schannel) by unexpected accounts, from rare geographies
+  or new devices; and the theft-to-exfiltration sequence where a certificate file is staged to disk and
+  then transmitted outbound. Detection methods combine deterministic symbolic-logic rules (hash/thumbprint
+  watchlists, ESC template/SAN policy enforcement, SACL-audited key and file access, certificate-logon
+  watchlists), statistical baselining (execution frequency and failure-state profiling, command-line entropy,
+  requester-template rarity, new-actor and impossible-travel scoring, outbound transfer volume percentiles),
+  and explainable machine learning (gradient-boosted and isolation-forest classifiers, graph link-prediction
+  over enrollment and authentication edges, multivariate time-series detectors, with SHAP-surfaced top
+  contributing features), applied across Windows Security events (4688, 4104, 4886/4887/4888/4898, 5058/5059,
+  4663, 4768/4771, 4624), auditd SYSCALL, macOS unified/keychain logs, Azure/M365 sign-in and audit logs,
+  and Zeek x509/conn/files logs, so the analyst can corroborate suspected certificate theft or forgery
+  across process lineage, enrollment activity, key access, and authentication telemetry.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: '[Credential Access] Using the ''Match process hashes and TLS certificate thumbprints against
+    known-bad watchlists'' (Symbolic Logic) approach: can you determine whether a process execution event
+    where the process file hash matches a known hash of a certificate theft tool, or a network connection
+    is observed using a TLS certificate whose thumbprint matches a known malicious certificate.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    execution event where the process file hash matches a known hash of a certificate theft tool, or a
+    network connection is observed using a TLS certificate whose thumbprint matches a known malicious
+    certificate. The Symbolic Logic approach works as follows: Create a SIEM rule that joins the process
+    hash from process creation events (Windows Event ID 4688/Sysmon EID 1) against a watchlist of hashes
+    for known certificate-abuse tools (Certipy, Certify/ForgeCert, Mimikatz `crypto::`, Rubeus), per the
+    AD CS tradecraft in [Certified Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf)
+    and [Certipy](https://github.com/ly4k/Certipy). Separately, join the certificate thumbprint (`id`
+    field) from Zeek x509.log against a watchlist of malicious certificate thumbprints/serials. ALSO enforce
+    the deterministic forged-certificate signal of digest mismatch / signature-status=Invalid (Windows
+    error 0x80096010 Bad Digest) from [Certified Malware](https://doi.org/10.1145/3133956.3133958). Alert
+    text must include the matched hash/thumbprint, process, and user. Generate a high-severity alert on
+    any match; never remove this hard match layer. A positive result -- a rule match, a statistical outlier,
+    or a model alert -- indicates probable certificate theft, forgery, or abuse; pivot to the responsible
+    process and its parent lineage, the user and host, the certificate/template/key involved, and any
+    subsequent authentication or outbound transfer to scope the compromise and the accounts at risk. A
+    negative result helps rule out this particular vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, living-off-the-land, or novel certificate-abuse
+    variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "# Match process hashes and TLS certificate thumbprints against known-bad watchlists (Symbolic\
+      \ Logic)\nsource IN ['Windows Event ID 4688', 'Zeek x509.log']\n| approach: Create a SIEM rule that\
+      \ joins the process hash from process creation events (Windows Event ID 4688/Sysmon EID 1) against\
+      \ a watchlist of hashes for known certificate-abuse tools (Certipy, Certify/ForgeCert, Mimikatz\
+      \ `crypto::`, Rubeus), per \n| correlate over NAI: Domain Controllers, Certificate Authority Servers,\
+      \ All Endpoints, Network Egress Points\n| emit alert with contributing fields and entity context\
+      \ (process, parent, user, host, certificate/template/thumbprint, key path, destination)"
+  - technology: Zeek/pseudocode
+    query: '# Match process hashes and TLS certificate thumbprints against known-bad watchlists (Zeek
+      view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Profile execution frequency and failure state of certificate-management
+    tools per host role'' (Statistical Method) approach: can you determine whether a process execution
+    event where the process file hash matches a known hash of a certificate theft tool, or a network connection
+    is observed using a TLS certificate whose thumbprint matches a known malicious certificate.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    execution event where the process file hash matches a known hash of a certificate theft tool, or a
+    network connection is observed using a TLS certificate whose thumbprint matches a known malicious
+    certificate. The Statistical Method approach works as follows: For each host, baseline the per-hour
+    execution COUNT (Frequency) of legitimate cert tools (certutil.exe, certlm.msc, certreq.exe, openssl,
+    /usr/bin/security) and the success/failure State of their invocations, segmented by host role (workstation/DC/CA/Mac).
+    Alert when the count exceeds the trailing-30-day 99th percentile for that role, especially when correlated
+    with an anomalous user. Track failed/denied tool runs as a distinct signal (probing). Rarity baselining
+    follows [Context-Based Irregular Activity Detection](https://www.sciencedirect.com/science/article/pii/S0957417423014938).
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Profile execution frequency and failure state of certificate-management tools per host role
+      (Statistical Method)
+
+      source IN [''Windows Event ID 4688'', ''Zeek x509.log'']
+
+      | approach: For each host, baseline the per-hour execution COUNT (Frequency) of legitimate cert
+      tools (certutil.exe, certlm.msc, certreq.exe, openssl, /usr/bin/security) and the success/failure
+      State of their invocations, segmented by host role (workst
+
+      | correlate over NAI: Domain Controllers, Certificate Authority Servers, All Endpoints, Network
+      Egress Points
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Profile execution frequency and failure state of certificate-management tools per host role
+      (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Score process executions with an explainable supervised classifier''
+    (Machine Learning) approach: can you determine whether a process execution event where the process
+    file hash matches a known hash of a certificate theft tool, or a network connection is observed using
+    a TLS certificate whose thumbprint matches a known malicious certificate.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    execution event where the process file hash matches a known hash of a certificate theft tool, or a
+    network connection is observed using a TLS certificate whose thumbprint matches a known malicious
+    certificate. The Machine Learning approach works as follows: Train a gradient-boosted classifier (e.g.,
+    LightGBM) on enriched process executions (4688/Sysmon EID 1) using features: image name, parent image,
+    command-line token entropy, user context, known-good-hash flag, and Authenticode/certificate features
+    as schematized in [Certified Malware](https://doi.org/10.1145/3133956.3133958) and the EMBER-style
+    approach. Emit a risk score AND the top-3 SHAP contributing features in the alert text per the [SHAP-in-IDS
+    review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    Use as a parallel layer above the deterministic watchlist, not a replacement. A positive result --
+    a rule match, a statistical outlier, or a model alert -- indicates probable certificate theft, forgery,
+    or abuse; pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Score process executions with an explainable supervised classifier (Machine Learning)
+
+      source IN [''Windows Event ID 4688'', ''Zeek x509.log'']
+
+      | approach: Train a gradient-boosted classifier (e.g., LightGBM) on enriched process executions
+      (4688/Sysmon EID 1) using features: image name, parent image, command-line token entropy, user context,
+      known-good-hash flag, and Authenticode/certificate f
+
+      | correlate over NAI: Domain Controllers, Certificate Authority Servers, All Endpoints, Network
+      Egress Points
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Score process executions with an explainable supervised classifier (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Regex-match command lines for known certificate-abuse tooling''
+    (Symbolic Logic) approach: can you determine whether a process creation event is recorded with command-line
+    arguments containing patterns indicative of certificate enumeration, request, export, or theft using
+    known offensive security tools.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    creation event is recorded with command-line arguments containing patterns indicative of certificate
+    enumeration, request, export, or theft using known offensive security tools. The Symbolic Logic approach
+    works as follows: Scan command-line arguments (4688) and PowerShell script-block logs (4104) with
+    regexes for tool syntax documented in [Certipy](https://github.com/ly4k/Certipy) (`find -vulnerable`,
+    `req -template`, `auth -pfx`, `relay`, `shadow`) and [Certified Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf)
+    (Mimikatz `crypto::certificates`, `crypto::export`; Rubeus `asktgt /certificate`, `asktgs /pfx`).
+    Layer the [Sigma private-keys-recon rule](https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_creation/proc_creation_win_susp_private_keys_recon.yml)
+    for dir/findstr/Get-ChildItem searches of `.pfx .p12 .pem .key .cer .ppk`. Alert includes the matched
+    substring; keep these hard signatures regardless of ML coverage. A positive result -- a rule match,
+    a statistical outlier, or a model alert -- indicates probable certificate theft, forgery, or abuse;
+    pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD access'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Regex-match command lines for known certificate-abuse tooling (Symbolic Logic)
+
+      source IN [''Windows Event ID 4688'', ''Windows Event ID 4104'']
+
+      | approach: Scan command-line arguments (4688) and PowerShell script-block logs (4104) with regexes
+      for tool syntax documented in [Certipy](https://github.com/ly4k/Certipy) (`find -vulnerable`, `req
+      -template`, `auth -pfx`, `relay`, `shadow`) and [Cert
+
+      | correlate over NAI: Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD
+      access
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Baseline command-line argument entropy and volume per user/host''
+    (Statistical Method) approach: can you determine whether a process creation event is recorded with
+    command-line arguments containing patterns indicative of certificate enumeration, request, export,
+    or theft using known offensive security tools.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    creation event is recorded with command-line arguments containing patterns indicative of certificate
+    enumeration, request, export, or theft using known offensive security tools. The Statistical Method
+    approach works as follows: Per (user, host), baseline the entropy and length (Volume) of arguments
+    for powershell.exe, cmd.exe, certutil.exe and the Frequency of cert-tool invocations per hour. Flag
+    commands whose entropy exceeds 3 standard deviations from the (user, host) baseline (obfuscation/packing),
+    and flag rare (user, parent, command) tuples using the explainable rarity scoring of [Context-Based
+    Irregular Activity Detection](https://www.sciencedirect.com/science/article/pii/S0957417423014938).
+    Track failed executions (non-zero exit / error) as a distinct probing signal. A positive result --
+    a rule match, a statistical outlier, or a model alert -- indicates probable certificate theft, forgery,
+    or abuse; pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD access'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline command-line argument entropy and volume per user/host (Statistical Method)
+
+      source IN [''Windows Event ID 4688'', ''Windows Event ID 4104'']
+
+      | approach: Per (user, host), baseline the entropy and length (Volume) of arguments for powershell.exe,
+      cmd.exe, certutil.exe and the Frequency of cert-tool invocations per hour. Flag commands whose entropy
+      exceeds 3 standard deviations from the (user,
+
+      | correlate over NAI: Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD
+      access
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Classify command-line semantics with an explainable model''
+    (Machine Learning) approach: can you determine whether a process creation event is recorded with command-line
+    arguments containing patterns indicative of certificate enumeration, request, export, or theft using
+    known offensive security tools.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a process
+    creation event is recorded with command-line arguments containing patterns indicative of certificate
+    enumeration, request, export, or theft using known offensive security tools. The Machine Learning
+    approach works as follows: Embed command lines (e.g., BERT-style token embeddings) and score with
+    an unsupervised outlier detector ([Extended Isolation Forest](https://arxiv.org/pdf/1811.02141)) or
+    a supervised malicious/benign classifier over 4688/4104. Surface the top-3 contributing tokens/features
+    via SHAP per the [SHAP-in-IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full)
+    so analysts see why a line scored high. Detects novel/obfuscated variants that regex misses, in parallel
+    with the signature layer. A positive result -- a rule match, a statistical outlier, or a model alert
+    -- indicates probable certificate theft, forgery, or abuse; pivot to the responsible process and its
+    parent lineage, the user and host, the certificate/template/key involved, and any subsequent authentication
+    or outbound transfer to scope the compromise and the accounts at risk. A negative result helps rule
+    out this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD access'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "# Classify command-line semantics with an explainable model (Machine Learning)\nsource IN\
+      \ ['Windows Event ID 4688', 'Windows Event ID 4104']\n| approach: Embed command lines (e.g., BERT-style\
+      \ token embeddings) and score with an unsupervised outlier detector ([Extended Isolation Forest](https://arxiv.org/pdf/1811.02141))\
+      \ or a supervised malicious/benign classifier over 4688/4104. Surface the \n| correlate over NAI:\
+      \ Domain Controllers, Certificate Authority Servers, All Endpoints with PowerShell/CMD access\n\
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,\
+      \ key path, destination)"
+- question: '[Credential Access] Using the ''Enforce allow-listed (requester, template) pairs and SAN/template
+    policy on CA requests'' (Symbolic Logic) approach: can you determine whether a certificate enrollment
+    request is logged on a Certificate Authority (CA) server where the requestor, requested template,
+    or specified Subject Alternative Name (SAN) violates security policy or deviates from established
+    baselines.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a certificate
+    enrollment request is logged on a Certificate Authority (CA) server where the requestor, requested
+    template, or specified Subject Alternative Name (SAN) violates security policy or deviates from established
+    baselines. The Symbolic Logic approach works as follows: On certificate request events (Windows Event
+    ID 4886, fields documented by [Microsoft](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4886)),
+    check each (User/Group, Template) against a strict allow-list. Generate a critical alert when a requester
+    supplies a Subject Alternative Name on a SAN-enabled template (ESC1), requests a Sub-CA/cross-CA or
+    Domain-Controller-Authentication template from a non-CA/non-DC principal, or when a machine ($) account
+    requests a client-auth certificate consistent with the ESC8 NTLM-relay path hardened in [KB5005413](https://support.microsoft.com/en-us/topic/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs-3612b773-4043-4aa9-b23d-b87910cd3429).
+    These ESC mappings are defined in [Certified Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf)
+    and [Certipy](https://github.com/ly4k/Certipy). Keep concrete template/EKU rules; tune, do not delete.
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4886
+  - Windows Event ID 4898
+  - Windows Event ID 4887
+  - 'NAI: Active Directory Certificate Authority (CA) Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Enforce allow-listed (requester, template) pairs and SAN/template policy on CA requests
+      (Symbolic Logic)
+
+      source IN [''Windows Event ID 4886'', ''Windows Event ID 4898'', ''Windows Event ID 4887'']
+
+      | approach: On certificate request events (Windows Event ID 4886, fields documented by [Microsoft](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4886)),
+      check each (User/Group, T
+
+      | correlate over NAI: Active Directory Certificate Authority (CA) Servers
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Score new (requester, template) pairs by rarity and profile
+    request volume and denial state'' (Statistical Method) approach: can you determine whether a certificate
+    enrollment request is logged on a Certificate Authority (CA) server where the requestor, requested
+    template, or specified Subject Alternative Name (SAN) violates security policy or deviates from established
+    baselines.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a certificate
+    enrollment request is logged on a Certificate Authority (CA) server where the requestor, requested
+    template, or specified Subject Alternative Name (SAN) violates security policy or deviates from established
+    baselines. The Statistical Method approach works as follows: Per template, baseline the set of historical
+    requesters (4887 issued) and the Volume (requests/hour) and State (4888 denied vs 4887 issued ratio).
+    Assign a rarity score to each new (requester, template) pair using context-aware rarity from [Context-Based
+    Irregular Activity Detection](https://www.sciencedirect.com/science/article/pii/S0957417423014938);
+    alert on high-rarity enrollment for an authentication-capable template. Treat a spike in denied requests
+    (4888) per requester above the trailing-30-day 99th percentile as a distinct probing signal (failure-mode
+    awareness). Derive thresholds per CA from your own 30-day history. A positive result -- a rule match,
+    a statistical outlier, or a model alert -- indicates probable certificate theft, forgery, or abuse;
+    pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4886
+  - Windows Event ID 4898
+  - Windows Event ID 4887
+  - 'NAI: Active Directory Certificate Authority (CA) Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "# Score new (requester, template) pairs by rarity and profile request volume and denial state\
+      \ (Statistical Method)\nsource IN ['Windows Event ID 4886', 'Windows Event ID 4898', 'Windows Event\
+      \ ID 4887']\n| approach: Per template, baseline the set of historical requesters (4887 issued) and\
+      \ the Volume (requests/hour) and State (4888 denied vs 4887 issued ratio). Assign a rarity score\
+      \ to each new (requester, template) pair using context-aware rarity from \n| correlate over NAI:\
+      \ Active Directory Certificate Authority (CA) Servers\n| emit alert with contributing fields and\
+      \ entity context (process, parent, user, host, certificate/template/thumbprint, key path, destination)"
+- question: '[Credential Access] Using the ''Detect enrollment-graph and time-series anomalies with explainable
+    models'' (Machine Learning) approach: can you determine whether a certificate enrollment request is
+    logged on a Certificate Authority (CA) server where the requestor, requested template, or specified
+    Subject Alternative Name (SAN) violates security policy or deviates from established baselines.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a certificate
+    enrollment request is logged on a Certificate Authority (CA) server where the requestor, requested
+    template, or specified Subject Alternative Name (SAN) violates security policy or deviates from established
+    baselines. The Machine Learning approach works as follows: Model CA enrollment as a bipartite requester-template
+    graph and flag improbable new edges with link-prediction ([CyberGraph](https://www.usenix.org/system/files/raid20-bowman.pdf),
+    [Euler](https://dev.ndss-symposium.org/wp-content/uploads/2022-107A-paper.pdf)); in parallel, run
+    a multivariate time-series detector on per-template issued (4898) and denied (4888) volumes to catch
+    automated abuse bursts. Output the top-3 contributing features (template, requester rarity, time-of-day,
+    denial spike) via SHAP per the [SHAP-in-IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4886
+  - Windows Event ID 4898
+  - Windows Event ID 4887
+  - 'NAI: Active Directory Certificate Authority (CA) Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Detect enrollment-graph and time-series anomalies with explainable models (Machine Learning)
+
+      source IN [''Windows Event ID 4886'', ''Windows Event ID 4898'', ''Windows Event ID 4887'']
+
+      | approach: Model CA enrollment as a bipartite requester-template graph and flag improbable new
+      edges with link-prediction ([CyberGraph](https://www.usenix.org/system/files/raid20-bowman.pdf),
+      [Euler](https://dev.ndss-symposium.org/wp-content/uploads/2
+
+      | correlate over NAI: Active Directory Certificate Authority (CA) Servers
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Alert on key-export and key-store access by non-allow-listed
+    processes'' (Symbolic Logic) approach: can you determine whether an event is logged indicating a cryptographic
+    key was accessed or exported by a process or user account not authorized for certificate management,
+    or file system auditing shows access to protected key storage by an unusual process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that an event
+    is logged indicating a cryptographic key was accessed or exported by a process or user account not
+    authorized for certificate management, or file system auditing shows access to protected key storage
+    by an unusual process. The Symbolic Logic approach works as follows: Alert on key-export events (Windows
+    Event ID 5058, Operation ''Export of persistent key''); correlate the Process ID with 4688 to resolve
+    the image and alert when it is not on an allow-list (certlm.msc, certreq, approved enrollment clients).
+    On Linux audit read/open of `/etc/ssl/`, `/etc/pki/`, `~/.pki/nssdb/`; on macOS audit `security find-certificate`/`export`/`dump-keychain`
+    against `~/Library/Keychains`. The DPAPI/CryptoAPI/CNG export theft surface is described in [Certified
+    Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf); reinforce
+    with the [Sigma private-keys-recon rule](https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_creation/proc_creation_win_susp_private_keys_recon.yml).
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 5058
+  - Windows Event ID 5059
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: All Endpoints and Servers, especially Domain Controllers and Certificate Authority Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "# Alert on key-export and key-store access by non-allow-listed processes (Symbolic Logic)\n\
+      source IN ['Windows Event ID 5058', 'Windows Event ID 5059', 'Windows Event ID 4663', 'Windows Event\
+      \ ID 4688']\n| approach: Alert on key-export events (Windows Event ID 5058, Operation 'Export of\
+      \ persistent key'); correlate the Process ID with 4688 to resolve the image and alert when it is\
+      \ not on an allow-list (certlm.msc, certreq, approved enrollment clients). \n| correlate over NAI:\
+      \ All Endpoints and Servers, especially Domain Controllers and Certificate Authority Servers\n|\
+      \ emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,\
+      \ key path, destination)"
+- question: '[Credential Access] Using the ''Baseline key-export actors and access volume; flag first-time
+    and bursty access'' (Statistical Method) approach: can you determine whether an event is logged indicating
+    a cryptographic key was accessed or exported by a process or user account not authorized for certificate
+    management, or file system auditing shows access to protected key storage by an unusual process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that an event
+    is logged indicating a cryptographic key was accessed or exported by a process or user account not
+    authorized for certificate management, or file system auditing shows access to protected key storage
+    by an unusual process. The Statistical Method approach works as follows: Baseline the set of users/processes
+    that perform key access/export. Alert on a user''s FIRST key export (5058) using new-actor logic from
+    [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286.pdf).
+    Monitor file-access Volume to `C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys` (4663) and alert when
+    read events from one process in a 1-minute window exceed the 98th percentile for that host. Record
+    failed/denied access (4663 with access-denied) as a distinct signal. A positive result -- a rule match,
+    a statistical outlier, or a model alert -- indicates probable certificate theft, forgery, or abuse;
+    pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 5058
+  - Windows Event ID 5059
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: All Endpoints and Servers, especially Domain Controllers and Certificate Authority Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline key-export actors and access volume; flag first-time and bursty access (Statistical
+      Method)
+
+      source IN [''Windows Event ID 5058'', ''Windows Event ID 5059'', ''Windows Event ID 4663'', ''Windows
+      Event ID 4688'']
+
+      | approach: Baseline the set of users/processes that perform key access/export. Alert on a user''s
+      FIRST key export (5058) using new-actor logic from [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-
+
+      | correlate over NAI: All Endpoints and Servers, especially Domain Controllers and Certificate Authority
+      Servers
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Score key-access feature vectors with explainable unsupervised
+    anomaly detection'' (Machine Learning) approach: can you determine whether an event is logged indicating
+    a cryptographic key was accessed or exported by a process or user account not authorized for certificate
+    management, or file system auditing shows access to protected key storage by an unusual process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that an event
+    is logged indicating a cryptographic key was accessed or exported by a process or user account not
+    authorized for certificate management, or file system auditing shows access to protected key storage
+    by an unusual process. The Machine Learning approach works as follows: Train [Extended Isolation Forest](https://arxiv.org/pdf/1811.02141)
+    on features from 5058/5059/4663 (user, process, target key path, time-of-day as cyclical, access count)
+    to surface rare combinations (non-system process touching MachineKeys off-hours). Emit the top-3 SHAP
+    drivers in the alert per the [SHAP-in-IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full);
+    run alongside, not instead of, the deterministic export rule. A positive result -- a rule match, a
+    statistical outlier, or a model alert -- indicates probable certificate theft, forgery, or abuse;
+    pivot to the responsible process and its parent lineage, the user and host, the certificate/template/key
+    involved, and any subsequent authentication or outbound transfer to scope the compromise and the accounts
+    at risk. A negative result helps rule out this particular vector but should be corroborated with the
+    other questions in this playbook, since a single method can miss stealthy, living-off-the-land, or
+    novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 5058
+  - Windows Event ID 5059
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: All Endpoints and Servers, especially Domain Controllers and Certificate Authority Servers'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Score key-access feature vectors with explainable unsupervised anomaly detection (Machine
+      Learning)
+
+      source IN [''Windows Event ID 5058'', ''Windows Event ID 5059'', ''Windows Event ID 4663'', ''Windows
+      Event ID 4688'']
+
+      | approach: Train [Extended Isolation Forest](https://arxiv.org/pdf/1811.02141) on features from
+      5058/5059/4663 (user, process, target key path, time-of-day as cyclical, access count) to surface
+      rare combinations (non-system process touching MachineKey
+
+      | correlate over NAI: All Endpoints and Servers, especially Domain Controllers and Certificate Authority
+      Servers
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+- question: '[Credential Access] Using the ''Flag certificate-based logons by accounts not expected to
+    use certificates'' (Symbolic Logic) approach: can you determine whether a successful certificate-based
+    logon (Kerberos PKINIT or Schannel) occurs with multiple anomalous characteristics, such as originating
+    from a geographically rare location, being the first certificate-based logon for that user, or occurring
+    from a device never before seen for that user.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a successful
+    certificate-based logon (Kerberos PKINIT or Schannel) occurs with multiple anomalous characteristics,
+    such as originating from a geographically rare location, being the first certificate-based logon for
+    that user, or occurring from a device never before seen for that user. The Symbolic Logic approach
+    works as follows: Alert on Kerberos PKINIT authentication in Event ID 4768 where the Certificate Issuer/Serial/Thumbprint
+    fields are populated ([Microsoft](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769))
+    or Schannel certificate logons (4624 with authentication package indicating certificate use) for a
+    watchlist of privileged/service/machine accounts not expected to authenticate via certificate. Stolen/forged-certificate
+    (incl. ''golden certificate'' and Shadow Credentials) use surfaces here per [Certified Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf)
+    and [Certipy](https://github.com/ly4k/Certipy). Maintain the watchlist as a hard rule. A positive
+    result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Authentication Servers (RADIUS/NPS), VPN Concentrators, Network Gateways'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Flag certificate-based logons by accounts not expected to use certificates (Symbolic Logic)
+
+      source IN [''Windows Event ID 4624'', ''Zeek conn.log'', ''Zeek x509.log'']
+
+      | approach: Alert on Kerberos PKINIT authentication in Event ID 4768 where the Certificate Issuer/Serial/Thumbprint
+      fields are populated ([Microsoft](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protecti
+
+      | correlate over NAI: Domain Controllers, Authentication Servers (RADIUS/NPS), VPN Concentrators,
+      Network Gateways
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Flag certificate-based logons by accounts not expected to use certificates (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Baseline certificate-logon source, geography, and failure
+    state per account'' (Statistical Method) approach: can you determine whether a successful certificate-based
+    logon (Kerberos PKINIT or Schannel) occurs with multiple anomalous characteristics, such as originating
+    from a geographically rare location, being the first certificate-based logon for that user, or occurring
+    from a device never before seen for that user.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a successful
+    certificate-based logon (Kerberos PKINIT or Schannel) occurs with multiple anomalous characteristics,
+    such as originating from a geographically rare location, being the first certificate-based logon for
+    that user, or occurring from a device never before seen for that user. The Statistical Method approach
+    works as follows: Per account, baseline certificate-logon source IPs/hostnames/ASNs and times (4768/4624
+    enriched with Zeek conn.log geolocation). Alert on impossible-travel great-circle distance and on
+    a source ASN never before seen for that user; alert on the FIRST certificate-based logon for an account
+    using the Bayesian new-edge model of [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286.pdf),
+    baselined on the [LANL dataset](https://csr.lanl.gov/data/auth/). Track PKINIT failure codes (4768/4771)
+    as a distinct probing signal. A positive result -- a rule match, a statistical outlier, or a model
+    alert -- indicates probable certificate theft, forgery, or abuse; pivot to the responsible process
+    and its parent lineage, the user and host, the certificate/template/key involved, and any subsequent
+    authentication or outbound transfer to scope the compromise and the accounts at risk. A negative result
+    helps rule out this particular vector but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, living-off-the-land, or novel certificate-abuse
+    variants.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Authentication Servers (RADIUS/NPS), VPN Concentrators, Network Gateways'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "# Baseline certificate-logon source, geography, and failure state per account (Statistical\
+      \ Method)\nsource IN ['Windows Event ID 4624', 'Zeek conn.log', 'Zeek x509.log']\n| approach: Per\
+      \ account, baseline certificate-logon source IPs/hostnames/ASNs and times (4768/4624 enriched with\
+      \ Zeek conn.log geolocation). Alert on impossible-travel great-circle distance and on a source ASN\
+      \ never before seen for that user; alert on \n| correlate over NAI: Domain Controllers, Authentication\
+      \ Servers (RADIUS/NPS), VPN Concentrators, Network Gateways\n| emit alert with contributing fields\
+      \ and entity context (process, parent, user, host, certificate/template/thumbprint, key path, destination)"
+  - technology: Zeek/pseudocode
+    query: '# Baseline certificate-logon source, geography, and failure state per account (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Rank improbable certificate-authentication edges with graph
+    ML'' (Machine Learning) approach: can you determine whether a successful certificate-based logon (Kerberos
+    PKINIT or Schannel) occurs with multiple anomalous characteristics, such as originating from a geographically
+    rare location, being the first certificate-based logon for that user, or occurring from a device never
+    before seen for that user.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that a successful
+    certificate-based logon (Kerberos PKINIT or Schannel) occurs with multiple anomalous characteristics,
+    such as originating from a geographically rare location, being the first certificate-based logon for
+    that user, or occurring from a device never before seen for that user. The Machine Learning approach
+    works as follows: Build an authentication graph (user/host/CA/DC nodes) and flag low-probability certificate-logon
+    edges with link prediction ([CyberGraph](https://www.usenix.org/system/files/raid20-bowman.pdf), >85%
+    TPR / 0.0004% FPR on LANL) and temporal link prediction ([Euler](https://dev.ndss-symposium.org/wp-content/uploads/2022-107A-paper.pdf))
+    — e.g., an HR user authenticating to a CA/DC. Surface the top-3 contributing edge features (source
+    ASN rarity, new edge, off-hours) via SHAP per the [SHAP-in-IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Domain Controllers, Authentication Servers (RADIUS/NPS), VPN Concentrators, Network Gateways'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Rank improbable certificate-authentication edges with graph ML (Machine Learning)
+
+      source IN [''Windows Event ID 4624'', ''Zeek conn.log'', ''Zeek x509.log'']
+
+      | approach: Build an authentication graph (user/host/CA/DC nodes) and flag low-probability certificate-logon
+      edges with link prediction ([CyberGraph](https://www.usenix.org/system/files/raid20-bowman.pdf),
+      >85% TPR / 0.0004% FPR on LANL) and temporal l
+
+      | correlate over NAI: Domain Controllers, Authentication Servers (RADIUS/NPS), VPN Concentrators,
+      Network Gateways
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Rank improbable certificate-authentication edges with graph ML (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Alert on certificate-file writes to staging paths by non-allow-listed
+    processes'' (Symbolic Logic) approach: can you determine whether file system auditing logs show a
+    process creating or modifying a file with a certificate extension (e.g., .pfx, .p12, .pem) in a non-standard
+    directory (e.g., network share, user''s temp folder), immediately followed by an outbound network
+    connection from the same process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that file
+    system auditing logs show a process creating or modifying a file with a certificate extension (e.g.,
+    .pfx, .p12, .pem) in a non-standard directory (e.g., network share, user''s temp folder), immediately
+    followed by an outbound network connection from the same process. The Symbolic Logic approach works
+    as follows: Deploy SACLs on staging areas (%TEMP%, C:\Users\Public, network shares) for write events
+    (4663) on `.pfx .p12 .pem .crt .cer`, and alert when the writer is not an allow-listed app (browser,
+    enrollment client). Combine with the [Sigma private-keys-recon rule](https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_creation/proc_creation_win_susp_private_keys_recon.yml);
+    the export-to-disk staging step is documented in [Certified Pre-Owned](https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf).
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Alert on certificate-file writes to staging paths by non-allow-listed processes (Symbolic
+      Logic)
+
+      source IN [''Windows Event ID 4663'', ''Windows Event ID 4688'', ''Zeek conn.log'', ''Zeek files.log'']
+
+      | approach: Deploy SACLs on staging areas (%TEMP%, C:\Users\Public, network shares) for write events
+      (4663) on `.pfx .p12 .pem .crt .cer`, and alert when the writer is not an allow-listed app (browser,
+      enrollment client). Combine with the [Sigma privat
+
+      | correlate over NAI: User Workstations, Application Servers, Network Egress Points
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Alert on certificate-file writes to staging paths by non-allow-listed processes (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Baseline outbound certificate-file transfer volume and destination
+    rarity'' (Statistical Method) approach: can you determine whether file system auditing logs show a
+    process creating or modifying a file with a certificate extension (e.g., .pfx, .p12, .pem) in a non-standard
+    directory (e.g., network share, user''s temp folder), immediately followed by an outbound network
+    connection from the same process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that file
+    system auditing logs show a process creating or modifying a file with a certificate extension (e.g.,
+    .pfx, .p12, .pem) in a non-standard directory (e.g., network share, user''s temp folder), immediately
+    followed by an outbound network connection from the same process. The Statistical Method approach
+    works as follows: From Zeek files.log baseline the Frequency and Volume (byte counts) of files with
+    MIME `application/x-pkcs12` or `application/x-x509-ca-cert`; alert when outbound hourly volume exceeds
+    the trailing-30-day 95th percentile. Correlate with conn.log to score destination rarity (first-time
+    external destination) per [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286.pdf)
+    and flag low-reputation/uncategorized destinations and blocked/failed connections as a distinct signal.
+    A positive result -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate
+    theft, forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host,
+    the certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline outbound certificate-file transfer volume and destination rarity (Statistical Method)
+
+      source IN [''Windows Event ID 4663'', ''Windows Event ID 4688'', ''Zeek conn.log'', ''Zeek files.log'']
+
+      | approach: From Zeek files.log baseline the Frequency and Volume (byte counts) of files with MIME
+      `application/x-pkcs12` or `application/x-x509-ca-cert`; alert when outbound hourly volume exceeds
+      the trailing-30-day 95th percentile. Correlate with con
+
+      | correlate over NAI: User Workstations, Application Servers, Network Egress Points
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Baseline outbound certificate-file transfer volume and destination rarity (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
+- question: '[Credential Access] Using the ''Detect the theft-to-exfiltration sequence with an explainable
+    model'' (Machine Learning) approach: can you determine whether file system auditing logs show a process
+    creating or modifying a file with a certificate extension (e.g., .pfx, .p12, .pem) in a non-standard
+    directory (e.g., network share, user''s temp folder), immediately followed by an outbound network
+    connection from the same process.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), the adversary steals or forges
+    authentication certificates to obtain credentials that survive password resets and enable lateral
+    movement, privilege escalation, and persistence. This evidence focuses on the condition that file
+    system auditing logs show a process creating or modifying a file with a certificate extension (e.g.,
+    .pfx, .p12, .pem) in a non-standard directory (e.g., network share, user''s temp folder), immediately
+    followed by an outbound network connection from the same process. The Machine Learning approach works
+    as follows: Score the per-process sequence (by Process GUID) within a short window: (1) write a `.pfx/.pem`
+    file (4663); (2) outbound connection (conn.log); (3) certificate-MIME file transferred (files.log).
+    Train a sequence/anomaly model ([Extended Isolation Forest](https://arxiv.org/pdf/1811.02141) over
+    windowed features) and emit the top-3 contributing steps/features via SHAP per the [SHAP-in-IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    High-severity alert on the full chain; keep the deterministic SACL rule independent. A positive result
+    -- a rule match, a statistical outlier, or a model alert -- indicates probable certificate theft,
+    forgery, or abuse; pivot to the responsible process and its parent lineage, the user and host, the
+    certificate/template/key involved, and any subsequent authentication or outbound transfer to scope
+    the compromise and the accounts at risk. A negative result helps rule out this particular vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    living-off-the-land, or novel certificate-abuse variants.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days (correlate event-centered windows of +/- 10 minutes around the matched event)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Detect the theft-to-exfiltration sequence with an explainable model (Machine Learning)
+
+      source IN [''Windows Event ID 4663'', ''Windows Event ID 4688'', ''Zeek conn.log'', ''Zeek files.log'']
+
+      | approach: Score the per-process sequence (by Process GUID) within a short window: (1) write a
+      `.pfx/.pem` file (4663); (2) outbound connection (conn.log); (3) certificate-MIME file transferred
+      (files.log). Train a sequence/anomaly model ([Extended Is
+
+      | correlate over NAI: User Workstations, Application Servers, Network Egress Points
+
+      | emit alert with contributing fields and entity context (process, parent, user, host, certificate/template/thumbprint,
+      key path, destination)'
+  - technology: Zeek/pseudocode
+    query: '# Detect the theft-to-exfiltration sequence with an explainable model (Zeek view)
+
+      watch x509.log/conn.log/files.log for certificate-related activity
+
+      | join thumbprint/serial and file MIME (application/x-pkcs12, x-x509-ca-cert)
+
+      | evaluate destination rarity and outbound volume
+
+      | emit candidates with host, dest, cert id, bytes'
