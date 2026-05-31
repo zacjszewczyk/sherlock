@@ -1,0 +1,311 @@
+name: 'T1409: Stored Application Data'
+id: 69ca133c-a2ea-4e50-be07-9aa6fcea3c32
+description: Investigate whether an adversary is accessing and collecting application data stored on managed
+  mobile devices (Android and iOS) and exfiltrating it. Stored Application Data abuse is possible when
+  an app keeps files in unprotected external/shared storage, when an app stores files in its internal
+  directory with insecure permissions (e.g., 777), or when the adversary holds root/jailbreak privileges.
+  This playbook helps an analyst hunt for cross-application sandbox access (one package reading another
+  package's data container or exported ContentProviders, or chmod operations loosening sandbox permissions),
+  iOS App Group / Photos / Files / pasteboard cross-container reads, sensitive files written to world-readable
+  external storage, and the network egress that carries the collected data off the device. It pairs deterministic
+  allow-list and pattern rules with statistical baselining (per-app directory drift, entropy, volume/frequency,
+  failure-rate bursts) and machine-learning models (inter-app access-graph anomaly detection, per-device
+  network anomaly detection, and content classification) so the analyst can confirm or rule out collection
+  of stored application data and the resulting exfiltration.
+type: technique
+related:
+- tactic_id: TA0035
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is any process reading or writing files inside another application's sandboxed storage container,
+    or loosening sandbox permissions, without being on the approved inter-process communication allowlist?
+    Specifically, do you see a source package (e.g., com.malicious.app) reading a path that belongs to
+    a different package (e.g., /data/data/com.corporate.app/databases/creds.db), a 'chmod 77x' or 'chmod
+    666' against a path under /data/data/, a QUERY against another package's exported ContentProvider
+    (content://<other.pkg>/*) immediately followed by file reads, or — on iOS — reads from App Group containers
+    not owned by the requesting bundle and TCC grants for Photos/Files preceding bulk reads?
+  context: 'This is the canonical cross-app collection path for Stored Application Data under the Collection
+    tactic: mobile OS sandboxing normally isolates each app, so a process touching another package''s
+    private container, or deliberately making a directory world-readable, is a strong sign of sandbox
+    bypass. Maintain an allowlist of known-good (source_process, target_path) IPC pairs and alert when
+    the source package name does not match the package owning the target path and the pair is not allowlisted.
+    Treat chmod loosening of /data/data/ paths and exported-ContentProvider QUERY-then-read sequences
+    as high severity (the inter-component leak path modeled by IccTA). Define the sensitive source/sink
+    path set using SUSI''s machine-classified FILE/CONTACT/ACCOUNT categories and FlowDroid''s lifecycle-aware
+    source/sink model. A positive result is a concrete cross-app read or permission change to investigate;
+    a negative result reduces suspicion of on-device collection.'
+  answer_sources:
+  - Mobile EDR file access audit logs
+  - Mobile EDR process execution logs
+  - MDM compliance violation alerts
+  - 'NAI: Internal application storage directories (e.g., /data/data/ on Android, Application Sandboxes
+    on iOS) on all managed mobile endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM mobile_edr.file_access, mobile_edr.process_exec\nLET src_pkg = source_process_package\n\
+      LET tgt_pkg = extract_package(target_path)  // e.g. /data/data/<pkg>/...\nALERT IF event=FILE_READ_OR_WRITE\n\
+      \       AND src_pkg != tgt_pkg\n       AND (src_pkg, target_path) NOT IN ipc_allowlist\nOR ALERT\
+      \ IF process_cmdline MATCHES /chmod\\s+(77[0-7]|666)\\s+\\/data\\/data\\//\nOR ALERT IF (event=PROVIDER_QUERY\
+      \ AND uri MATCHES /content:\\/\\/(?!<src_pkg>)/)\n          FOLLOWED_BY event=FILE_READ WITHIN 5s\n\
+      // iOS: ALERT IF read_path STARTS_WITH /var/mobile/Containers/Shared/AppGroup/\n//           AND\
+      \ appgroup_owner != requesting_bundle\n//      OR tcc_grant(Photos|Files) FOLLOWED_BY bulk_read\
+      \ WITHIN 60s"
+- question: For each managed application, has its set of accessed directories drifted sharply away from
+    its normal 30-day baseline, or is it scanning many directories in a short window? Are the bytes read
+    per cross-app target or the number of distinct foreign packages read per hour anomalously high?
+  context: Under the Collection tactic, an app that begins reaching into directories it has never touched
+    — especially other apps' containers — is exhibiting abnormal sensitive-data handling. Profile each
+    app's normal accessed-directory set over 30 days (per-source normal-sink mining as in MUDFLOW). Hourly,
+    compare the current accessed-directory set to baseline with Jaccard similarity and alert when similarity
+    drops below the 10th percentile of historic scores or below a static 0.5. Concurrently compute Shannon
+    entropy of directory names accessed within a 5-minute window; entropy above the 95th percentile for
+    that process indicates directory scanning. Also track Volume (bytes read per cross-app target) and
+    Frequency (distinct foreign packages read per hour) and alert above 3 standard deviations over the
+    app's 30-day mean. A positive result flags an app whose data access pattern has changed in a way consistent
+    with collection.
+  answer_sources:
+  - Mobile EDR file access audit logs
+  - Mobile EDR process execution logs
+  - MDM compliance violation alerts
+  - 'NAI: Internal application storage directories (e.g., /data/data/ on Android, Application Sandboxes
+    on iOS) on all managed mobile endpoints.'
+  range: Last 90 days (baseline 30 days; evaluate hourly and over 5-minute windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each managed_app:\n  baseline_dirs = set(dirs accessed over trailing 30d)\n  EVERY 1h:\n\
+      \    cur = set(dirs accessed this hour)\n    jacc = |cur & baseline_dirs| / |cur | baseline_dirs|\n\
+      \    ALERT IF jacc < max(p10(historic_jaccard), 0.5)\n  EVERY 5m window:\n    ent = shannon_entropy(dir_names_accessed)\n\
+      \    ALERT IF ent > p95(process_entropy)\n  vol = bytes_read_per_cross_app_target\n  freq = distinct_foreign_pkgs_read_per_hour\n\
+      \  ALERT IF vol > mean30d+3*std30d OR freq > mean30d+3*std30d"
+- question: Is a source package generating a burst of permission-denied (EACCES) file accesses or rejected
+    ContentProvider QUERYs against many foreign packages — and in particular, is there any failed read
+    that later succeeds after a chmod or permission change?
+  context: 'This failure-mode signal catches sandbox-bypass probing even when no read succeeds, which
+    matters for the Collection tactic because adversaries often enumerate targets before they get access.
+    Count permission-denied/EACCES file-access attempts and rejected ContentProvider QUERYs per source
+    package per 5-minute window. A burst of denials against many foreign packages (e.g., >10 distinct
+    denied targets in 5 minutes, or a denial rate above the 99th percentile of the package''s baseline)
+    indicates probing. The highest-severity pattern is a denied-then-succeeded transition: a failed read
+    followed by a successful read after a chmod/permission change, which shows the adversary overcame
+    the sandbox. This complements behavioral baselining shown effective by Andromaly. A positive result
+    is an app actively testing for accessible cross-app data.'
+  answer_sources:
+  - Mobile EDR file access audit logs
+  - Mobile EDR process execution logs
+  - MDM compliance violation alerts
+  - 'NAI: Internal application storage directories (e.g., /data/data/ on Android, Application Sandboxes
+    on iOS) on all managed mobile endpoints.'
+  range: Last 90 days (evaluate over 5-minute windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each src_pkg, EACH 5m window:\n  denied = count(file_access WHERE result=EACCES)\n   \
+      \      + count(provider_query WHERE result=REJECTED)\n  distinct_denied_targets = count_distinct(target_pkg\
+      \ WHERE denied)\n  ALERT IF distinct_denied_targets > 10\n        OR denial_rate > p99(pkg_baseline_denial_rate)\n\
+      \  HIGH SEV IF exists(target WHERE\n        FILE_READ result=EACCES\n        FOLLOWED_BY (chmod|permission_change)\n\
+      \        FOLLOWED_BY FILE_READ result=OK)"
+- question: When the inter-application file-access activity is modeled as a graph — apps as nodes and
+    file accesses from a source app into a target app's container as directed edges enriched with frequency,
+    time-of-day, byte volume, and success/fail state — do any new edges score as anomalous against a learned
+    baseline of known-good device activity?
+  context: For the Collection tactic, modeling the whole device as an inter-app access graph surfaces
+    stealthy collection that per-rule checks miss. Build a graph anomaly model (Graph Convolutional Network
+    / graph autoencoder, identified as state-of-the-art for inter-app/data-flow modeling) trained on a
+    baseline of known-good activity, then score new edges in near-real-time and flag any above the 99th
+    anomaly percentile. Every alert must surface the top-3 contributing features — for example 'edge to
+    a never-before-seen target package', 'byte volume 40x baseline', or 'access at 03:14 outside active
+    hours' — following the explainable-model principle of DREBIN so the analyst can triage quickly. A
+    high-scoring edge to a foreign package's data container is a strong lead for on-device collection.
+  answer_sources:
+  - Mobile EDR file access audit logs
+  - Mobile EDR process execution logs
+  - MDM compliance violation alerts
+  - 'NAI: Internal application storage directories (e.g., /data/data/ on Android, Application Sandboxes
+    on iOS) on all managed mobile endpoints.'
+  range: Last 90 days (near-real-time scoring against a learned baseline)
+  queries:
+  - technology: ML/Graph-anomaly pseudocode
+    query: "BUILD graph G: nodes=app_packages\n  edges = (src_app -> tgt_app) for each cross-container\
+      \ file access\n  edge_features = [freq, hour_of_day, byte_volume, success_fail_ratio]\nTRAIN GCN/graph_autoencoder\
+      \ on known-good baseline device activity\nSCORE new edges in near-real-time -> anomaly_score\nALERT\
+      \ IF anomaly_score > p99(baseline_scores)\nEMIT top3_contributing_features per alert  // explainability\
+      \ (DREBIN)"
+- question: Are any managed mobile devices making outbound connections whose destination IP or domain
+    matches a threat-intelligence indicator, or whose destination domain was registered within the last
+    30 days — especially when paired with a large upload volume?
+  context: 'This is the exfiltration sink for collected stored application data. In the SIEM, build a
+    rule over Zeek conn.log records sourced from managed-mobile IP space: join conn.log.id.resp_h against
+    intel.log.indicator where indicator_type is ''Intel::ADDR'' or ''Intel::DOMAIN'', and join conn.log
+    to dns.log on uid to flag queries to domains younger than 30 days (passive DNS / WHOIS). Alert on
+    any match. This deterministic first-party rule complements the data-flow exfiltration model where
+    sensitive reads terminate at NETWORK sinks (TaintDroid, SUSI''s NETWORK sink category). A positive
+    result ties an on-device collection signal to a known-bad or suspiciously new external destination,
+    strongly indicating exfiltration; a negative result lowers the likelihood that staged data left the
+    device to a flagged host.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek intel.log
+  - Passive DNS logs
+  - 'NAI: Corporate Wi-Fi network gateways; VPN concentrators; Cloud Access Security Broker (CASB) egress
+    points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM zeek.conn WHERE id.orig_h IN managed_mobile_ip_space\nJOIN zeek.intel ON conn.id.resp_h\
+      \ = intel.indicator\n     AND intel.indicator_type IN ('Intel::ADDR','Intel::DOMAIN')\nJOIN zeek.dns\
+      \ ON conn.uid = dns.uid\nLET young = domain_age(dns.query) < 30d   // passive DNS / WHOIS\nALERT\
+      \ IF intel_match OR young\nENRICH WITH orig_bytes  // corroborate large upload"
+- question: Does any managed device send an outbound connection whose orig_bytes exceeds the 99.5th percentile
+    of that device's own 30-day upload profile — and is that anomaly amplified by an unusually short duration
+    (fast upload) or by a service (http/dns/ssl) not seen from that device in the last 7 days?
+  context: Large or unusual uploads are the network signature of exfiltrating collected application data
+    under the Collection-then-exfil chain. For each mobile-range source IP (id.orig_h) maintain a 30-day
+    rolling profile of conn.log outbound stats — the distribution of orig_bytes, duration, and service.
+    Raise a primary (Volume) alert when a connection's orig_bytes exceeds the 99.5th percentile of that
+    device's profile, and escalate (Frequency/State) when the anomaly coincides with duration in the bottom
+    5th percentile or a service not observed from that device in 7 days. Per-device byte/flow baselining
+    is validated by Andromaly's network-bytes features, and the outlier-from-benign-baseline approach
+    mirrors MUDFLOW. A positive result is a candidate bulk exfiltration event to correlate with on-device
+    collection.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek intel.log
+  - Passive DNS logs
+  - 'NAI: Corporate Wi-Fi network gateways; VPN concentrators; Cloud Access Security Broker (CASB) egress
+    points'
+  range: Last 90 days (per-device 30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each id.orig_h IN mobile_range:\n  profile = rolling_30d(orig_bytes, duration, service)\n\
+      \  ALERT (Volume) IF conn.orig_bytes > p99_5(profile.orig_bytes)\n  ESCALATE IF conn.duration <\
+      \ p5(profile.duration)        // fast upload\n        OR conn.service NOT IN services_seen_last_7d"
+- question: Per device, are failed/rejected outbound connection states (S0/REJ/RSTO) or DNS error rates
+    (NXDOMAIN/SERVFAIL) spiking more than 3 standard deviations above the device's 30-day mean within
+    a 10-minute window?
+  context: 'This failure-mode network signal often precedes successful exfiltration: bursts of failed
+    connections or DNS errors to many new destinations frequently appear as malware searches for a surviving
+    C2 or staging host. Per device, track conn.log connection state (S0/REJ/RSTO) and dns.log NXDOMAIN/SERVFAIL
+    rates, and alert when blocked/rejected connection counts or NXDOMAIN rate exceeds 3 standard deviations
+    above the device''s 30-day mean within a 10-minute window. Behavioral failure/error telemetry as a
+    discriminating feature is consistent with Andromaly. Within the Collection tactic, a positive result
+    is an early warning that a device may be attempting to move collected data off-device even before
+    a successful egress is observed.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek intel.log
+  - Passive DNS logs
+  - 'NAI: Corporate Wi-Fi network gateways; VPN concentrators; Cloud Access Security Broker (CASB) egress
+    points'
+  range: Last 90 days (evaluate over 10-minute windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each device, EACH 10m window:\n  fails = count(conn.state IN ('S0','REJ','RSTO'))\n  nx\
+      \ = count(dns.rcode IN ('NXDOMAIN','SERVFAIL'))\n  ALERT IF fails > mean30d(fails)+3*std30d(fails)\n\
+      \        OR nx   > mean30d(nx)+3*std30d(nx)"
+- question: Using a per-device one-class anomaly model trained on normal connection behavior (orig_bytes,
+    resp_bytes, duration, protocol, one-hot service/dst_port, plus hour-of-day and day-of-week), do any
+    live connections score as outliers — and what are the top-3 deviating features driving each alert?
+  context: Multivariate per-device anomaly detection catches exfiltration patterns that single-threshold
+    rules miss. For each device, train a one-class SVM or Isolation Forest on normal conn.log behavior
+    with engineered temporal features, then score live connections and alert on outliers. One-class/anomaly
+    models over host-and-network telemetry are surveyed as effective for mobile (Deep Learning for Android
+    Malware Defenses), with cautions on temporal bias when fitting baselines. Each alert must list the
+    top-3 deviating features (e.g., 'orig_bytes 60x median', 'dst_port unseen', 'connection at 02:00')
+    for analyst triage, per DREBIN's explainability principle. Within the Collection tactic, a positive
+    result is an anomalous device network session worth correlating with on-device collection evidence.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek intel.log
+  - Passive DNS logs
+  - 'NAI: Corporate Wi-Fi network gateways; VPN concentrators; Cloud Access Security Broker (CASB) egress
+    points'
+  range: Last 90 days (per-device baseline; live scoring)
+  queries:
+  - technology: ML/Anomaly-detection pseudocode
+    query: "FOR each device:\n  X = conn features [orig_bytes,resp_bytes,duration,proto,\n       onehot(service),onehot(dst_port),hour_of_day,day_of_week]\n\
+      \  model = OneClassSVM | IsolationForest fit on normal X\n  score live connections\n  ALERT IF outlier\n\
+      \  EMIT top3_deviating_features per alert  // DREBIN explainability"
+- question: Is a managed application writing files to world-readable external/shared storage (paths starting
+    with /storage/emulated/0/ or /sdcard/) whose filenames match sensitive-data patterns such as backup,
+    dump, export, creds, credentials, password, secret, token, key, private, session, contact, or vcard
+    with extensions like .db/.sql/.sqlite/.json/.xml/.txt/.zip/.bak/.vcf — and on iOS, equivalent .zip/.db
+    exports aggregating recently read Files/Photos items?
+  context: 'World-readable external storage is a classic exfiltration sink in the source->sink taint model
+    (FlowDroid): once sensitive data lands there, any app or user can read it, so a managed app staging
+    such files is a Collection-tactic red flag. Deploy a Mobile EDR rule monitoring file writes from managed-app
+    processes that triggers when the target path is on an external/shared mount, and raise priority when
+    the filename matches the sensitive-data regex ''(?i).*(backup|dump|export|creds|credentials|password|secret|token|key|private|session|contact|vcard).*\.(db|sql|sqlite|json|xml|txt|zip|bak|vcf)$''.
+    Use SUSI''s machine-classified FILE sink lists to keep the path/API set complete, and corroborate
+    with static signals (MANAGE_EXTERNAL_STORAGE/READ_MEDIA_* grants, legacy storage mode) per DREBIN.
+    A positive result is a concrete sensitive file exposed on shared storage and ready for exfiltration.'
+  answer_sources:
+  - Mobile EDR file write event logs (including process name, file path, and file hash)
+  - Mobile DLP file content scan results
+  - 'NAI: Publicly accessible external storage directories on managed mobile devices (e.g., /storage/emulated/0/,
+    /sdcard/, and their subdirectories like Download and Documents).'
+  range: Last 90 days
+  queries:
+  - technology: Mobile EDR/Rule pseudocode
+    query: "FROM mobile_edr.file_write WHERE process IN managed_apps\nLET ext = target_path STARTS_WITH\
+      \ ('/storage/emulated/0/','/sdcard/')\nALERT IF ext\nHIGH PRIORITY IF filename MATCHES\n  /(?i).*(backup|dump|export|creds|credentials|password|secret|token|\n\
+      \    key|private|session|contact|vcard).*\\.(db|sql|sqlite|json|xml|txt|\n    zip|bak|vcf)$/\nCORROBORATE\
+      \ WITH grants(MANAGE_EXTERNAL_STORAGE|READ_MEDIA_*), legacy_storage_mode\n// iOS: same logic for\
+      \ .zip/.db exports of recently-read Files/Photos"
+- question: Among files written to external storage by managed apps, are any showing content entropy above
+    the 99th percentile for their file type (e.g., a .txt with entropy > 4.5, indicating compression/encryption),
+    or is any app's external-storage write frequency more than 3 standard deviations above its 30-day
+    average?
+  context: High-entropy writes to shared storage suggest an app is compressing or encrypting a data dump
+    before exfiltration, and a spike in write frequency suggests bulk staging — both consistent with the
+    Collection tactic. For files written to external storage by managed apps, compute Shannon entropy
+    of the content (via DLP/EDR) and compare against a per-extension baseline, alerting when entropy exceeds
+    the 99th percentile for that type. Simultaneously count writes to external storage per app per hour
+    and alert above 3 standard deviations over the app's 30-day average. This outlier-vs-benign-baseline
+    detection follows MUDFLOW, and the per-app behavioral baselining follows Andromaly. A positive result
+    indicates an app packaging or rapidly staging data on shared storage.
+  answer_sources:
+  - Mobile EDR file write event logs (including process name, file path, and file hash)
+  - Mobile DLP file content scan results
+  - 'NAI: Publicly accessible external storage directories on managed mobile devices (e.g., /storage/emulated/0/,
+    /sdcard/, and their subdirectories like Download and Documents).'
+  range: Last 90 days (per-app 30-day baseline; evaluate hourly)
+  queries:
+  - technology: Mobile EDR/Stats pseudocode
+    query: "FOR files written to external storage by managed apps:\n  ent = shannon_entropy(content)\n\
+      \  ALERT IF ent > p99(entropy_baseline[file_ext])   // e.g. .txt > 4.5\nFOR each app, EACH 1h:\n\
+      \  writes = count(external_storage_writes)\n  ALERT IF writes > mean30d(writes)+3*std30d(writes)"
+- question: When a managed app writes a file to external storage, does a text/PII classifier (EDR/DLP
+    text classification or a central pre-trained NLP model such as BERT fine-tuned for PII/credential
+    detection) classify the sampled content as 'Sensitive' (PII, API key, password) with confidence above
+    0.95 — and if so, what evidence spans drive the verdict?
+  context: Content classification confirms whether a file staged to shared storage actually contains sensitive
+    data, turning a structural Collection-tactic signal into a concrete incident. On a write to external
+    storage by a managed app, sample the content to the classifier; if classified 'Sensitive' with confidence
+    > 0.95, raise a critical incident and trigger MDM quarantine. Drift-resilient behavioral classification
+    of collect-then-exfil patterns is demonstrated by MaMaDroid, with model-selection and robustness/explainability
+    caveats catalogued in Deep Learning for Android Malware Defenses. The alert must surface the top-3
+    evidence spans/features (e.g., matched credential pattern, filename token, source app) per DREBIN's
+    explainable-detection principle. A high-confidence 'Sensitive' verdict on a world-readable file is
+    a strong indicator of imminent or in-progress data loss.
+  answer_sources:
+  - Mobile EDR file write event logs (including process name, file path, and file hash)
+  - Mobile DLP file content scan results
+  - 'NAI: Publicly accessible external storage directories on managed mobile devices (e.g., /storage/emulated/0/,
+    /sdcard/, and their subdirectories like Download and Documents).'
+  range: Last 90 days (classify on write events)
+  queries:
+  - technology: ML/Content-classification pseudocode
+    query: "ON external_storage_write BY managed_app:\n  sample = read_sample(file)\n  label, conf, spans\
+      \ = nlp_classifier(sample)  // BERT PII/credential\n  IF label=='Sensitive' AND conf > 0.95:\n \
+      \   raise_critical_incident()\n    mdm_quarantine(device)\n    EMIT top3 evidence_spans  // DREBIN\
+      \ explainability"
