@@ -1,0 +1,541 @@
+name: 'T1003.005: Cached Domain Credentials'
+id: ad1bf73d-fcb7-415e-b781-83b7e659235e
+description: 'Investigate adversary attempts to access cached domain credentials (DCC2 / MS-Cache v2 hashes
+  on Windows, and SSSD or Quest/VAS credential caches on Linux) that allow authentication when a domain
+  controller is unavailable. This playbook helps an analyst hunt for credential-dumping tooling and tradecraft:
+  execution of known dumping utilities (Mimikatz, secretsdump.py, Linikatz, reg.exe, tdbdump), command
+  lines bearing dumping signatures, unauthorized access to the SECURITY/SYSTEM/SAM registry hives, suspicious
+  process handles to LSASS memory, reads of Linux SSSD/Quest cache databases, and the multi-stage follow-on
+  activity (lateral movement, credential reuse, lockouts) that indicates cracked DCC2 hashes are being
+  used. It combines symbolic-logic detections, statistical baselining of rare/first-seen behavior, profiling
+  of failed/denied attempts, and machine-learning classification across Windows (Event IDs 4688/4663/4656)
+  and Linux (auditd, Sysmon for Linux) endpoint telemetry plus network/authentication logs.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process execute whose SHA256 hash matches a known credential-dumping utility (e.g.,
+    Mimikatz, secretsdump.py, Linikatz) from a curated threat-intelligence feed?
+  context: Cached domain credential theft almost always begins with a known tool. By computing the SHA256
+    of each executed binary and comparing it against TI lists of dumping utilities, you get a high-confidence,
+    low-noise signal that a dumper ran on an endpoint or domain controller. Ground expected tool and command
+    artifacts in Atomic Red Team T1003.005. A positive match is an immediate escalation because these
+    hashes have no legitimate enterprise use; a negative result does not clear the host because attackers
+    recompile or rename binaries to change the hash, so pair this with the behavioral questions below.
+    This directly supports the Credential Access mission of stealing account names and passwords from
+    local caches.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon for Linux Event ID 1
+  - 'NAI: All Windows and Linux Endpoints, Privileged Access Workstations, Critical Application Servers,
+    and Domain Controllers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'proc = process_creation events (4688 / Sysmon 1 / Sysmon-Linux 1);
+
+      alert when sha256(proc.image) in threat_intel.credential_dumpers;
+
+      output host, user, image, sha256, parent_image, command_line, ts.'
+- question: Are any executed binary hashes rare across the fleet (seen on fewer than 5 hosts or under
+    0.01% of endpoints), particularly when run from temp or user-writable paths?
+  context: Sophisticated actors evade hash blocklists by using novel or freshly compiled dumpers, so absolute
+    rarity becomes the signal. Baseline binary-hash prevalence across the whole fleet and flag hashes
+    that appear on very few hosts, escalating those launched from temporary or user-writable directories
+    where credential dumpers are commonly staged. Derive the rarity cutoff from your own fleet distribution
+    (e.g., mean+3sigma thresholding) rather than a fixed guess. A rare hash executing from %TEMP% on a
+    domain controller is far more suspicious than a rare hash in Program Files. This catches Credential
+    Access tooling that has never been seen before.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon for Linux Event ID 1
+  - 'NAI: All Windows and Linux Endpoints, Privileged Access Workstations, Critical Application Servers,
+    and Domain Controllers.'
+  range: Last 90 days, with a fleet-wide prevalence baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "stats = count distinct hosts per sha256 over fleet;\nprevalence = host_count / total_hosts;\n\
+      cutoff = mean(prevalence) - 3*std(prevalence);\nalert when host_count < 5 or prevalence < 0.0001,\n\
+      \  boost when image_path in temp_or_user_writable;\noutput sha256, host_count, prevalence, image_path."
+- question: Were any executions of credential-dumping binaries blocked, quarantined, or denied by AV/EDR,
+    and are they being treated as a high-priority signal rather than noise?
+  context: An AV/EDR block or an access-denied launch of a dumping binary is evidence of an attempted
+    credential dump, not a resolved one. Adversaries frequently retry with a different technique after
+    being blocked, so these events should be elevated, not suppressed. Correlate quarantine/block telemetry
+    and failed launches of dumping tools per host and treat repeated attempts as an active intrusion indicator.
+    In the Credential Access context this often marks the moment before a successful dump via an alternative
+    method, so it warrants prompt host triage and review of subsequent process activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon for Linux Event ID 1
+  - 'NAI: All Windows and Linux Endpoints, Privileged Access Workstations, Critical Application Servers,
+    and Domain Controllers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "blocked = av_edr events where action in ['blocked','quarantined','denied']\n  and file in\
+      \ threat_intel.credential_dumpers;\ndenied = process_creation with status='access_denied';\nalert\
+      \ on blocked or denied; group by host, count retries;\noutput host, user, tool, action, attempt_count,\
+      \ ts."
+- question: Does an explainable classifier flag a process as a likely credential dumper based on hash
+    prevalence, path entropy, parent image, name length, and signature status?
+  context: When neither a known hash nor a rare-hash heuristic fires, a supervised model can still separate
+    dumpers from benign software. Train an XGBoost or Random Forest on features such as hash prevalence,
+    path entropy, parent image, executable name length, and code-signing status, and require the alert
+    to surface the top-3 contributing features (e.g., low prevalence, temp path, unsigned) so analysts
+    can validate quickly. This provides a resilient parallel detection path for Credential Access tooling
+    and reduces reliance on static signatures while keeping triage explainable.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon for Linux Event ID 1
+  - 'NAI: All Windows and Linux Endpoints, Privileged Access Workstations, Critical Application Servers,
+    and Domain Controllers.'
+  range: Last 90 days for scoring, with periodic retraining.
+  queries:
+  - technology: ML/pseudocode
+    query: "features = featurize(hash_prevalence, path_entropy, parent_image,\n  name_length, signed_status);\n\
+      score = model.predict_proba(features);  # XGBoost / RandomForest\nexplain = top3_features(features);\n\
+      alert when score >= threshold; output score, explain, image, host."
+- question: Do any process command lines contain credential-dumping signatures such as `lsadump::cache`,
+    `sekurlsa::`, `reg save/export HKLM\SECURITY`, secretsdump.py, or `tdbdump`?
+  context: The command line is often the clearest evidence of intent. Regex-match command lines for cached-credential
+    dumping patterns including `lsadump::cache`, `sekurlsa::`, `reg save|export HKLM\SECURITY` (and SAM/SYSTEM),
+    secretsdump.py, and `tdbdump`. Use an obfuscation/homoglyph-aware ruleset (e.g., Sigma's reg.exe sensitive-hive
+    dumping rule) so variants like `ˢave` or `hk˪m` still fire. A match is a strong Credential Access
+    indicator because these argument strings have essentially no benign use; preserve the full command
+    line, user, and parent so the analyst can confirm whether the dump targeted the cached-credential
+    hive.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: All Windows Endpoints, Authentication Servers, Linux systems integrated with Active Directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc = process_creation (4688 / Sysmon 1);\nalert when proc.command_line matches_regex_ci\
+      \ [\n  'lsadump::cache','sekurlsa::','reg.*(save|export).*(SECURITY|SAM|SYSTEM)',\n  'secretsdump','tdbdump']\
+      \ (homoglyph-normalized);\noutput host, user, command_line, parent_image, ts."
+- question: Which command lines are statistically rare for the host/user (top 0.5% by n-gram rarity),
+    especially those combining a hive or cache path with a save/export verb?
+  context: Renamed binaries and novel tooling defeat static signatures, so rarity scoring catches what
+    regex misses. Build 30-day per-host and per-user n-gram baselines of command lines and flag commands
+    in the 99.5th percentile of rarity, prioritizing those that combine a registry-hive or cache path
+    with save/export verbs. A command that is both rare for the actor and references the SECURITY hive
+    is highly suspicious. This statistical approach supports Credential Access detection by surfacing
+    living-off-the-land dumping commands that look superficially ordinary but are unprecedented for that
+    user.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: All Windows Endpoints, Authentication Servers, Linux systems integrated with Active Directory'
+  range: Last 90 days, with 30-day per-host/user n-gram baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = ngram_model(command_lines) per host,user over 30d;\nrarity = 1 - baseline.likelihood(cmd);\n\
+      alert when rarity >= p99.5,\n  boost when cmd has hive_or_cache_path AND save_or_export_verb;\n\
+      output host, user, command_line, rarity_score."
+- question: Are there failed or error-returning `reg save` and dumping commands (non-zero exit, access-denied)
+    that indicate an under-privileged actor probing for cached credentials?
+  context: Cached-credential dumping requires SYSTEM/admin rights, so an actor who lacks them will generate
+    failed attempts before escalating. Track `reg save`/`reg export` and other dumping commands that return
+    non-zero exit codes or access-denied errors and treat them as a distinct early-warning signal rather
+    than benign noise. Reference Atomic Red Team T1003.005 for expected command forms. A cluster of failed
+    dump attempts on a host often precedes successful Credential Access after privilege escalation, so
+    it should drive immediate review of the actor's privilege level and subsequent activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: All Windows Endpoints, Authentication Servers, Linux systems integrated with Active Directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'dump_cmds = proc where command_line matches dumping_patterns;
+
+      failed = dump_cmds where exit_code != 0 or status=''access_denied'';
+
+      count failed by host,user; alert on >=1 (escalate on bursts);
+
+      output host, user, command_line, exit_code, attempt_count.'
+- question: Does an NLP/embedding classifier identify renamed or obfuscated dumping commands that evade
+    regex, and can each hit be attributed to the rule it evaded?
+  context: Attackers obfuscate or rename dumping commands specifically to bypass signature rules. Apply
+    NLP token/embedding classifiers and adaptive misuse detection (e.g., AMIDES) to catch these evasive
+    variants, and attribute each hit to the specific rule it evaded so the result is explainable. This
+    complements the regex and rarity questions by covering deliberate evasion of Credential Access detections.
+    Surface the matched/evaded rule and the token features that drove the score so an analyst can rapidly
+    confirm whether the command is a disguised cached-credential dump.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: All Windows Endpoints, Authentication Servers, Linux systems integrated with Active Directory'
+  range: Last 90 days for scoring.
+  queries:
+  - technology: ML/pseudocode
+    query: 'tokens = tokenize(command_line); emb = embed(tokens);
+
+      score = nlp_model.predict(emb);  # AMIDES-style misuse detection
+
+      evaded_rule = nearest_rule(emb);
+
+      alert when score >= threshold;
+
+      output command_line, score, evaded_rule, top_tokens.'
+- question: Is any process outside the approved allowlist requesting a handle to or reading the `\REGISTRY\MACHINE\SECURITY`
+    (or SAM/SYSTEM) hive, per SACL object-access auditing?
+  context: Cached DCC2 hashes live in the SECURITY hive, so unauthorized access to it is direct evidence
+    of cached-credential theft. Configure SACL object-access auditing on the SECURITY/SAM/SYSTEM keys
+    and alert on handle requests (4656) and access attempts (4663) from processes not on an approved allowlist
+    (e.g., legitimate backup or registry tooling). See Microsoft's Event 4663 guidance for field semantics.
+    A positive result identifies the exact process, user, and access mask used to read the cached-credential
+    store, making it a high-fidelity Credential Access detection; tune the allowlist carefully to suppress
+    legitimate system processes.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers with cached credentials enabled, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "acc = events 4656/4663 (and Sysmon 13) where\n  object_name matches '\\\\REGISTRY\\\\MACHINE\\\
+      \\(SECURITY|SAM|SYSTEM)';\nalert when process_name not in allowlist;\noutput host, process_name,\
+      \ user, access_mask, object_name, ts."
+- question: Which (process, target hive, user, parent) access tuples are first-seen or rare for the host
+    or role, especially high-entropy temp-path processes touching the SECURITY hive?
+  context: Even allowlisted-looking access can be malicious if the combination of attributes is unprecedented.
+    Baseline (process, target hive, user, parent) tuples per host and role, then flag first-seen or rare
+    itemsets, weighting heavily toward high-entropy temp-path processes accessing the SECURITY hive. This
+    context-based approach catches dumpers masquerading under common names or running from unusual parents.
+    In the Credential Access context, a never-before-seen process/parent combination reading the cached-credential
+    hive is a strong anomaly that merits investigation of the full process tree.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers with cached credentials enabled, User Workstations'
+  range: Last 90 days, with per-host/role tuple baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "tuples = (process, hive, user, parent) from hive_access events;\nbaseline = frequency(tuples)\
+      \ per host,role;\nalert when tuple first_seen or freq <= rare_threshold,\n  boost when process_path\
+      \ is temp or process_name high_entropy;\noutput host, tuple, frequency, parent_image."
+- question: Are there bursts of access-denied 4663 events against HKLM\SECURITY on a host that exceed
+    the mean+3sigma baseline, indicating under-privileged dumping attempts?
+  context: An actor without sufficient rights will trigger access-denied events while probing the cached-credential
+    hive. Count access-denied 4663 events targeting HKLM\SECURITY per host and alert when the count exceeds
+    a mean+3sigma baseline, capturing under-privileged dumping attempts before they succeed. This statistical
+    profiling of failures is a distinct early signal in the Credential Access chain. A burst of denied
+    SECURITY-hive reads on a workstation that normally has none should prompt review of what privilege
+    escalation the actor may attempt next.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers with cached credentials enabled, User Workstations'
+  range: Last 90 days, with per-host failure baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'denied = 4663 where object=''HKLM\\SECURITY'' and status=''access_denied'';
+
+      per_host = count denied by host over rolling window;
+
+      threshold = mean(per_host) + 3*std(per_host);
+
+      alert when current > threshold; output host, denied_count, threshold, processes.'
+- question: Do unsupervised clusters of registry access events (process, user, time, parent, access mask)
+    reveal outlier clusters around the cached-credential hives?
+  context: Clustering surfaces coordinated or anomalous access patterns without labeled data. Cluster
+    registry access events using features such as process, user, time, parent, and access mask (e.g.,
+    with DBSCAN) and investigate outlier clusters, surfacing the defining features of each outlier for
+    the analyst. This catches subtle Credential Access tradecraft, such as a low-and-slow dumper or an
+    unusual access-mask combination, that point rules might miss. Present the cluster's distinguishing
+    characteristics so the analyst can judge whether the outlier represents a legitimate maintenance task
+    or a cached-credential dump.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers with cached credentials enabled, User Workstations'
+  range: Last 90 days for feature extraction and clustering.
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = (process, user, hour, parent, access_mask) from hive_access;
+
+      clusters = DBSCAN(features);
+
+      alert on outlier clusters / noise points;
+
+      output cluster_id, defining_features, member_events, hosts.'
+- question: Is any process not on the allowlist requesting a handle to lsass.exe with credential-theft
+    access masks such as 0x1010, 0x1410, or 0x1438?
+  context: Tools like Mimikatz read cached and live credentials from LSASS memory, requesting specific
+    access rights to do so. Monitor Sysmon Event ID 10 for lsass.exe access where GrantedAccess masks
+    indicate memory read (e.g., 0x1010/0x1410/0x1438) and alert when the SourceImage is not on an allowlist
+    of legitimate accessors (AV, EDR, system tooling). See the USENIX RAID research on detecting LSASS
+    credential theft. A positive result names the exact process reading LSASS, a high-confidence Credential
+    Access signal; the allowlist must be maintained carefully to suppress benign security products.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, especially Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "lsass = Sysmon 10 where TargetImage='lsass.exe';\nalert when GrantedAccess in [0x1010,0x1410,0x1438,...]\n\
+      \  and SourceImage not in allowlist;\noutput host, SourceImage, GrantedAccess, user, ts."
+- question: Do any LSASS access sessions read an abnormally large number of bytes or make more read attempts
+    than benign baselines, separating credential theft from routine access?
+  context: Legitimate processes touch LSASS lightly, whereas credential dumpers read substantial memory.
+    Profile total bytes read and the number of read attempts against lsass.exe per session and flag those
+    exceeding benign baselines, which cleanly separates credential theft from routine access. This statistical
+    magnitude signal complements access-mask rules and resists evasion via mask variation. In the Credential
+    Access context, a process that reads megabytes from LSASS or hammers it with many read calls is exhibiting
+    dumping behavior even if it spoofs a common image name.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, especially Domain Controllers'
+  range: Last 90 days, with benign per-process baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "sessions = aggregate lsass_access by SourceImage,session\n  with total_bytes_read, read_attempts;\n\
+      baseline = benign distribution per SourceImage;\nalert when total_bytes_read > p99 or read_attempts\
+      \ > p99;\noutput host, SourceImage, total_bytes_read, read_attempts."
+- question: Which (SourceImage, LogonId) pairs accessing LSASS are first-seen over a 30-day window, scoring
+    higher for rare images and temp/user-writable paths?
+  context: Novel access relationships are a reliable anomaly signal for LSASS reads. Baseline (SourceImage,
+    LogonId) pairs over 30 days and flag first-seen pairs, scoring higher when the SourceImage is rare
+    or runs from a temp/user-writable path. This catches new dumpers and unusual logon sessions accessing
+    LSASS that would not match a static allowlist. For Credential Access, a first-seen process under an
+    unexpected logon session reading LSASS on a domain controller is a strong indicator of cached/live
+    credential theft and warrants immediate triage of that session.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, especially Domain Controllers'
+  range: Last 90 days, with a 30-day first-seen baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "pairs = (SourceImage, LogonId) from Sysmon 10 lsass access;\nbaseline = seen_pairs over 30d;\n\
+      alert when pair first_seen,\n  score += rare(SourceImage) + temp_or_user_path(SourceImage);\noutput\
+      \ host, SourceImage, LogonId, score, ts."
+- question: Does a One-Class SVM trained on SourceImage, parent, user, GrantedAccess, and bytes-read features
+    flag novel LSASS access as anomalous?
+  context: A one-class anomaly model learns the shape of normal LSASS access and flags deviations without
+    needing attack examples. Train a One-Class SVM on features such as SourceImage, parent, user, GrantedAccess,
+    and bytes-read to flag novel LSASS access, and include the top-3 deviating features in the alert text
+    for triage. This provides resilient coverage of Credential Access dumping that evades both allowlists
+    and fixed thresholds. The explainability requirement lets analysts confirm whether the flagged access
+    reflects a new but legitimate tool or an actual credential dumper.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, especially Domain Controllers'
+  range: Last 90 days for scoring, with periodic retraining.
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = (SourceImage, parent, user, GrantedAccess, bytes_read);
+
+      model = OneClassSVM.fit(benign_lsass_access);
+
+      alert when model.predict(features) == anomaly;
+
+      explain = top3_deviating_features(features);
+
+      output host, features, explain, ts.'
+- question: After a dumping indicator (LSASS access, SECURITY-hive read, or dumping command) on a host,
+    are there type-3 logons (4624) to more than 5 new internal hosts from that same source within 60 minutes?
+  context: Cached-credential theft is rarely the end goal; cracked or reused credentials enable lateral
+    movement. Alert when an LSASS access, SECURITY-hive read, or dumping command on a host is followed
+    within 60 minutes by network (type-3) logons (4624) to more than 5 new internal hosts from the same
+    source, per the Hopper lateral-movement model. This temporal correlation ties Credential Access to
+    its follow-on Lateral Movement, dramatically raising confidence. A positive result is a likely active
+    intrusion and should trigger containment of the source host and review of the accessed destinations.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Enterprise-wide network traffic gateways, Authentication logs on all servers, Process execution
+    logs on all endpoints'
+  range: Last 90 days, correlated within 60-minute windows after each dump indicator.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'dump = lsass_access OR security_hive_read OR dumping_command;
+
+      logons = 4624 type=3 from same source within 60m after dump;
+
+      alert when distinct_new_dest_hosts(logons) > 5;
+
+      output source_host, dump_event, dest_hosts, logon_times.'
+- question: Following a dump indicator, do distinct destinations or ports in Zeek conn.log from the source
+    host exceed its 99th-percentile baseline, indicating a lateral-movement spike?
+  context: Lateral movement after credential theft produces a fan-out of network connections. After a
+    dump indicator, analyze Zeek conn.log from the source host and flag when the number of distinct destinations
+    or ports exceeds the host's 99th-percentile baseline. This network-side statistical signal corroborates
+    the authentication-side correlation and catches movement over protocols that may not generate clean
+    logon events. In the Credential Access-to-Lateral-Movement chain, a sudden connection fan-out shortly
+    after a dump strongly suggests stolen credentials are being exercised across the environment.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Enterprise-wide network traffic gateways, Authentication logs on all servers, Process execution
+    logs on all endpoints'
+  range: Last 90 days, with per-host connection baselines, evaluated after each dump indicator.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'post = conn.log from source_host after dump within window;
+
+      distinct_dst = count distinct dst_ip; distinct_ports = count distinct dst_port;
+
+      baseline = p99(distinct_dst, distinct_ports) per host;
+
+      alert when distinct_dst > baseline or distinct_ports > baseline;
+
+      output source_host, distinct_dst, distinct_ports, dump_event.'
+- question: After a dump indicator, are there spikes in failed logons (4625) and account lockouts (4740)
+    that suggest cracked DCC2 hashes are being reused?
+  context: Because DCC2 (MS-Cache v2) hashes cannot be passed and must be cracked offline first, credential
+    reuse after a cached-credential dump often manifests as failed logons during password guessing or
+    as lockouts when cracked passwords are stale. Profile failed logons (4625) and account lockouts (4740)
+    following a dump indicator as a distinct signal of cracked DCC2 hashes being reused. See PassLib's
+    msdcc2 notes on the offline-cracking requirement. This links Credential Access to later authentication
+    abuse; a burst of failures/lockouts tied to a recent dump indicator should be treated as evidence
+    the offline crack succeeded.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Enterprise-wide network traffic gateways, Authentication logs on all servers, Process execution
+    logs on all endpoints'
+  range: Last 90 days, correlated after each dump indicator.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "post = events 4625 (failed logon) and 4740 (lockout)\n  after dump indicator within window;\n\
+      baseline = normal failure/lockout rate per account/host;\nalert when post_rate > mean+3*std;\noutput\
+      \ account, host, failed_count, lockout_count, dump_event."
+- question: Does causal login-path modeling with rarity-based anomaly scoring surface post-dump credential
+    reuse and new-edge logons across the authentication graph?
+  context: Stolen credentials create new, rare edges in the enterprise login graph. Build causal login
+    paths from authentication logs and apply rarity-based anomaly scoring (per the Hopper approach) to
+    surface post-dump credential reuse and new-edge logons, presenting the contributing path features
+    for analyst review. This graph-aware ML method catches stealthy lateral movement that per-host thresholds
+    miss by reasoning about who logged in where, when, and from which prior step. For the Credential Access
+    mission, low-probability login paths originating shortly after a dump indicator are prime candidates
+    for stolen cached credentials being exercised.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Enterprise-wide network traffic gateways, Authentication logs on all servers, Process execution
+    logs on all endpoints'
+  range: Last 90 days, scored over the authentication graph after dump indicators.
+  queries:
+  - technology: ML/pseudocode
+    query: 'graph = build_login_paths(4624/4625) with edges (src,dst,user,time);
+
+      score = rarity_anomaly(graph paths after dump indicator);
+
+      alert when path_score >= threshold or new_edge=true;
+
+      output path, score, contributing_features, dump_event.'
+- question: On Linux hosts, are non-root/non-sssd processes reading `/var/lib/sss/db/cache_*.ldb` or `/var/opt/quest/vas/authcache/vas_auth.vdb`,
+    or invoking `tdbdump`/Linikatz against those paths?
+  context: Linux systems joined to Active Directory cache domain credential hashes in SSSD and Quest/VAS
+    databases, which adversaries dump with tools like tdbdump or Linikatz. Use auditd to alert when non-root/non-sssd
+    processes read `/var/lib/sss/db/cache_*.ldb` or `/var/opt/quest/vas/authcache/vas_auth.vdb`, or when
+    command lines invoke `tdbdump` or Linikatz against these paths. Only specific service accounts should
+    ever touch these files, so any other reader is a strong Credential Access indicator. A positive match
+    names the process and user dumping the Linux credential cache and should trigger immediate host triage.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - auditd:SYSCALL
+  - auditd:EXECVE
+  - 'NAI: Linux servers and workstations integrated with Active Directory via SSSD or Quest/VAS.'
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: "watch = auditd file rules on /var/lib/sss/db/cache_*.ldb,\n  /var/opt/quest/vas/authcache/vas_auth.vdb;\n\
+      alert when reader uid not in [root,sssd] (SYSCALL)\n  OR EXECVE comm in ['tdbdump','linikatz'] targeting\
+      \ those paths;\noutput host, exe, uid, path, syscall, ts."
+- question: Which processes or users reading the SSSD/Quest caches are first-seen, or show access-count
+    spikes beyond the mean+3sigma baseline?
+  context: Renamed tools and novel access patterns evade exact-path signatures, so baselining helps. Build
+    a baseline of processes and users that read the SSSD/Quest caches and flag first-seen processes or
+    commands and access-count spikes beyond a mean+3sigma threshold. Because legitimate access is dominated
+    by a small set of service accounts, any new reader or sudden burst is anomalous. This statistical
+    method extends Linux Credential Access coverage beyond known tooling and helps catch a careful actor
+    reading the cache via an uncommon utility or copying the database for offline dumping.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - auditd:SYSCALL
+  - auditd:EXECVE
+  - 'NAI: Linux servers and workstations integrated with Active Directory via SSSD or Quest/VAS.'
+  range: Last 90 days, with per-host reader baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "reads = auditd reads of sss/quest cache files;\nbaseline = known (process,user) readers and\
+      \ access counts;\nalert when (process,user) first_seen\n  or access_count > mean+3*std;\noutput\
+      \ host, process, user, access_count, path."
+- question: Are there permission-denied (EACCES) reads on the SSSD/Quest cache files indicating an under-privileged
+    actor attempting to dump cached credentials?
+  context: Dumping the Linux credential cache requires root/sudo, so an under-privileged actor generates
+    EACCES failures while probing. Treat permission-denied (EACCES) reads on the cache files as a distinct
+    signal of an attempted cached-credential dump, not noise; reference Atomic Red Team T1003.005 for
+    expected access patterns. A cluster of denied reads on `cache_*.ldb` from a non-privileged user often
+    precedes a privilege-escalation attempt followed by a successful dump, so it is an early Credential
+    Access warning that should prompt review of the actor's escalation activity.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - auditd:SYSCALL
+  - auditd:EXECVE
+  - 'NAI: Linux servers and workstations integrated with Active Directory via SSSD or Quest/VAS.'
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: 'denied = auditd SYSCALL on cache files where exit=EACCES;
+
+      group by host,uid; alert on >=1 (escalate on bursts);
+
+      output host, uid, exe, path, denied_count, ts.'
+- question: Does a Logistic Regression model trained on user, privilege, process, parent, and time features
+    label a Linux cache access as malicious, with top contributing features reported?
+  context: A lightweight supervised model can classify cache-access events that neither exact paths nor
+    baselines clearly resolve. Train Logistic Regression on features such as user, privilege level, process,
+    parent, and time-of-day to label SSSD/Quest cache accesses, reporting the top contributing features
+    per alert for triage. This provides explainable, parallel coverage of Linux Credential Access and
+    helps prioritize among many benign service-account reads. The reported features let an analyst confirm
+    whether a flagged access reflects unusual privilege, an unexpected parent process, or off-hours timing
+    consistent with a credential dump.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - auditd:SYSCALL
+  - auditd:EXECVE
+  - 'NAI: Linux servers and workstations integrated with Active Directory via SSSD or Quest/VAS.'
+  range: Last 90 days for scoring, with periodic retraining.
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = (user, privilege, process, parent, hour) per cache_access;
+
+      model = LogisticRegression.fit(labeled_accesses);
+
+      score = model.predict_proba(features);
+
+      alert when score >= threshold;
+
+      output host, features, score, top_features, path.'
