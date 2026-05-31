@@ -1,0 +1,229 @@
+name: 'AZT509: Azure Bastion'
+id: dc7b626b-478a-4961-8771-b4f34fd5a463
+description: Investigate adversary abuse of Azure Bastion - and in particular the Bastion Shareable Link
+  feature - to establish durable, credential-less RDP/SSH access to virtual machines over the public internet
+  as a persistence mechanism. This playbook helps an analyst detect creation or modification of Bastion
+  hosts, enablement of the Shareable Link feature, Basic-to-Standard SKU upgrades, and generation or retrieval
+  of shareable links, then correlate those control-plane events with downstream interactive sessions to
+  targeted VMs. It covers per-session Bastion telemetry (source IP/geo anomalies, target-VM fan-out, periodic
+  automation-like session reuse, and failed-session probing), network corroboration of RDP/SSH flows from
+  the AzureBastionSubnet to target VMs, and blocked/denied inbound probing. Symbolic-logic, statistical
+  baselining, and graph/ML methods are provided so an analyst can confirm whether Bastion is being used
+  as a covert public remote-access channel rather than for routine administration.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any principal create or modify an Azure Bastion host and then create or retrieve shareable
+    links, and were those links followed by interactive access to the targeted virtual machines?
+  context: 'This is the core persistence chain for Azure Bastion abuse aligned to the Persistence tactic:
+    an adversary writes a Bastion host (Microsoft.Network/bastionHosts/write) and then mints or fetches
+    shareable links so they can return to a VM over the public internet without re-opening management
+    ports. Use the canonical AzureActivity hunting query for the createShareableLinks/getShareableLinks
+    operation values and correlate them with subsequent interactive logins or other persistence-enabling
+    changes on the targeted VMs. A positive result - especially links created for high-value hosts or
+    a Bastion newly deployed by an unusual operator - strongly indicates deliberate persistence rather
+    than routine administration; escalate accordingly.'
+  answer_sources: &id001
+  - AzureActivity
+  - SigninLogs
+  - NSGFlowLogs
+  - 'NAI: Bastion hosts serving sensitive virtual networks, Shareable-Link feature enablement and SKU
+    upgrades, shareable link creation and retrieval events, and downstream interactive access to virtual
+    machines that do not normally rely on Bastion for administration'
+  range: Last 90 days, correlating link creation/retrieval with downstream VM access within a 24-hour
+    window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: SEARCH AzureActivity WHERE OperationName IN ['Microsoft.Network/bastionHosts/write','Microsoft.Network/bastionHosts/createShareableLinks/action','Microsoft.Network/bastionHosts/getShareableLinks/action'];
+      JOIN downstream interactive_access_to_target_VM ON caller, target_vm, time_window<=24h; ESCALATE
+      when target IN high_value_hosts OR caller NOT IN known_bastion_operators; OUTPUT caller, operation,
+      bastion_host, target_vm, event_times.
+- question: Was the Shareable Link feature enabled on a Bastion host, or was a Bastion host upgraded from
+    Basic to Standard SKU, and did any low-privilege principal newly acquire create/delete shareable-link
+    rights?
+  context: 'Credential-less public RDP/SSH webpages are only possible once the Shareable Link feature
+    is turned on, so its enablement and any Basic-to-Standard SKU upgrade are rare, high-severity prerequisite
+    events for this persistence technique. Treat the configuration change itself as an alert. Apply hard
+    guardrails at Microsoft''s documented limits: more than 50 concurrent create/delete operations, or
+    approaching 500 links per Bastion host, indicates bulk abuse. Also flag any principal that previously
+    held only default Read access but newly gains create/delete shareable-link RBAC, which can indicate
+    an adversary granting themselves the rights needed to maintain access.'
+  answer_sources: *id001
+  range: Last 90 days, with immediate review of any current-period feature enablement or SKU upgrade.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ALERT on AzureActivity WHERE shareable_link_feature_enabled=true OR bastion_sku_change='Basic->Standard';
+      ALSO ALERT when concurrent_create_or_delete_link_ops>50 OR links_per_host>=450; FLAG principal newly
+      granted createShareableLinks/deleteShareableLinks RBAC when prior_access='Read'; OUTPUT principal,
+      bastion_host, change_type, link_count.
+- question: Are shareable-link creation or retrieval events repeatedly followed by access to the same
+    set of VMs from unusual operators or during after-hours windows?
+  context: Persistence is durable access, not a one-off action. By treating each createShareableLinks/getShareableLinks
+    event as the head of a causal login path and tracing it to repeated downstream sessions against the
+    same VM set, an analyst can distinguish a persistent remote-access channel from ad hoc troubleshooting.
+    Pay attention to repeated reuse by unusual operators or during after-hours windows. Modeling link
+    creation as a causal precursor to subsequent logins (as in Hopper) makes durable shareable-link reuse
+    stand out as adversary persistence rather than benign administration.
+  answer_sources: *id001
+  range: Last 90 days, tracking repeated reuse of the same shareable link over multi-day windows.
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: SEARCH AzureActivity WHERE OperationName IN ['Microsoft.Network/bastionHosts/createShareableLinks/action','Microsoft.Network/bastionHosts/getShareableLinks/action'];
+      LINK to subsequent sessions ON target_vm_set; ALERT when same_vm_set accessed repeatedly AND (operator
+      NOT IN baseline_operators OR access_time IN after_hours); OUTPUT link_id, operator, vm_set, session_times.
+- question: Do Bastion deployment frequency, shareable-link volume, target-VM count, operator diversity,
+    or access timing exceed the trailing baseline for any Bastion host?
+  context: Per-entity statistical baselining catches Bastion abuse that no single deterministic rule would
+    flag. Build baselines per Bastion host for deployment frequency, shareable-link generation volume,
+    distinct target-VM count, operator diversity, and access timing from 30-90 days of trailing AzureActivity,
+    then flag values above the trailing 95th percentile or robust MAD/z-score outliers as improbable administrative
+    behavior. A spike in any of these dimensions can reveal an adversary expanding their persistent footprint
+    (more links, more target VMs, off-hours activity) supporting the Persistence tactic. Derive site-specific
+    thresholds rather than using fixed numbers.
+  answer_sources: *id001
+  range: Last 90 days, with 30-90 day trailing baselines per Bastion host.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline per bastion_host over 30-90d => deploy_freq, link_volume, distinct_target_vms, operator_diversity,
+      access_hour_dist; FLAG when any metric > trailing_p95 OR robust_mad_z>3.5; OUTPUT host, metric,
+      value, baseline_percentile.
+- question: Does graph-based modeling of the principal->Bastion->VM control plane surface structurally
+    anomalous, contextually malicious edges such as a low-activity principal deploying Bastion and minting
+    links over a high-value VNet?
+  context: When attackers blend into normal admin volume, a heterogeneous graph model over IAM/cloud audit
+    logs can score the principal->Bastion->VM control-plane edges for structural and contextual anomaly.
+    Prioritize cases where Bastion activity appears after suspicious admin sessions and targets systems
+    not previously reached through that path, which is the signature of a new persistence channel. Surface
+    the top-3 contributing features (new operator, off-hours, target-VM rarity) in the alert text so an
+    analyst can quickly judge whether the edge reflects credential-less persistence or legitimate buildout.
+  answer_sources: *id001
+  range: Last 90 days for graph construction and training, with current edges scored continuously.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: graph = build_hetero_graph(principal, bastion, vm) FROM iam_and_cloud_audit; score = attention_gnn.score_edges(graph);
+      ALERT when edge_anomaly_high AND principal_low_activity AND target IN high_value_vnet AND bastion_follows_suspicious_admin_session;
+      OUTPUT top_3_features, principal, bastion, target_vm.
+- question: Are interactive Bastion sessions originating from new or anonymizing source IPs, impossible-travel
+    geographies, or off-hours windows that are anomalous for the operator?
+  context: BastionAuditLogs records per-session fields - user name, client source IP, target VM IP, protocol,
+    and timestamps - that let an analyst baseline each operator's normal source IPs, ASNs, geographies,
+    and session times. Flag sessions from first-seen or anonymizing IPs, impossible-travel geos, or off-hours
+    windows. In the context of Bastion persistence, such anomalies suggest an adversary using shareable
+    links or stolen credentials to reach VMs from infrastructure the legitimate operator never uses, confirming
+    the public remote-access channel is being abused.
+  answer_sources: &id002
+  - BastionAuditLogs
+  - SigninLogs
+  - AzureMetrics
+  - 'NAI: BastionAuditLogs session records (user name, client source IP, target VM IP, protocol, timestamps)
+    and the Bastion Session Count metric for hosts fronting sensitive virtual networks'
+  range: Last 90 days, with rolling 30-day per-operator source/geo/time baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline per operator over 30d for source_ip, asn, geo, session_hour FROM BastionAuditLogs;
+      FLAG sessions from first_seen_ip OR anonymizing_ip OR impossible_travel OR off_hours; OUTPUT operator,
+      source_ip, geo, target_vm, timestamp.
+- question: Is any operator reaching an unusually large number of distinct target VMs, or generating abnormal
+    session duration or byte volume, through Bastion within a window?
+  context: An adversary using Bastion as a durable access channel often fans out across many VMs or runs
+    longer/larger sessions than the operator normally would. Compute distinct target-VM count, session
+    duration, and byte/volume per operator per window from BastionAuditLogs and the Bastion Session Count
+    metric, then alert when fan-out or session volume exceeds the trailing 95th percentile. A per-entity
+    host-graph outlier approach distinguishes broad lateral reach (consistent with persistence and follow-on
+    movement) from a single-VM administrative session.
+  answer_sources: *id002
+  range: Last 90 days, with trailing per-operator baselines over 30 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: CALCULATE per operator per window => distinct_target_vms, session_duration, bytes FROM BastionAuditLogs
+      + AzureMetrics SessionCount; ALERT when distinct_target_vms OR session_volume > trailing_p95; OUTPUT
+      operator, vm_count, duration, bytes, window.
+- question: Do Bastion sessions to the same VM set recur on a periodic, automation-like schedule that
+    suggests a persistent shareable link being reused?
+  context: Periodic recurrence of sessions to a fixed VM set is a hallmark of a persistent shareable link
+    or scripted access rather than human troubleshooting. Extract FFT-based periodicity from per-(operator,target)
+    session time series and suppress known benign automation, following beaconing-detection techniques
+    such as BAYWATCH. A strong, persistent periodic signal that does not map to a scheduled job indicates
+    the adversary has automated re-entry through Bastion, directly supporting the Persistence tactic.
+  answer_sources: *id002
+  range: Last 90 days, using multi-day session time series with benign-automation suppression.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: BUILD per (operator,target_vm) session_time_series FROM BastionAuditLogs; run FFT; ALERT when
+      dominant_spectral_power>noise_floor+3sigma AND period NOT IN known_automation_schedule; OUTPUT operator,
+      target_vm, period, power.
+- question: Are there spikes in failed or aborted Bastion sign-ins and authentication errors per operator
+    or per target VM that indicate brute-force or reconnaissance against the exposed access path?
+  context: Failed and aborted Bastion sessions are a distinct brute-force/recon signal separate from successful
+    access. Profile authentication errors and failed/aborted sessions per operator and per target VM,
+    and alert on spikes in the failed-to-successful session ratio. This mirrors the failure-mode and blocked-connection
+    emphasis in cloud-compute-credential abuse research. A rising failure ratio against a Bastion fronting
+    sensitive VNets can indicate an adversary probing the public remote-access path before establishing
+    durable access.
+  answer_sources: *id002
+  range: Last 90 days, with per-operator and per-VM failure-ratio baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: CALCULATE per operator and per target_vm => failed_sessions, successful_sessions, failure_ratio
+      FROM BastionAuditLogs; ALERT when failure_ratio>baseline_p95 OR failed_sessions>mean+3sigma; OUTPUT
+      operator, target_vm, fail_count, success_count, ratio.
+- question: Does any Bastion session represent a rare or first-seen operator->VM authentication edge when
+    scored against historical access graphs?
+  context: Treat each Bastion session as an operator->VM authentication edge and score rare or novel edges
+    using link-prediction and temporal-graph methods (node2vec, temporal link prediction, causal-path
+    rarity) to suppress benign admin volume. A first-time operator->VM edge through Bastion, especially
+    off-hours or from a rare source IP, is a strong indicator that an adversary is using the Bastion public
+    channel to reach systems they have never legitimately accessed - a persistence and lateral-movement
+    signal. Surface the top-3 contributing features (first-time edge, off-hours, source-IP rarity) in
+    the alert text.
+  answer_sources: *id002
+  range: Last 90 days for graph training, with current sessions scored as edges.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: build operator->vm edges FROM BastionAuditLogs; score = link_prediction(node2vec) + temporal_link_prediction
+      + causal_path_rarity; ALERT on rare_or_first_seen_edge; OUTPUT top_3_features, operator, target_vm,
+      source_ip, timestamp.
+- question: After a shareable link is created or retrieved, do NSG flow logs show RDP (3389) or SSH (22)
+    sessions from the AzureBastionSubnet to target VMs that had no prior Bastion-sourced access?
+  context: Network telemetry corroborates control-plane evidence of Bastion persistence. Correlate shareable-link
+    creation/retrieval in AzureActivity with subsequent RDP/SSH flows from the AzureBastionSubnet to target
+    VMs in NSGFlowLogs to confirm that credential-less public access was actually used. Escalate when
+    the target VMs had no prior Bastion-sourced sessions, an exposure pattern analogous to ingress-rule
+    abuse for cloud persistence. This network-plus-control-plane confirmation removes ambiguity from proxied
+    or NAT'd access and proves the public remote-access channel is live.
+  answer_sources: &id003
+  - NSGFlowLogs
+  - AzureActivity
+  - BastionAuditLogs
+  - 'NAI: NSG flow records to/from the AzureBastionSubnet and target VM NICs, correlated with shareable-link
+    control-plane events'
+  range: Last 90 days, correlating link events with Bastion-subnet flows within a short post-creation
+    window.
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: JOIN AzureActivity shareable_link_create_or_get TO NSGFlowLogs flows WHERE src IN AzureBastionSubnet
+      AND dst_port IN [3389,22] AND dst IN target_vm_nics AND time_window<=link_validity; ESCALATE when
+      target_vm has no prior bastion_sourced_session; OUTPUT link_event, src, dst, port, bytes.
+- question: Are blocked or denied inbound flows and failed connection attempts toward the Bastion host
+    or target VMs deviating above their baseline, indicating probing of the exposed access path?
+  context: Blocked/denied inbound flows toward Bastion and its target VMs are a distinct probing signal
+    that complements successful-access detection. Profile blocked/denied flows and failed connection counts
+    in NSGFlowLogs and alert on deviations above the trailing baseline. Failure-rate profiling for cloud
+    remote-access abuse is well documented; a rise in blocked attempts toward a Bastion fronting sensitive
+    VNets can reveal an adversary scanning or brute-forcing the exposed public access path before or during
+    persistence establishment.
+  answer_sources: *id003
+  range: Last 90 days, with trailing baselines for blocked/denied inbound flow counts.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: CALCULATE blocked_or_denied_inbound_flows and failed_conn_counts toward bastion_host and target_vms
+      FROM NSGFlowLogs per window; ALERT when count>trailing_baseline_mean+3sigma; OUTPUT target, blocked_count,
+      baseline, window.
