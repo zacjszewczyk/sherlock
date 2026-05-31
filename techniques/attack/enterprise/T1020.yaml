@@ -1,0 +1,498 @@
+name: 'T1020: Automated Exfiltration'
+id: a6c64810-6c6d-40ad-af0c-efdc295a0f7a
+description: 'Investigate potential Automated Exfiltration (T1020), where an adversary uses automated
+  processing — scripts, scheduled tasks, cron jobs, daemons, or LaunchAgents/LaunchDaemons — to transfer
+  collected sensitive data out of the environment, frequently in tandem with Exfiltration Over C2 Channel
+  (T1041) or Over Alternative Protocol (T1048). This playbook helps an analyst hunt for: outbound connections
+  to threat-intel-flagged C2/exfiltration destinations; high-volume or upload-heavy flows and abnormal
+  upload:download ratios; fixed-cadence/beaconing transfers indicative of scheduled jobs; DNS- and HTTP-based
+  covert channels with long, high-entropy subdomains or Base64-encoded POST bodies; archiving-utility
+  execution against sensitive directories followed by large transfers (the collection->staging->send chain);
+  single processes touching anomalously many files or file types in a short window; and coordinated, multi-host
+  staging that converges on a single external destination. It pairs deterministic symbolic-logic ''floor''
+  detectors with statistical baselining and machine-learning anomaly models across network (Zeek), endpoint
+  (Windows Event IDs, auditd), and macOS unified-log telemetry.'
+type: technique
+related:
+- tactic_id: TA0010
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any internal host make an outbound connection to an external IP or domain that appears
+    on a threat-intelligence feed categorized as C2, Exfiltration, or Malware?
+  context: 'This is the deterministic ''floor'' detector for Automated Exfiltration under the Exfiltration
+    tactic: correlate first-party Zeek conn.log/dns.log against curated CTI lists and alert whenever the
+    destination is categorized as C2, Exfiltration, or Malware. It catches the transfer using your own
+    logs even when the malware itself is unknown, and should run alongside the behavioral detectors so
+    a known-bad indicator never slips through. A positive match is high-confidence and warrants immediate
+    triage of the source host; a negative result simply means no known IOC was hit and you must rely on
+    the behavioral detectors below.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'join conn.log/dns.log dest (id.resp_h, query) against CTI_feed
+
+      where CTI.category in ("C2","Exfiltration","Malware")
+
+      alert host=id.orig_h dest=id.resp_h category=CTI.category'
+- question: For connections to low-reputation, dynamic, or newly-observed domains, do any flows show upload
+    volumes above the 95th percentile for that destination category or an orig_bytes:resp_bytes upload
+    ratio greater than 10:1?
+  context: 'Normal web browsing is download-biased (you receive far more bytes than you send). Exfiltration
+    inverts this: the host sends much more than it receives. By computing per-destination-category byte
+    percentiles from 30 days of conn.log and flagging flows whose orig_bytes exceed the 95th percentile,
+    plus tracking the upload ratio (>10:1 is exfil-like), an analyst can surface suspicious uploads to
+    sketchy destinations even without an IOC. Focus on low-reputation/dynamic/newly-observed domains to
+    keep volume manageable. A high upload ratio to an unfamiliar destination is a strong lead; benign
+    large uploads (e.g., cloud backup) should be allow-listed.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies'
+  range: Last 90 days (baseline percentiles over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = percentile(orig_bytes, 95) by dest_category over 30d\nfor flow in conn.log where\
+      \ dest_reputation in (low,dynamic,new):\n  ratio = orig_bytes / max(resp_bytes,1)\n  if orig_bytes\
+      \ > baseline[dest_category] or ratio > 10: alert"
+- question: Are any host-to-destination pairs communicating on a fixed cadence consistent with automated/scheduled
+    data transfer (highly regular inter-arrival times or a strong dominant periodicity)?
+  context: Automated exfiltration tools transfer on a schedule (cron, scheduled task, beacon interval),
+    producing connections with very regular timing. Score each host->destination pair by connection inter-arrival
+    regularity (coefficient of variation < 0.1 indicates near-clockwork timing) and by DFT dominant-period
+    strength. Suppress benign periodic services (NTP, software update, telemetry) using role-aware baselines
+    and allow-lists. A strong, low-jitter period to an unusual external destination is characteristic
+    of beaconing/scheduled exfiltration; jittered, human-driven traffic will score low.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies'
+  range: Last 90 days (require sufficient samples per pair, e.g. >= 12 connections)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'group conn.log by (orig_h, resp_h)
+
+      intervals = diff(sorted(ts))
+
+      cov = stddev(intervals)/mean(intervals)
+
+      period_strength = DFT_dominant_power(timeseries)
+
+      if cov < 0.1 or period_strength > threshold and dest not in benign_periodic: alert'
+- question: When a supervised classifier scores connection metadata (reputation, port, protocol, duration,
+    bytes, upload ratio, connection state), are there high-confidence exfiltration predictions — and for
+    opaque TLS destinations, does an encrypted-flow anomaly detector flag abnormal size/timing patterns?
+  context: Where payload is encrypted, content inspection fails, so a model trained on flow metadata becomes
+    the detector. Train a Random Forest/Gradient Boosting classifier on destination reputation, port,
+    protocol, duration, byte counts, upload ratio, and connection state and alert on high-confidence exfiltration
+    picks. For TLS destinations where bytes are opaque, layer a self-supervised encrypted-flow anomaly
+    detector on size/timing metadata. Surface the top-3 contributing features (e.g., bytes-out, upload
+    ratio, period strength) via SHAP so the analyst can triage quickly. High score + upload-heavy features
+    to an unusual destination is the actionable case.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features(conn.log): [reputation, port, proto, duration, orig_bytes, resp_bytes, upload_ratio,
+      conn_state]
+
+      score = RandomForest.predict_proba(X)
+
+      tls_score = SSL_flow_anomaly(size_timing_metadata)
+
+      if score > 0.9 or tls_score anomalous: alert with SHAP_top3(X)'
+- question: Is any host generating a burst of failed or blocked outbound connections (Zeek states S0/REJ/RSTO)
+    to many destinations, especially shortly before a successful large transfer?
+  context: Automated exfiltration scripts often probe multiple destinations or retry aggressively, producing
+    a spike in failed/blocked egress (conn states S0 = no reply, REJ = rejected, RSTO = reset by originator).
+    A cluster of such failures across many destinations — particularly immediately preceding a single
+    successful large upload — is a distinct automated-exfiltration signal. Profile the per-host failed-connection
+    rate and alert on bursts. Benign causes (broken proxy config, dead service) exist, so correlate with
+    a subsequent successful large transfer to raise confidence.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'fail = count(conn.log where conn_state in (S0,REJ,RSTO)) by orig_h, bin(5m)
+
+      baseline = mean+3sigma per host
+
+      if fail > baseline and distinct(resp_h) high: alert, then check for >50MB success flow within 1h'
+- question: Do any HTTP POST headers/URIs or DNS queries match known data-exfiltration tool signatures
+    (Iodine, DNSCat2, Cobalt Strike, DET)?
+  context: 'Known tunneling/exfiltration tools leave recognizable patterns in DNS query structure and
+    HTTP POST headers/URIs. Scan Zeek http.log POST headers/URIs and dns.log queries with regexes for
+    Iodine/DNSCat2/Cobalt Strike/DET fingerprints and alert on matches. This is a deterministic signature
+    floor: a hit is high-confidence and should trigger immediate host isolation review. Keep signatures
+    updated and validate coverage via emulation (e.g., the DET toolkit). Absence of a match does not rule
+    out custom tunnels — rely on the entropy/heavy-hitter detectors next.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'for q in dns.log.query: if regex_match(q, [iodine, dnscat2, cobaltstrike, det]): alert
+
+      for h in http.log where method==POST: if regex_match(uri|headers, exfil_sigs): alert'
+- question: Does the cumulative encoded information carried in subdomain labels for any registered domain
+    far exceed what benign DNS resolution would require (information-theoretic ceiling exceeded)?
+  context: DNS is meant to resolve names, not carry payloads. By compressing the stream of observed subdomain
+    labels per registered domain and measuring cumulative information content, you can flag domains whose
+    encoded data vastly exceeds plausible resolution needs — a hallmark of DNS tunneling/exfiltration.
+    This information-bound approach catches encoded channels regardless of specific tool signature. A
+    domain accumulating large amounts of unique, incompressible label content is suspicious; CDNs and
+    large SaaS providers can be high-volume but compressible/structured, so baseline and allow-list them.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'group dns.log by registered_domain
+
+      info = len(compress(concat(subdomain_labels)))
+
+      if info >> benign_resolution_ceiling[domain] and domain not in allowlist: alert'
+- question: Are there DNS queries with entropy above 4.5 (vs. a benign baseline near 3.2), subdomain labels
+    longer than 64 characters, or HTTP POST bodies above the 99th-percentile size — combined with encoding
+    markers?
+  context: Encoded/encrypted exfiltrated data shows higher randomness (entropy) and longer labels than
+    human-readable domain names. Baseline DNS query entropy (typically ~3.2) and flag entries above 4.5,
+    subdomain labels exceeding 64 characters, and HTTP POST bodies above the 99th percentile. Combining
+    content-metadata features (entropy, length, character distribution, Base64/hex encoding markers) with
+    behavioral features sharpens detection. A long, high-entropy label or oversized POST body with encoding
+    markers indicates a covert channel; legitimate high-entropy names (DGA-like CDN hostnames) should
+    be baselined out.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days (baseline over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for q in dns.log: if shannon_entropy(q) > 4.5 or max_label_len(q) > 64: flag
+
+      for h in http.log where method==POST: if body_len > p99 and has_encoding_markers: flag
+
+      baseline entropy ~3.2; alert flags not in allowlist'
+- question: When information content is accumulated per registered second-level domain over a sliding
+    window, are there domains ranking high on total bytes/entropy that individually stay under per-query
+    thresholds (slow, low-throughput exfiltration)?
+  context: Stealthy exfiltration drips data slowly so each individual query looks benign. Defeat this
+    by aggregating information content (bytes/entropy) per registered second-level domain over a sliding
+    window and ranking domains by the accumulated total. This heavy-hitter approach catches low-and-slow
+    tunnels that evade per-query thresholds. A domain quietly accumulating large cumulative encoded content
+    over hours/days is a strong exfiltration lead even though no single query was alarming.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days (sliding-window accumulation)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'window = sliding(6h)
+
+      accum[domain] += info_content(query)
+
+      rank domains by accum desc; alert top-N where accum > baseline and not in allowlist'
+- question: Does any registered domain show an anomalously high NXDOMAIN/SERVFAIL ratio or an unusually
+    high count of unique subdomains, consistent with a misconfigured or one-way DNS tunnel?
+  context: Misconfigured or one-way (upload-only) DNS tunnels generate many queries to subdomains that
+    do not resolve, producing abnormally high NXDOMAIN/SERVFAIL ratios and a large number of unique subdomains
+    compared to benign traffic. Track per-domain error ratios and unique-subdomain counts and alert on
+    outliers. This is a distinct signal even when entropy detectors are evaded. Benign causes (typo-squatting
+    protection, certain telemetry) can elevate error rates, so corroborate with entropy/heavy-hitter findings.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'group dns.log by registered_domain
+
+      err_ratio = count(rcode in (NXDOMAIN,SERVFAIL)) / count(*)
+
+      uniq = distinct(subdomain)
+
+      if err_ratio > baseline+3sigma or uniq > threshold: alert'
+- question: Does an unsupervised model over per-domain sliding-window DNS features (distinct subdomains,
+    mean label length, entropy, query-type mix, unique-resolution ratio) flag any domain as anomalous,
+    indicating low-throughput DNS exfiltration?
+  context: Some DNS exfiltration is deliberately low-throughput and won't trip fixed thresholds. Train
+    an Isolation Forest on per-domain sliding-window features — distinct subdomains, mean label length,
+    entropy, query-type mix, unique-resolution ratio — to isolate anomalous domains while suppressing
+    benign high-volume services like CDNs and AV update channels. List the top-3 anomalous features in
+    each alert for fast triage. A domain that is an outlier across multiple features simultaneously is
+    the actionable case; single-feature outliers are often benign.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Internal DNS Resolvers, Web Proxies, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = per_domain_window_features: [distinct_subdoms, mean_label_len, entropy, qtype_mix, uniq_resolution_ratio]
+
+      score = IsolationForest.fit_predict(X)
+
+      if anomalous(score) and domain not in benign_services: alert with top3_features(X)'
+- question: Did a known archiving utility (7z.exe, tar.exe, rar.exe, zip.exe) execute against sensitive
+    directories and, within 15 minutes, did the same host send more than 50MB to an external IP?
+  context: This reconstructs the classic collection->staging->send chain. Alert when Windows Event ID
+    4688 shows an archiver (7z/tar/rar/zip) with command-line arguments targeting sensitive user/system
+    directories, and within 15 minutes Zeek conn.log reports a >50MB outbound transfer to an external
+    IP from the same host. Linking the staging event to the transfer confirms intent and elevates confidence
+    far above either signal alone. Legitimate backup software can mimic this, so allow-list known backup
+    processes/destinations and focus on ad-hoc archiver use.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, File Servers, Domain Controllers, Application Servers'
+  range: Last 90 days (correlate archiver exec with transfer within 15 minutes)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'archive_evt = 4688 where image in (7z,tar,rar,zip) and cmdline ~ sensitive_dirs
+
+      transfer = conn.log where orig_bytes > 50MB and resp_h external
+
+      if same_host(archive_evt, transfer) and transfer.ts - archive_evt.ts < 15m: alert (staging->send
+      chain)'
+- question: After an archiver runs, does the host's outbound byte volume exceed its own baseline (mean
+    + 3 sigma), and do the upload:download ratio and transfer-rate regularity look like an automated scripted
+    dump rather than interactive use?
+  context: 'A host that suddenly uploads far more than its historical norm right after archiving is staging-then-exfiltrating.
+    Baseline each host''s daily orig_bytes from 30 days of history and flag post-archiver flows exceeding
+    mean + 3 sigma. Also score the upload:download ratio and transfer-rate regularity: automated scripted
+    dumps are steady and upload-heavy, whereas interactive use is bursty and more balanced. A per-host
+    volume spike combined with steady upload-heavy transfer after an archiver event is a strong automated-exfiltration
+    indicator.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, File Servers, Domain Controllers, Application Servers'
+  range: Last 90 days (per-host baseline over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "host_baseline = mean+3sigma(daily orig_bytes) per host over 30d\nfor flow after archiver_event\
+      \ on host:\n  if orig_bytes > host_baseline and upload_ratio high and rate_regular: alert"
+- question: Are recurring outbound transfers occurring on a fixed schedule (DFT/coefficient-of-variation
+    periodicity), indicating an automated exfiltration job rather than a benign backup?
+  context: Scheduled exfiltration produces transfers at regular intervals. Apply DFT/coefficient-of-variation
+    periodicity scoring to recurring transfers to identify automated exfiltration jobs, and distinguish
+    them from legitimate backups using role-aware baselines (a file server's nightly backup is expected;
+    a workstation beaconing 50MB hourly to an unknown host is not). A strong, low-jitter period to an
+    unsanctioned destination is the actionable case; sanctioned backup schedules to known destinations
+    should be allow-listed.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, File Servers, Domain Controllers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'group transfers by (host, dest)
+
+      cov = stddev(intervals)/mean(intervals); period = DFT_dominant(timeseries)
+
+      if (cov < 0.1 or strong(period)) and dest not in sanctioned_backup: alert'
+- question: Do host-level time-series models of bytes-per-minute (with archiver executions as exogenous
+    signals) show reconstruction spikes, or does a whole-system provenance graph reveal a rare staging->send
+    subgraph?
+  context: Model each host's bytes-per-minute with an LSTM/autoencoder and feed archiver executions in
+    as exogenous variables; a large reconstruction error right after an archiver runs flags anomalous
+    transfer volume tied to staging. Alternatively, build a whole-system provenance graph and use a graph
+    autoencoder to surface the rare collection->staging->send subgraph (process reads many files -> writes
+    archive -> network send). Report the top-3 contributing features/edges via SHAP. A reconstruction
+    spike or a rare staging->send subgraph correlated with an archiver is a high-value lead that captures
+    novel tooling.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, File Servers, Domain Controllers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = bytes_per_minute(host); exog = archiver_exec_events
+
+      err = LSTM_autoencoder.reconstruction_error(ts, exog)
+
+      if err > threshold: alert
+
+      OR graph_autoencoder(provenance_graph): flag rare staging->send subgraph; report top3 edges (SHAP)'
+- question: Did a scripting/interpreter host (powershell, cscript, wscript, python) access more than 100
+    sensitive files in 1 minute, or more than 1000 files / more than 10 distinct extensions in 5 minutes?
+  context: Data staging shows up as one process reading an unusual breadth/volume of files quickly. Using
+    Windows Event ID 4688 to identify scripting/interpreter parents and Event ID 4663 to count their file
+    accesses, alert when such a host reads >100 sensitive files in 1 minute, or >1000 files / >10 distinct
+    extensions in 5 minutes. This is a deterministic floor for staging. Indexing/backup services can trip
+    these counts, so allow-list known services and focus on interactive interpreters touching sensitive
+    repositories. A scripted mass-read is a strong staging signal and a precursor to exfiltration.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Sensitive Data Repositories, User Workstations, Source Code Repositories, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'proc = 4688 where image in (powershell,cscript,wscript,python)
+
+      reads = 4663 by proc, bin(1m): if reads>100 sensitive -> alert
+
+      reads5 = 4663 by proc, bin(5m): if count>1000 or distinct(ext)>10 -> alert'
+- question: Is any process an outlier (above the 99th percentile) on both file-access count and file-extension
+    entropy, including read-volume bytes and access frequency (count/min) rather than just file variety?
+  context: Beyond hard thresholds, baseline per-process file-access counts and the entropy of accessed
+    file extensions, then flag processes above the 99th percentile on both. Include read-volume bytes
+    and access frequency (accesses per minute), not just extension variety, so high-rate bulk reads are
+    caught. A process that is simultaneously an outlier in how many files it touches, how many distinct
+    types, how many bytes it reads, and how fast is behaving like a staging tool. Single-metric outliers
+    are common and usually benign; joint outliers are the actionable case.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Sensitive Data Repositories, User Workstations, Source Code Repositories, File Servers'
+  range: Last 90 days (baseline over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per process: access_count, ext_entropy, read_bytes, accesses_per_min
+
+      p99 = percentile(metric,99) per metric
+
+      if access_count>p99 AND ext_entropy>p99 (and read_bytes/rate high): alert'
+- question: Is any process generating a spike in access-denied audits (Event ID 4656/4663 failures) as
+    it enumerates protected files?
+  context: When a staging script enumerates files it lacks permission to read, it produces a burst of
+    access-denied audit events (Event ID 4656/4663 failure audits). Profile the per-process access-denied
+    rate and alert on spikes. This catches staging even when many reads fail, and it reveals reconnaissance/enumeration
+    of protected data. A process suddenly tripping many access-denied events across protected paths is
+    suspicious; correlate with successful reads and any subsequent transfer to confirm.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Sensitive Data Repositories, User Workstations, Source Code Repositories, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'denied = count(4656/4663 where access==denied) by process, bin(5m)
+
+      baseline = mean+3sigma per process
+
+      if denied > baseline and distinct(protected_paths) high: alert'
+- question: Does an unsupervised model over process behavior (parent name, command line, access count,
+    read bytes, target directories) flag any process as an anomalous staging actor?
+  context: 'To catch novel staging patterns without predefined rules, run an Isolation Forest on per-process
+    features: parent process name, command line, file-access count, bytes read, and target directories.
+    Isolation Forest gives a low-latency unsupervised baseline well suited to novel behavior. Surface
+    the top-3 contributing features in the alert text so an analyst can immediately see why a process
+    was flagged (e.g., unusual parent + huge read count + sensitive directory). A multi-feature outlier
+    touching sensitive repositories is the actionable staging lead.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: Sensitive Data Repositories, User Workstations, Source Code Repositories, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = process_features: [parent_name, cmdline_features, access_count, read_bytes, target_dirs]
+
+      score = IsolationForest.fit_predict(X)
+
+      if anomalous(score): alert with SHAP_top3(X)'
+- question: Did a known exfiltration script or file hash execute on more than 5 hosts within a 10-minute
+    window, with those hosts subsequently connecting to a shared external destination?
+  context: Coordinated, scripted exfiltration deploys the same tool across many hosts at once. Alert when
+    a known exfiltration script/hash (Event ID 4688) executes on >5 hosts within 10 minutes and those
+    hosts then share a common Zeek conn.log destination. The synchronized execution plus convergent destination
+    is a strong indicator of an automated campaign. Validate that your detectors actually see this by
+    emulating multi-channel exfiltration (e.g., the DET toolkit). A cluster of identical executions converging
+    on one external IP warrants immediate incident response.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Entire Workstation Subnet, Server Farm, Internet Egress Points, Domain Controllers'
+  range: Last 90 days (correlate executions within 10-minute window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "exec = 4688 where hash in known_exfil_hashes\nif distinct(host) > 5 within 10m:\n  dests =\
+      \ conn.log dest for those hosts after exec\n  if shared_dest(dests): alert"
+- question: Is there a >3-sigma spike in concurrent file accesses (Event ID 4663) across a group of hosts
+    that coincides with a traffic surge to a single external IP, with synchronized cadence across the
+    hosts?
+  context: Mass, coordinated staging shows up as many hosts accessing similar files at once. Baseline
+    a host group's concurrent file-access volume (Event ID 4663) and flag >3-sigma spikes, then match
+    those spikes to a simultaneous outbound traffic surge to a single external IP. Correlating synchronized
+    cadence across the hosts strengthens the case for automation. A group-wide access spike that lines
+    up in time with convergent egress to one destination is characteristic of coordinated automated exfiltration,
+    distinct from incidental concurrent activity.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Entire Workstation Subnet, Server Farm, Internet Egress Points, Domain Controllers'
+  range: Last 90 days (baseline over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "grp_access = count(4663) across host_group, bin(5m)\nif grp_access > mean+3sigma:\n  if conn.log\
+      \ surge to single resp_h same window and cadence_synced(hosts): alert"
+- question: Are there external destinations receiving upload-heavy flows (orig_bytes >> resp_bytes) from
+    an abnormally large number of internal hosts (high fan-in) versus a 30-day baseline?
+  context: When many internal hosts all upload to the same external destination, that convergence (fan-in)
+    is suspicious. For destinations receiving flows from many internal hosts, flag those with aggregate
+    upload-heavy ratios (orig_bytes >> resp_bytes) and abnormal fan-in relative to a 30-day baseline.
+    A previously-unseen external IP suddenly receiving upload-heavy traffic from a swarm of hosts is a
+    hallmark of coordinated automated exfiltration. Legitimate shared services (corporate SaaS, update
+    servers) have high fan-in too, so baseline and allow-list them.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Entire Workstation Subnet, Server Farm, Internet Egress Points, Domain Controllers'
+  range: Last 90 days (baseline over trailing 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'group conn.log by resp_h
+
+      fan_in = distinct(orig_h); agg_ratio = sum(orig_bytes)/max(sum(resp_bytes),1)
+
+      if fan_in > baseline+3sigma and agg_ratio > 10 and resp_h not in allowlist: alert'
+- question: Does a graph model of host-to-external traffic reveal a sudden hub-and-spoke convergence of
+    unrelated internal hosts onto a single external destination, indicative of coordinated automated exfiltration?
+  context: Build host<->external-destination traffic graphs and apply a graph convolutional/GNN model
+    to detect a sudden hub-and-spoke pattern where many normally-unrelated internal hosts converge on
+    one external node. This captures coordinated automated exfiltration that simpler per-host detectors
+    miss because the signal is in the graph structure, not any single flow. Report the top contributing
+    nodes/edges for triage. A new external hub rapidly accumulating spokes from diverse, unrelated hosts
+    is the actionable case; expected shared services form stable, known hubs.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Entire Workstation Subnet, Server Farm, Internet Egress Points, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = build_graph(internal_host <-> external_dest, edge=flow_features)
+
+      score = GNN.detect(G)
+
+      if sudden hub_spoke_convergence(unrelated_hosts -> single_dest): alert with top_nodes_edges (SHAP)'
