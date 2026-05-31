@@ -1,0 +1,446 @@
+name: 'T1569: System Services'
+id: 656f1807-0986-4d01-9388-d8656de0def9
+description: 'Investigate adversary abuse of system services and daemons to execute commands or programs
+  on Windows, Linux, and macOS hosts. Adversaries create or modify services (Windows SCM via sc.exe, PowerShell
+  New-Service/Set-Service, or direct API calls; Linux systemd/init scripts via systemctl; macOS launchd
+  LaunchDaemons/LaunchAgents plists) to run malicious payloads either persistently or for one-time/transient
+  execution such as PsExec-style remote movement. This playbook helps an analyst hunt for: services whose
+  binaries match malicious indicators, are rare across the fleet, or live in user-writable/temporary directories;
+  service-management utilities invoked with suspicious command lines or anomalous parents; typosquatted/lookalike
+  service names impersonating legitimate Windows services; anomalous service lifecycles (rapid create-run-delete
+  patterns or repeated crashes); and legitimate service-host processes (svchost.exe, services.exe, dllhost.exe)
+  spawning unexpected children or making rare/low-reputation network connections. It combines symbolic-logic
+  correlation rules, statistical baselining/outlier detection, and machine-learning anomaly models to
+  surface service abuse for execution.'
+type: technique
+related:
+- tactic_id: TA0002
+  tactic_name: Execution
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has a newly created or modified Windows service (Event ID 7045/4697) launched a binary whose
+    file hash matches a known-malicious indicator, and did the resulting process then make an outbound
+    connection to a known C2 destination? Absent threat-intel, did a 7045 install a service whose ImagePath
+    embeds an interpreter/LOLBin (powershell, cscript, mshta, rundll32, regsvr32, wscript) or resolves
+    to a user-writable/temp directory?
+  context: Supports the Execution tactic by catching adversaries who register a service to run malicious
+    code. The primary path correlates service create/modify events against a threat-intel feed on the
+    service binary's hash, then pivots through process creation (4688) to that process's outbound connections
+    (Zeek conn.log) and alerts when the destination is on a C2 blocklist - a high-confidence chain from
+    service install to active C2. Because intel coverage is incomplete, a first-party fallback alerts
+    on any service install whose ImagePath uses an interpreter/LOLBin or points to C:\Users, C:\Windows\Temp,
+    or C:\ProgramData, which legitimate services rarely do. Also count failed starts (7000/7009) and crashes
+    (7034) for the service as a corroborating state signal. A positive result is a service binary matching
+    intel or running from an abnormal path with suspicious egress; a negative result is a signed service
+    binary in a system path with no risky egress.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "service_evt = EventCode IN (7045, 4697)\n| join type=inner threat_intel ON service_evt.ImagePathHash\
+      \ = threat_intel.sha256\n| join EventCode=4688 ON Host, ImagePath\n| join zeek_conn ON Host, ProcessGuid\n\
+      | where dest_ip IN c2_blocklist OR dest_domain IN c2_blocklist\n| OR (EventCode=7045 AND (ImagePath\
+      \ MATCHES /(powershell|cscript|mshta|rundll32|regsvr32|wscript)/i\n      OR ImagePath MATCHES /\\\
+      \\(Users|Temp|ProgramData|PerfLogs)\\\\/i))\n| eval failed_starts = count(EventCode IN (7000,7009,7034)\
+      \ by ServiceName)\n| emit alert"
+  - technology: Zeek/pseudocode
+    query: '// pivot conn.log + dns.log for the service process destinations
+
+      conn.log | where id.orig_h == host_of_service AND id.resp_h IN c2_blocklist
+
+      | join dns.log ON query where answer IN c2_blocklist'
+- question: Across the fleet over the last 30 days, which newly installed service binary hashes (Event
+    ID 7045) are rare (present on fewer than 5 hosts or below the 1st percentile of host-prevalence),
+    and do their service processes connect to destinations that are statistically rare for the organization
+    (never seen before or in the bottom 0.1% of all connections)?
+  context: 'Supports Execution by using prevalence as a proxy for maliciousness: attacker tooling is almost
+    always far less common than legitimate software. Compute each new service hash''s host-prevalence
+    over a rolling 30-day window and flag hashes appearing on a tiny fraction of machines. Then score
+    the service process''s outbound destinations using prevalence and time-dynamism (EXPOSURE-style) and
+    flag never-before-seen or bottom-0.1% destinations. Record outbound byte counts and connections/min
+    as volume/frequency signals, and track NXDOMAIN/blocked-connection rates as a separate failure-mode
+    signal (common with dead or sinkholed C2). All thresholds must come from your own 30-day baseline
+    (Grubbs''/percentile methodology) rather than fixed constants, reducing false positives from environment-specific
+    norms. A positive result is a rare hash plus rare egress; a negative is a widely deployed hash with
+    ordinary destinations.'
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EventCode=7045 earliest=-30d
+
+      | stats dc(Host) AS host_prev BY ImagePathHash
+
+      | eventstats perc1(host_prev) AS p1
+
+      | where host_prev < 5 OR host_prev <= p1
+
+      | join EventCode=4688 -> zeek_conn ON ProcessGuid
+
+      | stats dc(Host) AS dest_prev, sum(bytes_out) AS bytes, count AS conns BY dest_ip
+
+      | where dest_prev == 0 OR dest_prev <= perc(dest_prev, 0.1)
+
+      | emit alert'
+  - technology: Zeek/pseudocode
+    query: 'conn.log | stats count, sum(orig_bytes) AS bytes, count/window AS conns_per_min BY id.resp_h
+
+      | where new_destination OR prevalence_rank <= 0.001
+
+      // failure signal
+
+      dns.log | where rcode_name == ''NXDOMAIN'' | stats count BY query'
+- question: When scoring every new service creation event (7045) with a supervised classifier (e.g., Random
+    Forest) or unsupervised Isolation Forest using features like service-name/path entropy, binary path
+    location (temp/user profile), signing status, fleet hash prevalence, and the parent process of the
+    installer, which events are high-confidence outliers (probability > 0.90 or short isolation path)?
+  context: Supports Execution by learning the multivariate profile of benign service installations and
+    flagging deviations that simple rules miss. Extract per-event features - entropy of the service name
+    and ImagePath, whether the binary sits in a temp/user-profile directory, code-signing status, how
+    prevalent the binary hash is across the fleet, and what process spawned the service installer - and
+    score all new 7045 events in real time. High classifier probability or a short Isolation Forest path
+    marks anomalous installs (e.g., unsigned binary in C:\Users registered by an Office child process).
+    Every alert must list the top-3 contributing features so analysts can triage quickly. A positive result
+    is a high-confidence outlier with explainable risky features; a negative is a signed, prevalent, system-path
+    service from an expected installer.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features(7045) = [name_entropy, path_entropy, in_temp_or_userprofile,\n                  is_signed,\
+      \ fleet_hash_prevalence, installer_parent_rarity]\nmodel = RandomForest(labeled_history) OR IsolationForest(history)\n\
+      score = model.predict(features(new_7045))\nif score.prob > 0.90 OR isolation_path < threshold:\n\
+      \    alert(top3_features=score.explain())"
+- question: Was a service-management utility (sc.exe, powershell.exe, pwsh.exe; or systemctl/launchctl
+    on Linux/macOS) executed (Event ID 4688 / Sysmon EID 1 / auditd execve) with command-line arguments
+    that create or configure a service (create, config, New-Service, Set-Service) where the target binary
+    path points to a user-writable, temporary, or otherwise non-standard directory?
+  context: Supports Execution by catching the moment an adversary registers a service to run a payload
+    from a suspicious location. The rule matches service-management process names and applies regular
+    expressions to the command line for service-creation keywords combined with binary paths under C:\Users\*,
+    C:\Windows\Temp\*, C:\ProgramData\*, or C:\PerfLogs\*. Pair this with SCM-side detection of interpreter
+    ImagePaths. On Linux/macOS, apply the equivalent over auditd execve for systemctl enable/start and
+    launchctl load referencing binaries outside system paths. A positive result is a service-create command
+    pointing a service at a non-standard path; a negative is administrative service management targeting
+    legitimate system binaries.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - 'NAI: All Windows Endpoints, Windows Server Infrastructure, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EventCode IN (4688, 1) AND process_name IN (''sc.exe'',''powershell.exe'',''pwsh.exe'')
+
+      AND command_line MATCHES /(create|config|New-Service|Set-Service)/i
+
+      AND command_line MATCHES /(C:\\Users|C:\\Windows\\Temp|C:\\ProgramData|C:\\PerfLogs)\\/i
+
+      | emit alert'
+  - technology: auditd/pseudocode
+    query: 'type=SYSCALL syscall=execve AND (exe=~/systemctl/ OR exe=~/launchctl/)
+
+      AND args MATCHES /(enable|start|load)/ AND target_binary NOT IN system_paths
+
+      | emit alert'
+- question: For all service-creating/modifying command lines from sc.exe and powershell.exe, which have
+    anomalously high Shannon entropy (modified z-score > 3.5 or > 3 standard deviations above the known-good
+    baseline), are near-duplicates of known attack scripts, originate from a statistically rare parent
+    process (e.g., winword.exe, chrome.exe), or arrive in bursts above the 99th percentile?
+  context: 'Supports Execution by detecting obfuscated or anomalous service-creation commands. Compute
+    Shannon entropy of each command line and compare against a baseline built from known-good administrative
+    scripts; outliers (modified z-score > 3.5) often indicate encoded/obfuscated payloads. Complement
+    entropy with distance-based near-duplicate scoring to catch variants of known script-based attacks.
+    Track the parent of sc.exe/powershell.exe and alert when it is statistically rare for service creation
+    - an Office app or browser spawning sc.exe is highly suspicious. Add a frequency dimension: alert
+    on bursts of more than N service-create commands per host per hour above the 99th percentile, characteristic
+    of scripted deployment of malicious services. A positive result is a high-entropy or anomalous-parent
+    service command; a negative is a clean, low-entropy command from an expected admin tool.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - 'NAI: All Windows Endpoints, Windows Server Infrastructure, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EventCode=4688 process_name IN (''sc.exe'',''powershell.exe'') command_line~service_create
+
+      | eval ent = shannon_entropy(command_line)
+
+      | eventstats median(ent) AS m, mad(ent) AS mad_v
+
+      | eval mz = 0.6745*(ent-m)/mad_v
+
+      | where mz > 3.5
+
+      | stats count BY parent_process, Host, bin(_time,1h)
+
+      | where parent_rarity_low OR count > perc99(count_per_host_hour)
+
+      | emit alert'
+- question: When an Isolation Forest or density-based clustering (DBSCAN) is applied to feature vectors
+    of service-related command lines (command length, argument count, entropy, presence of create/config/binPath
+    keywords, path characteristics, parent-process rarity), which commands fall into tiny clusters, are
+    flagged as noise, or have short isolation paths?
+  context: Supports Execution by surfacing service-creation commands that do not resemble the bulk of
+    legitimate administrative activity. Build feature vectors for each service-related 4688 command line
+    and cluster them; legitimate admin commands form dense clusters while malicious or unusual commands
+    appear as noise points or tiny clusters, and Isolation Forest assigns them short isolation paths.
+    This catches novel obfuscation and tradecraft that signature rules miss. Each alert must surface the
+    top-3 features driving the anomaly score for analyst triage. A positive result is a noise/small-cluster
+    command with risky features; a negative is membership in a large dense cluster of routine admin commands.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - 'NAI: All Windows Endpoints, Windows Server Infrastructure, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [cmd_len, arg_count, entropy, kw_create, kw_config, kw_binpath,\n            path_chars,\
+      \ parent_rarity]\nmodel = IsolationForest() OR DBSCAN(eps, min_samples)\nlabels = model.fit_predict(features(service_cmds_4688))\n\
+      if label == noise OR cluster_size < min OR isolation_path < threshold:\n    alert(top3_features=explain())"
+- question: Has a new service been created (Event ID 7045/4697) whose ServiceName exists in the authorized
+    baseline (golden image/CMDB) but whose ImagePath does not exactly match the authorized path, or whose
+    legitimate service-host process is parented abnormally (e.g., a non-services.exe parent spawning svchost.exe)?
+  context: Supports Execution by detecting service masquerading and hijacking. Maintain a baseline dictionary
+    mapping every legitimate service name to its authorized ImagePath and file hash, sourced from a golden
+    image or CMDB. Alert when a service create/modify event reuses a known service name but points to
+    a different ImagePath, or when a service-host process violates the canonical parent allowlist. This
+    catches adversaries who impersonate trusted services to evade scrutiny. A positive result is a known
+    service name bound to an unauthorized binary or an svchost.exe with an abnormal parent; a negative
+    is an exact match to the authorized path and lineage.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - 'NAI: Standardized Server Builds (Golden Images), Endpoint Fleet, Configuration Management Database
+    (CMDB), Software Asset Management Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EventCode IN (7045,4697)
+
+      | lookup service_baseline ServiceName OUTPUT authorized_path, authorized_hash
+
+      | where isnotnull(authorized_path) AND ImagePath != authorized_path
+
+      | OR (proc==svchost.exe AND parent_process != ''services.exe'')
+
+      | emit alert'
+- question: For any new service name (Event ID 7045) not found in the baseline, is the minimum Levenshtein
+    (edit) distance to a known-good service name very low (1 or 2 characters), does it match a homoglyph/token-level
+    lookalike via embedding similarity, or does its display-name character distribution rank as rare against
+    the fleet baseline?
+  context: Supports Execution by catching typosquatted service names designed to blend in (e.g., 'W32Tlme'
+    vs 'W32Time'). For each new service name absent from the baseline, compute the edit distance to every
+    legitimate name and alert on minimum distances of 1-2, which strongly indicate impersonation. Embedding/nearest-neighbor
+    similarity generalizes this to homoglyph and token-level lookalikes that pure edit distance misses.
+    Additionally score the display name's character-distribution rarity against the fleet baseline to
+    catch random-looking or unusual names. A positive result is a near-miss lookalike or distributionally
+    rare name; a negative is a clearly distinct, well-formed, common name.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - 'NAI: Standardized Server Builds (Golden Images), Endpoint Fleet, Configuration Management Database
+    (CMDB), Software Asset Management Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EventCode=7045 | where ServiceName NOT IN baseline_names
+
+      | eval min_dist = min(levenshtein(ServiceName, baseline_names))
+
+      | eval char_rarity = distribution_rarity(DisplayName, fleet_baseline)
+
+      | where min_dist IN (1,2) OR embedding_similarity_high OR char_rarity > threshold
+
+      | emit alert'
+- question: When an autoencoder or Isolation Forest is trained on feature vectors of legitimate services
+    (character-level embedding of the service name, image-path properties such as directory depth/parent
+    folder/signed status, and fleet prevalence), which new services produce high reconstruction error
+    or short isolation paths?
+  context: Supports Execution by modeling the holistic profile of legitimate services and flagging new
+    services that deviate across name and path characteristics simultaneously. Train on the population
+    of known-good services; a new service yielding high reconstruction error (autoencoder) or a short
+    isolation path (Isolation Forest) is anomalous - for example a name one edit from W32Time, an unsigned
+    ImagePath, and zero prior fleet presence. The model must report the top-3 contributing features for
+    explainability. A positive result is a high-error/short-path service with suspicious name+path features;
+    a negative is a service reconstructed accurately as typical.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - 'NAI: Standardized Server Builds (Golden Images), Endpoint Fleet, Configuration Management Database
+    (CMDB), Software Asset Management Database'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [char_embedding(ServiceName), path_depth, parent_folder,\n            is_signed,\
+      \ fleet_prevalence]\nmodel = Autoencoder(legit_services) OR IsolationForest(legit_services)\nerr\
+      \ = model.score(features(new_service))\nif err > recon_threshold OR isolation_path < threshold:\n\
+      \    alert(top3_features=explain())"
+- question: Did a service follow a transient create-run-delete lifecycle - Event ID 7045 (Create) -> 7036
+    (Start) -> 4688 with 'sc.exe delete' - for the same host and service name within a 15-minute window?
+  context: Supports Execution by detecting PsExec-style one-time service execution used for remote command
+    execution and lateral movement. Implement a stateful correlation rule keyed on Host and ServiceName
+    that fires when the create -> start -> delete sequence completes within a short window (e.g., 15 minutes).
+    This ephemeral pattern - install a service, run the payload, immediately remove the service - is a
+    hallmark of remote-execution tooling and is rare in legitimate operations. A positive result is the
+    full transient sequence within the window; a negative is a normally persisting service or an incomplete
+    sequence.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 7036
+  - Windows Event ID 7034
+  - Windows Event ID 4688
+  - 'NAI: All Windows Hosts, Software Deployment and Patch Management Servers, SIEM/Log Management System'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "sequence BY Host, ServiceName WITHIN 15m:\n  EventCode=7045 (Create)\n  -> EventCode=7036\
+      \ (Start)\n  -> EventCode=4688 WHERE command_line MATCHES /sc(.exe)?\\s+delete/i\n| emit alert"
+- question: For each service, is the runtime (time delta between start 7036 and stop/crash 7036/7034)
+    anomalously short by IQR/Grubbs/modified z-score, or does its crash (7034) and start-failure (7000/7009)
+    frequency exceed the 99th percentile across all services?
+  context: Supports Execution by flagging services whose lifecycle deviates from normal. Track the start-to-stop/crash
+    time delta per service and use IQR or Grubbs/modified z-score to find anomalously short-lived services,
+    consistent with run-once payloads. As a failure-mode signal, count crash (7034) and start-failure
+    (7000/7009) events per service per hour and alert when a service's crash frequency exceeds the 99th
+    percentile - repeated crashing is a strong indicator of injection or exploitation attempts delivered
+    through a service. A positive result is an unusually short runtime or excessive crashing; a negative
+    is a stable, long-running service.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 7036
+  - Windows Event ID 7034
+  - Windows Event ID 4688
+  - 'NAI: All Windows Hosts, Software Deployment and Patch Management Servers, SIEM/Log Management System'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "EventCode IN (7036,7034,7000,7009)\n| transaction ServiceName startswith=(7036 Start) endswith=(7036\
+      \ Stop OR 7034)\n| eval runtime = duration\n| eventstats p25(runtime) AS q1, p75(runtime) AS q3\n\
+      | where runtime < q1 - 1.5*(q3-q1)\n| append [ stats count(7034) AS crashes BY ServiceName, bin(_time,1h)\n\
+      \          | where crashes > perc99(crashes) ]\n| emit alert"
+- question: When service lifecycle events (Create, Start, Stop, Crash) are modeled per service as a log-key
+    sequence with DeepLog or an LSTM autoencoder trained on known-good sequences, which services exhibit
+    low-probability next-event transitions or high reconstruction error?
+  context: Supports Execution by learning the normal temporal grammar of service lifecycles and flagging
+    deviations online. Represent each service's events as an ordered log-key sequence and apply DeepLog,
+    which flags low-probability next-event transitions and parameter anomalies, or an LSTM autoencoder
+    that flags high reconstruction error against known-good sequences. This catches abnormal patterns
+    such as Create->Delete in seconds or Create without a normal Start->Running progression. Alerts must
+    cite the specific anomalous transition (e.g., 'Create->Delete in 42s; expected Create->Start->Running')
+    as the explanation. A positive result is a low-probability transition or high-error sequence; a negative
+    is a sequence matching learned-normal lifecycles.
+  answer_sources:
+  - Windows Event ID 7045
+  - Windows Event ID 7036
+  - Windows Event ID 7034
+  - Windows Event ID 4688
+  - 'NAI: All Windows Hosts, Software Deployment and Patch Management Servers, SIEM/Log Management System'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "seq = ordered_log_keys(per_service events in {Create,Start,Stop,Crash})\nmodel = DeepLog(known_good_seq)\
+      \ OR LSTM_Autoencoder(known_good_seq)\nfor s in services:\n    if model.next_event_prob(s) < epsilon\
+      \ OR model.recon_error(s) > threshold:\n        alert(anomalous_transition=model.explain(s))"
+- question: Did a legitimate service-host process (svchost.exe, dllhost.exe, services.exe) spawn an anomalous
+    child process such as cmd.exe, powershell.exe, cscript.exe, wscript.exe, or rundll32.exe (Event ID
+    4688 / Sysmon EID 1), run a child from a user-writable/temp directory, or violate the canonical service-host
+    parent allowlist?
+  context: Supports Execution by detecting abuse of service-host processes to launch interactive shells
+    or scripting engines - behavior characteristic of service-based code execution and injection. Alert
+    on any 4688/Sysmon EID 1 where the parent is svchost.exe/dllhost.exe/services.exe and the child is
+    a known shell/scripting/LOLBin binary, or where the child runs from a temp/user-writable directory,
+    or where service-host lineage violates the canonical parent allowlist (e.g., svchost.exe not parented
+    by services.exe). A positive result is a service host spawning an unexpected interpreter or abnormal
+    lineage; a negative is normal service-host children in expected paths.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress Network Gateways, DNS Resolvers, All Windows Hosts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "EventCode IN (4688,1)\nAND parent_process IN ('svchost.exe','dllhost.exe','services.exe')\n\
+      AND (process_name IN ('cmd.exe','powershell.exe','cscript.exe','wscript.exe','rundll32.exe')\n \
+      \    OR ImagePath MATCHES /\\\\(Users|Temp|ProgramData)\\\\/i\n     OR svchost_parent != 'services.exe')\n\
+      | emit alert"
+- question: For each common service-host parent (e.g., svchost.exe), does it spawn a never-before-seen
+    child process, or make outbound connections to out-of-baseline ports or low-prevalence destinations
+    (seen by fewer than 5 hosts), with step-changes in bytes-out/connections-per-minute above baseline
+    percentiles or elevated blocked-connection/NXDOMAIN counts?
+  context: Supports Execution by baselining the normal behavior of quiet service-host processes and alerting
+    on deviations. Build a historical baseline of unique child process names each service host normally
+    spawns and alert on any never-before-seen child. For network activity, baseline destination ports
+    and destination-IP prevalence (EXPOSURE-style) and alert on out-of-baseline ports or destinations
+    seen by fewer than 5 hosts. Record bytes-out and connections/min from typically silent service hosts
+    and flag step-changes above baseline percentiles (Grubbs'/percentile methodology); track blocked-connection
+    and NXDOMAIN counts as a distinct failure signal indicating dead or sinkholed C2. A positive result
+    is a novel child or rare/voluminous egress from a service host; a negative is established children
+    and ordinary network behavior.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress Network Gateways, DNS Resolvers, All Windows Hosts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "EventCode=4688 parent_process IN service_hosts\n| where child_process NOT IN baseline_children[parent_process]\n\
+      | append [ zeek_conn WHERE orig_proc IN service_hosts\n           | stats dc(Host) AS dest_prev,\
+      \ sum(bytes_out) AS bytes, count AS conns BY dest_ip, dest_port\n           | where dest_port NOT\
+      \ IN baseline_ports OR dest_prev < 5\n              OR bytes > perc(baseline_bytes) OR conns > perc(baseline_conns)\
+      \ ]\n| emit alert"
+  - technology: Zeek/pseudocode
+    query: 'dns.log | where rcode_name==''NXDOMAIN'' AND orig_proc IN service_hosts | stats count BY query
+
+      conn.log | where conn_state IN (''REJ'',''S0'') AND orig_proc IN service_hosts | stats count BY
+      id.resp_h'
+- question: When a process/provenance graph (nodes = processes, edges = parent-child and network relations
+    from 4688/Zeek) is analyzed with a node-level GNN (ThreaTrace), a graph temporal autoencoder (KAIROS),
+    or heterogeneous-graph embedding (Log2vec), which service-host subgraphs or bridging edges (e.g.,
+    svchost.exe -> powershell.exe) are flagged as anomalous?
+  context: 'Supports Execution by capturing relational context that point detections miss. Construct a
+    provenance graph from process and network events and apply graph-based anomaly detection: node-level
+    GNN detection (ThreaTrace) and a graph temporal autoencoder (KAIROS) flag anomalous service-host subgraphs,
+    while heterogeneous-graph embedding (Log2vec) flags rare service operations relative to a user/host
+    baseline. Community-detection edges that bridge otherwise-unrelated clusters - such as svchost.exe
+    -> powershell.exe -> external IP - are high-fidelity anomalies indicative of service abuse and lateral
+    movement. Each alert must surface the top-3 contributing nodes/edges/features for triage. A positive
+    result is an anomalous subgraph or bridging edge; a negative is a service host embedded in its expected
+    neighborhood.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress Network Gateways, DNS Resolvers, All Windows Hosts'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "G = build_graph(nodes=processes, edges=parentchild+network from 4688+zeek)\nmodel = ThreaTrace(G)\
+      \ OR KAIROS(G) OR Log2vec(G)\nscores = model.score_nodes_edges(G)\nfor x in scores where x.anomaly\
+      \ OR bridges_unrelated_communities(x):\n    alert(top3=x.explain())"
