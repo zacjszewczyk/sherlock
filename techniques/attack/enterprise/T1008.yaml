@@ -1,0 +1,645 @@
+name: 'T1008: Fallback Channels'
+id: f6b1a148-b750-4ff2-8e08-bc3570207596
+description: >-
+  Hunt for adversary fallback or alternate command-and-control (C2) channels — the backup communication
+  paths an actor turns to when a primary C2 channel is blocked, disrupted, or becomes inaccessible, or
+  when they want to stay under data-transfer thresholds. This playbook helps an analyst investigate outbound
+  traffic that matches threat intelligence for known C2 infrastructure or JA3/JA3S/JA4 fingerprints; DNS
+  abused as a covert transport (high TXT/NULL/AAAA ratios, high-entropy or encoded labels, oversized query/answer
+  ratios, DGA-style NXDOMAIN bursts); machine-like beaconing with low timing jitter and low payload variance;
+  connections initiated by processes that are not normally network-aware or that run under unexpected
+  parents; highly asymmetric upload-heavy transfers indicative of fallback exfiltration; TLS handshakes
+  with certificate and fingerprint anomalies on uncommon ports; and the tell-tale 'channel switch' where
+  a host pivots to uncommon ports or alternate transports (raw TCP/UDP, ICMP, DNS) immediately after a
+  primary destination is blocked. It combines deterministic symbolic-logic rules, statistical baselining,
+  and machine-learning models across Zeek network logs, Windows/Sysmon and auditd host telemetry, firewall
+  logs, and macOS/ESXi sources so fallback C2 can be surfaced even when the adversary varies timing, ports,
+  protocols, or encryption.
+type: technique
+related:
+- tactic_id: TA0011
+  tactic_name: Command and Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Does any outbound connection match curated threat intelligence or community JA3/JA3S/JA4 blocklists
+    for a known C2 framework — by destination IP, resolved domain, TLS server name, or client/server fingerprint?
+  context: >-
+    Adversaries who lose a primary C2 path commonly fall back to infrastructure or tooling that has already
+    been catalogued. Stitch Zeek conn.log, dns.log, and ssl.log together on the shared connection UID
+    and compare id.resp_h, dns.query, ssl.server_name, and ssl.ja3s against curated TI and public JA3/JA3S
+    blocklists for known C2 frameworks. Because GREASE and TLS extension-shuffling let attackers churn
+    JA3 values, also apply version-resilient JA4/JA4X fingerprints that survive that evasion, and pair
+    with SigmaHQ C2 rules. In a Command and Control context a direct match is a high-confidence sign the
+    host is using a known-malicious fallback channel; tag the alert with the matched indicator, host,
+    destination, and fingerprint to scope and respond. A clean result lowers but does not eliminate suspicion,
+    since novel infrastructure will not be in any feed.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet gateway/proxy servers, Internal DNS resolvers, DMZ servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/SIEM correlation pseudocode
+    query: |2-
+        join conn.log, dns.log, ssl.log on uid;
+        match = (id.resp_h in ti_ips) or (dns.query in ti_domains)
+                or (ssl.server_name in ti_sni) or (ssl.ja3s in ja3s_blocklist)
+                or (ja4(ssl) in ja4_blocklist);
+        alert severity=high when match; output host, id.resp_h, dns.query,
+        ssl.server_name, ssl.ja3, ssl.ja3s, matched_indicator.
+- question: >-
+    Is a host newly contacting an external destination that scores high on a composite TI risk score and
+    is reached by very few internal hosts (a rare-destination signal)?
+  context: >-
+    Even without an exact TI match, rarity plus reputation is a strong fallback-C2 signal. Build a 30-day
+    baseline of outbound peers per host from first-party Zeek conn.log and aggregate multiple TI feeds
+    into a single weighted composite risk score. Alert on newly contacted destinations whose composite
+    score exceeds the 95th percentile AND that are contacted by fewer than three unique internal hosts,
+    as RITA does for rare destinations. Track Volume (total orig/resp bytes), Frequency (connections/hour),
+    and State (conn_state SF vs S0/REJ) so isolated, persistent, or repeatedly-blocked fallback peers
+    are surfaced distinctly. For Command and Control this catches a host quietly pivoting to a low-prevalence
+    backup server; a positive result warrants pivoting to beacon and byte-ratio analysis on that destination.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet gateway/proxy servers, Internal DNS resolvers, DMZ servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        baseline = peers_per_host over 30d;
+        for dst in today.connections:
+          if dst not in baseline[host]
+             and composite_risk(dst) > p95(composite_risk)
+             and unique_internal_hosts(dst) < 3:
+            alert host, dst, composite_risk, volume, freq, conn_state.
+- question: >-
+    Is a single internal host generating a burst of failed or blocked outbound connections across many
+    distinct destinations — the signature of fallback logic cycling through alternates?
+  context: >-
+    Connection-failure telemetry is a first-class fallback signal, not noise. Fallback code that cannot
+    reach its primary will rapidly try alternate destinations, producing a cluster of failures. Alert
+    when a single internal host generates a burst of conn_state S0/REJ/RSTO in conn.log, or repeated blocked/denied
+    firewall egress, to more than five distinct destinations within ten minutes. Surface the count of
+    failed versus successful connections and the full destination list in the alert. In a Command and
+    Control investigation, this pattern often immediately precedes a successful fallback connection, so
+    a positive result should trigger a look at what the host connected to successfully right after the
+    failure burst.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet gateway/proxy servers, Internal DNS resolvers, DMZ servers'
+  range: Last 90 days, with event-centered correlation in 10-minute windows.
+  queries:
+  - technology: Zeek/SIEM correlation pseudocode
+    query: |2-
+        window 10m per id.orig_h:
+          fails = count(conn_state in {S0,REJ,RSTO}) or fw_action in {blocked,denied};
+          distinct_dst = count_distinct(id.resp_h where failed);
+        alert when distinct_dst > 5; output host, fails, successes,
+        destination_list, ts_window.
+- question: >-
+    Does a supervised classifier flag any TLS or flow record as C2 with probability above 0.9, and what
+    features drove that decision?
+  context: >-
+    When indicators and simple stats miss stealthy fallback channels, a learned model can catch them.
+    Train a supervised classifier (XGBoost / Random Forest) on labeled C2-versus-benign Zeek flows using
+    proto, id.resp_p, duration, orig_bytes, resp_bytes, byte ratio, ssl.version, ssl.ja3, ssl.ja3s, and
+    the composite risk score. For TLS 1.3/ECH where handshake fields disappear, add payload-agnostic flow
+    features (packet sizes, directions, timing). Flag any flow with C2 probability above 0.9 and emit
+    the top-three contributing features (e.g., rare JA3, high byte ratio, uncommon port) via SHAP so analysts
+    can triage quickly. For Command and Control this is the catch-all for novel fallback tooling; treat
+    high-probability hits with explained features as priority leads feeding the rule and baseline checks
+    above.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Internet gateway/proxy servers, Internal DNS resolvers, DMZ servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        feats = [proto, id.resp_p, duration, orig_bytes, resp_bytes,
+                 byte_ratio, ssl.version, ssl.ja3, ssl.ja3s, composite_risk,
+                 pkt_sizes, pkt_timing];
+        p = classifier.predict_proba(feats);
+        alert when p > 0.9; attach shap_top3(feats).
+- question: >-
+    Are any DNS queries carrying large encoded payloads — TXT/NULL/CNAME records with very long labels,
+    high query/answer length ratios, or Base64/Hex-looking content?
+  context: >-
+    DNS is a favored fallback transport because it is almost always allowed to egress. Build dns.log rules
+    that fire when a query has qtype_name TXT/NULL/CNAME with query length greater than 200, a query/answer
+    length ratio above 10, or a label matching a Base64/Hex regex. These conditions surface the large
+    encoded payloads characteristic of DNS-based fallback C2. In a Command and Control investigation a
+    hit means an analyst should pivot to the requesting host and the queried domain's registration/age,
+    and check whether the same host shows the entropy or NXDOMAIN signals below. Legitimate TXT-heavy
+    services (SPF, DKIM, some CDNs) can match, so corroborate against host role and destination reputation
+    before escalating.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internal DNS resolvers, Endpoint devices, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/SIEM rule pseudocode
+    query: |2-
+        alert dns where qtype_name in {TXT,NULL,CNAME}
+          and (length(query) > 200
+               or length(query)/max(length(answers),1) > 10
+               or query matches /^[A-Za-z0-9+/=]{40,}$/  // base64
+               or query matches /([0-9a-fA-F]{40,})/);   // hex
+        output host, query, qtype_name, answer_len.
+- question: >-
+    How much actual information (compressed bytes) is each host pushing through DNS per hour, and does
+    it exceed a baseline-derived threshold?
+  context: >-
+    Per Born, Gustafson & Paxson, legitimate DNS is highly cacheable and low-information while tunnels
+    carry high-information content. Gzip/bzip2-compress each host's concatenated DNS query+answer strings
+    over rolling windows and alert when the aggregate compressed (information) bytes per host per hour
+    exceed a baseline-derived threshold. This information-theoretic approach distinguishes high-information
+    tunnels from cacheable, low-information legitimate DNS with low analyst overhead and few false positives.
+    For Command and Control this directly quantifies covert-channel capacity: a host whose compressed
+    DNS volume jumps well above its own and its peers' norm is a strong fallback-tunnel candidate that
+    should be correlated with the encoding and entropy signals.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internal DNS resolvers, Endpoint devices, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        per host, rolling 1h:
+          blob = concat(dns.query + dns.answers);
+          info_bytes = len(gzip(blob));
+        baseline = rolling_mean+3*std(info_bytes) per host;
+        alert when info_bytes > baseline; output host, info_bytes, query_count.
+- question: >-
+    Does a host's DNS label entropy exceed its own 99th-percentile baseline, or is it showing a sustained
+    spike in NXDOMAIN/SERVFAIL responses (DGA-style fallback resolution)?
+  context: >-
+    Encoded or encrypted DNS labels approach the ~7.0+ bits/byte range established by Lyda & Hamrock,
+    and DGA fallback produces many failed lookups before a live domain is found. For each source host
+    compute the Shannon entropy of the first DNS label over 5-minute sliding windows, maintain a 7-day
+    baseline, and alert when current average entropy exceeds the host's 99th percentile. In parallel,
+    profile NXDOMAIN/SERVFAIL rates as a distinct signal and alert on a sustained spike (e.g., more than
+    50/min or 3x baseline). For Command and Control, high entropy suggests an encoded tunnel while an
+    NXDOMAIN burst suggests algorithmic fallback domain resolution; either, especially both together on
+    one host, is a strong lead.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internal DNS resolvers, Endpoint devices, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        per host, window 5m:
+          H = shannon_entropy(first_label(query));
+        baseline = p99(H) over 7d per host;
+        alert when avg(H) > baseline;
+        per host, window 1m:
+          nx = count(rcode in {NXDOMAIN,SERVFAIL});
+        alert when nx > 50 or nx > 3*baseline_nx; output host, H, nx_rate.
+- question: >-
+    Does a multivariate time-series model flag any host's per-minute DNS behavior as anomalous across
+    several dimensions at once?
+  context: >-
+    Single thresholds miss tunnels tuned to stay under each one. Assemble per-host per-minute features
+    (TXT/NULL/AAAA counts, mean query length, mean label entropy, NXDOMAIN ratio, query/answer byte ratio)
+    and train an anomaly model (Prophet or an LSTM autoencoder per Gupta et al.) to flag intervals that
+    deviate across multiple dimensions simultaneously. Report the top-three deviating features per alert
+    for triage. For Command and Control this captures slow or blended DNS fallback channels that evade
+    the static encoding, information, and entropy rules; a flagged interval with, say, elevated TXT count
+    plus high entropy plus an abnormal byte ratio is a much stronger lead than any single dimension and
+    should be correlated with the host's connection history.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Internal DNS resolvers, Endpoint devices, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = per_host_per_minute([txt_cnt, null_cnt, aaaa_cnt, mean_qlen,
+              mean_label_entropy, nxdomain_ratio, qa_byte_ratio]);
+        err = lstm_autoencoder.reconstruction_error(X);
+        alert when err > p99(err); attach top3_deviating_features(X).
+- question: >-
+    Is a single host making more than ten connections to the same destination/port within a minute with
+    nearly fixed payload size (orig_bytes variance under 20 bytes)?
+  context: >-
+    Fixed-payload, high-frequency check-ins are the hallmark of a hard-coded beacon, including one that
+    has fallen back to a new channel. Group Zeek conn.log by (id.orig_h, id.resp_h, id.resp_p, proto)
+    in 1-minute windows and alert when a group exceeds ten connections with orig_bytes variance under
+    20 bytes, as RITA does, revealing fixed-payload periodicity. Keep these deterministic thresholds as
+    the floor regardless of ML availability. For Command and Control a positive result strongly implies
+    automated implant traffic; pivot to the destination's reputation and to the originating process via
+    Windows EID 5156 to confirm whether a non-interactive process is responsible.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: User workstations, Servers hosting sensitive data, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: |2-
+        group conn.log by (id.orig_h,id.resp_h,id.resp_p,proto) in 1m windows;
+        alert when count > 10 and variance(orig_bytes) < 20;
+        output host, dst, dst_port, count, orig_bytes_var.
+- question: >-
+    Per source/destination/port, do timing-regularity metrics (low CV, low MAD, low skew, or a strong
+    FFT period) indicate sustained beaconing — after suppressing benign automation?
+  context: >-
+    Beacons betray themselves through regular inter-arrival timing. Per (src,dst,port) compute the inter-arrival
+    coefficient of variation, median absolute deviation, Bowley skewness, and FFT dominant-period power
+    as in RITA and BAYWATCH, and alert when CV is below 0.1 (or a strong FFT peak) persists with more
+    than 20 connections over at least 10 minutes. Crucially, suppress benign periodic automation (NTP,
+    software updates, telemetry) using empirical periodic-traffic baselines from Mack et al. to control
+    false positives. For Command and Control this catches steady fallback check-ins that the fixed-size
+    rule above might miss; a flagged (src,dst,port) with a tight period and no benign explanation is a
+    high-quality C2 lead.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: User workstations, Servers hosting sensitive data, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: |2-
+        per (src,dst,port):
+          ia = inter_arrival_times();
+          cv=std(ia)/mean(ia); mad=mad(ia); skew=bowley(ia);
+          fft_peak=dominant_period_power(ia);
+        alert when (cv<0.1 or fft_peak>thr) and count>20 and span>=10m
+              and not in benign_periodic_baseline;
+        output src,dst,port,cv,fft_peak,count.
+- question: >-
+    For beacons that randomize their timing, does a continuous-time or deep time-series model still recover
+    an underlying periodic structure?
+  context: >-
+    Sophisticated implants add jitter specifically to defeat CV and FFT detection. For these, model inter-arrival
+    sequences with a Continuous-Time Hidden Markov Model (CT-HMM) or an LSTM/transformer time-series classifier.
+    Surface the inferred period, jitter magnitude, and connection count in the alert so analysts understand
+    why a flow was flagged. For Command and Control this is the answer to anti-detection jitter on a fallback
+    channel: even when simple statistics look benign, the learned model can expose a hidden cadence. Treat
+    a flagged flow with a plausible recovered period and no legitimate scheduled-task explanation as a
+    strong beacon candidate and correlate with destination rarity and the originating process.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: User workstations, Servers hosting sensitive data, Internet gateway/proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        seq = inter_arrival_sequence(src,dst,port);
+        model = CT_HMM.fit(seq)  // or LSTM/transformer classifier
+        if model.is_periodic(seq):
+          alert; output inferred_period, jitter, connection_count.
+- question: >-
+    Is a process that is not normally network-aware (notepad.exe, calc.exe, mshta, rundll32) initiating
+    outbound connections, or is a common system process running under an unexpected parent?
+  context: >-
+    Fallback C2 is often injected into or launched from processes that have no business talking to the
+    network. Correlate EID 4688 (process creation) with EID 5156 / Sysmon EID 3 (network connection) and
+    alert when a watchlisted non-network process initiates outbound connections, or when a common system
+    process runs under an unexpected parent, using first-party host logs only. For Command and Control
+    this directly exposes implant tradecraft regardless of destination: notepad.exe making an outbound
+    connection, or svchost.exe spawned by Word, is almost never legitimate. A positive result should be
+    tied to the destination (rare? on TI?) and to any beaconing or byte-ratio anomalies on the same host
+    for a fast, defensible escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - 'NAI: Endpoint devices, Domain controllers, Application servers'
+  range: Last 90 days, with process-to-network correlation in tight windows.
+  queries:
+  - technology: SIEM correlation pseudocode
+    query: |2-
+        proc = 4688 where image in watchlist{notepad,calc,mshta,rundll32};
+        net  = 5156/sysmon3 where pid=proc.pid and direction=outbound;
+        alert when net exists;
+        also alert when image in system_procs and parent not in expected_parents[image];
+        output host, image, parent, dst, dst_port.
+- question: >-
+    Is any (ProcessName, ParentProcessName, DestinationPort, proto) tuple in the bottom 1% of historical
+    prevalence, and is a process accumulating failed/blocked outbound attempts?
+  context: >-
+    Rare process-to-network behavior and retry-after-denial both betray fallback C2. Maintain daily frequency
+    tables of (ProcessName, ParentProcessName, DestinationPort, proto) from EID 4688/5156 and Zeek conn.log
+    and flag tuples in the bottom 1% by prevalence. Add a State dimension: count failed/blocked outbound
+    attempts (EID 5157 filtering-platform blocks, conn_state S0/REJ) per process, since fallback code
+    retries alternates after a denial. For Command and Control a never-before-seen process/port tuple,
+    especially from a process also racking up blocked egress, is a strong indication of an implant cycling
+    through fallback options; pivot to the destinations involved and the process command line.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - 'NAI: Endpoint devices, Domain controllers, Application servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        freq = daily_counts(proc, parent, dst_port, proto);
+        alert when prevalence(tuple) < p01;
+        fails = count(5157_block or conn_state in {S0,REJ}) per process;
+        alert when fails high; output proc, parent, dst_port, proto, fails.
+- question: >-
+    Does an Isolation Forest flag any joint process/network record as a strong outlier, and which features
+    drive the anomaly?
+  context: >-
+    Fallback C2 launched from unusual processes produces records that are simply unlike the bulk of host
+    activity. Train an Isolation Forest on joint process/network features — process name, parent name,
+    command-line length and entropy, destination port, proto, destination rarity, bytes sent/received,
+    and failure count — to score isolated records. Attach the top-three SHAP features driving each anomaly
+    so analysts see why a record was flagged. For Command and Control this catches implant behavior that
+    does not match any single rule: e.g., a high-entropy command line plus a rare destination plus elevated
+    failures. Treat strongly isolated, well-explained records as priority leads and corroborate with the
+    correlation and rare-tuple checks above.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - 'NAI: Endpoint devices, Domain controllers, Application servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = [proc_name, parent_name, cmdline_len, cmdline_entropy,
+             dst_port, proto, dst_rarity, bytes_sent, bytes_recv, fail_count];
+        score = IsolationForest.decision_function(X);
+        alert when score < threshold; attach shap_top3(X).
+- question: >-
+    Are there completed connections where the client sent at least ten times more bytes than it received
+    (orig_bytes > 10x resp_bytes and > 1,024 bytes) over HTTP/S or DNS?
+  context: >-
+    A fallback channel used to push data out is strongly upload-heavy, the opposite of normal browsing.
+    Alert on completed Zeek connections (conn_state='SF') where service is http/ssl/dns, orig_bytes exceeds
+    10x resp_bytes, and orig_bytes is over 1,024 bytes, capturing asymmetric transfers indicative of fallback
+    exfiltration. Preserve these concrete byte thresholds as the deterministic floor. For Command and
+    Control this is a low-cost, high-signal check: a workstation uploading kilobytes-to-megabytes over
+    what should be a request/response protocol is anomalous. Correlate positives with destination rarity
+    and the TLS/cert checks below, since heavy upload over an unusual destination is a classic exfil-over-fallback
+    pattern.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, DMZ servers, User workstations'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/SIEM rule pseudocode
+    query: |2-
+        alert conn where conn_state='SF' and service in {http,ssl,dns}
+          and orig_bytes > 10*resp_bytes and orig_bytes > 1024;
+        output host, dst, service, orig_bytes, resp_bytes.
+- question: >-
+    Relative to per-service, per-host-role baselines, is any connection above the 99.5th percentile for
+    upload ratio and volume — and does it carry high-entropy payload on a plaintext-expected port?
+  context: >-
+    Static thresholds miss role-specific exfil; baselines do not. Maintain per-service, per-host-role
+    baselines of the orig_bytes/resp_bytes ratio and absolute Volume from Zeek conn.log, and flag connections
+    above the 99.5th percentile for their protocol with orig_bytes over 10 KB. As corroboration, flag
+    high-entropy payloads (~7.0+ bits/byte per Lyda & Hamrock) on ports where plaintext is expected, which
+    indicates encoded or encrypted tunneling. For Command and Control this adapts to what is normal for
+    each protocol and role — a mail server's ratios differ from a workstation's — so an outlier carries
+    real weight. High ratio plus high entropy on, say, a plaintext HTTP port is a compelling fallback-tunnel
+    indicator.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, DMZ servers, User workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        baseline = ratio_and_volume per (service, host_role);
+        alert when ratio > p995(baseline) and orig_bytes > 10KB;
+        corroborate when payload_entropy > 7.0 on plaintext_expected_port;
+        output host, service, ratio, orig_bytes, entropy.
+- question: >-
+    Where payload is encrypted (TLS 1.3/ECH), do payload-agnostic flow features or clustering separate
+    upload-heavy fallback flows from ordinary browsing and downloads?
+  context: >-
+    Encryption hides the bytes but not the shape of the conversation. Where payload is encrypted (TLS
+    1.3/ECH), train a classifier on payload-agnostic flow features — directional packet sizes, inter-packet
+    timing, byte ratios, and duration — per Novo et al., and cluster log-transformed orig_bytes/resp_bytes/duration
+    with K-Means to separate browsing and downloads from upload-heavy fallback flows. Report the contributing
+    features per alert. For Command and Control this preserves exfil detection even when DPI is impossible:
+    a flow that clusters with upload-heavy outliers rather than with normal browsing, despite full encryption,
+    is a strong fallback-channel candidate worth correlating with destination rarity and beacon timing.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, DMZ servers, User workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        feats = [dir_pkt_sizes, inter_pkt_timing, byte_ratio, duration];
+        p = flow_classifier.predict_proba(feats);
+        clusters = KMeans(log(orig_bytes), log(resp_bytes), log(duration));
+        alert when p_upload_heavy high or cluster==upload_heavy_outlier;
+        attach contributing_features.
+- question: >-
+    On uncommon or fallback ports, do TLS connections present certificate anomalies — self-signed, issuer-subject
+    mismatch, very short validity, or an unexpected issuer for the destination?
+  context: >-
+    Covert TLS fallback channels frequently use throwaway or self-signed certificates. Alert when Zeek
+    ssl.log connections on uncommon/fallback ports have an x509.log entry that is self-signed, shows an
+    issuer-subject mismatch, has very short validity, or carries an unexpected issuer for the destination
+    in conn.log. Tag the alert with the certificate fingerprint, JA3/JA3S, and host. For Command and Control
+    these certificate red flags on a non-standard port strongly suggest an attacker-controlled endpoint
+    rather than a legitimate service. A positive result should be correlated with destination rarity and
+    any beaconing on the same flow; legitimate self-signed internal services exist, so confirm the destination
+    is external/unexpected before escalating.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, VPN concentrators, Application load balancers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/SIEM rule pseudocode
+    query: |2-
+        join ssl.log, x509.log, conn.log on uid;
+        alert when id.resp_p in uncommon_ports and (
+           cert.self_signed or cert.issuer != cert.subject
+           or cert.validity < short_thr or cert.issuer not_expected_for(dst));
+        output host, dst, id.resp_p, cert_fp, ja3, ja3s.
+- question: >-
+    Is a host presenting a certificate fingerprint or JA3/JA3S in the bottom 0.5% of prevalence that also
+    coincides with other fallback indicators (uncommon port, rare destination, cert ORG change)?
+  context: >-
+    Novelty plus coincidence beats novelty alone. Track certificate fingerprint and JA3/JA3S counts per
+    destination and per host over 90 days, and flag new fingerprints in the bottom 0.5% prevalence that
+    coincide with fallback-channel indicators such as an uncommon port, a rare destination, or a certificate
+    ORG change. Use version-resilient JA4/JA4X so GREASE and extension shuffling do not inflate apparent
+    novelty. For Command and Control a rare fingerprint on its own is often benign (new app, new CDN),
+    but a rare fingerprint landing on an uncommon port toward a rare destination is a much stronger fallback-channel
+    signal worth pivoting on to the cert anomaly and beacon checks.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, VPN concentrators, Application load balancers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        counts = cert_fp, ja3, ja3s per (host,dst) over 90d;
+        alert when prevalence(fp) < p005 and (
+           id.resp_p in uncommon_ports or dst in rare_destinations
+           or cert.org_changed);
+        prefer ja4/ja4x to reduce GREASE-driven false novelty;
+        output host, dst, fp, ja3, ja3s, port.
+- question: >-
+    Does an autoencoder ensemble flag any TLS handshake on a fallback port with reconstruction error above
+    the 99th percentile, and which features contribute most?
+  context: >-
+    Anomalous TLS handshakes can be learned holistically. Train an autoencoder ensemble (Kitsune) on Zeek
+    ssl/x509 features — JA3, JA3S, cert length, issuer, subject_alt_names, validity, orig_bytes — and
+    flag handshakes whose reconstruction error exceeds the 99th-percentile threshold while on fallback
+    ports. Decompose the reconstruction error per feature to surface the top-three contributors in the
+    alert. For Command and Control this captures TLS fallback channels whose individual fields each look
+    plausible but whose combination is unusual; restricting alerts to fallback ports keeps the false-positive
+    rate manageable. Treat a high-error handshake on a non-standard port with explained features as a
+    priority lead to correlate with cert anomalies and rare-fingerprint findings.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Internet gateway/proxy servers, VPN concentrators, Application load balancers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = [ja3, ja3s, cert_len, issuer, san, validity, orig_bytes];
+        err = kitsune_autoencoder.reconstruction_error(X);
+        alert when err > p99(err) and id.resp_p in fallback_ports;
+        attach per_feature_error_top3(X).
+- question: >-
+    Is a host initiating egress on ports/protocols outside its expected allowlist — raw TCP/UDP on high
+    ports, ICMP echo with encoded payload, or DNS to a non-resolver — especially right after a blocked
+    connection to a primary destination?
+  context: >-
+    When a primary channel is blocked, implants reach for whatever transport still works. Maintain an
+    allowlist of expected egress ports/protocols per host role and alert when a host initiates outbound
+    connections outside it — raw TCP/UDP above 1024, ICMP echo with non-empty/encoded payload, or DNS
+    to a non-resolver — particularly within a short window after a blocked/denied connection to a primary
+    destination. Keep this deterministic allowlist as the floor. For Command and Control this is the core
+    fallback signature: the unusual transport itself plus the timing relative to a block makes the behavior
+    hard to explain benignly. Pivot to the originating process via Sysmon EID 3 or auditd:SYSCALL to attribute
+    the switch.
+  answer_sources:
+  - Zeek conn.log
+  - WinEventLog:Sysmon EventCode 3
+  - auditd:SYSCALL
+  - Firewall logs
+  - 'NAI: Internet gateway/proxy servers, Endpoint devices, Internal firewalls'
+  range: Last 90 days, with correlation in short windows after blocked egress.
+  queries:
+  - technology: SIEM correlation pseudocode
+    query: |2-
+        allow = expected_ports_protocols[host_role];
+        alert when egress not in allow and (
+           (proto in {tcp,udp} and dst_port > 1024)
+           or (proto=icmp and payload nonempty/encoded)
+           or (proto=dns and dst not in resolvers));
+        boost when within 15m after blocked/denied primary egress;
+        output host, proc, dst, dst_port, proto.
+- question: >-
+    Did a (src,dst) pair go from successful to repeatedly failed/blocked, after which the same source
+    started new successful sessions to a different destination or port — a 'channel switch'?
+  context: >-
+    Treat failure as the trigger signal for fallback. When a (src,dst) pair transitions from successful
+    (conn_state SF) to repeated S0/REJ/RSTO or firewall-blocked, and then the same src begins new successful
+    sessions to a different destination/port within N minutes (default 15), raise a 'channel switch' alert.
+    Score the alternate destination's rarity against a 30-day baseline (RITA) and report Volume, Frequency,
+    and failure counts. For Command and Control this is among the most specific fallback indicators because
+    it captures the cause-and-effect of disruption followed by recovery on a new channel. A switch to
+    a rare alternate destination is high-confidence; a switch to a common, well-known service is more
+    likely benign failover.
+  answer_sources:
+  - Zeek conn.log
+  - WinEventLog:Sysmon EventCode 3
+  - auditd:SYSCALL
+  - Firewall logs
+  - 'NAI: Internet gateway/proxy servers, Endpoint devices, Internal firewalls'
+  range: Last 90 days, event-centered on the failure-to-success transition (default 15-minute pivot).
+  queries:
+  - technology: Zeek/SIEM correlation pseudocode
+    query: |2-
+        detect (src,dst) SF -> repeated {S0,REJ,RSTO} or fw_blocked;
+        then within 15m: src -> new SF session to dst2/port2 (dst2 != dst);
+        alert 'channel_switch'; score rarity(dst2) vs 30d baseline;
+        output src, dst, dst2, port2, fail_count, volume, freq.
+- question: >-
+    After a primary-channel outage, does periodicity scoring on the host's new destinations reveal beaconing
+    that resumed on the fallback channel?
+  context: >-
+    Beaconing often pauses during disruption and reappears on the fallback. After a primary-channel outage,
+    run FFT/CV periodicity scoring (BAYWATCH, RITA) on the host's new destinations to catch beaconing
+    that resumes on the fallback channel, suppressing benign scheduled traffic via Mack et al. baselines.
+    For Command and Control, the reappearance of a regular cadence on a new destination immediately after
+    the old one went quiet is strong evidence the implant survived and re-homed. Anchor the analysis to
+    the outage timestamp and compare pre- and post-outage destinations; a new periodic peer that emerged
+    only after the disruption is a high-quality lead to correlate with the channel-switch and uncommon-port
+    findings.
+  answer_sources:
+  - Zeek conn.log
+  - WinEventLog:Sysmon EventCode 3
+  - auditd:SYSCALL
+  - Firewall logs
+  - 'NAI: Internet gateway/proxy servers, Endpoint devices, Internal firewalls'
+  range: Last 90 days, anchored on the detected primary-channel outage window.
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: |2-
+        outage = drop_in_primary_destination_traffic(host);
+        for dst in new_destinations_after(outage):
+          cv, fft_peak = periodicity(inter_arrivals(host,dst));
+          if (cv<0.1 or fft_peak>thr) and not benign_periodic:
+            alert; output host, dst, cv, fft_peak, outage_ts.
+- question: >-
+    Does an online autoencoder flag a host's egress feature vector right after its primary-destination
+    traffic drops, and which features (new high port, ICMP volume, rare destination) drove the spike?
+  context: >-
+    The whole shape of a host's egress changes when it re-homes. Train an online autoencoder (Kitsune)
+    on per-host egress feature vectors — destination port set, proto mix, ICMP/DNS volume, byte ratios,
+    failed-connection rate — and alert on reconstruction-error spikes that follow a drop in the host's
+    primary-destination traffic. Emit the top-three deviating features (e.g., new high port, ICMP volume,
+    rare destination) via SHAP. For Command and Control this is the catch-all for post-disruption fallback
+    that no single rule anticipates: tying the anomaly spike to the primary-traffic drop gives strong
+    temporal context. A flagged host whose egress profile shifted sharply right after losing its usual
+    destination, with interpretable features, is a priority lead.
+  answer_sources:
+  - Zeek conn.log
+  - WinEventLog:Sysmon EventCode 3
+  - auditd:SYSCALL
+  - Firewall logs
+  - 'NAI: Internet gateway/proxy servers, Endpoint devices, Internal firewalls'
+  range: Last 90 days, correlated with drops in primary-destination traffic.
+  queries:
+  - technology: ML/pseudocode
+    query: |2-
+        X = per_host_egress([dst_port_set, proto_mix, icmp_vol, dns_vol,
+              byte_ratios, failed_conn_rate]);
+        err = online_autoencoder.update_and_score(X);
+        primary_drop = detect_drop(host.primary_destination_traffic);
+        alert when err spikes and follows primary_drop;
+        attach shap_top3(X).
