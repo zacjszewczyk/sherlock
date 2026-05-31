@@ -1,0 +1,370 @@
+name: 'D3-PAN: Pointer Authentication'
+id: 8011311a-a956-431c-a9dd-ea9a392d29fc
+description: Investigate the extent to which critical applications and systems are actually protected
+  by Pointer Authentication (PAC, D3-PAN) — the ARMv8.3-A / Apple arm64e feature that cryptographically
+  signs pointers to mitigate memory-corruption exploitation — and detect erosion or active bypass of that
+  protection. This playbook supports the Harden (D3-H) tactic and helps an analyst (1) confirm PAC is
+  compiled in by parsing build logs, compile_commands.json, and CFLAGS/CXXFLAGS/LDFLAGS for the required
+  AArch64 branch-protection / return-address-signing flags and catch downgrades of those flags in build
+  configuration; (2) verify deployed binaries genuinely contain pointer-authentication instructions and
+  metadata (PACIA/AUTIA/RETAA, GNU-property PAC/BTI bits, arm64e slices) independent of declared flags,
+  and flag signing-gadget / PAC-bypass exposure; (3) confirm the executing hardware and OS kernel actually
+  support and enforce PAC at runtime so 'compiled-in' protection is not silently lost; and (4) measure
+  fleet coverage by criticality tier, detect release-over-release regressions, and monitor PAC authentication-failure
+  fault telemetry for spikes (forging/exploitation attempts) or suspicious silence. It combines deterministic
+  configuration/binary/hardware checks, statistical coverage and fault-rate baselining, and machine-learning
+  prioritization and anomaly detection so the analyst can quantify PAC coverage gaps and catch tampering
+  against high-value ARM-based assets.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are our critical applications actually compiled with AArch64 pointer-authentication protection
+    — that is, do the build logs, compile_commands.json, and CFLAGS/CXXFLAGS/LDFLAGS for each artifact
+    contain the required branch-protection / return-address-signing flags, and which artifacts are non-compliant?
+  context: 'Within the Harden (D3-H) tactic, the first prerequisite for any PAC protection is that the
+    binary was actually built with it. Parse build logs, compile_commands.json, and the compiler/linker
+    flags for each artifact and mark it compliant or non-compliant by matching exact tokens: GCC/Clang
+    `-mbranch-protection=standard` or `pac-ret[+leaf][+b-key][+pc]`, legacy `-msign-return-address=all`,
+    and on Apple arm64e via `-arch arm64e` / `-fptrauth-*`. Treat `=none`, missing flags, or `pac-ret`
+    without `+leaf` (which leaves leaf functions unsigned) as deficient. A positive (deficient) finding
+    means the application ships with no or partial return-address signing and remains exposed to memory-corruption
+    / ROP-style exploitation that PAC is meant to blunt; a negative finding means the artifact carries
+    the required flags. This is deterministic symbolic-logic matching, so results are high-confidence
+    per artifact.'
+  answer_sources: &id001
+  - Compiler build logs and configuration scripts (e.g., Makefiles, CMakeLists.txt, compile_commands.json)
+  - CI/CD pipeline definitions and build environment variables (e.g., CFLAGS/CXXFLAGS/LDFLAGS)
+  - Toolchain/SDK version manifests
+  - 'NAI: CI/CD build servers and pipelines; Developer workstations; Artifact/package registries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from build_logs OR compile_commands OR ci_build_env\n| extract flags = CFLAGS + CXXFLAGS +\
+      \ LDFLAGS + compiler_invocation\n| eval compliant = match(flags, '-mbranch-protection=standard')\n\
+      \    OR match(flags, 'pac-ret\\\\+leaf') OR match(flags, '-msign-return-address=all')\n    OR (match(flags,\
+      \ '-arch arm64e') OR match(flags, '-fptrauth'))\n| eval deficient = match(flags,'=none') OR (match(flags,'pac-ret')\
+      \ AND NOT match(flags,'\\\\+leaf')) OR NOT compliant\n| where deficient\n| table artifact, commit,\
+      \ job_id, flags, deficient"
+- question: Has any build configuration or CI/CD pipeline change removed or weakened a previously-present
+    pointer-authentication flag — for example `standard`->`none`, `pac-ret+leaf`->`pac-ret`, or dropping
+    `-arch arm64e` — and which exact token changed in which commit/job?
+  context: 'Still under the Harden (D3-H) tactic, this catches silent regressions in build-time protection.
+    Rather than only inspecting the end state, diff build configs and pipeline definitions over time and
+    alert when a flag that was present is removed or downgraded, capturing the exact changed token plus
+    the commit or job id so a reviewer sees the state transition. Examples worth alerting: `-mbranch-protection=standard`
+    dropping to `none`, `pac-ret+leaf` losing `+leaf` (re-exposing leaf functions), or removal of the
+    Apple `-arch arm64e` slice. A positive result is a concrete downgrade event that quietly reduces PAC
+    coverage on a critical service — often unnoticed because the binary still builds and runs; surfacing
+    the transition lets reviewers reject or remediate the change before it ships.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from build_config_diffs OR pipeline_definition_diffs\n| eval before = prior(flags), after\
+      \ = flags\n| eval downgrade = (contains(before,'standard') AND contains(after,'none'))\n    OR (contains(before,'pac-ret+leaf')\
+      \ AND NOT contains(after,'+leaf'))\n    OR (contains(before,'-arch arm64e') AND NOT contains(after,'arm64e'))\n\
+      | where downgrade\n| table repo, commit, job_id, changed_token, before, after"
+- question: Do the binaries we actually deploy contain real ARMv8.3-A pointer-authentication instructions
+    and metadata — PACIA/PACIB/AUTIA/RETAA/BRAA/XPACI, the ELF GNU-property PAC/BTI feature bits, and
+    (on Apple) an arm64e slice — or are PAC-flagged artifacts being shipped with zero or near-zero PAC
+    instructions?
+  context: Supporting the Harden (D3-H) tactic, this verifies ground truth independent of declared build
+    flags, because a flag in a Makefile does not guarantee the shipped artifact is actually signed. Disassemble
+    production artifacts (objdump, readelf, otool, llvm-readobj, checksec) and confirm the presence of
+    signing/auth/strip ops (PACIA/PACIB/PACDA/PACDB/PACGA, AUTIA/AUTIB, combined RETAA/RETAB, BRAA/BLRAA,
+    XPACI/XPACD) and the ELF GNU_PROPERTY_AARCH64_FEATURE_1_AND PAC/BTI bits; on Apple confirm an arm64e
+    slice via `lipo -archs`/`otool`. Alert when an artifact is deployed with zero or near-zero PAC instructions
+    despite a flagged build — a clear deception/regression between intended and actual protection. checksec
+    enables scriptable fleet-wide inspection. A positive result is a 'compliant' build that is in fact
+    unprotected on disk.
+  answer_sources: &id002
+  - Binary analysis tool output (e.g., objdump, readelf, otool, llvm-readobj, checksec)
+  - Artifact storage and deployment manifests
+  - 'ELF/Mach-O note/property sections (GNU property GNU_PROPERTY_AARCH64_FEATURE_1_AND: PAC/BTI bits)'
+  - 'NAI: Production servers hosting critical applications; Endpoint device fleet (especially ARM-based
+    devices); Artifact/package registries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from binary_analysis (objdump|readelf|otool|llvm-readobj|checksec)
+
+      | eval pac_instrs = count(opcodes in [PACIA,PACIB,PACDA,PACDB,PACGA,AUTIA,AUTIB,RETAA,RETAB,BRAA,BLRAA,XPACI,XPACD])
+
+      | eval gnu_prop_pac = note.GNU_PROPERTY_AARCH64_FEATURE_1_AND.PAC == true
+
+      | eval arm64e = lipo_archs contains ''arm64e''
+
+      | where build_flagged_pac == true AND (pac_instrs <= near_zero AND NOT gnu_prop_pac AND NOT arm64e)
+
+      | table artifact, host, pac_instrs, gnu_prop_pac, arm64e'
+- question: Which binaries expose PAC signing-gadget or strip primitives reachable from attacker-controlled
+    flow — stray XPACI/XPACD, lone PAC* signing gadgets, or unauthenticated indirect branches downstream
+    of an AUT* — that could let an attacker forge or strip pointer authentication?
+  context: 'Under the Harden (D3-H) tactic, this addresses the known weakness that PAC can be defeated
+    by signing/substitution gadgets even when present. Statically analyze binaries to flag strip/forge
+    primitives that are reachable from attacker-controlled data flow: a stray `XPACI/XPACD` (strips the
+    PAC, restoring a raw pointer), a lone `PAC*` signing gadget (lets an attacker get arbitrary pointers
+    signed), or an unauthenticated indirect branch (`BR`/`BLR`) downstream of an `AUT*` where the authenticated
+    value can be substituted. These are exactly the signing-gadget weaknesses documented against naive
+    single-return-address PAC and the iPhone XS kernel work. Prefer designs using chained/authenticated
+    call-stack patterns (e.g., PACStack) over single return-address signing. A positive result is a binary
+    that nominally has PAC but contains a usable bypass primitive — meaning the protection may be illusory.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from disassembly_cfg(artifact)
+
+      | find gadget where op in [XPACI,XPACD] AND reachable_from(attacker_controlled_flow)
+
+      | union (find lone_pac_signing_gadget where op in [PACIA,PACGA] AND operand_attacker_controlled)
+
+      | union (find indirect_branch where op in [BR,BLR] AND downstream_of(AUT*) AND NOT authenticated)
+
+      | eval prefers_chained_stack = uses(PACStack_pattern)
+
+      | where gadget_found AND NOT prefers_chained_stack
+
+      | table artifact, gadget_type, address, reachability'
+- question: For each binary, what is the PAC instruction density — the ratio of authenticated returns
+    (RETAA+RETAB) to total returns and signed-pointer instructions per KB of .text — and which binaries
+    fall below the 10th percentile of their language/toolchain peers or have density near zero despite
+    a 'compliant' flag?
+  context: This statistical method, supporting the Harden (D3-H) tactic, quantifies how thoroughly PAC
+    is actually applied rather than treating it as a binary present/absent flag. Compute (RETAA+RETAB)/(all
+    RET) and the count of signed-pointer instructions per KB of .text for each artifact, then baseline
+    per language and toolchain (different compilers/runtimes have different normal densities). Flag binaries
+    below the 10th percentile of their peer group or with density near zero even though they carry a 'compliant'
+    build flag — these are effectively unprotected. A low ratio means most returns are still unauthenticated,
+    leaving ample ROP surface; a healthy ratio approaching 1.0 means returns are broadly protected. Because
+    thresholds are derived from the environment's own peer distribution, this adapts to each toolchain
+    rather than relying on a fixed external number.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from binary_analysis
+
+      | eval auth_ret_ratio = (count_RETAA + count_RETAB) / count_all_RET
+
+      | eval signed_density = count_signed_pointer_instrs / text_size_kb
+
+      | eventstats perc10(auth_ret_ratio) as p10_ratio, perc10(signed_density) as p10_density by language,
+      toolchain
+
+      | where auth_ret_ratio <= p10_ratio OR signed_density <= p10_density OR (build_flagged_pac AND auth_ret_ratio
+      < near_zero)
+
+      | sort auth_ret_ratio asc
+
+      | table artifact, language, toolchain, auth_ret_ratio, signed_density'
+- question: Does each host's CPU actually advertise pointer-authentication support before we credit it
+    as protected — Linux HWCAP_PACA/HWCAP_PACG and ID_AA64ISAR1_EL1 APA/API/GPA fields, or macOS hw.optional.arm.FEAT_PAuth
+    — and which hosts are x86-only or pre-ARMv8.3 and therefore PAC-incapable?
+  context: 'Within the Harden (D3-H) tactic, compiled-in PAC does nothing unless the executing CPU supports
+    it. Confirm the hardware capability before counting a host as protected: on Linux check HWCAP_PACA/HWCAP_PACG
+    (via getauxval or `/proc/cpuinfo` flags such as ''paca''/''pacg'') and the ID_AA64ISAR1_EL1 APA/API/GPA
+    fields; on macOS check `sysctl hw.optional.arm.FEAT_PAuth`. Mark x86-only or pre-ARMv8.3 hosts as
+    PAC-incapable so coverage math is not inflated by counting hardware that can never run PAC. A positive
+    (incapable) result means PAC instructions on that host execute as no-ops or are simply absent, so
+    any ''compiled-in'' protection is moot there; this lets the analyst separate genuine coverage gaps
+    from architecturally-impossible ones.'
+  answer_sources: &id003
+  - Hardware architecture reports (e.g., lscpu, /proc/cpuinfo, sysctl hw.optional.arm.FEAT_PAuth)
+  - CPU feature registers / HWCAP (ID_AA64ISAR1_EL1 APA/API/GPA; HWCAP_PACA/HWCAP_PACG via getauxval)
+  - OS kernel configuration files or boot parameters (CONFIG_ARM64_PTR_AUTH*, kernel cmdline)
+  - 'NAI: Production servers hosting critical applications; Endpoint device fleet (especially mobile and
+    ARM-based devices)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from hw_arch_reports (lscpu | /proc/cpuinfo | sysctl | HWCAP)\n| eval pac_capable = (cpuinfo_flags\
+      \ contains 'paca' OR cpuinfo_flags contains 'pacg')\n    OR (ID_AA64ISAR1_EL1.APA>0 OR ID_AA64ISAR1_EL1.API>0\
+      \ OR ID_AA64ISAR1_EL1.GPA>0)\n    OR (sysctl 'hw.optional.arm.FEAT_PAuth' == 1)\n| eval incapable\
+      \ = (arch == 'x86' OR arch < 'ARMv8.3') OR NOT pac_capable\n| table host, arch, pac_capable, incapable"
+- question: Does the operating system kernel enable and manage PAC keys at runtime — Linux CONFIG_ARM64_PTR_AUTH
+    / CONFIG_ARM64_PTR_AUTH_KERNEL set and not disabled on the kernel cmdline, with per-process key management
+    present — and are there hosts where a PAC-built binary runs on a kernel with PAC disabled?
+  context: 'Also under the Harden (D3-H) tactic, even PAC-capable hardware silently loses protection if
+    the OS does not enable and manage the keys. Confirm Linux kernels have CONFIG_ARM64_PTR_AUTH and CONFIG_ARM64_PTR_AUTH_KERNEL
+    set, that PAC is not disabled via the kernel command line, and that per-process key management is
+    in place. The highest-value alert correlates the binary check with the runtime check: a binary compiled
+    and verified with PAC instructions running on a kernel where PAC is disabled is a silent loss of protection
+    — the program believes it is hardened but the keys are never installed/checked. A positive result
+    is exactly that mismatch, which is invisible in build or binary inspection alone and only emerges
+    by examining the runtime platform.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from os_kernel_config AND kernel_cmdline
+
+      | eval kernel_pac = CONFIG_ARM64_PTR_AUTH == ''y''
+
+      | eval kernel_pac_kernel = CONFIG_ARM64_PTR_AUTH_KERNEL == ''y''
+
+      | eval pac_disabled_cmdline = cmdline contains ''arm64.nopauth''
+
+      | join running_binaries on host where binary_has_pac == true
+
+      | where (NOT kernel_pac) OR pac_disabled_cmdline OR NOT per_process_key_mgmt
+
+      | table host, binary, kernel_pac, kernel_pac_kernel, pac_disabled_cmdline'
+- question: What is our PAC enablement coverage — the share of protected PAC-capable binaries out of total
+    PAC-capable binaries — broken down by asset tier, business unit, and criticality, and which groups
+    fall below the policy target or the 10th percentile of their peers?
+  context: 'This statistical roll-up supports the Harden (D3-H) tactic by turning per-binary and per-host
+    PAC checks into a governable coverage metric tied to asset criticality from the CMDB. Compute PAC
+    coverage = (protected PAC-capable binaries) / (total PAC-capable binaries) for each asset tier, business
+    unit, and criticality level, then flag groups below the policy target or below the 10th percentile
+    of peer groups. Crucially, report PAC-incapable assets (x86, pre-ARMv8.3) separately so they are not
+    silently counted as failures and do not distort the denominator. A positive result is a critical tier
+    or business unit whose protected share is materially below target — a prioritized, defensible hardening
+    backlog. This answers the FFIR directly: to what extent are critical systems protected by PAC.'
+  answer_sources: &id004
+  - Asset/CMDB inventory with criticality tier and platform
+  - Per-binary and per-host PAC verification results (from the checks above)
+  - Crash/fault telemetry (kernel logs, ARM ESR_EL1 PAC-fault codes, macOS crash reports with PAC failure,
+    SIGILL/SIGSEGV with PAC-stripped pointer)
+  - 'NAI: Production servers hosting critical applications; Endpoint device fleet; SIEM / EDR crash and
+    security-event pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from pac_verification_results | join cmdb on asset
+
+      | where pac_capable == true
+
+      | stats sum(protected) as protected, count as total by tier, business_unit, criticality
+
+      | eval coverage = protected / total
+
+      | eventstats perc10(coverage) as p10 by tier
+
+      | where coverage < policy_target OR coverage <= p10
+
+      | append (from pac_verification_results where pac_capable==false | stats count by tier)
+
+      | table tier, business_unit, criticality, coverage, policy_target'
+- question: Has any new release dropped its protected-binary share by more than 3 sigma or below a fixed
+    floor for a critical service compared with prior releases, and exactly which artifacts regressed?
+  context: 'Under the Harden (D3-H) tactic, this guards against erosion of PAC coverage over the software
+    lifecycle. Compare release-over-release protected-binary share using a control-chart / proportion
+    test, alerting when a new release drops the protected share by more than 3 standard deviations from
+    the historical mean, or below a fixed policy floor for any critical service, and surface the specific
+    artifacts that lost protection. A positive result is a regression event: a service that was well-protected
+    in release N becomes materially less protected in release N+1, often through a flag downgrade, toolchain
+    change, or a newly-added unsigned component. Pinpointing the regressed artifacts makes remediation
+    fast and prevents slow, unnoticed decay of the protection posture across many releases.'
+  answer_sources: *id004
+  range: Last 180 days (span multiple release cycles)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from pac_verification_results | bin by release, service
+
+      | stats sum(protected)/count as protected_share by service, release
+
+      | eventstats avg(protected_share) as mu, stdev(protected_share) as sd by service
+
+      | eval drop_sigma = (mu - protected_share) / sd
+
+      | where drop_sigma > 3 OR (criticality==''critical'' AND protected_share < floor)
+
+      | join artifact_level_results to list regressed_artifacts
+
+      | table service, release, protected_share, drop_sigma, regressed_artifacts'
+- question: Are PAC authentication-failure faults (ARM ESR_EL1 PAC fault codes, macOS PAC crash reports,
+    SIGILL/SIGSEGV with a high-bit-set / stripped fault address) spiking per process/host/minute — indicating
+    possible exploitation or pointer-forging attempts — and conversely is there suspicious silence where
+    faults are expected under attack conditions?
+  context: 'This statistical method under the Harden (D3-H) tactic treats PAC authentication-failure faults
+    as a first-class failure-mode signal, analogous to failed-logon or NXDOMAIN rates. Count PAC-fault
+    crashes — ARM ESR_EL1 PAC Fault Status Codes, macOS crash reports flagging PAC failure, and SIGILL/SIGSEGV
+    where the faulting address has the high bits set or shows a stripped pointer — per process, host,
+    and minute, then alert on spikes (an adversary repeatedly hitting authentication checks while attempting
+    to forge or substitute pointers will generate a burst of faults). Critically, also alert on suspicious
+    silence: speculative-execution oracles such as PACMAN can forge valid PACs without triggering crashes,
+    so an absence of faults during otherwise-suspicious activity can itself be meaningful. A positive
+    spike suggests active brute/forge attempts or a broken deployment; the dual reading prevents over-reliance
+    on crashes alone.'
+  answer_sources: *id004
+  range: 'Last 90 days (event-centered: bin per-minute, correlate with concurrent suspicious activity)'
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from crash_fault_telemetry\n| eval pac_fault = (ESR_EL1.FSC in PAC_fault_codes) OR (macos_crash.pac_failure==true)\n\
+      \    OR (signal in [SIGILL,SIGSEGV] AND fault_addr_high_bits_set)\n| bin _time span=1m\n| stats\
+      \ count as faults by process, host, _time\n| eventstats avg(faults) as mu, stdev(faults) as sd by\
+      \ process, host\n| eval z = (faults - mu)/sd\n| where z > 3 OR (faults == 0 AND concurrent_suspicious_activity(host))\n\
+      | sort z desc"
+- question: Which PAC-incapable or currently-unprotected systems should be prioritized for near-term hardening,
+    based on a model over component exposure, memory-safety defect history (CVE / CWE-119 / CWE-787),
+    code complexity, indirect-call/return density, exploit prevalence, and asset criticality — and what
+    are the top-3 contributing features for each ranked item?
+  context: This machine-learning method supports the Harden (D3-H) tactic by producing a defensible, risk-ranked
+    PAC rollout backlog rather than hardening blindly. Train/score a ranking model over features including
+    component internet/attack-surface exposure, historical memory-safety defect counts (CVEs and weaknesses
+    like CWE-119 buffer errors and CWE-787 out-of-bounds writes), code complexity, the density of indirect
+    calls and returns (which PAC specifically protects), exploit prevalence in the wild, and asset criticality.
+    The output is an ordered list of unprotected systems most worth hardening next, and every alert must
+    surface the top-3 contributing features so an engineer understands why an item ranks high (e.g., 'exposed
+    service + high CWE-787 history + dense indirect branches'). A positive result is a high-ranked, currently-unprotected
+    component whose risk profile justifies immediate PAC (plus BTI) adoption.
+  answer_sources: *id004
+  range: Last 365 days (defect history needs a long window)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = [exposure, cve_history, cwe119_count, cwe787_count, code_complexity,\n        \
+      \    indirect_call_density, return_density, exploit_prevalence, asset_criticality]\nX = build_vectors(unprotected_or_incapable_systems,\
+      \ features)\nmodel = train_ranker(labeled_history)\nscores = model.rank(X)\nfor s in top_ranked(scores):\n\
+      \    emit_alert(system=s, rank=scores[s], top3=feature_attribution(model, s, k=3))"
+- question: Which components have a high predicted buffer/pointer-vulnerability density according to a
+    learned vulnerability-prediction model over source/binary code-gadget features, such that mandatory
+    PAC plus BTI should be enforced — and what code-gadget/feature evidence supports each recommendation?
+  context: Under the Harden (D3-H) tactic, this ML method targets components that are statistically likely
+    to harbor memory-safety bugs and therefore most benefit from mandatory PAC + BTI. Apply learned vulnerability-density
+    prediction (e.g., data-dependency code-gadget models in the spirit of VulDeePecker) over source and
+    binary features to estimate each component's buffer/pointer-vulnerability density. Components whose
+    predicted density exceeds a policy threshold are nominated for mandatory PAC + Branch Target Identification.
+    To keep the recommendation auditable, output the contributing code-gadget / feature evidence so a
+    reviewer can validate (or reject) why the model flagged a component, rather than acting on an opaque
+    score. A positive result is a component predicted to be vulnerability-dense that currently lacks full
+    PAC/BTI — a strong, evidence-backed case for enforcing hardening before an attacker finds the latent
+    memory-corruption bug.
+  answer_sources: *id004
+  range: Last 365 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "gadgets = extract_code_gadgets(source_and_binary[components])\nmodel = train_vuln_density_model(labeled_gadget_corpus)\n\
+      pred = model.predict_density(gadgets)\nfor c in components:\n    if pred[c] > mandatory_hardening_threshold\
+      \ and not has_pac_bti(c):\n        emit_alert(component=c, predicted_density=pred[c],\n        \
+      \           evidence=model.contributing_gadgets(c))"
+- question: Do per-host/per-process PAC-fault sequences deviate from their learned baseline in ways fixed
+    thresholds would miss — slow pointer-forging campaigns or systematic deployment breakage — and what
+    are the top-3 anomalous features (process, fault code, rate) driving each alert?
+  context: This ML method complements the deterministic fault-rate threshold under the Harden (D3-H) tactic
+    by catching low-and-slow or subtly-structured PAC-fault behavior. Train an unsupervised model (e.g.,
+    autoencoder or sequence model) on per-host/per-process PAC-fault sequences using features such as
+    fault counts over time, faulting addresses, and the crashing modules involved. At inference, flag
+    sequences that diverge from the learned normal envelope — slow forging campaigns that never trip a
+    static rate threshold, or systematic deployment breakage that produces an unusual but low-volume fault
+    pattern. Run this in parallel with (not instead of) the fixed fault-rate threshold, and emit the top-3
+    anomalous features (process, fault code, rate) in each alert so the analyst can triage quickly. A
+    positive result is a host/process whose PAC-fault behavior is anomalous relative to its own history,
+    suggesting either patient exploitation attempts or a quietly broken PAC deployment.
+  answer_sources: *id004
+  range: Last 90 days (train on a longer clean baseline; score recent windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seqs = build_fault_sequences(pac_fault_telemetry, by=[host, process],\n                  \
+      \           features=[fault_count, faulting_addr, crashing_module, rate])\nmodel = train_unsupervised(seqs[clean_baseline])\
+      \  # autoencoder / sequence model\nfor w in recent_windows:\n    score = model.anomaly_score(w)\n\
+      \    if score > threshold:\n        emit_alert(host=w.host, process=w.process,\n               \
+      \    top3=model.top_anomalous_features(w, k=3))  # parallel to fixed threshold"
