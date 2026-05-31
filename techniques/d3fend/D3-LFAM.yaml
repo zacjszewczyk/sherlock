@@ -1,0 +1,318 @@
+name: 'D3-LFAM: Local File Access Mediation'
+id: 0fefa4b9-e33d-4912-b1a8-80be71894e86
+description: Investigate the effectiveness of local file access mediation (D3-LFAM) on hosts holding sensitive
+  data, and detect attempts to probe, bypass, or abuse file permissions. Local file access mediation is
+  the operating system's allow/deny decision on each request to open or modify a local file, and the denied-access
+  (failure) decisions it produces are a first-class detection signal. This playbook helps an analyst (1)
+  alert deterministically on denied or unexpected access to curated sensitive paths and decoy honeyfiles
+  using object-access auditing (SACL), (2) detect distributed permission probing where a single account
+  is denied across many folders, shares, and hosts in a short window, (3) catch file-type header/magic-number
+  tampering and the high-velocity, high-entropy read->encrypt->delete modification pattern characteristic
+  of ransomware, (4) baseline per-user and per-server denial and modification rates with robust median/MAD
+  and EWMA control limits to surface anomalous failure bursts, and (5) model file-access sequences and
+  process->file provenance chains with machine learning to separate benign misconfiguration noise from
+  malicious probing. It combines deterministic SACL/honeyfile rules, robust statistical baselining of
+  denial and modification rates, and sequence/provenance ML across Windows object-access events, Linux
+  auditd, Sysmon, and EDR file telemetry, so the analyst can measure how well file access controls actually
+  prevent unauthorized access to sensitive files.
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which accounts and processes are being DENIED or making unexpected access to curated sensitive
+    files and directories, and what specific access rights (ReadData, WriteData, AppendData, DELETE) are
+    they requesting against protected paths such as C:\Windows\System32?
+  context: Under the Isolate (D3-I) tactic, the most direct measure of file access mediation is the allow/deny
+    decision the OS records when an account touches a sensitive object. Maintain a curated list of sensitive
+    files/directories with object-access auditing (SACL) enabled and generate immediate alerts when Windows
+    Event ID 4656 Failure or Event ID 4663 records denied or unexpected access against those paths. Decode
+    the AccessMask bits (ReadData 0x1, WriteData 0x2, AppendData 0x4, DELETE 0x10000) and enrich each
+    alert with the initiating account type, host, process name, and interactive logon context drawn from
+    Event ID 4624. Treat WriteData or DELETE attempts against protected system directories such as C:\Windows\System32
+    as high severity, since legitimate users rarely modify those locations. A positive result is a denied
+    or unexpected access to a protected path; it indicates either a misconfigured permission, an account
+    probing for files it should not reach, or an adversary attempting to tamper with system binaries.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from object_access (Windows EID 4656 Failure OR EID 4663)
+
+      | where ObjectName in sensitive_path_list
+
+      | eval read = AccessMask & 0x1, write = AccessMask & 0x2, append = AccessMask & 0x4, delete = AccessMask
+      & 0x10000
+
+      | join logon_context (EID 4624) on LogonId
+
+      | eval severity = if((write OR delete) AND ObjectName startswith "C:\\Windows\\System32", "high",
+      "medium")
+
+      | where AccessMask matches (read OR write OR append OR delete)
+
+      | table host, SubjectAccount, account_type, ProcessName, ObjectName, AccessMask, severity'
+- question: Is a single user or service account being denied access across many distinct folders, shares,
+    and hosts within a short interval (for example, 10 or more distinct denied paths in 5 minutes) — the
+    breadth-first signature of an actor enumerating ACLs to find weakly protected files?
+  context: Supporting the Isolate (D3-I) tactic, this method catches reconnaissance against file permissions
+    rather than a single denied access. Correlate denied access events — Event ID 4656/4663 Failure plus
+    SMB share access checks via Event ID 5145 Failure — across multiple folders, shares, and hosts for
+    the same user or service account within short intervals. Alert when one principal accumulates many
+    distinct denied paths quickly (e.g., >= 10 distinct denied paths in 5 minutes), and escalate breadth-first
+    probing of ACLs as reconnaissance for weak permissions. Tune the path/host fan-out threshold per environment,
+    since vulnerability scanners and backup jobs can produce benign fan-out. A positive result is a single
+    account fanning out across many protected objects and being denied repeatedly, which strongly suggests
+    automated permission enumeration looking for an exploitable misconfiguration.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from (Windows EID 4656 Failure OR EID 4663 Failure OR EID 5145 Failure)
+
+      | bin _time span=5m
+
+      | stats dc(ObjectName) as distinct_denied_paths, dc(host) as host_fanout by SubjectAccount, _time
+
+      | where distinct_denied_paths >= 10 OR host_fanout >= 3
+
+      | where SubjectAccount not in scanner_backup_allowlist
+
+      | sort distinct_denied_paths desc'
+- question: Are there write events where a file's magic-number/header no longer matches its extension
+    after modification, or ANY read/write/rename access to decoy honeyfiles planted in sensitive directories
+    that legitimate users would never touch?
+  context: 'Within the Isolate (D3-I) tactic, this method provides two high-fidelity, malware-agnostic
+    signals. First, flag write events where the file''s magic-number/header no longer matches its extension
+    or declared content type after modification — a binary tamper indicator that does not depend on identifying
+    any malware binary, following the CryptoDrop approach (Scaife et al.). This catches ransomware and
+    content-replacement attacks that change a file''s true type. Second, deploy decoy/honeyfiles in sensitive
+    directories and alert on ANY read, write, or rename access (Event ID 4663) to them, following UNVEIL''s
+    artificial-environment approach (Kharraz et al.): because no legitimate user or process has a reason
+    to touch bait files, any access is inherently suspicious. A positive result is either a post-write
+    header/extension mismatch or any access to a honeyfile, both indicating unauthorized or malicious
+    file manipulation.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from file_write (EID 4663 WriteData OR Sysmon EID 11 OR auditd PATH)
+
+      | eval header_mismatch = (magic_number(file) != expected_type(file_extension))
+
+      | where header_mismatch
+
+      | append [ from file_access (EID 4663) where ObjectName in honeyfile_list ]
+
+      | table host, SubjectAccount, ProcessName, ObjectName, file_extension, detected_type, access_type'
+- question: For each user, host role, and hour of day, do denied file-access counts deviate sharply from
+    a 30-day robust baseline — for example a modified Z-score above 3.5 or daily failures above the user's
+    own 95th percentile?
+  context: Treating denied-access (failure) rate as a distinct signal from successful access is central
+    to the Isolate (D3-I) tactic. Build 30-day baselines of denied file accesses per user, per host role,
+    and by hour of day, then alert using a robust median/MAD modified Z-score (flag |Z| > 3.5) rather
+    than mean/standard deviation, which is easily distorted by batch jobs. Also alert when a user's daily
+    failures exceed their own 95th percentile, and include the deviation magnitude in the alert to help
+    prioritize triage. The modified Z-score is resistant to outliers, so a few large maintenance bursts
+    do not inflate the baseline and mask real anomalies. A positive result is a user whose denied-access
+    rate jumps well beyond their established norm, which may indicate compromised credentials probing
+    files they cannot reach or an insider testing access boundaries.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from denied_file_access (EID 4656/4663 Failure)
+
+      | bin _time span=1d
+
+      | stats count as failures by user, host_role, hour_of_day, _time
+
+      | eventstats median(failures) as med, mad(failures) as mad_val, perc95(failures) as p95 by user,
+      host_role, hour_of_day
+
+      | eval modz = 0.6745 * (failures - med) / mad_val
+
+      | where abs(modz) > 3.5 OR failures > p95
+
+      | sort modz desc'
+- question: Which critical servers show sustained surges in denied file/share access counts beyond their
+    historical bounds, as measured by EWMA or rolling robust (median/MAD) control limits that ignore routine
+    maintenance windows?
+  context: This server-centric view supports the Isolate (D3-I) tactic by detecting automated permission
+    abuse aimed at a specific high-value host rather than a single user's behavior. Aggregate denied file/share
+    access counts (Event ID 4656 and 5145 Failure) by critical server and monitor each with an EWMA or
+    rolling z-score control chart. Investigate sustained spikes beyond historical bounds as automated
+    permission abuse. Use robust median/MAD control limits so that scheduled maintenance windows and backup
+    runs do not trigger false alerts. A positive result is a server experiencing a sustained, statistically
+    significant increase in denied access — distinct from a brief, expected maintenance spike — which
+    suggests scripted or distributed probing of that server's file permissions.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from denied_access (EID 4656 Failure OR EID 5145 Failure)
+
+      | bin _time span=1h
+
+      | stats count as denials by server, _time
+
+      | eventstats median(denials) as med, mad(denials) as mad_val by server
+
+      | eval ewma = ewma(denials, alpha=0.3) by server
+
+      | eval upper_limit = med + 3.5 * 1.4826 * mad_val
+
+      | where ewma > upper_limit AND sustained_over(2 windows)
+
+      | sort denials desc'
+- question: Is any single process modifying files at high velocity (for example more than 10 files/second
+    sustained) or exhibiting a read -> high-entropy-write -> delete/overwrite pattern with near-uniform
+    write entropy across many files — the canonical ransomware encryption signature?
+  context: 'Under the Isolate (D3-I) tactic, this method targets the destructive end of file-access abuse:
+    bulk encryption. Monitor per-process modification rate (Event ID 4663 with AccessMask WriteData 0x2
+    / Append 0x6), files-renamed/deleted counts, file-type spread, and the average Shannon entropy of
+    written data across multiple time windows, following ShieldFS (Continella et al.). Alert when the
+    modification rate exceeds 10 files/second sustained, OR when a read -> high-entropy-write -> delete/overwrite
+    pattern with near-uniform write entropy spans many files — the canonical ransomware signature documented
+    in CryptoDrop (Scaife et al.) and UNVEIL (Kharraz et al.). Report volume (bytes/files), frequency
+    (files/min), and state (delete/overwrite ratio) in the alert. A positive result is a process churning
+    through many files with high write entropy and deletion, which is a near-certain indicator of active
+    ransomware or mass data destruction.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from file_modify (EID 4663 WriteData/Append, Sysmon EID 11, auditd)
+
+      | bin _time span=10s
+
+      | stats count as files_mod, dc(file_type) as type_spread, avg(write_entropy) as ent, sum(deleted)
+      as deletes, sum(bytes) as vol by process, host, _time
+
+      | eval rate_per_sec = files_mod / 10
+
+      | where rate_per_sec > 10 OR (ent > 7.5 AND deletes > 0 AND seq(read, high_entropy_write, delete_or_overwrite))
+
+      | table host, process, rate_per_sec, ent, deletes, vol, type_spread'
+- question: Do the ordered sequences of file-access outcomes, path categories, AccessMask values, and
+    process identity for a host deviate from a learned normal model (LSTM next-event prediction / n-gram
+    baselines), and what are the top contributing transitions driving each anomaly?
+  context: Supporting the Isolate (D3-I) tactic, this machine-learning method distinguishes benign misconfiguration
+    noise from malicious probing by modeling the order of file-access events rather than individual events.
+    Train sequence anomaly detection — LSTM next-event prediction with top-g deviation per DeepLog (Du
+    et al.), and n-gram baselining per Forrest et al. — on ordered file-access outcomes, path categories,
+    AccessMask, and process identity. At inference, flag sequences whose next event falls outside the
+    model's predicted set, and use attention to surface the top-3 contributing transitions or fields in
+    the alert text (per Brown et al.) so the analyst can triage. Critically, keep deterministic deny-on-sensitive-path
+    rules running in parallel and do not gate them on the model. A positive result is a process whose
+    file-access sequence diverges from its learned envelope, which can indicate scripted enumeration or
+    an actor behaving unlike the normal workload on that host.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seqs = build_sequences(file_access_events, fields=[outcome, path_category, AccessMask, process])\n\
+      model = train_lstm_next_event(seqs[clean_baseline])  # DeepLog top-g; n-gram baseline in parallel\n\
+      for window in recent_windows:\n    if model.next_event(window) not in model.topg_predicted:\n  \
+      \      emit_alert(host, process, top3=model.attention_top_transitions(window, k=3))\n# deterministic\
+      \ deny-on-sensitive-path rules remain independent"
+- question: Where whole-system provenance or EDR lineage is available, which process -> file causal chains
+    are anomalous — unexpected or first-seen processes accessing sensitive files — as scored by provenance-graph
+    learning, and what is the compact causal subgraph explaining each alert?
+  context: At the most contextual layer of the Isolate (D3-I) tactic, this method scores the causal relationship
+    between processes and the sensitive files they touch. Where whole-system provenance or EDR lineage
+    is available, score anomalous process -> file causal chains using provenance-graph learning — a temporal
+    GNN autoencoder per KAIROS (Cheng et al.) and node-level GraphSAGE per ThreaTrace (Wang et al.) —
+    to flag unexpected processes accessing sensitive files and to localize the suspicious file/process
+    nodes. Emit the compact causal subgraph and the top contributing edges as explanation, and correlate
+    with rare or first-seen access paths using rarity scoring per Hopper (Ho et al.). A positive result
+    is a process with no legitimate reason to read or write a sensitive file appearing in an anomalous
+    lineage — for example, a document viewer or script interpreter suddenly accessing a domain controller's
+    directory — which is a strong indicator of unauthorized access or lateral data theft.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4624
+  - Windows Event ID 5145
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd (PATH/SYSCALL)
+  - EDR file telemetry
+  - 'NAI: File servers hosting sensitive data, domain controllers, and critical system directories (e.g.,
+    C:\Windows\System32) on endpoints and servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "graph = build_provenance_graph(edr_lineage, process_file_edges)\nmodel = train_temporal_gnn_autoencoder(graph[baseline])\
+      \  # KAIROS; GraphSAGE node scoring (ThreaTrace)\nfor edge in process_to_sensitive_file_edges:\n\
+      \    score = model.reconstruction_error(edge)\n    rarity = rarity_score(edge.path, edge.process)\
+      \  # Hopper\n    if score > threshold OR rarity is first_seen:\n        emit_alert(host, subgraph=model.localize(edge),\
+      \ top_edges=model.top_contributing(edge))"
