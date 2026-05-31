@@ -1,0 +1,431 @@
+name: 'T1570: Lateral Tool Transfer'
+id: 9a8a6e17-ec24-4e1d-b3c4-3f23bc6c913f
+description: 'Investigate the lateral transfer of tools or files between internal systems within a compromised
+  environment. This playbook helps an analyst determine whether an adversary is moving binaries, scripts,
+  or other files host-to-host to stage tooling for follow-on operations. It guides examination of: files
+  transferred over SMB/admin shares or via native utilities (scp, rsync, curl, sftp, ftp, certutil, bitsadmin)
+  whose hashes or names match known-bad threat intelligence or adversary-tool watchlists; files written
+  to directories that are unusual for the destination host or commonly abused (C:\Windows\Temp, C:\Users\Public,
+  C:\ProgramData, C:\$Recycle.Bin, /tmp, /dev/shm, ~/Library/LaunchAgents); processes not normally associated
+  with file sharing (winword.exe, w3wp.exe, explorer.exe, LOLBins) initiating transfers over file-sharing
+  ports; statistically significant hash fan-out from a single source to many destinations indicating mass
+  tool deployment; and east-west connections over non-allowlisted protocols/ports or with anomalous data
+  volume. Each line of inquiry pairs a deterministic symbolic-logic floor with statistical baselining
+  and machine-learning approaches across Windows, Linux, macOS, and ESXi.'
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Do any files transferred between internal systems have a hash that matches a known-bad threat-intelligence
+    indicator, or a filename/import-hash that matches a watchlist of common adversary tooling (e.g., mimikatz.exe,
+    psexec.exe, Impacket *.py modules, rclone.exe)?
+  context: Lateral Tool Transfer almost always involves moving recognizable offensive tooling between
+    hosts to stage follow-on actions. This deterministic check computes MD5/SHA256 of files extracted
+    from monitored protocols (Zeek smb_files.log/files.log with file extraction enabled per BZAR) and
+    joins them to process-creation events (Windows 4688, Sysmon 1). Alert when a hash matches a known-bad
+    TI hash, or when the filename or imphash matches an adversary-tool watchlist. Correlate to the remote-write-then-execute
+    chain (write a file to a remote share, then execute it). A positive result is a high-confidence indicator
+    of lateral movement staging; a negative result does not clear the host because adversaries rename
+    and repack tools, so pair this floor with the statistical and ML layers below. This is the deterministic
+    floor for the Lateral Movement tactic and should run regardless of ML availability.
+  answer_sources:
+  - Zeek files.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: All internal network segments, Domain Controllers, File Servers, Privileged Access Workstations
+    (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "files = zeek_files OR zeek_smb_files | compute md5, sha256\nproc = (win:4688 OR sysmon:1)\n\
+      join files to proc on host, file_name\nwhere files.sha256 IN ti_known_bad_hashes\n   OR files.md5\
+      \ IN ti_known_bad_hashes\n   OR files.file_name IN adversary_tool_watchlist\n   OR proc.imphash\
+      \ IN adversary_tool_watchlist\nalert \"Known-bad/adversary-tool file transferred between internal\
+      \ hosts\""
+  - technology: Zeek/pseudocode
+    query: '# enable file extraction (BZAR) on smb/ftp/http
+
+      event file_hash(f): if f.md5 in known_bad or f.sha256 in known_bad
+
+      then notice(Lateral_Tool_Transfer_KnownBad, src=f.tx_host, dst=f.rx_host, name=f.filename)'
+- question: For each internal source host, is the volume (bytes/hour), frequency (transfers/min), or failed-to-successful
+    write ratio of file transfers a statistical outlier versus its own 30-day baseline?
+  context: Rather than relying only on filename style, this method examines the physics of the transfer.
+    From Zeek conn.log and smb_files.log, per source host compute total transfer bytes/hour, transfer
+    count/min, and the ratio of failed/blocked writes (Windows 4663 access-denied, SMB STATUS_ACCESS_DENIED,
+    conn_state S0/REJ/RSTO) to successful writes. Alert when bytes/hour or count/min exceed mu+3sigma
+    of a 30-day per-host baseline, or when the failed-write ratio spikes, because reconnaissance and permission
+    probing typically precede a successful transfer. Use Median Absolute Deviation rather than mean/sigma
+    for robustness to skew. Retain a 95th-percentile filename-entropy check as a secondary signal. A spike
+    in failed writes followed by a success is a strong lateral-movement staging signal under the Lateral
+    Movement tactic.
+  answer_sources:
+  - Zeek files.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: All internal network segments, Domain Controllers, File Servers, Privileged Access Workstations
+    (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = stats over 30d by src_host: med(bytes_hr), mad(bytes_hr), med(cnt_min), mad(cnt_min)\n\
+      cur  = per src_host now: bytes_hr, cnt_min, failed_writes/successful_writes\nalert if cur.bytes_hr\
+      \ > med+3*1.4826*mad\n    or cur.cnt_min  > med+3*1.4826*mad\n    or cur.fail_ratio spikes vs baseline"
+  - technology: Zeek/pseudocode
+    query: 'from conn.log + smb_files.log group by orig_h
+
+      metric bytes_per_hour, transfers_per_min, fail_ratio(S0|REJ|RSTO + access_denied)
+
+      flag MAD outliers; secondary: filename entropy > p95'
+- question: Does a supervised classifier scoring file-transfer events on first-party host and network
+    features rank any transfer above the tuned malicious-probability threshold, and what features drive
+    the score?
+  context: 'A supervised classifier (Random Forest or Gradient Boosting) is trained over first-party Zeek
+    and host features: file MIME type, size, filename entropy, source/destination subnet role, protocol,
+    conn_state, duration, bytes, and parent process. Training uses rare-class over/under-sampling and
+    graph-derived authentication features to handle class imbalance. The model emits the top-3 contributing
+    features (e.g., ''destination subnet rarely receives writes'', ''size 10x host norm'', ''unsigned
+    binary'') in alert text for explainability. Alert above a tuned probability threshold. This catches
+    lateral transfers that evade hash and path rules by learning combinations of subtle deviations. Analysts
+    should treat high-probability alerts as prioritized leads and validate against the deterministic checks.'
+  answer_sources:
+  - Zeek files.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: All internal network segments, Domain Controllers, File Servers, Privileged Access Workstations
+    (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [mime, size, fname_entropy, src_role, dst_role, proto, conn_state, duration, bytes,
+      parent_proc]
+
+      model = RandomForest/GBM trained w/ rare-class resampling + auth-graph features
+
+      p = model.predict_proba(event)
+
+      if p > threshold: alert with top3 SHAP features'
+- question: Is a file being written from another internal host into a directory that is commonly abused
+    for staging (e.g., C:\Windows\Temp, C:\Users\Public, C:\ProgramData, C:\$Recycle.Bin, ADMIN$/C$ roots,
+    /tmp, /dev/shm, ~/Library/LaunchAgents)?
+  context: Adversaries stage transferred tools in world-writable or low-scrutiny directories. Monitor
+    file write events (Sysmon 11, Windows 4663) and SMB writes (Zeek smb_files.log action/path/name fields).
+    Alert when a file is written from another internal host into a watchlist path. Critically, correlate
+    writes to IPC$/admin shares with subsequent remote service or scheduled-task creation (the classic
+    ATSVC/SCM lateral-movement pattern), which converts a file drop into execution. These concrete path
+    rules form the deterministic floor for the Lateral Movement tactic. A positive result with remote
+    origin and follow-on execution is high confidence; benign software installers and patch agents are
+    common false positives, so enrich with the writing process and signer.
+  answer_sources:
+  - Zeek smb_files.log
+  - Zeek ftp.log
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Workstation-to-workstation traffic, Server-to-server traffic, Critical application servers,
+    File servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "writes = sysmon:11 OR win:4663 OR zeek_smb_files(action=write)\nwhere target_path MATCHES\
+      \ watchlist_paths\n  and origin = remote_internal_host\nalert; enrich: join 5140/5145 share access\
+      \ + remote svc/task create (ATSVC/SCM)"
+  - technology: Zeek/pseudocode
+    query: 'event smb_files: if action=="SMB::FILE_WRITE" and path in {ADMIN$,C$,IPC$}
+
+      and name under temp/public/programdata then notice(Sensitive_Path_Write)'
+- question: Is a file being written to a destination path that falls below the 5th percentile of that
+    host's 30-day historical write-frequency profile, particularly when the write originates remotely?
+  context: 'Per host, build a 30-day rolling frequency profile of write destination paths and writing
+    processes. Alert when a write lands in a path below the 5th percentile of that host''s historical
+    write frequency, especially when paired with remote share access (Windows 5140/5145). Add a state
+    metric: count access-denied (4663 failure) write attempts per source, because a burst of failures
+    followed by a success indicates path/permission probing before transfer. This finds novel staging
+    directories that fixed watchlists miss. Rare-path writes from a remote internal host are a meaningful
+    lateral-movement staging signal; routine writes by local applications to their own data directories
+    should fall well within baseline.'
+  answer_sources:
+  - Zeek smb_files.log
+  - Zeek ftp.log
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Workstation-to-workstation traffic, Server-to-server traffic, Critical application servers,
+    File servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'profile = 30d freq by host of (dest_path, writing_proc)
+
+      alert if dest_path freq < p5 for host AND origin=remote(5140/5145)
+
+      side-signal: count 4663 access_denied per src; burst_fail -> success = probing'
+- question: Do unsupervised clustering or anomaly-detection models flag any file-creation events as outliers
+    (noise points or small distinct clusters), and which features drive the anomaly?
+  context: 'Apply unsupervised clustering / anomaly detection (DBSCAN or Isolation Forest) to file-creation
+    events (Sysmon 11) using features: writing process, path depth, extension, signed/unsigned, remote-origin
+    flag, and destination-host role. Investigate noise points and small distinct clusters. Surface the
+    top-3 features driving the outlier (e.g., ''unsigned exe'', ''written by w3wp.exe'', ''remote SMB
+    origin'') in the alert. This complements the statistical path profiling by detecting unusual feature
+    combinations rather than single-dimension rarity. Outliers warrant triage as potential lateral tool
+    staging under the Lateral Movement tactic; analysts should validate against the deterministic path
+    watchlist.'
+  answer_sources:
+  - Zeek smb_files.log
+  - Zeek ftp.log
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Workstation-to-workstation traffic, Server-to-server traffic, Critical application servers,
+    File servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = sysmon11 features [writing_proc, path_depth, ext, signed, remote_origin, dst_role]
+
+      model = IsolationForest or DBSCAN
+
+      flag noise_points / small_clusters; alert with top3 driving features'
+- question: Is a process not normally associated with file sharing (e.g., winword.exe, excel.exe, w3wp.exe,
+    explorer.exe) or a LOLBin (certutil.exe, bitsadmin.exe, curl.exe, scp/rsync/sftp) opening an outbound
+    connection on a file-sharing port (445, 21, 22, 3389) to another internal IP?
+  context: When an unexpected parent process initiates network file transfer, it often signals tool transfer
+    driven by an exploited application or hands-on-keyboard activity. Correlate process creation (Sysmon
+    1) with network connections (Sysmon 3, Zeek conn.log). Alert when a process from a non-transfer watchlist,
+    or a LOLBin, opens an outbound connection on a file-sharing port to another internal IP. This LOLBin-over-SMB
+    chain is the deterministic core of the detection strategy. A web server process (w3wp.exe) or an Office
+    application suddenly speaking SMB to an internal host is a strong indicator of webshell-driven or
+    macro-driven lateral transfer. Maintain this as the symbolic-logic floor for the Lateral Movement
+    tactic.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek smb_files.log
+  - 'NAI: Application servers (e.g., web servers, database servers), User workstations, Privileged access
+    workstations (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc = sysmon:1; net = sysmon:3 OR zeek_conn\njoin on host, pid\nwhere (proc.image IN nonxfer_watchlist\
+      \ OR proc.image IN lolbins)\n  and net.dest_port IN (445,21,22,3389)\n  and net.dest_ip IN internal_ranges\n\
+      alert \"Unexpected process file-transfer to internal host\""
+  - technology: Zeek/pseudocode
+    query: 'conn.log where id.resp_p in {445,21,22,3389} and resp_h in internal
+
+      join host process(sysmon3) on conn; flag if orig_proc in {winword,w3wp,explorer,certutil,bitsadmin,curl}'
+- question: Is a process initiating a connection or spawning a child below the 1st percentile of its observed
+    30-day frequency for (parent_process, child_process) or (process, dest_port, dest_subnet)?
+  context: 'For each process name, baseline its (parent_process, child_process) and (process, dest_port,
+    dest_subnet) frequencies over 30 days. Alert when a process initiates a connection or spawns a child
+    below the 1st percentile of observed frequency. Add volume/state context from Zeek conn.log: bytes
+    transferred and conn_state for the rare pair, and count failed connection attempts (S0/REJ) by the
+    process as a distinct probing signal. This catches rare process behaviors that fixed watchlists miss,
+    e.g., a process that has never before connected to a domain controller subnet on 445. Rare process-destination
+    pairs accompanied by failed connection bursts indicate transfer probing preceding lateral movement.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek smb_files.log
+  - 'NAI: Application servers (e.g., web servers, database servers), User workstations, Privileged access
+    workstations (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = 30d freq by (parent,child) and (proc,dest_port,dest_subnet)
+
+      alert if observed pair freq < p1
+
+      enrich: zeek bytes, conn_state; count S0/REJ per proc = probing signal'
+- question: Do self-supervised sequence models (LSTM autoencoder or transformer) flag any host event sequence
+    (parent process -> process -> dest port/file write) with high reconstruction error or low next-event
+    probability?
+  context: Model each host's event sequence (parent process -> process -> dest port/file write) with an
+    LSTM autoencoder or self-supervised transformer. High reconstruction error or low next-event probability
+    indicates deviation from learned normal behavior. Alert with the top-3 anomalous transitions named
+    (e.g., 'winword.exe->cmd.exe->445') so analysts can triage without re-deriving the score. This captures
+    multi-step lateral-transfer chains that single-event rules miss, learning the temporal grammar of
+    each host. Anomalous transitions involving an Office or web process pivoting into network file-sharing
+    are high-priority leads under the Lateral Movement tactic.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek smb_files.log
+  - 'NAI: Application servers (e.g., web servers, database servers), User workstations, Privileged access
+    workstations (PAWs)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = per host ordered [parent_proc -> proc -> dest_port/file_write]
+
+      model = LSTM-autoencoder / self-supervised transformer
+
+      score = reconstruction_error OR 1 - next_event_prob
+
+      if score > threshold: alert naming top3 anomalous transitions'
+- question: Does a single source IP transfer a file with the same hash or name to more than 10 distinct
+    internal destination IPs within 30 minutes, indicating mass tool deployment?
+  context: 'Mass, rapid distribution of one file is a hallmark of ransomware staging or Impacket-based
+    deployment. Implement a stateful rule: if one source IP transfers a file with the same hash or name
+    to more than 10 distinct internal destination IPs within 30 minutes (Zeek smb_files.log/files.log,
+    Windows 4663), alert as potential mass tool deployment. Keep this concrete count threshold and tune
+    the 10/30-minute values to the environment (e.g., legitimate software-distribution servers may require
+    allowlisting). A fan-out that matches this pattern from a non-distribution host is among the highest-confidence
+    indicators of an active, scaling intrusion under the Lateral Movement tactic and warrants immediate
+    response.'
+  answer_sources:
+  - Zeek files.log
+  - Zeek smb_files.log
+  - Windows Event ID 4663
+  - 'NAI: Entire internal network address space, Subnets containing high-value assets, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'window 30m: group by src_ip, file_hash|file_name
+
+      count distinct dest_ip in internal_ranges
+
+      if distinct_dest > 10 and src not in approved_distribution_servers
+
+      alert "Mass tool deployment / hash fan-out"'
+  - technology: Zeek/pseudocode
+    query: 'table[src_h, sha256] -> set(dst_h) within 30m sliding
+
+      when |set(dst_h)| > 10: notice(Hash_FanOut_Mass_Deploy)'
+- question: Over a rolling 1-hour window, does the count of unique destination hosts receiving a given
+    file hash exceed the 99th percentile of the 30-day baseline, and is there an accompanying spike in
+    failed/blocked deliveries?
+  context: 'Over a rolling 1-hour window, group transfers by file hash and count unique destination hosts
+    (fan-out). Alert when fan-out exceeds the 99th percentile of a 30-day baseline; prefer Median Absolute
+    Deviation for robustness to skew. Add a failure dimension: also baseline the count of failed/blocked
+    deliveries (access-denied/REJ) per source, because a high failure-to-success fan-out indicates spray
+    attempts against hardened hosts. This adapts the fixed 10/30-minute rule to environments with legitimate-but-variable
+    distribution patterns. A statistically anomalous fan-out, especially with many blocked deliveries,
+    indicates an adversary spraying tooling across the estate.'
+  answer_sources:
+  - Zeek files.log
+  - Zeek smb_files.log
+  - Windows Event ID 4663
+  - 'NAI: Entire internal network address space, Subnets containing high-value assets, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = 30d per src: med/mad of unique_dest_per_hash_per_hour
+
+      cur  = rolling 1h: unique_dest per hash
+
+      alert if cur > p99 (med+k*1.4826*mad)
+
+      also baseline failed_deliveries(access_denied/REJ); flag high fail:success fan-out'
+- question: Does a dynamic transfer graph reveal a sudden out-degree spike (star/broadcast pattern) from
+    one node, especially when new edges share an identical file hash or name?
+  context: Build a dynamic transfer graph (hosts = nodes, transfers = directed edges). Use temporal link
+    prediction (EULER) and unsupervised edge-probability scoring (CyberGraph) to flag a sudden out-degree
+    spike from one node, especially when new edges share identical file hash/name (a broadcast 'star').
+    Report the top-3 contributing edges/destinations and the edge-probability in the alert for explainability.
+    Graph methods capture the topological signature of mass deployment that aggregate counts can blur,
+    and distinguish a true broadcast star from gradual organic spread. A newly-formed star pattern carrying
+    one file hash is a strong indicator of coordinated lateral tool deployment.
+  answer_sources:
+  - Zeek files.log
+  - Zeek smb_files.log
+  - Windows Event ID 4663
+  - 'NAI: Entire internal network address space, Subnets containing high-value assets, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = dynamic_graph(nodes=hosts, edges=transfers)
+
+      score new edges via temporal link prediction (EULER) + edge-prob (CyberGraph)
+
+      flag node with out-degree spike where new edges share hash/name (star)
+
+      alert with top3 edges + edge_probability'
+- question: Is there a direct connection between two internal endpoints using a protocol or port that
+    is not on the approved east-west allow-list (e.g., 22/scp, 21/ftp, or ad-hoc high ports rather than
+    approved SMB/445 or RDP/3389)?
+  context: Maintain an allow-list of approved east-west protocols/ports (e.g., SMB/445, RDP/3389) and
+    alert on any Zeek conn.log connection between internal ranges using a port/protocol not on the list
+    (e.g., 22/scp, 21/ftp, ad-hoc high ports). This deterministic allow-list is the recommended floor
+    for the Lateral Movement tactic. Adversaries frequently use native tools like scp, rsync, and ftp
+    that produce traffic on ports not normally seen east-west in a managed enterprise. A positive result
+    is a clear policy violation worth investigating; tune the allow-list to legitimate internal services
+    to control false positives.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: East-west traffic between all internal subnets, Network traffic to/from bastion hosts, VPN user
+    subnets'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'conn.log where orig_h in internal and resp_h in internal
+
+      and id.resp_p NOT IN allowlist_east_west_ports (445,3389,...)
+
+      notice(NonAllowlisted_EastWest_Transfer)'
+  - technology: SIEM/Rule pseudocode
+    query: 'internal_to_internal conn where dest_port not in approved_ports
+
+      alert "Non-allowlisted east-west protocol/port"'
+- question: For an internal source-destination pair, does daily transferred volume exceed mu+3sigma of
+    the 30-day baseline, or is there a surge of failed/half-open connections (S0, REJ, RSTO) from one
+    source?
+  context: 'Per internal source-destination pair, baseline total bytes (orig_bytes+resp_bytes) over 30
+    days and alert when daily volume exceeds mu+3sigma. Using Zeek conn.log conn_state/history, separately
+    profile failed/half-open connections (S0, REJ, RSTO): a surge of failed internal connections from
+    one source is a distinct reconnaissance/transfer-probing signal preceding successful transfer. This
+    captures both bulk data movement (large tool/payload transfer) and the scanning that often precedes
+    it. An internal host pair suddenly exchanging far more data than baseline, or a host generating many
+    half-open internal connections, are both meaningful lateral-movement signals.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: East-west traffic between all internal subnets, Network traffic to/from bastion hosts, VPN user
+    subnets'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = 30d per (src,dst): mean/std of daily bytes(orig+resp)
+
+      alert if today_bytes > mean+3*std
+
+      separately: count conn_state in {S0,REJ,RSTO} per src; flag surge = probing'
+  - technology: Zeek/pseudocode
+    query: 'group conn.log by (orig_h,resp_h) daily sum(orig_bytes+resp_bytes)
+
+      outlier > mu+3sigma; parallel count half-open(S0/REJ/RSTO) per orig_h'
+- question: Do anomaly-detection and link-prediction models rank any internal host-to-host connection
+    as a rare or previously-unseen edge, and what features (e.g., first-ever edge, abnormal bytes, non-allowlisted
+    port) drive the ranking?
+  context: Score internal connections with an Isolation Forest over features (protocol, dest port, duration,
+    bytes, conn_state, subnet roles, TCP flags), and in parallel rank previously-unseen host-to-host edges
+    with unsupervised link prediction (CyberGraph) and temporal link prediction (EULER); login-path rarity
+    (Hopper) further prioritizes credentialed transfer sessions. Emit the top-3 features (e.g., 'first-ever
+    edge', 'bytes 8x norm', 'non-allowlisted port') in the alert. This finds anomalous east-west transfers
+    that neither the allow-list nor simple volume thresholds catch, by combining per-connection anomaly
+    scoring with graph novelty. A first-ever edge to a high-value subnet carrying unusual volume is a
+    priority lateral-movement lead.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: East-west traffic between all internal subnets, Network traffic to/from bastion hosts, VPN user
+    subnets'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = conn features [proto, dest_port, duration, bytes, conn_state, subnet_roles, tcp_flags]
+
+      s1 = IsolationForest(X)
+
+      s2 = link_prediction(CyberGraph) + temporal(EULER) on host-graph
+
+      s3 = login-path rarity (Hopper) for credentialed sessions
+
+      alert top-ranked edges with top3 driving features'
