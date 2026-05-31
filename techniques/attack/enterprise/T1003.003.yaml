@@ -1,0 +1,515 @@
+name: 'T1003.003: NTDS'
+id: 2942c661-860e-4748-b566-302982c6e0c8
+description: 'Investigate attempts to access, copy, or exfiltrate the Active Directory domain database
+  (NTDS.dit) from Domain Controllers for credential theft. This playbook helps an analyst hunt the full
+  NTDS-dumping kill chain: large, atypical single-file network transfers leaving a Domain Controller;
+  execution of known NTDS dumping utilities (ntdsutil.exe, vssadmin, impacket-secretsdump, Invoke-NinjaCopy,
+  Invoke-DCSync) and obfuscated PowerShell one-liners; unauthorized processes reading %SystemRoot%\NTDS\ntds.dit
+  or shadow-copy paths; Volume Shadow Copies created by non-service accounts or outside backup windows;
+  DCSync (DsGetNcChanges) replication requests from hosts that are not legitimate Domain Controllers;
+  and time-correlated sequences where a host-based dumping event on a DC is rapidly followed by anomalous
+  outbound transfer. It pairs symbolic-logic detections with statistical baselining (rarity, frequency,
+  volume, failure-mode profiling, EWMA) and machine-learning approaches (isolation forests, sequence models,
+  character-level command classifiers, and provenance-graph analysis) so a SOC analyst can confirm or
+  rule out NTDS credential theft.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a Domain Controller send a large single-file transfer (greater than ~500MB) to any non-DC
+    internal-management host or external IP, with filenames or traffic characteristics consistent with
+    an NTDS database export?
+  context: NTDS dumping copies the entire Active Directory database, so the resulting file (ntds.dit,
+    an IFM/GUID export, or an accompanying SYSTEM hive) is large and a Domain Controller pushing hundreds
+    of megabytes outbound is highly atypical. Watch Zeek conn.log for a DC source sending >500MB to any
+    destination that is not another DC or sanctioned management/replication peer, and pivot to files.log
+    for names like ntds.dit, *.dit, SYSTEM, or IFM-export patterns. A positive result is a strong exfiltration
+    signal for the Credential Access objective; a negative result helps rule out bulk database theft over
+    the wire.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controller network interfaces'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'dc_flows = FILTER conn.log WHERE orig_h IN domain_controllers
+
+      big = FILTER dc_flows WHERE orig_bytes > 500MB AND resp_h NOT IN (domain_controllers, sanctioned_mgmt)
+
+      names = JOIN big WITH files.log ON conn_uid
+
+      ALERT WHERE names.filename MATCH /(ntds\.dit|\.dit$|SYSTEM|IFM|\{GUID\})/ OR big.orig_bytes > 500MB'
+- question: Is a Domain Controller's outbound byte volume exceeding its own historical 99th percentile,
+    especially toward a first-seen ASN, country, or destination tuple?
+  context: Replication and management baselines differ per Domain Controller, so a single global threshold
+    misfires. Baseline each DC's outbound orig_bytes over ~30 days and flag connections above that host's
+    99th percentile, weighting destinations that are first-seen ASNs/countries or new dst tuples. Track
+    an EWMA so a slow, sustained climb in transfer volume also fires rather than only single spikes. A
+    positive result indicates abnormal bulk data leaving a DC consistent with NTDS exfiltration; a negative
+    result shows the transfer fits normal DC behavior.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controller network interfaces'
+  range: Last 90 days, with a 30-day per-DC baseline window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = PERCENTILE(orig_bytes, 99) BY dc_host OVER last_30d\newma = EWMA(orig_bytes) BY\
+      \ dc_host\nALERT WHERE orig_bytes > baseline[dc_host]\n  AND (dst_asn FIRST_SEEN OR dst_country\
+      \ FIRST_SEEN OR ewma_drift > threshold)"
+- question: Are there bursts of blocked, reset, proxy-denied, or TLS-handshake-failed outbound connections
+    from a Domain Controller, particularly following a host-side NTDS trigger?
+  context: Even failed exfiltration confirms intent. Profile failure-mode events from DCs - RST/blocked
+    connections, proxy denials, and TLS handshake failures - as a distinct frequency/state series instead
+    of mixing them with successful traffic. A sudden burst of blocked large transfers, especially right
+    after an NTDS dumping or shadow-copy event on the same DC, is itself high-signal for attempted credential
+    exfiltration. A positive result suggests an adversary tried to move the database out and was stopped;
+    a negative result reduces suspicion of an active egress attempt.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controller network interfaces'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = FILTER egress WHERE src IN domain_controllers\n  AND status IN ('RST','blocked','proxy_deny','tls_handshake_fail')\n\
+      series = COUNT fails BY dc_host, bucket(5m)\nALERT WHERE series > baseline_burst[dc_host]\n  OR\
+      \ fails WITHIN 10m AFTER ntds_host_trigger(dc_host)"
+- question: Does a machine-learning model score a Domain Controller's outbound flow as a high-anomaly
+    egress event based on byte volume, ratios, destination reputation, and TLS fingerprint?
+  context: Train an Isolation Forest or Random Forest on flow features - orig_bytes, resp_bytes, byte
+    ratio, resp port, protocol, duration, destination reputation, ASN, JA3, and internal/external flag
+    - and alert on high anomaly scores, surfacing the top-3 contributing features (e.g., bytes, new ASN,
+    port) so analysts can triage quickly. This catches NTDS exfiltration that does not trip simple thresholds
+    because it deviates across several dimensions at once. A positive result flags a flow that statistically
+    does not look like normal DC traffic and warrants payload/destination review; a negative result indicates
+    the flow resembles baseline DC communication.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controller network interfaces'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = EXTRACT(orig_bytes, resp_bytes, byte_ratio, resp_p, proto, duration,\n  dst_reputation,\
+      \ asn, ja3, is_external) FROM dc_flows\nmodel = IsolationForest().fit(historical_dc_flows)\nscore\
+      \ = model.anomaly_score(feats)\nALERT WHERE score > threshold REPORT top_3_features(score)"
+- question: Did a process on a Domain Controller execute a known NTDS dumping command - ntdsutil.exe,
+    vssadmin/wmic/powershell shadow-copy creation, or arguments such as 'ifm', 'create full', 'ac i ntds',
+    '-just-dc', 'secretsdump', 'Invoke-NinjaCopy', or 'Invoke-DCSync'?
+  context: This is the highest-fidelity host-based detection for NTDS theft. Alert on Event ID 4688 /
+    Sysmon 1 when ntdsutil.exe runs on a DC, when a command line contains both 'shadow' and 'create',
+    or when 4688/4104 strings include IFM-export and dumping keywords ('ifm', 'create full', 'ac i ntds',
+    '-just-dc', 'secretsdump', 'Invoke-NinjaCopy', 'Invoke-DCSync', 'Copy-VSS'). These commands are how
+    adversaries extract the AD database for Credential Access. A positive result is near-confirmation
+    of a dumping attempt; a negative result means no known dumping tooling was invoked in the window.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc = FILTER (Event4688 OR Sysmon1 OR Event4104) WHERE host IN domain_controllers\nALERT\
+      \ WHERE proc.image ENDSWITH 'ntdsutil.exe'\n  OR (proc.cmdline CONTAINS 'shadow' AND proc.cmdline\
+      \ CONTAINS 'create')\n  OR proc.cmdline MATCH /(ifm|create full|ac i ntds|-just-dc|secretsdump|Invoke-NinjaCopy|Invoke-DCSync|Copy-VSS)/i"
+- question: Is a process on a Domain Controller running with rare or never-before-seen command-line tokens
+    or unusually high argument entropy compared to that DC's maintenance history?
+  context: Adversary tooling and obfuscated one-liners introduce command-line tokens and parameter distributions
+    that do not appear in a DC's normal administrative activity. Baseline distinct command-line tokens
+    and parameter distributions per process on each DC, then flag executions with rare/never-seen arguments
+    or entropy above the 95th percentile, deriving thresholds from each DC's own maintenance history.
+    A positive result points to anomalous administrative behavior worth inspecting for NTDS dumping; a
+    negative result indicates the command matches routine maintenance.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days, with a per-DC historical baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = TOKEN_FREQ(cmdline) BY dc_host, process OVER history\nALERT WHERE host IN domain_controllers\n\
+      \  AND (cmdline_token NOT IN baseline\n    OR cmdline_entropy > PERCENTILE(entropy, 95) BY dc_host)"
+- question: Are there repeated failed or access-denied process starts (non-zero exits, access-denied on
+    ntdsutil/vssadmin) on a Domain Controller, especially preceding a successful execution?
+  context: Hands-on-keyboard intrusions often involve trial and error. Profile failed/denied process starts
+    and command errors - non-zero exit codes, access-denied on ntdsutil or vssadmin - as a distinct failure
+    series rather than discarding them. Repeated failures that culminate in a success strongly suggest
+    an attacker iterating toward a working NTDS dump. A positive result (a cluster of failures before
+    success) is a high-signal indicator of manual attacker activity; a negative result suggests no struggling
+    dumping attempts occurred.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = FILTER proc_events WHERE host IN domain_controllers\n  AND (exit_code != 0 OR result\
+      \ == 'access_denied')\n  AND image MATCH /(ntdsutil|vssadmin)/i\nALERT WHERE COUNT(fails) BY host,\
+      \ user, bucket(10m) >= N\n  OR fails FOLLOWED_BY success(image) WITHIN 30m"
+- question: Does a character-level deep-learning classifier flag a 4688/4104 command line on a Domain
+    Controller as an obfuscated or encoded NTDS-dumping one-liner?
+  context: Attackers encode and obfuscate PowerShell to evade keyword rules. Score 4688/4104 command lines
+    with a character-level CNN/LSTM classifier trained on benign vs. malicious PowerShell to catch obfuscated/encoded
+    NTDS-dumping one-liners at low false-positive rate, surfacing the top-3 influential tokens in the
+    alert. A positive result flags a command that looks malicious despite obfuscation and should be decoded
+    and reviewed; a negative result indicates the command text does not resemble known dumping patterns.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'cmds = FILTER (Event4688 OR Event4104) WHERE host IN domain_controllers
+
+      model = CharCNN_LSTM().load(''powershell_malicious'')
+
+      score = model.predict(cmds.cmdline)
+
+      ALERT WHERE score > threshold REPORT top_3_tokens(score)'
+- question: Did an atypical parent-child process chain occur on a Domain Controller, such as w3wp.exe
+    or wmiprvse.exe spawning ntdsutil.exe?
+  context: The lineage of a process is as telling as its name. Train an LSTM on parent-child process sequences
+    observed on DCs and alert on atypical chains - for example a web worker (w3wp.exe) or WMI provider
+    host (wmiprvse.exe) spawning ntdsutil.exe - reporting the anomalous chain edges for triage. Such chains
+    indicate dumping launched via web shell or remote execution rather than legitimate admin. A positive
+    result reveals an abnormal execution path worth full process-tree investigation; a negative result
+    shows the process ancestry is consistent with normal DC operation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "chains = BUILD parent_child_sequences FROM proc_events WHERE host IN domain_controllers\n\
+      model = LSTM().fit(historical_chains)\nALERT WHERE model.sequence_prob(chain) < threshold\n  REPORT\
+      \ anomalous_edges(chain)"
+- question: Did any process outside the allowlist read or copy ntds.dit, the %SystemRoot%\NTDS\ directory,
+    or a shadow-copy NTDS path on a Domain Controller?
+  context: Only lsass.exe, System, and sanctioned backup agents (e.g., dfm.exe, vmms.exe, veeam*) should
+    touch the live NTDS database. Alert on Event ID 4663 / Sysmon 11 when ntds.dit, %SystemRoot%\NTDS\*,
+    or a shadow-copy path (\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy*) is read/copied by any process
+    outside that allowlist. This directly catches the file-access step of credential theft. A positive
+    result identifies an unauthorized reader of the AD database and is near-conclusive; a negative result
+    shows only sanctioned processes accessed the file.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controller file systems, specifically the %SystemRoot%\NTDS\ directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "reads = FILTER (Event4663 OR Sysmon11) WHERE host IN domain_controllers\n  AND object_path\
+      \ MATCH /(ntds\\.dit|\\\\NTDS\\\\|HarddiskVolumeShadowCopy)/i\nALERT WHERE reads.process NOT IN\
+      \ ('lsass.exe','System','dfm.exe','vmms.exe','veeam*')"
+- question: Is there a first-seen (ProcessName, SubjectUserName, AccessMask) combination accessing NTDS,
+    or an access occurring outside the scheduled backup window?
+  context: Legitimate NTDS access is repetitive and tied to specific service accounts and backup schedules.
+    Baseline (ProcessName, SubjectUserName, AccessMask) tuples for NTDS access and flag first-seen tuples
+    or accesses occurring outside scheduled backup windows, following structural-rarity baselining. A
+    new actor/permission combination touching the AD database, or access at an unusual time, is suspicious
+    for Credential Access. A positive result surfaces a rare access pattern to investigate; a negative
+    result indicates the access matches an established, scheduled pattern.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controller file systems, specifically the %SystemRoot%\NTDS\ directory'
+  range: Last 90 days, with a per-DC backup-schedule baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = SET(process, subject_user, access_mask) FROM ntds_access OVER history\nALERT WHERE\
+      \ (process, subject_user, access_mask) NOT IN baseline\n  OR access_time OUTSIDE backup_window[dc_host]"
+- question: Are there spikes of Access Denied (4663 result 0xc0000022) events or audit failures on the
+    NTDS directory, particularly before a successful read?
+  context: Probing for the AD database often generates denied attempts before an attacker finds a working
+    path. Profile Access Denied (4663 result 0xc0000022) and audit failures on the NTDS directory as a
+    distinct failure series. A spike of denied reads that precedes a successful read indicates active
+    probing of the database. A positive result (denied-then-success pattern) is a strong indicator of
+    an attacker working toward NTDS access; a negative result suggests no probing of the directory occurred.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controller file systems, specifically the %SystemRoot%\NTDS\ directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "denied = FILTER Event4663 WHERE host IN domain_controllers\n  AND object_path MATCH /\\\\\
+      NTDS\\\\/i AND result == '0xc0000022'\nALERT WHERE COUNT(denied) BY host, user, bucket(10m) > baseline\n\
+      \  OR denied FOLLOWED_BY successful_read WITHIN 30m"
+- question: Does an Isolation Forest over NTDS 4663 access features (ProcessName, SubjectUserName, LogonID,
+    AccessMask, hour) flag a high-anomaly access event?
+  context: Multivariate anomalies in who/what/when accesses NTDS can escape simple allowlists. Train an
+    Isolation Forest on 4663 features - ProcessName, SubjectUserName, LogonID, AccessMask, hour - and
+    alert on high anomaly scores, surfacing the top-3 contributing features. This catches access that
+    is unusual across several dimensions even if no single field is itself blocklisted. A positive result
+    flags an outlier NTDS access for review; a negative result indicates the access fits learned-normal
+    behavior.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controller file systems, specifically the %SystemRoot%\NTDS\ directory'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = EXTRACT(process, subject_user, logon_id, access_mask, hour)\n  FROM Event4663 WHERE\
+      \ object_path MATCH /\\\\NTDS\\\\/i\nmodel = IsolationForest().fit(historical_ntds_access)\nALERT\
+      \ WHERE model.anomaly_score(feats) > threshold REPORT top_3_features"
+- question: Does host provenance modeling reveal an anomalous subgraph where an unusual process reads
+    ntds.dit shortly after a Volume Shadow Copy is created?
+  context: 'The ntds.dit file is typically copied from a shadow snapshot, producing a recognizable provenance
+    pattern: VSS creation followed by a process reading the snapshot''s ntds.dit. Model DC host provenance
+    and flag the anomalous subgraph where an unusual process reads ntds.dit after VSS creation, localizing
+    the offending node for triage. A positive result pinpoints the suspect process and its causal context
+    for rapid response; a negative result indicates no such anomalous read-after-snapshot pattern exists.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controller file systems, specifically the %SystemRoot%\NTDS\ directory'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "graph = BUILD provenance_graph FROM (proc, file, vss) events ON domain_controllers\nmodel\
+      \ = ThreaTrace_or_KAIROS().fit(benign_provenance)\nALERT WHERE model.subgraph_anomaly(vss_create\
+      \ -> proc -> read(ntds.dit)) > threshold\n  REPORT offending_node"
+- question: Was a Volume Shadow Copy created on a Domain Controller by a non-allowlisted account using
+    vssadmin/wmic/powershell with 'shadow'+'create'?
+  context: Shadow copies are the most common way to obtain an unlocked copy of ntds.dit. Alert on Event
+    ID 4688/4104/7036 commands creating Volume Shadow Copies (vssadmin/wmic/powershell with 'shadow' and
+    'create') by accounts not on the sanctioned backup allowlist on DCs. Legitimate snapshots come from
+    known service accounts on schedule; ad-hoc creation by other accounts is a strong precursor to NTDS
+    theft. A positive result flags a likely staging step for credential dumping; a negative result shows
+    snapshot creation was authorized.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 7036
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "vss = FILTER (Event4688 OR Event4104 OR Event7036) WHERE host IN domain_controllers\n  AND\
+      \ cmdline CONTAINS 'shadow' AND cmdline CONTAINS 'create'\nALERT WHERE vss.subject_user NOT IN backup_allowlist"
+- question: Did a Volume Shadow Copy creation or VSS service start on a Domain Controller occur outside
+    its normal daily/weekly backup seasonality?
+  context: Backup snapshots follow predictable daily/weekly rhythms per DC. Model VSS service-start and
+    'shadow create' event times for normal seasonality and flag out-of-schedule creations, deriving each
+    DC's backup-window baseline. A snapshot created off-schedule is far more likely to be adversarial
+    staging for NTDS extraction. A positive result surfaces an off-cycle snapshot to investigate; a negative
+    result indicates the snapshot aligns with the established backup schedule.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 7036
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days, with a per-DC seasonal backup-window baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "schedule = MODEL_SEASONALITY(vss_create_time) BY dc_host\nALERT WHERE host IN domain_controllers\n\
+      \  AND vss_create_time NOT IN expected_window(schedule[dc_host])"
+- question: Are there repeated failed or denied shadow-copy creations and VSS service errors on a Domain
+    Controller, especially preceding a successful snapshot?
+  context: Manual attacker attempts to snapshot the volume frequently fail before succeeding. Profile
+    failed/denied shadow-copy creations and VSS service errors (Event 7036 error states) as a distinct
+    failure series. Repeated failures before a success indicate hands-on attacker effort rather than automated
+    backup. A positive result (failures culminating in a snapshot) signals manual staging for NTDS dumping;
+    a negative result suggests no struggling snapshot attempts occurred.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 7036
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = FILTER Event7036 WHERE host IN domain_controllers\n  AND service ~ 'VSS' AND state\
+      \ IN ('error','stopped_unexpected')\nALERT WHERE COUNT(fails) BY host, bucket(10m) > baseline\n\
+      \  OR fails FOLLOWED_BY successful_vss_create WITHIN 30m"
+- question: Does a tree/forest classifier label a Volume Shadow Copy creation on a Domain Controller as
+    malicious based on account, group membership, timing, and follow-on activity?
+  context: Combine context to separate benign snapshots from staging. Train a decision tree / random forest
+    on features such as ProcessName, SubjectUserName, group membership, time, and follow-on activity (subsequent
+    ntds.dit access or large egress) to label malicious VSS creation, reporting the top-3 features driving
+    the decision. Snapshots followed by NTDS reads or bulk egress are especially suspicious. A positive
+    result flags a snapshot whose surrounding context resembles credential theft; a negative result indicates
+    a benign-looking backup operation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 7036
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = EXTRACT(process, subject_user, group_membership, hour,\n  followon_ntds_read, followon_large_egress)\
+      \ FROM vss_create_events\nmodel = RandomForest().fit(labeled_vss)\nALERT WHERE model.predict(feats)\
+      \ == 'malicious' REPORT top_3_features"
+- question: Did a host or account that is not a legitimate Domain Controller issue a DsGetNcChanges (DCSync)
+    replication request, evidenced by replication control-access-right GUIDs in Event 4662 or DsGetNcChanges
+    in Zeek dce_rpc.log?
+  context: DCSync lets an adversary pull credentials by impersonating a DC's replication, without ever
+    touching ntds.dit on disk. Alert when Event ID 4662 shows the replication control-access-right GUIDs
+    (DS-Replication-Get-Changes 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 / Get-Changes-All 1131f6ad-...) requested
+    by a SID that is NOT a Domain Controller computer account or sanctioned sync service, or when Zeek
+    dce_rpc.log shows DsGetNcChanges from IPs outside the approved DC list. A positive result is near-conclusive
+    evidence of DCSync credential theft; a negative result indicates replication came only from legitimate
+    DCs.
+  answer_sources:
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Network segments connecting to Domain Controllers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "repl = FILTER Event4662 WHERE properties CONTAINS\n  ('1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'\
+      \ OR '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2')\nALERT WHERE repl.subject_sid NOT IN (dc_computer_accounts,\
+      \ sanctioned_sync)\n  OR dce_rpc.log:DsGetNcChanges WHERE orig_h NOT IN approved_dc_list"
+- question: Is there a statistical spike in the number of distinct hosts or accounts issuing DsGetNcChanges,
+    or any first-seen replication requester, beyond normal inter-DC replication?
+  context: Normal AD replication involves a stable, small set of DC computer accounts. Baseline hourly
+    counts of distinct hosts/accounts issuing DsGetNcChanges and flag spikes greater than 3 sigma above
+    the 7-day average, or any first-seen requester, deriving the per-domain baseline from normal inter-DC
+    replication. A new or surging requester points to DCSync abuse. A positive result surfaces an abnormal
+    replication source/volume to investigate; a negative result indicates replication activity matches
+    the known DC mesh.
+  answer_sources:
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Network segments connecting to Domain Controllers, Authentication Servers'
+  range: Last 90 days, with a 7-day replication baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "hourly = COUNT(distinct requester) FROM dsgetncchanges BY bucket(1h)\nALERT WHERE hourly >\
+      \ AVG_7d + 3*STDDEV_7d\n  OR requester NOT IN known_dc_replication_set"
+- question: Are there failed or denied replication attempts (4662 audit failures, access-denied) - especially
+    DCSync attempts originating from a workstation?
+  context: A denied DCSync attempt is high-signal even without success because workstations should never
+    request directory replication. Profile failed/denied replication attempts (4662 audit failures, access-denied)
+    as a distinct failure series. A workstation or non-DC account being denied DsGetNcChanges strongly
+    implies attempted credential theft. A positive result flags an unauthorized replication attempt regardless
+    of outcome; a negative result indicates no denied replication requests were seen.
+  answer_sources:
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Network segments connecting to Domain Controllers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = FILTER Event4662 WHERE result == 'audit_failure' OR result == 'access_denied'\n  AND\
+      \ properties CONTAINS replication_guids\nALERT WHERE fails.source_host NOT IN domain_controllers"
+- question: Does temporal link prediction on the DC/authentication graph flag a low-probability new replication
+    edge originating from a non-DC node?
+  context: Replication relationships form a stable graph; a brand-new edge from a workstation to a DC
+    is improbable under normal conditions. Apply temporal link prediction on the DC/authentication graph
+    and flag low-probability new replication edges from non-DC nodes, scoring against an authentication
+    benchmark and surfacing the originating node and edge novelty. A positive result identifies an anomalous
+    replication relationship consistent with DCSync; a negative result indicates the replication topology
+    is unchanged.
+  answer_sources:
+  - Zeek dce_rpc.log
+  - Windows Event ID 4662
+  - 'NAI: Network segments connecting to Domain Controllers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "graph = BUILD temporal_graph FROM replication_and_auth_events\nmodel = TemporalLinkPredictor().fit(graph_history)\n\
+      ALERT WHERE model.edge_probability(new_edge) < threshold\n  AND src(new_edge) NOT IN domain_controllers\
+      \ REPORT node, edge_novelty"
+- question: Was a host-based NTDS event on a Domain Controller (4688/4663/VSS/4662) followed within 5
+    minutes by outbound traffic exceeding that host's 99th-percentile transfer size?
+  context: Tying the dumping action to the data leaving the building is the strongest end-to-end case
+    for exfiltration. Alert when a T1003.003 host-based event (process execution, NTDS file read, VSS
+    creation, or DCSync) on a DC is followed within 5 minutes by outbound traffic (Zeek conn.log / Sysmon
+    3) exceeding the host's 99th-percentile transfer size, following path-based causal correlation. A
+    positive result links credential collection to exfiltration and is a high-confidence incident; a negative
+    result means a host-side trigger was not immediately followed by bulk egress.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 3
+  - 'NAI: Domain Controllers, Network Egress Points, Internet Gateway'
+  range: Last 90 days, with a 5-minute trigger-to-egress correlation window.
+  queries:
+  - technology: SIEM/correlation pseudocode
+    query: "trigger = FILTER (Event4688 OR Event4663 OR vss_create OR Event4662)\n  WHERE host IN domain_controllers\
+      \ AND matches_T1003_003\negress = FILTER (conn.log OR Sysmon3) WHERE src == trigger.host\n  AND\
+      \ orig_bytes > PERCENTILE(orig_bytes,99) BY host\nALERT WHERE egress WITHIN 5m AFTER trigger"
+- question: Does a per-DC EWMA of outbound volume show a significant positive deviation coinciding with
+    a host-based NTDS trigger?
+  context: An EWMA smooths normal variation so that a meaningful jump stands out. Track per-DC EWMA of
+    outbound volume and alert when a host-based trigger (dumping/VSS/read/DCSync) coincides with a significant
+    positive deviation in transfer volume, deriving smoothing factor and threshold per DC. Pairing the
+    volume deviation with a concurrent host event raises confidence over volume alone. A positive result
+    indicates abnormal egress coincident with a dumping action; a negative result shows volume stayed
+    within smoothed-normal bounds around the trigger.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 3
+  - 'NAI: Domain Controllers, Network Egress Points, Internet Gateway'
+  range: Last 90 days, centered on each host-based trigger.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ewma = EWMA(outbound_bytes) BY dc_host\nALERT WHERE outbound_bytes - ewma[dc_host] > k*STDDEV[dc_host]\n\
+      \  AND host_based_trigger(dc_host) WITHIN correlation_window"
+- question: In the window after a host-side NTDS trigger on a Domain Controller, are there blocked or
+    failed egress attempts (RST, proxy-deny, NXDOMAIN to staging domains)?
+  context: Blocked exfiltration still confirms intent and helps reconstruct the attack even when controls
+    succeed. Profile blocked/failed egress - RST, proxy-deny, NXDOMAIN to staging domains - in the window
+    after a host-side trigger as a distinct failure series. Such failures immediately following an NTDS
+    dumping event indicate the adversary tried and failed to move the database out. A positive result
+    confirms an attempted exfiltration of dumped credentials; a negative result reduces suspicion that
+    data movement was attempted.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 3
+  - 'NAI: Domain Controllers, Network Egress Points, Internet Gateway'
+  range: Last 90 days, within the post-trigger correlation window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "trigger = host_based_ntds_event(dc_host)\nfails = FILTER egress WHERE src == dc_host\n  AND\
+      \ status IN ('RST','proxy_deny','NXDOMAIN')\nALERT WHERE fails WITHIN post_trigger_window AFTER\
+      \ trigger\n  AND (dst IN staging_domains OR status != 'ok')"
+- question: Does a provenance model flag the multi-stage chain (shadow copy creation -> ntds.dit read
+    -> outbound transfer) on a Domain Controller as an anomalous attack path?
+  context: The complete NTDS theft kill chain has a distinctive causal shape. Model the multi-stage causal
+    chain (shadow copy creation, ntds.dit read, then outbound transfer) as a provenance subgraph and flag
+    anomalous attack paths via reconstruction error, auto-summarizing the path for the analyst. Detecting
+    the whole chain at once is far more reliable than any single step and gives a ready incident narrative.
+    A positive result surfaces a reconstructed end-to-end dumping-and-exfiltration path; a negative result
+    indicates no such causal chain is present.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 3
+  - 'NAI: Domain Controllers, Network Egress Points, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "graph = BUILD provenance_graph FROM (vss, file_read, network) events ON domain_controllers\n\
+      model = KAIROS_or_MAGIC().fit(benign_provenance)\nALERT WHERE model.path_reconstruction_error(\n\
+      \  vss_create -> read(ntds.dit) -> outbound_transfer) > threshold\n  REPORT summarized_attack_path"
