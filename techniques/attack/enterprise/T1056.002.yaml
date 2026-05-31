@@ -1,0 +1,549 @@
+name: 'T1056.002: GUI Input Capture'
+id: 05e3ffcc-5e64-4f7b-9de0-cbaefcf5a80e
+description: Investigate whether an adversary is mimicking legitimate operating-system or application
+  GUI components to deceive users into disclosing credentials, and whether captured credentials are then
+  being exfiltrated. GUI Input Capture spoofs trusted authentication prompts (fake UAC dialogs, installer
+  credential boxes, browser/email re-authentication prompts) using PowerShell/.NET on Windows, AppleScript/osascript
+  and NSAlert on macOS, and zenity/kdialog/dialog on Linux. This playbook helps an analyst (1) detect
+  the credential-capture activity itself -- known-malicious tooling by hash, scripting interpreters that
+  build password dialogs, anomalous document/mail-application parent-child process chains, and repeated
+  validation-loop prompts -- and (2) detect the follow-on collection/exfiltration -- temporally correlated
+  outbound C2 connections, credential patterns in HTTP/S POST bodies, and low-bandwidth DNS/ICMP tunneling
+  that immediately follows a suspected capture event. Guidance spans deterministic symbolic-logic floors,
+  statistical baselining, and explainable machine-learning classifiers across Windows event logs, Sysmon,
+  auditd, macOS unified log/osquery, and Zeek/PCAP network telemetry.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process execute on an endpoint whose file hash (SHA256/MD5) matches a curated indicator
+    list of known GUI-based credential-capture tooling (EmPyre osx/prompt, Stitch RAT PowerShell prompt,
+    OSX/Keydnap, PowerSploit Invoke-CredentialPhisher, Mimikatz variants)?
+  context: This is the deterministic signature floor for Credential Access via spoofed GUI prompts. Monitor
+    every process-creation event (Windows EID 4688, Sysmon EID 1, macOS osquery process_events, Linux
+    auditd execve), compute the executable hash, and compare against a curated IoC list of GUI credential-prompt
+    tooling. A match is high-confidence evidence that a known credential-harvesting tool ran on the host,
+    so alert at high severity with hostname, user, process, command line, and matched hash. Keep this
+    hash floor permanently and tune the list rather than removing it; a negative result does not exclude
+    novel or recompiled tooling, which the statistical and ML methods are designed to catch.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4697
+  - 'NAI: User workstations, Remote Desktop servers, Citrix servers, Virtual Desktop Infrastructure (VDI)
+    instances, SIEM correlation engine'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM process_creation (EID 4688 OR Sysmon EID 1 OR osquery process_events OR auditd execve)
+
+      COMPUTE sha256 = hash(Image)
+
+      WHERE sha256 IN credential_stealer_ioc_list  // EmPyre osx/prompt, Stitch, OSX/Keydnap, Invoke-CredentialPhisher
+
+      ALERT severity=high WITH host, user, Image, CommandLine, sha256'
+- question: Is a process executing from a hash that is rare across the enterprise (present on <0.1% of
+    hosts or <5 hosts) and was spawned by a document, mail, or browser application such as OUTLOOK.EXE,
+    WINWORD.EXE, AcroRd32.exe, osascript, or zenity?
+  context: Novel credential-capture tooling will not be on any IoC list, so this statistical method finds
+    rarity instead of signatures. Track enterprise-wide prevalence of each process hash (host count and
+    executions/day) over a rolling 30-day window. A binary that is nearly unique AND launched by a document/mail/browser
+    parent is suspicious because legitimate rare tools are seldom children of Office or browsers. Derive
+    the exact percentile cutoff from your own 30-day hash-prevalence distribution. A positive result warrants
+    pulling the binary and parent context for triage; expect benign first-runs of admin utilities as false
+    positives, which the parent-application constraint reduces.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4697
+  - 'NAI: User workstations, Remote Desktop servers, Citrix servers, Virtual Desktop Infrastructure (VDI)
+    instances, SIEM correlation engine'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM process_creation OVER last 30d
+
+      STATS host_prev = dc(host) BY sha256
+
+      JOIN current_events WHERE ParentImage IN (OUTLOOK.EXE,WINWORD.EXE,AcroRd32.exe,osascript,zenity)
+
+      WHERE host_prev < max(0.001*total_hosts, 5)
+
+      ALERT ''rare binary spawned by document/mail/browser parent'''
+- question: Does a supervised process-behavior classifier score a process-creation event above 0.85 confidence
+    as credential-capture activity based on parent process, path depth, command-line entropy/length, signing
+    status, user context, and time-of-day?
+  context: Where signatures and simple rarity miss, a Gradient Boosting / Random Forest classifier learns
+    the multivariate fingerprint of spoofed-prompt tooling. Score each process-creation event and alert
+    above confidence 0.85. Per explainable-AI practice, attach SHAP/LIME attributions so the alert lists
+    the top-3 contributing features (for example 'unsigned binary', 'document parent', 'high command-line
+    entropy') instead of an opaque score, letting the analyst quickly judge plausibility. This supports
+    Credential Access detection by flagging behaviorally anomalous executions; validate hits against the
+    deterministic and statistical layers before escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4697
+  - 'NAI: User workstations, Remote Desktop servers, Citrix servers, Virtual Desktop Infrastructure (VDI)
+    instances, SIEM correlation engine'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [parent_image, path_depth, cmdline_entropy, cmdline_len, signed, user_ctx, hour]
+
+      score = gbm_model.predict_proba(features)
+
+      IF score > 0.85: ALERT with top3 = shap_explain(features)'
+- question: Did a scripting interpreter (powershell.exe, cscript.exe, wscript.exe) execute command-line
+    or script-block content containing credential-prompt keywords such as 'PromptForCredential', 'Get-Credential',
+    '$host.ui.PromptForCredential', 'System.Windows.Forms', or 'Add-Type'?
+  context: This deterministic keyword floor catches programmatic generation of fake Windows authentication
+    prompts. Scan command-line text (EID 4688, Sysmon EID 1) and PowerShell script-block logs (EID 4104)
+    case-insensitively for the listed strings plus patterns like 'CreateObject.*WScript.Shell'. Alert
+    when multiple keywords co-occur or when the parent is not a legitimate administrative IDE (powershell_ise.exe,
+    code.exe). A positive result strongly indicates a script building a credential dialog to phish the
+    interactive user. Keep these concrete string rules as the always-on floor and tune parent allowlists
+    rather than weakening the keywords.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - auditd:SYSCALL execve
+  - macos:unifiedlog
+  - macos:osquery process_events
+  - 'NAI: User workstations, Domain Controllers, Application servers, Exchange servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM (EID 4688 OR Sysmon EID 1 OR EID 4104 script_block)\nWHERE CommandLine|ScriptBlock MATCHES_CI\
+      \ ('PromptForCredential'|'Get-Credential'|\n  '$host.ui.PromptForCredential'|'System.Windows.Forms'|'Add-Type'|'CreateObject.*WScript\\\
+      .Shell')\nAND ParentImage NOT IN (powershell_ise.exe, code.exe)\nALERT 'PowerShell/WSH credential-prompt\
+      \ construction'"
+- question: On macOS, did osascript execute a script containing 'display dialog' together with 'hidden
+    answer' and password/passphrase/keychain text, or on Linux did 'zenity --password', 'kdialog --password',
+    or 'dialog --passwordbox' run from a non-interactive shell or service context?
+  context: Cross-platform GUI password-dialog matching covers the macOS and Linux variants of spoofed
+    credential prompts. On macOS, osascript run via -e or stdin with 'display dialog' + 'hidden answer'
+    + password/keychain wording is the canonical AppleScript credential-phish pattern; correlate with
+    anomalous applet lineage or a ScriptMonitor.app co-launch. On Linux, zenity/kdialog/dialog password
+    widgets invoked from a non-interactive shell or daemon (rather than an interactive desktop session)
+    indicate a script forcing a credential box on the user. Positive hits are strong Credential Access
+    evidence; benign admin scripts occasionally use these, so weight by parent context and interactivity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - auditd:SYSCALL execve
+  - macos:unifiedlog
+  - macos:osquery process_events
+  - 'NAI: User workstations, Domain Controllers, Application servers, Exchange servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "// macOS\nFROM macos:unifiedlog|osquery process_events\nWHERE proc=osascript AND args MATCHES\
+      \ 'display dialog' AND args MATCHES 'hidden answer'\n  AND args MATCHES_CI (password|passphrase|keychain)\n\
+      ALERT\n// Linux\nFROM auditd execve\nWHERE exe IN (zenity,kdialog,dialog) AND args MATCHES (--password|--passwordbox)\n\
+      \  AND parent_session NOT interactive\nALERT"
+- question: For PowerShell executions, does a script exhibit character entropy above the 98th percentile
+    or script-block length beyond 5 standard deviations from the per-user/host 30-day baseline, with elevated
+    GUI/credential keyword density?
+  context: Obfuscated or unusually complex credential-capture scripts deviate structurally from a user's
+    normal PowerShell. Baseline character entropy, script-block length (EID 4104), and GUI/credential
+    keyword density per user/host over 30 days, then flag entropy above the 98th percentile or length
+    beyond 5 standard deviations from that baseline. These structural features separate benign admin scripts
+    from malicious/obfuscated ones. Derive cutoffs from your own corpus distribution. A positive result
+    flags a script worth decoding and reviewing for prompt-building logic; pair with the keyword rule
+    to confirm credential intent and reduce false positives from large legitimate automation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - auditd:SYSCALL execve
+  - macos:unifiedlog
+  - macos:osquery process_events
+  - 'NAI: User workstations, Domain Controllers, Application servers, Exchange servers'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM EID 4104 OVER 30d
+
+      COMPUTE entropy(script), len(script), kw_density(script) BY user,host
+
+      BASELINE per user,host
+
+      WHERE entropy > p98 OR len > mean+5*stddev
+
+      ALERT ''anomalous PowerShell complexity'''
+- question: Is a single process issuing 3 or more credential-prompt calls (PromptForCredential / Get-Credential
+    / 'display dialog') within 5 minutes, especially interleaved with directory-validation calls or failed
+    logon events (EID 4625)?
+  context: 'Spoofed credential prompts typically re-display until the victim enters a password that validates
+    -- a distinctive repeated-prompt validation loop. Count credential-prompt invocations per process
+    and per host per minute and track the success/fail state of the loop. Flag a process making >=3 prompt
+    calls within 5 minutes, and escalate when interleaved with System.DirectoryServices.AccountManagement
+    validation or EID 4625 failed logons, which reveal the attacker testing entered passwords against
+    the directory. This is a high-fidelity Credential Access signal: legitimate prompts rarely loop. A
+    positive result indicates active credential harvesting in progress and warrants immediate containment.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - auditd:SYSCALL execve
+  - macos:unifiedlog
+  - macos:osquery process_events
+  - 'NAI: User workstations, Domain Controllers, Application servers, Exchange servers'
+  range: Last 90 days, evaluated over rolling 5-minute windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM credential_prompt_events
+
+      BUCKET 5min BY process,host
+
+      COUNT prompts; JOIN dir_validation_calls, EID 4625 failed_logons
+
+      WHERE prompts >= 3
+
+      ALERT ''repeated credential-prompt validation loop'''
+- question: Does an NLP classifier score a new script execution above 0.80 malicious probability, with
+    top contributing tokens such as 'PromptForCredential', 'hidden answer', or high keyword density?
+  context: An NLP model (char-level CNN/LSTM or TF-IDF/token+AST hybrid) trained on benign admin scripts
+    versus credential-capture payloads generalizes beyond fixed keyword lists, catching renamed functions
+    and novel obfuscation. Score new script executions and alert above 0.80 malicious probability. Surface
+    the top-3 contributing tokens/features in the alert so the analyst sees why it fired (for example
+    'PromptForCredential', 'hidden answer', high keyword density). This complements the deterministic
+    keyword floor for Credential Access; confirm hits by reading the decoded script and checking parent
+    lineage before escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4104
+  - auditd:SYSCALL execve
+  - macos:unifiedlog
+  - macos:osquery process_events
+  - 'NAI: User workstations, Domain Controllers, Application servers, Exchange servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'tokens = tokenize(script_text)
+
+      prob = nlp_model.predict(tokens)  # char-CNN/LSTM or TF-IDF+AST
+
+      IF prob > 0.80: ALERT with top3_tokens = explain(tokens)'
+- question: Did a document or mail application (WINWORD.EXE, OUTLOOK.EXE, AcroRd32.exe) spawn a scripting
+    interpreter (powershell.exe, cmd.exe, wscript.exe, osascript) or an unsigned binary outside trusted
+    directories?
+  context: Block-list enforcement of dangerous parent-child pairs catches macro-based attacks and phishing
+    documents that launch credential-capture scripts. Maintain forbidden pairs -- Office/Adobe/mail apps
+    spawning script interpreters; any document/mail app spawning osascript or a credential-dialog builder;
+    non-Terminal/service parents spawning osascript or zenity/kdialog --password -- and alert on matching
+    process-creation events (EID 4688, Sysmon EID 1, auditd execve, osquery). Also flag document apps
+    spawning unsigned binaries outside System32/Program Files/trusted app dirs. This is a strong deterministic
+    Credential Access/initial-execution signal; legitimate add-ins occasionally trip it, so maintain a
+    tight allowlist.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4688 (ParentImage)
+  - 'NAI: User workstations, File servers hosting Office documents, Mail servers, SIEM correlation engine'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM process_creation (EID 4688 OR Sysmon EID 1 OR auditd execve OR osquery)
+
+      WHERE ParentImage IN (WINWORD.EXE,OUTLOOK.EXE,AcroRd32.exe) AND Image IN (powershell.exe,cmd.exe,wscript.exe,osascript)
+
+      OR (ParentImage doc/mail app AND Image unsigned AND Path NOT IN trusted_dirs)
+
+      ALERT ''dangerous parent-child pair'''
+- question: Is a parent-child process pair a first-seen or bottom-1% rare combination over the last 30
+    days where the child is a scripting interpreter, osascript, or zenity/kdialog?
+  context: Rarity scoring finds suspicious lineage that a static block-list misses. Build a 30-day frequency
+    table of parent-child pairs and score rarity as inverse prevalence percentile. Flag first-seen pairs
+    in the bottom 1% when the child is a script interpreter, osascript, or zenity/kdialog, and escalate
+    pairs involving known phishing vectors such as mail or file-sharing applications. A positive result
+    indicates an execution chain the environment has essentially never produced before, which for credential-dialog-capable
+    children is a meaningful Credential Access lead. Benign novel automation can appear; the script-child
+    constraint and phishing-vector escalation focus attention.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4688 (ParentImage)
+  - 'NAI: User workstations, File servers hosting Office documents, Mail servers, SIEM correlation engine'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM process_creation OVER 30d
+
+      STATS prevalence BY (ParentImage,Image)
+
+      WHERE Image IN (script_interpreters,osascript,zenity,kdialog) AND prevalence <= p1
+
+      ALERT ''rare/first-seen parent-child chain'''
+- question: Does an unsupervised anomaly detector (Isolation Forest/LOF) score a process-chain above the
+    0.75 percentile based on parent/child identity, user context, time, and command-line entropy/length/URL
+    patterns?
+  context: Unsupervised process-graph anomaly detection learns normal process lineage and surfaces deviations
+    without labeled data. Apply Isolation Forest or LOF to process-chain features (one-hot parent/child,
+    user context, time, command-line entropy/length/URL patterns) and flag scores above the 0.75 percentile.
+    Include the top-3 deviating features in the alert (for example 'rare parent', 'osascript child', 'off-hours')
+    so the analyst understands the anomaly. This catches credential-capture execution chains that evade
+    fixed rules; corroborate with the keyword, loop, and block-list questions before escalating, as unusual-but-benign
+    administrative activity will also score high.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 4688 (ParentImage)
+  - 'NAI: User workstations, File servers hosting Office documents, Mail servers, SIEM correlation engine'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = onehot(parent,child) + [user,hour,cmd_entropy,cmd_len,has_url]
+
+      score = iforest.decision_function(features)
+
+      IF percentile(score) > 0.75: ALERT top3=explain(features)'
+- question: Within 5-15 minutes of a suspected GUI credential-capture alert, did the same host (or the
+    capturing process/child) initiate an outbound connection to a known C2/Tor blocklist destination or
+    to a never-before-seen external destination?
+  context: This temporal-spatial correlation links Credential Access to Collection/exfiltration. Correlate
+    capture alerts from the credential-access evidence with Zeek conn.log within a 5-15 minute window
+    and alert when the same host connects to an IP/domain on a curated C2/Tor blocklist (e.g., MISP feeds),
+    matching the capture-then-exfiltrate pattern of malware like OSX/Keydnap. As a first-party fallback
+    requiring no external feed, alert when the capturing process or its child opens a new outbound connection
+    to a never-before-seen external destination inside the window. A positive result is strong evidence
+    that harvested credentials are leaving the environment and warrants immediate containment.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 3033
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: 5-15 minutes after each capture alert; correlation over Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'JOIN capture_alerts a, zeek_conn c ON a.host=c.host AND c.ts BETWEEN a.ts AND a.ts+15min
+
+      WHERE c.dest IN c2_tor_blocklist OR c.dest NOT IN host_known_destinations
+
+      ALERT ''post-capture outbound to C2/new destination'''
+- question: In the 5-15 minutes after a capture alert, do the host's DNS queries resolve newly registered
+    (<30 day) domains, exhibit hostname entropy >3.5, target rare resolvers, or show a spike in NXDOMAIN/SERVFAIL
+    responses?
+  context: Adversaries often resolve attacker infrastructure immediately before exfiltrating captured
+    credentials. For hosts with capture alerts, extract DNS queries (Zeek dns.log) 5-15 minutes post-alert
+    and compute domain age, hostname entropy, TTL, and resolver-IP rarity; flag newly registered domains
+    (<30 days), entropy >3.5, or destinations seen on <1% of connections. Also profile NXDOMAIN/SERVFAIL
+    rates, since a spike in failed resolutions is a distinct beacon/exfil signal. Positive results corroborate
+    that the host is reaching attacker-controlled infrastructure to ship credentials; combine with the
+    conn.log correlation for higher confidence.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 3033
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: 5-15 minutes after each capture alert
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM dns.log WHERE host IN capture_hosts AND ts within 15min of alert
+
+      COMPUTE domain_age, entropy(qname), ttl, resolver_rarity, nxdomain_rate
+
+      WHERE domain_age < 30d OR entropy > 3.5 OR seen_pct < 1% OR nxdomain_rate spikes
+
+      ALERT'
+- question: Does a DGA/C2 classifier score a host's post-capture DNS/TLS activity above 0.80 confidence
+    based on n-grams, entropy, WHOIS age, IP reputation, and TLS-certificate anomalies?
+  context: Algorithmically generated domains and disposable C2 infrastructure are common credential-exfil
+    destinations. Apply a DGA/C2 classifier on n-grams, entropy, WHOIS age, IP reputation, and TLS-cert
+    anomalies (Zeek dns.log/ssl.log) and alert at >0.80 DGA confidence. List the top-3 contributing features
+    (for example 'high bigram improbability', 'young domain', 'rare resolver') in the alert for fast triage.
+    In the Collection context this confirms that the destination contacted after a capture event is likely
+    adversary-controlled rather than a benign service, strengthening the case that captured credentials
+    are being exfiltrated.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 3033
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: 5-15 minutes after each capture alert; model trained over Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [ngram_prob, entropy, whois_age, ip_rep, tls_cert_anom]
+
+      conf = dga_model.predict(features)
+
+      IF conf > 0.80: ALERT top3=explain(features)'
+- question: Does an outbound HTTP/S POST request body contain credential field patterns like 'username='/'password='/'email='
+    and originate from a process that is not a whitelisted browser or trusted agent (e.g., powershell.exe,
+    rundll32.exe, an unsigned binary)?
+  context: This regex floor detects credentials being POSTed off the host. Inspect HTTP request bodies
+    (Zeek http.log; TLS decryption where available) for patterns such as (username|uid|user|login|email|account)\s?=([^&\s]+)
+    and (password|pwd|pass)\s?=([^&\s]+), and correlate with process creation. Alert when the originating
+    process is not a whitelisted browser (chrome.exe, firefox.exe, iexplore.exe) or trusted agent, which
+    indicates likely credential exfiltration rather than normal web login. For HTTPS without decryption,
+    fall back to metadata (SNI, destination, timing). A positive result is direct evidence of Collection/exfiltration
+    of harvested credentials.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Web proxy logs
+  - 'NAI: Web proxies with TLS inspection, Network TAPs at egress points, Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM http.log\nWHERE method=POST AND body MATCHES '(username|uid|user|login|email|account)\\\
+      s?=[^&\\s]+'\n  AND body MATCHES '(password|pwd|pass)\\s?=[^&\\s]+'\nJOIN process_creation ON host,conn\n\
+      WHERE proc NOT IN (chrome.exe,firefox.exe,iexplore.exe,trusted_agents)\nALERT"
+- question: Did a non-browser process issue a small (<1 KB) HTTP POST that is 3 standard deviations from
+    its own mean size, or did POST frequency from a typically non-web process jump more than 10x within
+    an hour, accompanied by a burst of 401/403/404 responses?
+  context: 'Statistical anomaly detection on POST size and frequency catches scripted credential exfiltration
+    that does not match an obvious regex. Baseline HTTP POST sizes per process over 30 days (Volume) and
+    POST frequency (Frequency). Alert when a non-browser process issues a small (<1 KB) POST that is 3
+    standard deviations from its own mean, or when POST frequency from a typically non-web process spikes
+    >10x within an hour. Profile the HTTP response state too: a burst of 401/403/404 from candidate exfil
+    endpoints is a distinct failure-mode signal of automated, non-interactive activity. Positive results
+    indicate anomalous outbound data movement consistent with credential Collection.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Web proxy logs
+  - 'NAI: Web proxies with TLS inspection, Network TAPs at egress points, Endpoints'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM http.log POSTs OVER 30d
+
+      BASELINE size,freq BY process
+
+      WHERE process NOT browser AND (size < 1KB AND |size-mean|>3*stddev OR freq > 10x_baseline_1h)
+
+      PROFILE response_codes (401/403/404 burst)
+
+      ALERT ''anomalous POST exfil pattern'''
+- question: Does a multi-modal HTTP classifier label a scripting or unsigned-binary connection as malicious
+    above 0.85 confidence using process name, signing status, destination reputation, SNI, URI patterns,
+    TLS subject, method frequency, and payload entropy?
+  context: A supervised multi-modal model fuses endpoint and network features to identify credential-exfil
+    HTTP that simple rules miss. Classify HTTP connections on process name, signing status, destination
+    reputation, SNI, URI patterns (e.g., /api/login, /admin), TLS subject, method frequency, and payload
+    entropy. Alert on scripting/unsigned-binary connections labeled malicious above 0.85 and surface the
+    top-3 features driving the score for analyst triage. In the Collection context, a positive result
+    indicates a non-browser process communicating in a way consistent with shipping captured credentials
+    to attacker infrastructure; corroborate with the regex and statistical questions before escalation.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Web proxy logs
+  - 'NAI: Web proxies with TLS inspection, Network TAPs at egress points, Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [proc, signed, dest_rep, sni, uri_pattern, tls_subject, method_freq, payload_entropy]
+
+      label = http_model.predict(features)
+
+      IF malicious_prob > 0.85: ALERT top3=explain(features)'
+- question: Within minutes of a suspected capture event, are there DNS queries longer than 100 characters,
+    with high-entropy subdomains (>4.0), or ICMP echo requests carrying large/non-zero payloads (>1,000
+    bytes) indicative of tunneling?
+  context: Low-bandwidth covert channels are ideal for slipping small credential payloads past egress
+    controls. Monitor Zeek dns.log for queries >100 characters, high-entropy subdomains (entropy >4.0),
+    and repeating tunneling patterns, and correlate to recent capture alerts on the host. Also monitor
+    Zeek icmp.log for echo requests with non-zero/large payloads (>1,000 bytes) suggestive of ICMP tunneling
+    of credentials. A positive result post-capture strongly implies the adversary is exfiltrating harvested
+    credentials via DNS or ICMP tunneling, a high-priority Collection/exfiltration finding that warrants
+    blocking the channel and isolating the host.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek icmp.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Network PCAP
+  - 'NAI: DNS resolvers, Network egress points (firewalls), Endpoints, SIEM correlation engine'
+  range: Within minutes of each capture alert; baseline over Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM dns.log WHERE len(qname) > 100 OR entropy(subdomain) > 4.0
+
+      CORRELATE host IN recent_capture_hosts
+
+      UNION FROM icmp.log WHERE type=echo AND payload_len > 1000
+
+      ALERT ''DNS/ICMP tunneling post-capture'''
+- question: Do a host's DNS or ICMP metrics jump more than 3 standard deviations from its 30-day baseline
+    within a 5-minute post-capture window (e.g., query length, unique subdomains/hour, TXT frequency,
+    ICMP echo rate/payload size), including elevated NXDOMAIN counts?
+  context: Statistical baselining catches tunneling that stays under fixed thresholds by measuring deviation
+    from each host's own normal. Maintain per-host 30-day baselines for DNS (median query length, unique
+    subdomains/hour, TXT frequency, record types) and ICMP (echo rates, payload sizes, inter-packet timing).
+    Flag jumps greater than 3 standard deviations within a 5-minute post-capture window. Per the failure-mode
+    principle, treat elevated NXDOMAIN counts as a separate tunneling/exfil indicator. A positive result
+    indicates anomalous covert-channel activity temporally tied to a credential capture, supporting the
+    Collection hypothesis; tune baselines to suppress noisy hosts.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek icmp.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Network PCAP
+  - 'NAI: DNS resolvers, Network egress points (firewalls), Endpoints, SIEM correlation engine'
+  range: 5-minute windows after capture alerts; baseline over Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'BASELINE per host 30d: dns_qlen, uniq_subdomains/h, txt_freq, icmp_rate, icmp_payload
+
+      WHERE metric > mean+3*stddev within 5min post-capture OR nxdomain_count spikes
+
+      ALERT'
+- question: Does an unsupervised tunnel detector (Isolation Forest/LOF) flag a host's DNS/ICMP traffic
+    as anomalous based on query/response size distributions, label entropy, record-type prevalence, inter-packet
+    intervals, and payload variance?
+  context: Unsupervised models detect novel tunneling without labeled samples. Train Isolation Forest/LOF
+    on per-host DNS/ICMP features (query/response size distributions, label entropy, record-type prevalence,
+    inter-packet intervals, payload variance), score real-time traffic, and include the top-3 anomaly-driving
+    features in the alert to aid triage. Corroborate downstream credential reuse with login-graph anomaly
+    detection to catch structurally anomalous logins from the exfiltrated credentials. A positive result
+    indicates covert-channel exfiltration consistent with credential Collection; validate against the
+    symbolic-logic and statistical tunnel questions and recent capture alerts before escalating.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek icmp.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Network PCAP
+  - 'NAI: DNS resolvers, Network egress points (firewalls), Endpoints, SIEM correlation engine'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [qsize_dist, rsize_dist, label_entropy, rtype_prev, ipi, payload_var]
+
+      score = iforest.decision_function(features)
+
+      IF anomalous: ALERT top3=explain(features); CHECK login_graph_anomaly(reused creds)'
