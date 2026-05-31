@@ -1,0 +1,288 @@
+name: 'D3-DLIC: Driver Load Integrity Checking'
+id: 275d79e3-381d-4e8f-9e79-e28b4cac45c3
+description: Investigate the integrity of drivers loaded during operating-system initialization and at
+  runtime. This playbook helps an analyst validate that unauthorized, unsigned, revoked, or known-vulnerable
+  drivers are prevented from loading, that code-integrity block/failure events are surfaced and escalated,
+  and that rare or suspicious driver loads are reviewed against a trusted enterprise inventory and threat-intel
+  catalogs (e.g., LOLDrivers, Microsoft Recommended Driver Block Rules). It also covers runtime kernel/module
+  integrity attestation and whole-system provenance to detect drivers that bypass load-time checks or
+  conceal themselves after loading (rootkit/DKOM), using out-of-band attestation, kernel data-structure
+  invariant checks, cross-view comparison, statistical prevalence/change-point baselining, and explainable
+  provenance-graph machine-learning models. The goal is to detect Bring-Your-Own-Vulnerable-Driver (BYOVD)
+  activity, tampered or copied signatures, and kernel-level compromise on Windows and Linux hosts, with
+  particular focus on Domain Controllers, privileged workstations, and high-value virtualized servers.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did Windows Code Integrity block or fail to validate any driver/kernel image, and have those
+    events been escalated as high-priority alerts enriched with host criticality, user context, and the
+    process lineage that attempted the driver install?
+  context: 'Under the Harden tactic, Code Integrity enforcement is the load-time gate that prevents untrusted
+    drivers from initializing. Every block/failure event is security-relevant: EID 3033 (image blocked
+    because it did not meet the required signing level), 3077 (image blocked by a code-integrity policy),
+    3004 (image failed validation), and 3037 (an unsigned image/driver was loaded) each indicate that
+    something attempted to run a driver the policy distrusts. Generate a high-priority alert per event
+    and enrich it with how critical the host is, who was logged on, and which process spawned the driver-install
+    (service-control, installer, etc.). Treat audit-mode ''would-have-blocked'' equivalents (3036/3076)
+    as tuning signals before you move a policy to enforcement, so you do not break legitimate drivers.
+    A positive result (real blocks on a production host) is a strong indicator of attempted BYOVD or tampered-driver
+    execution; a clean result confirms enforcement is holding.'
+  answer_sources: &id001
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3033
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3077
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3004
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3037
+  - Sysmon Event ID 6
+  - Windows Security Event ID 7045
+  - Windows Security Event ID 4697
+  - Zeek conn.log
+  - 'NAI: All managed Windows endpoints, with a focus on Domain Controllers and privileged user workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Microsoft-Windows-CodeIntegrity/Operational
+
+      | where EventID in (3033, 3077, 3004, 3037)
+
+      | enrich host_criticality, logged_on_user
+
+      | join recent_process_lineage on host, ~install_window
+
+      | set severity = "high"
+
+      | alert
+
+      // audit-mode tuning only: EventID in (3036, 3076) -> severity=info'
+- question: Do any loaded drivers (Sysmon Event ID 6) fail to match the approved enterprise driver inventory,
+    and does each loaded driver's Authenticode status validate as Valid with a recomputed digest that
+    actually matches the embedded signature block (not merely a trusted signer name)?
+  context: 'Hardening assumes only approved, properly signed drivers load. Compare each Sysmon EID 6 loaded-driver
+    hash and signature chain to a curated approved-driver inventory and alert on unsigned, revoked, untrusted,
+    or simply unapproved drivers even when the load succeeded. Crucially, do not trust the signer name
+    alone: verify the Authenticode Status is Valid AND that the recomputed file digest matches the signature
+    block. A Bad Digest (0x80096010) or otherwise invalid status means the signature was copied onto,
+    or the file tampered after, signing - the dominant failure mode of certified malware. A positive result
+    surfaces a driver that is either off-inventory or carrying a forged/copied signature, both high-value
+    leads for kernel compromise.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventID=6\n| lookup approved_driver_inventory on ImageLoaded_hash -> approved\n\
+      | where approved!=true OR Signed!=true OR SignatureStatus!=\"Valid\"\n       OR recompute_digest(ImageLoaded)\
+      \ != signature_block_digest\n| where SignatureStatus==\"Bad Digest(0x80096010)\" as tamper_flag\n\
+      | alert severity=high"
+- question: Do any loaded-driver hashes or signer metadata match the LOLDrivers catalog of known-vulnerable
+    / malicious drivers, and are the Microsoft Recommended Driver Block Rules (Vulnerable Driver Blocklist
+    / HVCI) confirmed active on the host?
+  context: 'A legitimately signed but vulnerable driver loading is a high-confidence Bring-Your-Own-Vulnerable-Driver
+    (BYOVD) indicator: the attacker abuses a trusted driver''s flaws to gain kernel execution. Match Sysmon
+    EID 6 / CodeIntegrity driver hashes (SHA256/SHA1/MD5, Imphash) and signer metadata against the LOLDrivers
+    catalog. Simultaneously confirm the host actually has the Microsoft Vulnerable Driver Blocklist /
+    HVCI enforced - if a known-vulnerable driver loaded successfully, the blocklist may be disabled or
+    bypassed. A match here, especially on a privileged host, warrants immediate response.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (Sysmon EventID=6, CodeIntegrity)
+
+      | lookup loldrivers on (SHA256, SHA1, MD5, Imphash, signer) -> known_bad
+
+      | where known_bad=true
+
+      | join hvci_blocklist_status on host where blocklist_active!=true as gap
+
+      | alert severity=critical'
+- question: Are any drivers loading from user-writable paths (e.g., %TEMP%, %APPDATA%, ProgramData, user
+    profile), and do those loads correlate with newly registered kernel-mode services (Security EID 7045
+    / 4697) pointing at the same paths?
+  context: Legitimate drivers almost always reside in protected system locations; a driver loading from
+    a user-writable directory is abnormal and is a documented stage of kernel-threat installation. Flag
+    Sysmon EID 6 driver loads whose ImageLoaded path is user-writable, then correlate with new kernel-mode
+    service installs (EID 7045) or service-creation audit events (EID 4697) that reference those same
+    suspicious paths. The chained observation - a driver dropped to a writable path AND a new kernel service
+    created to load it - is a strong installation signal for rootkits/BYOVD. A positive correlation is
+    a high-priority lead; isolated suspicious-path loads still merit review.
+  answer_sources: *id001
+  range: Last 90 days, correlate driver-load and service-creation events within a 10-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventID=6\n| where ImageLoaded matches \"(?i)\\\\(Temp|AppData|ProgramData|Users)\\\
+      \\\"\n| join (source IN (Security EventID=7045, Security EventID=4697)\n        | where ServiceType==\"\
+      kernel mode driver\"\n        | where ImagePath matches user_writable_path)\n     on host within\
+      \ 10m\n| alert severity=high"
+- question: Which loaded drivers are rare across the enterprise (below the 1st percentile of fleet prevalence),
+    and of those, which have weak or absent signature trust and should be prioritized for analyst review?
+  context: 'Rarity is a robust heuristic: malicious or attacker-supplied drivers are typically present
+    on very few hosts, whereas legitimate drivers are widespread. Compute the prevalence of each driver
+    hash across all endpoints, derive a percentile cutoff from a 30-90 day fleet baseline, and identify
+    drivers below the 1st percentile. Cross-reference those rare drivers with signature trust and surface
+    the rare-AND-untrusted intersection first. This statistical approach catches novel BYOVD/rootkit drivers
+    that no IOC list yet covers. A driver that is both extremely rare and weakly signed is a prime candidate
+    for deep inspection.'
+  answer_sources: *id001
+  range: Last 90 days, prevalence baseline computed over a rolling 30-90 day window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventID=6 earliest=-90d
+
+      | stats dc(host) as host_count by ImageLoaded_hash, Signed, SignatureStatus
+
+      | eventstats perc1(host_count) as p1
+
+      | where host_count <= p1
+
+      | eval trust_score = case(Signed!=true,0, SignatureStatus!="Valid",1, true,2)
+
+      | sort trust_score asc, host_count asc
+
+      | table ImageLoaded_hash, host_count, trust_score'
+- question: On any host, has the volume (count of new/unique driver loads and distinct load paths) or
+    frequency (driver loads per hour) of driver-load activity spiked beyond its established percentile
+    bands, indicating possible rootkit or BYOVD activity?
+  context: Sudden bursts of driver-load activity, or a spike in distinct load paths, can mark rootkit
+    installation or rapid BYOVD staging. Track per-host Volume (unique driver loads, distinct paths) and
+    Frequency (loads/hour), establish percentile bands, and apply change-point detection methods (CUSUM,
+    Bayesian online CPD, PELT) to flag abrupt regime shifts. Corroborate suspicious spikes with sudden
+    drops in post-load telemetry, which can indicate a kernel component blinding the sensor. A statistically
+    significant spike on a normally quiet host - especially a Domain Controller or privileged workstation
+    - warrants prompt investigation.
+  answer_sources: *id001
+  range: Last 90 days, evaluate change points against a rolling per-host baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Sysmon EventID=6 earliest=-90d\n| bin _time span=1h\n| stats count as loads, dc(ImageLoaded)\
+      \ as unique_drivers,\n        dc(ImageLoaded_path) as distinct_paths by host, _time\n| changepoint(loads,\
+      \ method=cusum|pelt) by host\n| where changepoint_detected=true OR loads > perc99(loads_by_host)\n\
+      | alert severity=medium"
+- question: Has any host or user shown a statistically significant spike in code-integrity failure signals
+    - validation failures (EID 3004), blocked loads (3033/3077), or Bad-Digest/invalid-signature ratios
+    - that would indicate repeated tampered-driver load attempts?
+  context: 'Beyond individual blocks, the rate of failures is itself a feature. Baseline distinct failure
+    signals per host/user: CodeIntegrity validation failures (EID 3004), blocked loads (3033/3077), and
+    the ratio of Bad-Digest/invalid-signature events. Apply change-point detection to alert on significant
+    spikes. A burst of invalid-signature load attempts is a strong tamper signal because Bad Digest is
+    the dominant signed-malware failure mode - it suggests something is repeatedly trying to load a driver
+    whose signature does not match its contents. A sustained spike localized to one host or account is
+    a high-value lead.'
+  answer_sources: *id001
+  range: Last 90 days, evaluate failure-rate change points per host/user
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Microsoft-Windows-CodeIntegrity/Operational earliest=-90d\n| bin _time span=1h\n| stats\
+      \ count(eval(EventID=3004)) as val_fail,\n        count(eval(EventID IN (3033,3077))) as blocked,\n\
+      \        count(eval(SignatureStatus=\"Bad Digest(0x80096010)\")) as bad_digest\n        by host,\
+      \ user, _time\n| eval bad_ratio = bad_digest / (val_fail+blocked+1)\n| changepoint(val_fail, blocked,\
+      \ bad_ratio) by host, user\n| where changepoint_detected=true | alert severity=high"
+- question: Does an out-of-band attestation (coprocessor, hypervisor, or secure enclave) show any deviation
+    between the live kernel text, loaded module/driver text, and syscall/jump tables versus a signed known-good
+    baseline?
+  context: Sophisticated drivers can subvert the host OS so that in-guest tools report a clean state.
+    From an out-of-band vantage point that the compromised OS cannot influence, periodically hash immutable
+    kernel text, loaded module/driver text, and the syscall/jump tables, then compare against a signed
+    known-good baseline. Any deviation indicates a tampered or injected driver or kernel hook - even when
+    the host is fully subverted. This is the runtime complement to load-time hardening and is especially
+    valuable on high-value servers, Domain Controllers, and virtualized hosts where hypervisor-level inspection
+    exists. A deviation is a near-certain compromise indicator.
+  answer_sources: &id002
+  - Sysmon Event ID 6
+  - Windows kernel audit / ETW provenance
+  - Linux auditd / eBPF kernel-module load events
+  - Hypervisor / out-of-band memory attestation
+  - 'NAI: High-value servers, Domain Controllers, and virtualized hosts where out-of-band or hypervisor-level
+    inspection is available.'
+  range: Last 90 days, attestation performed on a periodic (e.g., hourly) schedule
+  queries:
+  - technology: Attestation/pseudocode
+    query: "for each host with out-of-band vantage (coprocessor|hypervisor|enclave):\n  measured = hash(kernel_text,\
+      \ loaded_module_text, syscall_table, idt/jump_tables)\n  baseline = signed_known_good[host]\n  if\
+      \ measured != baseline:\n      alert(host, diff(measured, baseline), severity=critical)"
+- question: Do live kernel data structures violate any semantic invariants (e.g., runnable tasks missing
+    from the all-tasks list, inconsistent module/driver lists, function pointers not referencing known
+    module text), and does a hypervisor-reconstructed module/process list differ from in-guest enumeration,
+    revealing hidden drivers?
+  context: 'Rootkits using Direct Kernel Object Manipulation (DKOM) hide drivers by unlinking them from
+    kernel lists while keeping them executing. Check semantic invariants over live kernel structures:
+    every runnable task must appear in the all-tasks list, module/driver lists must be internally consistent,
+    and function pointers must reference known module text. Then perform cross-view comparison - reconstruct
+    module/process lists from the hypervisor and compare against in-guest enumeration; any item visible
+    externally but missing internally is a hidden driver. A failed invariant or a cross-view discrepancy
+    is strong evidence of kernel-level concealment.'
+  answer_sources: *id002
+  range: Last 90 days, invariant and cross-view checks on a periodic schedule
+  queries:
+  - technology: Hypervisor/pseudocode
+    query: "invariants:\n  assert every runnable_task in all_tasks_list\n  assert module_list consistent\
+      \ across enumeration paths\n  assert all func_ptrs in {known_module_text_ranges}\ncross_view:\n\
+      \  ext = hypervisor_reconstruct(modules, processes)\n  inn = in_guest_enumerate(modules, processes)\n\
+      \  if ext - inn: alert(hidden = ext - inn, severity=critical)"
+- question: Within a fleet of identical hosts/VMs, does any single host's driver-load or kernel-event
+    frequency distribution diverge from its peers, indicating compromise without needing a pre-trained
+    baseline?
+  context: Identical hosts (e.g., a cluster of cloned VMs or a uniform DC pool) should exhibit similar
+    kernel-module and driver-load profiles. Compare driver-load and kernel-event frequency distributions
+    across peers using distributional/change-point tests and flag the outlier whose distribution shifts
+    away from the group. This peer-relative method needs no historical baseline - the fleet itself is
+    the reference - making it effective for newly provisioned or rarely changing systems. A single host
+    that drifts from an otherwise-tight peer cluster is a prime compromise candidate.
+  answer_sources: *id002
+  range: Last 90 days, peer-relative comparison across the identical-host group
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (Sysmon EventID=6, kernel_events) earliest=-90d
+
+      | where host in identical_peer_group
+
+      | stats count by host, event_type
+
+      | compute distribution per host
+
+      | distributional_test(host_dist vs peer_group_dist)  // KS / chi-square / CPD
+
+      | where divergence_pvalue < 0.01
+
+      | alert outlier_host severity=high'
+- question: Do host-level provenance-graph anomaly models flag any coordinated or abrupt deviation in
+    driver-load behavior (frequency, novelty, signer, path), and can node-level scoring localize the specific
+    anomalous driver/module?
+  context: Provenance-graph anomaly detection captures relationships that simple rules miss. Train host-level
+    models on driver-load features - frequency, novelty, signer trust, and load path - and use streaming
+    graph sketches to detect coordinated or abrupt deviations across the whole-system provenance graph;
+    node-level scoring then localizes the specific anomalous driver/module node. This ML layer runs in
+    parallel with, and never replaces, the deterministic signing/IOC floor - it is a discovery aid for
+    novel behavior, not a verdict. A high anomaly score on a driver node, corroborated by signing/IOC
+    checks, warrants analyst review.
+  answer_sources: *id002
+  range: Last 90 days, streaming/online scoring with periodic model retraining
+  queries:
+  - technology: ML/pseudocode
+    query: "features = {load_freq, novelty, signer_trust, load_path} per driver node\nmodel = provenance_graph_anomaly(streaming_sketch)\
+      \   // UNICORN-style\ngraph_score = model.score(host_provenance_graph)\nnode_scores = ThreaTrace.localize(host_provenance_graph)\n\
+      if graph_score > threshold:\n    alert(top_nodes=node_scores.topk(), severity=medium)\n// always\
+      \ cross-check against signing + IOC floor before verdict"
+- question: For each model-generated driver-load alert, can the analyst be shown the reconstructed anomalous
+    subgraph and the top-3 contributing features (e.g., driver rarity, signer trust, load path, failure
+    ratio) to enable fast, confident triage?
+  context: 'Unexplained ML alerts erode analyst trust and slow triage. For every model-generated driver-load
+    alert, reconstruct the anomalous edges/attack subgraph with a temporal GNN and emit the top-3 contributing
+    features (driver rarity, signer trust, load path, failure ratio, etc.) directly in the alert text
+    using SHAP/LIME attributions. This gives the SOC analyst the causal context needed to confirm or dismiss
+    the alert quickly and to pivot to corroborating deterministic evidence. The value here is measured
+    in triage speed and accuracy: a well-explained alert is actioned correctly; an opaque one is ignored
+    or mishandled.'
+  answer_sources: *id002
+  range: Last 90 days, generated per ML alert at detection time
+  queries:
+  - technology: ML/pseudocode
+    query: "on each ml_driver_alert:\n  subgraph = temporal_gnn_reconstruct(alert)        // KAIROS-style\n\
+      \  attributions = shap_or_lime(model, alert.features)\n  alert.explanation = top3(attributions)\
+      \            // e.g., rarity, signer, path\n  alert.context = subgraph\n  emit(alert)"
