@@ -1,0 +1,479 @@
+name: 'T1666: Modify Cloud Resource Hierarchy'
+id: 07b83f70-f397-4889-9866-9990b542cd8e
+description: This playbook helps an analyst investigate adversary attempts to evade defenses by modifying
+  the cloud resource hierarchy in IaaS environments (AWS Organizations, Azure management groups/subscriptions,
+  GCP organizations/folders). It guides triage of high-impact control-plane hierarchy events such as AWS
+  LeaveOrganization, RemoveAccountFromOrganization, CreateAccount, MoveAccount, and OU create/delete;
+  Azure subscription transfer/create and management-group moves; and GCP organization/folder moves. The
+  questions correlate cloud audit logs with endpoint process creation (Windows Event ID 4688), credential-file
+  access, scripting-engine activity, and network egress (Zeek) to distinguish legitimate administration
+  from operator-driven abuse. It combines deterministic detection of rare hierarchy APIs, allow-list checks
+  against approved cloud-admin groups, geolocation/ASN baselining, statistical outlier and failed-permission-enumeration
+  detection, and explainable ML (rare-function, sequence/LSTM, and graph models) to surface subscription
+  hijacking, organization severing, rogue account creation, and hierarchy changes paired with defense-evasion
+  actions like log clearing and security-service tampering.
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any cloud audit log recorded a high-impact resource-hierarchy modification event by exact
+    event name, such as AWS LeaveOrganization, RemoveAccountFromOrganization, CreateAccount, MoveAccount,
+    CreateOrganizationalUnit, or DeleteOrganizationalUnit; an Azure Microsoft.Subscription transfer/create
+    or management-group move; or a GCP organization/folder move?
+  context: These are rare, high-blast-radius administrative actions that can sever accounts from Service
+    Control Policies and guardrails, create unmonitored accounts, or transfer subscriptions out of the
+    victim tenant. Because legitimate use is infrequent, unconditional alerting on the exact event names
+    stays low-volume and provides a deterministic detection floor for the Defense Impairment tactic. A
+    positive result means a hierarchy change occurred and must be tied to an approved change ticket; a
+    negative result lowers (but does not eliminate) the likelihood of hierarchy tampering.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Endpoint event logs from administrative workstations, developer workstations, and CI/CD servers;
+    Network traffic logs from internet gateways and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        source IN (CloudTrail, AzureActivity, GCPAdminActivity)
+        | where eventName IN ("LeaveOrganization","RemoveAccountFromOrganization","CreateAccount","MoveAccount","CreateOrganizationalUnit","DeleteOrganizationalUnit")
+           OR (provider=="Microsoft.Subscription" AND operation IN ("transfer","create","managementGroup/move"))
+           OR (gcp_method IN ("organizations.move","folders.move"))
+        | alert priority=high
+- question: Did a hierarchy-modification API call coincide with known offensive tooling (e.g., a Stratus
+    or Pacu userAgent) or with a matching Windows Event ID 4688 process launch and same-host network egress
+    within 10 minutes on the originating host?
+  context: 'Interactive operator use of offensive cloud tooling leaves correlatable traces: a recognizable
+    userAgent in the cloud audit log, a process-creation event on the operator host, and outbound DNS/HTTP
+    to the cloud API. Correlating these within a tight window raises confidence that the hierarchy change
+    was adversarial rather than routine automation. The alert should emit the eventName, principal, host,
+    and userAgent so the analyst can pivot quickly. A match strongly suggests hands-on-keyboard abuse
+    aimed at impairing defenses.'
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Endpoint event logs from administrative workstations, developer workstations, and CI/CD servers;
+    Network traffic logs from internet gateways and VPN concentrators.'
+  range: Last 90 days; correlate events within a 10-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        cloud_api = CloudAudit | where eventName IN (hierarchy_mod_apis) OR userAgent MATCHES "(?i)stratus|pacu"
+        proc = WinEID==4688 | where same_host
+        net = Zeek conn.log/dns.log egress | where same_host
+        | join cloud_api, proc, net on host within 10m
+        | alert fields=(eventName, principal, host, userAgent)
+- question: Is this the first time the issuing identity has ever invoked a hierarchy-modification API
+    (first-seen role/API pair), and does its call count, frequency, or source region/country deviate from
+    its 30-90 day baseline?
+  context: Maintaining a per-principal first-seen index of (role, API) pairs surfaces the moment an identity
+    does something it has never done before. Pairing first-seen detection with a modified Z-score (|z|>3.5)
+    on call counts and frequency, plus flagging never-before-seen source regions, catches both novel privilege
+    use and abnormal bursts. This statistical baselining is robust to outliers and tuned per identity,
+    reducing false positives from busy admins while still surfacing anomalous hierarchy activity indicative
+    of defense evasion.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Endpoint event logs from administrative workstations, developer workstations, and CI/CD servers;
+    Network traffic logs from internet gateways and VPN concentrators.'
+  range: Last 90 days (30-90 day baseline lookback)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        baseline = first_seen_index(principal, role, api) over 30-90d
+        | flag if (principal, api) NOT IN baseline  // first hierarchy-mod API
+        | z = modified_zscore(call_count_per_principal) ; flag if abs(z) > 3.5
+        | flag if source_region NOT IN seen_regions[principal]
+- question: When an unsupervised rare-function/population model scores cloud operator workflows, does
+    the hierarchy activity exceed the model's rarity threshold, and what are the top contributing features
+    (rare eventName-per-user/region, unusual geography, rare user-command pair, high API volume)?
+  context: Rare-function and population analysis over CloudTrail/Activity logs scores how unusual a given
+    hierarchy action is relative to peers and the principal's own history. Surfacing the top-3 contributing
+    features (eventName, principal rarity, source geo/ASN) makes the alert explainable and actionable
+    for a SOC analyst. A high rarity score on a hierarchy-modification event, especially combined with
+    unusual geography or volume, indicates likely adversarial manipulation of the cloud resource hierarchy
+    to evade controls.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Endpoint event logs from administrative workstations, developer workstations, and CI/CD servers;
+    Network traffic logs from internet gateways and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        model = rare_function_population_analysis(CloudAudit features=[api_per_user, region, user_command_pair, api_volume])
+        | score hierarchy_events
+        | alert if rarity_score > threshold
+        | output top3_features=(eventName, principal_rarity, source_geo_asn)
+- question: Did a sensitive hierarchy-modification API/CLI command (e.g., aws organizations leave-organization,
+    create-account, move-account; az account subscription transfer; gcloud organizations move) execute
+    from an identity that is NOT in the approved cloud-administration group, and was sts:AssumeRoot invoked
+    in a member account?
+  context: An allow-list of approved cloud administrators lets you treat any hierarchy-modification command
+    from an unapproved identity as immediately suspicious. Matching exact API/CLI strings in cloud audit
+    logs and Windows Event ID 4688 command lines, while checking group membership, catches privilege abuse
+    and stolen-credential use. Treating sts:AssumeRoot in a member account as an equivalent escalation
+    trigger covers AWS root-escalation paths. A hit means an unauthorized principal is reshaping the hierarchy
+    — a strong Defense Impairment signal warranting containment.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Cloud identity sign-in logs
+  - 'NAI: Administrative workstations, CI/CD pipeline servers, Bastion hosts, and servers with cloud management
+    SDKs installed.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        cmd IN ("aws organizations leave-organization","aws organizations create-account","aws organizations move-account","az account subscription transfer","gcloud organizations move")
+        | match against (CloudAudit.eventName, WinEID==4688.CommandLine)
+        | where principal NOT IN approved_cloud_admins
+           OR eventName == "AssumeRoot" (member account)
+        | alert priority=high
+- question: Does any cloud administrator's hierarchy-modification frequency (calls/day) or execution window
+    fall beyond their per-principal modified-Z-score bound (|z|>3.5) or the 99th percentile, or exceed
+    the forecasted upper confidence bound for control-plane API volume?
+  context: Even approved admins have stable rhythms. Comparing each admin's hierarchy-change frequency
+    and timing to their own baseline, and forecasting expected per-account control-plane volume, exposes
+    anomalous spikes that may indicate compromised admin credentials or insider abuse. Modified Z-score
+    and percentile thresholds resist skew from a few heavy days. Activity beyond the predicted upper confidence
+    bound suggests automated or unauthorized hierarchy manipulation hidden inside otherwise-trusted accounts.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Cloud identity sign-in logs
+  - 'NAI: Administrative workstations, CI/CD pipeline servers, Bastion hosts, and servers with cloud management
+    SDKs installed.'
+  range: Last 90 days (per-principal baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        per principal: freq = calls_per_day(hierarchy_mod)
+        | z = modified_zscore(freq) ; flag if abs(z) > 3.5 OR freq > p99
+        | forecast = ts_model(control_plane_api_volume[account])
+        | flag if observed > forecast.upper_ci
+- question: Has any principal generated a burst of AccessDenied/UnauthorizedOperation responses on IAM/Organizations
+    APIs — for example >=N distinct denied hierarchy actions within 10 minutes — suggesting probing for
+    the rights to modify the hierarchy?
+  context: Before a successful hierarchy change, an actor often probes which permissions they hold, generating
+    clusters of AccessDenied/UnauthorizedOperation errors on IAM and Organizations APIs. Profiling per-principal
+    denial rates and alerting on a burst of distinct denied hierarchy actions is a high-value failure-mode
+    signal that precedes the actual abuse. A spike in denials, especially followed by a successful hierarchy
+    call, indicates reconnaissance and attempted privilege misuse aimed at evading organizational guardrails.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Cloud identity sign-in logs
+  - 'NAI: Administrative workstations, CI/CD pipeline servers, Bastion hosts, and servers with cloud management
+    SDKs installed.'
+  range: Last 90 days; burst window of 10 minutes
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        denials = CloudAudit | where errorCode IN ("AccessDenied","UnauthorizedOperation") AND service IN ("iam","organizations")
+        | bucket by principal, 10m
+        | alert if distinct(denied_hierarchy_action) >= N
+- question: When per-principal cloud control-plane events are modeled as an ordered sequence (LSTM/DeepLog
+    or variable-order Markov), does a hierarchy-modification action appear outside the top-k predicted
+    next events or as a low-probability transition?
+  context: Admin activity follows learnable patterns. A DeepLog-style LSTM next-event predictor or a variable-order
+    Markov chain learns the normal order of each principal's control-plane operations; a hierarchy-modification
+    action that appears as an unexpected, low-probability event signals an out-of-pattern workflow. Reporting
+    the offending event and its preceding context makes the alert explainable. Such sequence anomalies
+    often reveal adversaries who string together API calls in ways legitimate operators never do, including
+    stealthy hierarchy changes to evade defenses.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - Windows Event ID 4688
+  - Cloud identity sign-in logs
+  - 'NAI: Administrative workstations, CI/CD pipeline servers, Bastion hosts, and servers with cloud management
+    SDKs installed.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        seq = order_events_per_principal(control_plane)
+        | model = LSTM_DeepLog OR variable_order_markov(seq)
+        | predict next_event ; alert if hierarchy_mod NOT IN topk OR transition_prob < epsilon
+        | output offending_event + preceding_context
+- question: Was a cloud administrative tool process (e.g., aws.exe, az.exe, gcloud.cmd) executed, or a
+    cloud sign-in performed, from a source IP geolocating to a country the identity has never authenticated
+    from, or from an IP/ASN with low reputation?
+  context: Enriching cloud CLI executions and sign-ins with the principal's recent logon IP/geo lets you
+    flag impossible or first-seen geographies and low-reputation infrastructure. Including the prior-seen
+    and current geo/ASN in the alert helps the analyst judge whether the location change is plausible
+    travel or credential theft. A hierarchy command issued from a never-before-seen country or a malicious
+    ASN is a strong indicator that an external actor is operating the account to modify the cloud hierarchy
+    and evade defenses.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Cloud identity sign-in logs
+  - Zeek conn.log
+  - 'NAI: All corporate endpoints and servers with cloud SDKs/CLIs installed, VPN access logs, Domain
+    Controllers, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        exec = WinEID==4688 process IN (aws.exe, az.exe, gcloud.cmd) OR cloud_signin
+        | enrich src_ip -> geo, asn, reputation
+        | prior = recent_logon_geo[principal]
+        | alert if country NOT IN prior_countries OR asn_reputation == low
+        | output prior_geo_asn, current_geo_asn
+- question: Do cloud CLI/API commands originate from ASNs or subnets the user has never used, or occur
+    in their bottom-5th-percentile login hours, and does a modified Z-score (|z|>3.5) on per-hour CLI/API
+    counts reveal off-baseline spikes?
+  context: Profiling each user's typical subnets, ASNs, and login hours establishes a behavioral fingerprint.
+    Commands from unseen ASNs or during unusual hours, combined with a modified-Z-score spike in per-hour
+    activity, indicate off-baseline operation that frequently accompanies account takeover. This statistical
+    approach is resilient to outliers and tuned per user. Off-hours hierarchy manipulation from unfamiliar
+    network infrastructure is a classic sign of an adversary trying to act when defenders are least attentive.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Cloud identity sign-in logs
+  - Zeek conn.log
+  - 'NAI: All corporate endpoints and servers with cloud SDKs/CLIs installed, VPN access logs, Domain
+    Controllers, and network egress points.'
+  range: Last 90 days (per-user baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        baseline = profile(user, subnets, asns, login_hours)
+        | flag if asn NOT IN baseline.asns OR hour IN bottom_5th_percentile
+        | z = modified_zscore(cli_api_count_per_hour) ; flag if abs(z) > 3.5
+- question: Does forecasted hourly cloud-management API/endpoint volume per principal/account exceed the
+    predicted upper confidence bound, indicating automated or off-hours hierarchy manipulation?
+  context: A time-series forecast of hourly control-plane volume per principal/account establishes expected
+    demand; observed volume above the upper confidence bound flags unexpected automation or bursts. This
+    catches scripted hierarchy abuse and off-hours activity that point-in-time rules miss. Sustained or
+    spiking volume beyond the forecast, particularly around hierarchy-modification endpoints, suggests
+    an actor driving the API programmatically to reshape the resource hierarchy faster than a human admin
+    would.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Cloud identity sign-in logs
+  - Zeek conn.log
+  - 'NAI: All corporate endpoints and servers with cloud SDKs/CLIs installed, VPN access logs, Domain
+    Controllers, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        forecast = ts_model(hourly cloud_mgmt_api_volume per principal/account)
+        | alert if observed_volume > forecast.upper_ci
+- question: When IAM/audit logs are represented as a heterogeneous/temporal graph (principal-role-resource-action),
+    are hierarchy events scored as anomalous edges or paths inconsistent with the identity's learned graph?
+  context: Graph-based modeling captures the relationships among principals, roles, resources, and actions
+    that flat logs obscure. Scoring hierarchy events as anomalous edges/paths reveals when an identity
+    touches resources or performs actions outside its learned graph neighborhood. Surfacing the attention-weighted
+    top-3 contributing nodes/edges keeps the alert explainable. Anomalous identity-resource edges around
+    hierarchy modifications often expose lateral, privilege-escalating, or hijacking behavior that signals
+    defense-evasion-driven hierarchy change.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Cloud identity sign-in logs
+  - Zeek conn.log
+  - 'NAI: All corporate endpoints and servers with cloud SDKs/CLIs installed, VPN access logs, Domain
+    Controllers, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        graph = build_temporal_graph(IAM/audit, nodes=[principal,role,resource,action])
+        | score hierarchy_event edges/paths vs learned_graph
+        | alert if anomaly_score > threshold
+        | output attention_top3_nodes_edges
+- question: On a single host within a 30-minute window, did a process access local cloud credential files
+    (e.g., %USERPROFILE%\.aws\credentials, ~/.aws/credentials, ~/.config/gcloud), then launch a scripting
+    engine, connect to a cloud management API endpoint, and produce a cloud audit log showing a hierarchy-changing
+    request?
+  context: 'This sequence captures the full credential-theft-to-abuse chain: reading stored cloud credentials,
+    invoking a scripting engine (powershell.exe, python.exe), establishing a network connection to the
+    cloud API, and issuing a hierarchy-modifying call. Correlating all four steps on one host within 30
+    minutes is highly specific to operator-driven credential misuse. A complete match is a strong, high-fidelity
+    indicator that stolen local credentials are being used to modify the cloud hierarchy and evade defenses.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Developer workstations, Administrator workstations, servers hosting automation scripts, and
+    CI/CD runners.'
+  range: Last 90 days; correlate within a 30-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        cred = (WinEID==4688 cmd reads OR WinEID==4663) on (%USERPROFILE%\.aws\credentials, ~/.aws/credentials, ~/.config/gcloud)
+        script = WinEID==4688 IN (powershell.exe, python.exe)
+        net = Zeek conn.log to cloud_api_endpoint
+        hier = CloudAudit hierarchy_mod
+        | sequence cred -> script -> net -> hier on same host within 30m
+        | alert priority=high
+- question: After credential-file access, is the immediately following hierarchy API a first-seen (role,
+    API) pair for that principal in the 30-90 day baseline, and does it co-occur with an off-baseline
+    call-volume flag (modified Z-score |z|>3.5)?
+  context: When credential-file access is observed, the very next hierarchy API call deserves elevated
+    scrutiny. If that call is a first-seen (role, API) pair for the principal, it suggests the credentials
+    are being used in a novel way; co-occurrence with an off-baseline volume flag further raises priority.
+    This blends event correlation with statistical novelty detection to prioritize the most suspicious
+    post-credential-access hierarchy operations, which frequently mark the transition from credential
+    theft to active defense evasion.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Developer workstations, Administrator workstations, servers hosting automation scripts, and
+    CI/CD runners.'
+  range: Last 90 days (30-90 day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        on cred_file_access[principal]:
+          next_api = first hierarchy_mod after access
+          | flag if (principal, next_api.role, next_api) is first_seen in 30-90d baseline
+          | escalate if modified_zscore(call_volume) abs(z) > 3.5
+- question: Does a sequence of credential access -> script execution -> cloud API connection -> hierarchy
+    modification score as low-probability under an LSTM (DeepLog) or variable-order Markov model trained
+    on benign admin sequences, or as anomalous on the principal's cross-service activity graph?
+  context: Training a sequence model on benign admin workflows lets you flag the credential-to-hierarchy
+    chain when it appears as a low-probability path. A graph-based alternative scores the cross-service
+    activity for the principal and reports the contributing events. Both approaches are explainable and
+    catch novel attack chains that signature rules miss. A low-probability credential-access-through-hierarchy-modification
+    sequence is a strong behavioral signal of adversarial use of harvested credentials to reshape the
+    cloud hierarchy.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Developer workstations, Administrator workstations, servers hosting automation scripts, and
+    CI/CD runners.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        seq = [cred_access, script_exec, cloud_api_conn, hierarchy_mod] per principal
+        | model = LSTM_DeepLog OR variable_order_markov(benign_admin_seq)
+        | alert if seq_probability < epsilon
+        | alt: score cross_service_activity_graph ; output contributing_events
+- question: Did a sensitive cloud hierarchy command/audit event (e.g., aws organizations leave-organization,
+    GuardDuty/CloudTrail deletion) occur within 5 minutes of log clearing (Windows Event ID 1102), a security-service
+    stop (Event ID 7040), or cloud logging/guardrail deletion on the same host or by the same principal?
+  context: Adversaries frequently pair hierarchy changes with active defense evasion to blind responders.
+    Correlating a sensitive hierarchy command with near-simultaneous log clearing, security-service stops,
+    or deletion of cloud logging/guardrails on the same host or by the same principal produces a high-confidence
+    Defense Impairment signal. The tight 5-minute window minimizes false positives from unrelated maintenance.
+    A match indicates a deliberate attempt to both reshape the hierarchy and erase or disable the evidence
+    of it.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - Windows Event ID 7040
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Endpoint event logs on administrative workstations and servers, Domain Controller security logs,
+    and centralized logging infrastructure.'
+  range: Last 90 days; correlate within a 5-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |2-
+        hier = CloudAudit IN ("leave-organization", GuardDuty/CloudTrail delete)
+        evade = WinEID==1102 (log clear) OR WinEID==7040 (service stop) OR cloud_logging/guardrail delete
+        | correlate hier, evade on same host OR same principal within 5m
+        | alert priority=high
+- question: How do hosts/principals score on the rarity of defense-evasion commands and on bursts of AccessDenied
+    control-plane responses, and did a hierarchy-modification command follow within an hour to justify
+    escalation?
+  context: Risk-scoring hosts and principals on the rarity of defense-evasion actions and on AccessDenied
+    bursts (a failure-mode signal of probing) lets you prioritize entities most likely under adversary
+    control. Escalating when a hierarchy-modification command follows within an hour links the evasion
+    and impact phases. Modified Z-score thresholds set per-environment bounds so the scoring adapts to
+    each estate. A high-scoring host that then modifies the hierarchy is a strong candidate for immediate
+    investigation and containment.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - Windows Event ID 7040
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Endpoint event logs on administrative workstations and servers, Domain Controller security logs,
+    and centralized logging infrastructure.'
+  range: Last 90 days; escalation window of 1 hour
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |2-
+        score = rarity(defense_evasion_cmds[host,principal]) + burst(AccessDenied_control_plane)
+        | bounds = modified_zscore_per_environment
+        | escalate if hierarchy_mod follows within 1h
+- question: What is the predicted per-host/principal 'Defense Evasion State' from features such as log-clearing
+    counts, security-service stops, cloud-logging deletions, and AccessDenied bursts, and does it raise
+    the priority of subsequent hierarchy commands?
+  context: A model that predicts a 'Defense Evasion State' from log-clearing, security-service stops,
+    cloud-logging deletions, and AccessDenied bursts captures the broader posture of a host/principal
+    rather than a single event. Using that state to elevate the priority of subsequent hierarchy commands
+    ensures that hierarchy changes from already-suspicious entities get analyst attention first. Surfacing
+    the top-3 contributing features keeps it explainable, and validation against labeled detonations and
+    public CloudTrail datasets keeps it grounded. A high evasion state preceding a hierarchy change strongly
+    implies coordinated adversarial activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - Windows Event ID 7040
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - GCP Admin Activity Logs
+  - 'NAI: Endpoint event logs on administrative workstations and servers, Domain Controller security logs,
+    and centralized logging infrastructure.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |2-
+        state = predict_defense_evasion_state(features=[log_clear_count, svc_stop_count, cloud_log_delete, accessdenied_burst])
+        | raise_priority(subsequent hierarchy_cmds) if state high
+        | output top3_features ; validate on labeled detonations + flaws.cloud CloudTrail
