@@ -1,0 +1,737 @@
+name: 'T1037: Boot or Logon Initialization Scripts'
+id: 0cd59be7-04ef-42e1-b967-db83ee32fca0
+description: Investigate adversary abuse of boot or logon initialization scripts (MITRE ATT&CK T1037)
+  for both persistence and privilege escalation. Adversaries plant or modify scripts that run automatically
+  at boot or logon -- Windows logon scripts (NETLOGON/SYSVOL GPO scripts, registry Run keys, UserInitMprLogonScript,
+  Startup folder items), Linux shell-init files (~/.bashrc, ~/.bash_profile, ~/.profile, /etc/profile.d),
+  macOS Startup Items/LaunchAgents/login hooks, ESXi rc.local.d scripts, and network-device startup-config
+  -- to maintain a foothold across reboots and credential changes, and often to run in an elevated context.
+  This playbook helps an analyst hunt for the creation or modification of these initialization artifacts
+  by unauthorized accounts or processes, for suspicious child processes spawned by logon/startup hosts
+  (unsigned binaries from user-writable paths, credential-dumping or escalation tooling, LSASS/SAM access,
+  token elevation), for obfuscated or persistence-laden command lines, and for outbound C2 originating
+  from script interpreters. It combines symbolic-logic detections, statistical rarity/frequency/entropy
+  scoring, and machine-learning (provenance-graph and outlier) models across Windows, Linux, macOS, ESXi,
+  and network-device telemetry.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are script interpreters (powershell.exe, cscript.exe, wscript.exe) launched as children of
+    logon or startup processes (userinit.exe, services.exe, wininit.exe) initiating outbound network connections
+    to known-bad or never-before-seen external destinations?
+  context: Logon and boot initialization scripts are a documented ATT&CK T1037 persistence hook that should
+    rarely, if ever, originate egress traffic. Under the Persistence tactic, an adversary who has planted
+    a logon script will frequently have it call home for tasking or to report installation. Correlate
+    process-creation events for script interpreters whose parent is a logon/startup host with Zeek conn.log/dns.log
+    flows from the same host and time window. A positive result is a script child contacting a threat-intel-listed
+    C2 indicator or any external IP absent from that host's 30-day egress baseline; a negative result
+    is traffic only to known internal logging/management servers. Investigate the script body, the destination
+    reputation, and whether the script persists across reboots.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Enterprise Workstations, Internet Gateway/Egress Points, DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=WinEventLog:Security EventCode=4688\n| where ParentImage in (\"userinit.exe\",\"services.exe\"\
+      ,\"wininit.exe\")\n      AND NewProcessName in (\"powershell.exe\",\"cscript.exe\",\"wscript.exe\"\
+      )\n| join host,timewindow [ source=zeek:conn dest_is_external=true ]\n| lookup threat_intel dest_ip\
+      \ OUTPUT ti_match\n| where ti_match=\"true\" OR NOT [dest_ip in host_egress_baseline_30d]\n| alert"
+  - technology: Zeek/pseudocode
+    query: 'conn.log: filter orig_h in script_child_hosts AND resp_h not in baseline_dest
+
+      | join dns.log on uid
+
+      | emit src_host, dest_ip, dest_domain, bytes_out'
+- question: Do any logon/startup script children contact destination ASNs/countries in the rarest 1st
+    percentile, make first-seen external contacts, or move byte volumes / connection rates exceeding 3
+    sigma above the host's rolling 30-day baseline?
+  context: Persistence implants often beacon to infrastructure that is statistically rare in the environment.
+    Score each script-child connection by destination ASN/country prevalence and bytes-out over a rolling
+    30-day window per host. Flag bottom-1st-percentile destinations, first-seen external contacts, and
+    volume or connections/min that exceed three standard deviations above the per-host baseline. Prevalence-based
+    rarity is a low-false-positive primitive; thresholds can be derived from datasets like LANL Unified
+    Host and Network. A positive result indicates a script reaching anomalous infrastructure consistent
+    with C2 or staging; benign admin scripts cluster on common internal/known destinations.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Enterprise Workstations, Internet Gateway/Egress Points, DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=zeek:conn join script_child_hosts
+
+      | stats sum(bytes_out) as vol, count as conns, dc(dest_asn) by host,dest_asn,dest_country, span=1d
+
+      | eventstats avg(vol) as mu, stdev(vol) as sd by host
+
+      | where dest_asn_prevalence < p01 OR first_seen_dest=true OR vol > mu+3*sd OR conns_per_min > host_conn_baseline+3*sd
+
+      | alert'
+- question: Does any logon/startup script child exhibit a high rate of failed (blocked/RST) connections
+    or NXDOMAIN DNS lookups at a regular cadence, indicating a heartbeat to a misconfigured or staging
+    C2?
+  context: 'Beaconing malware often reveals itself through failed connectivity rather than successful
+    exfil: a staging or misconfigured C2 produces blocked/RST TCP connections or non-resolving (NXDOMAIN)
+    lookups at a steady interval. Track per-script-child failed-connection and NXDOMAIN rates per hour
+    and test for periodicity. A high ratio of failures combined with regular cadence is a distinct heartbeat
+    signal that complements successful-exfil detection. A positive result is a script interpreter repeatedly
+    failing to reach the same endpoint(s) on a clock-like interval; benign failures are sporadic and uncorrelated
+    in timing.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Enterprise Workstations, Internet Gateway/Egress Points, DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'conn.log: per (host, script_child) compute fail_ratio = count(conn_state in RSTO,RSTR,REJ,S0)/count(*)
+
+      | join dns.log: nxdomain_rate = count(rcode_name="NXDOMAIN")/count(*)
+
+      | compute inter_arrival_stddev (regular cadence => low jitter)
+
+      | where (fail_ratio>0.5 OR nxdomain_rate>0.3) AND jitter < threshold
+
+      | alert'
+- question: Do whole-system provenance graphs reveal anomalous logon-script -> child-process -> network
+    subgraphs whose causal chain deviates from learned-normal behavior?
+  context: Sophisticated persistence may evade single-event rules but still produce an anomalous causal
+    chain. Build whole-system provenance graphs and apply a graph temporal autoencoder (e.g., KAIROS)
+    to flag anomalous logon-script -> child -> network subgraphs. The model reconstructs the causal chain
+    and surfaces the top-3 contributing nodes/edges (parent image, child path, destination) for analyst
+    triage. A positive result is a low-likelihood subgraph rooted at a logon/startup script that the analyst
+    can walk end-to-end; this is especially valuable for novel implants with no signature. Evaluate/tune
+    on DARPA TC/OpTC-style provenance data.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Domain Controllers, Enterprise Workstations, Internet Gateway/Egress Points, DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'build provenance_graph(window=24h) nodes=processes,files,sockets edges=spawn,write,connect
+
+      | model = GraphTemporalAutoencoder.load()
+
+      | score subgraphs rooted at (parent in logon/startup hosts)
+
+      | where reconstruction_error > p99
+
+      | emit top3_contributing_nodes_edges'
+- question: Do command lines or script bodies executed by logon/startup processes contain persistence
+    keywords (schtasks, reg add Run, UserInitMprLogonScript, Startup-folder writes) or PowerShell encoding
+    flags (-enc, -e, FromBase64String)?
+  context: Adversaries establishing persistence via T1037 frequently install additional autoruns or set
+    the UserInitMprLogonScript registry hook, which is rarely configured legitimately. Scan EventID 4688
+    process command lines and 4104 script blocks for persistence keywords and PowerShell encoding indicators.
+    A match -- especially UserInitMprLogonScript or a Startup-folder write -- is high fidelity for persistence
+    establishment. A positive result warrants pulling the full script and checking what it installs and
+    who installed it; a negative result still leaves statistical/ML checks below.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - PowerShell Event ID 4104
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=WinEventLog:Security EventCode=4688 OR source=WinEventLog:Sysmon EventCode=1 OR source=PowerShell
+      EventCode=4104)
+
+      | where CommandLine matches /(schtasks|reg(\.exe)?\s+add.*\\Run|UserInitMprLogonScript|Startup\\.*\.(bat|vbs|ps1)|-enc
+      |-e |FromBase64String)/i
+
+      | alert'
+- question: Do any logon/startup command lines or script bodies have Shannon entropy above ~4.5 (or 3
+    sigma over baseline), or character-class ratios / letter-frequency cosine distance exceeding corpus
+    thresholds, indicating obfuscation?
+  context: Obfuscation (Base64, char replacement, concatenation) raises measurable entropy and skews character-frequency
+    distributions away from natural language/normal scripting. Compute Shannon entropy and character-class
+    ratios for command lines and script bodies, and measure cosine distance from a baseline letter-frequency
+    distribution. Flag entropy above ~4.5 or 3 sigma over the legitimate baseline, or distribution distances
+    over corpus thresholds (per Revoke-Obfuscation research). A positive result identifies likely-obfuscated
+    persistence code even without keyword matches; benign admin scripts score near the baseline.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - PowerShell Event ID 4104
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'events with CommandLine or ScriptBlockText
+
+      | eval H = shannon_entropy(text), cc = char_class_ratio(text), cd = cosine_dist(letter_freq(text),
+      baseline_freq)
+
+      | eventstats avg(H) as mu, stdev(H) as sd
+
+      | where H>4.5 OR H>mu+3*sd OR cd>corpus_threshold
+
+      | alert'
+- question: Does a content classifier trained on character/token/AST features score any logon/startup
+    script as malicious with probability greater than 0.85?
+  context: A trained classifier can catch obfuscated or novel persistence scripts that evade keyword and
+    entropy rules. Extract character, token, and AST features from script content and score maliciousness
+    with a model such as Revoke-Obfuscation. Alert when probability exceeds 0.85 and emit the top-3 contributing
+    features (token entropy, encoded-string length, rare cmdlet) for triage. A positive result is a high-confidence
+    malicious-script verdict the analyst should validate against the script's purpose and provenance;
+    this is most useful as a complement to deterministic rules in the Persistence context.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - PowerShell Event ID 4104
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = extract(char_ngrams, token_freq, AST_nodes) from script_text
+
+      | p = ScriptContentClassifier.predict_proba(features)
+
+      | where p > 0.85
+
+      | emit top3_features'
+- question: Are known logon/startup script files (NETLOGON/SYSVOL GPO scripts, Startup-folder .bat/.vbs/.ps1)
+    being written by accounts or processes outside the authorized admin allow-list and approved change-management
+    tooling?
+  context: Legitimate changes to logon scripts come from a small set of administrators and change-management
+    tools. Under Persistence, an adversary modifying SYSVOL/NETLOGON scripts can push code to every user
+    at logon. Alert on WriteData/AppendData (EventID 4663/4656) to these artifacts where SubjectUserName
+    or ProcessName is not on the authorized allow-list. A positive result is an unexpected identity modifying
+    a high-leverage script -- treat as likely persistence; a negative result confirms changes came through
+    sanctioned channels. Pair with content review of the changed script.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers (SYSVOL share), File Servers hosting roaming profiles, Enterprise Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode in (4663,4656) AccessMask has WriteData
+
+      | where ObjectName matches /(SYSVOL|NETLOGON|Start Menu\\Programs\\Startup).*\.(bat|vbs|ps1|cmd)/i
+
+      | where SubjectUserName NOT in admin_allowlist AND ProcessName NOT in change_mgmt_tools
+
+      | alert'
+- question: Which logon-script modifications come from first-time modifiers, bottom-1%-prevalence processes,
+    off-hours times (high z-score), or change a byte volume exceeding 3 sigma over the per-script baseline?
+  context: Beyond allow-listing, statistical outliers expose stealthy tampering. Compute z-scores for
+    modification time, identify first-time modifiers and bottom-1%-prevalence modifying processes, and
+    flag changes whose modified-byte volume exceeds three sigma over the per-script baseline. A positive
+    result is a logon script edited by a never-seen process at an anomalous time with an unusually large
+    change -- strongly suggestive of malicious persistence injection; routine edits cluster on known processes,
+    business hours, and small diffs.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers (SYSVOL share), File Servers hosting roaming profiles, Enterprise Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode in (4663,4656) logon_script_objects
+
+      | eventstats avg(bytes_changed) as mu, stdev(bytes_changed) as sd by ObjectName
+
+      | eval mod_hour_z = zscore(_time_hour by ObjectName)
+
+      | where first_seen(ProcessName)=true OR process_prevalence<p01 OR bytes_changed>mu+3*sd OR abs(mod_hour_z)>3
+
+      | alert'
+- question: Does an unsupervised outlier model (Isolation Forest, or One-Class SVM where poisoning resistance
+    is needed) flag logon-script modification events as anomalous on user/workstation/time/parent/bytes-changed
+    features?
+  context: Multivariate anomalies in script modification are hard to capture with single thresholds. Train
+    Isolation Forest on user, workstation, time, parent process, and bytes-changed features to flag outlier
+    change events with low latency, using LIME to surface the top-3 contributing features per alert; prefer
+    One-Class SVM where adversarial poisoning is a concern. A positive result is a modification event
+    the model deems jointly anomalous across features -- a candidate persistence write the analyst should
+    correlate with the modifier's identity and the script content.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers (SYSVOL share), File Servers hosting roaming profiles, Enterprise Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = [user, workstation, hour, parent_image, bytes_changed] for logon_script_writes
+
+      | model = IsolationForest.fit(baseline_X)   # or OneClassSVM
+
+      | score = model.decision_function(X)
+
+      | where score < anomaly_threshold
+
+      | emit LIME_top3_features'
+- question: Are child processes of logon-script hosts (e.g., userinit.exe) running unsigned binaries from
+    user-writable directories such as C:\Users\Public, %APPDATA%, or %TEMP%?
+  context: A logon script launching an unsigned binary from a user-writable path is a high-fidelity living-off-the-land
+    deviation and a classic persistence dropper pattern. Alert when logon-script children execute unsigned
+    images from AppData, Temp, or Users\Public. A positive result is a logon-spawned unsigned executable
+    in a writable directory -- examine the file hash, prevalence, and what installed it; legitimate logon
+    children are signed and run from system paths.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=WinEventLog:Security EventCode=4688 OR Sysmon EventCode=1)
+
+      | where ParentImage in ("userinit.exe","services.exe","wininit.exe")
+
+      | where Signed="false" AND NewProcessName matches /\\(Users\\Public|AppData|Temp)\\/i
+
+      | alert'
+- question: Which logon-host -> child-image parent-child process combinations are newly observed or in
+    the bottom 1% by fleet-wide frequency?
+  context: Rare parent-child relationships are disproportionately malicious. Using fleet-wide frequency
+    analysis, flag newly observed or bottom-1%-prevalence (logon-host -> child image) combinations; baseline
+    from datasets like LANL Unified Host and Network. A positive result is a logon/startup host spawning
+    a child image almost never seen across the fleet -- a strong candidate for persistence execution.
+    Common, widely-seen combinations are deprioritized.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=4688 where ParentImage in logon_startup_hosts
+
+      | stats count by ParentImage, NewProcessName
+
+      | eval prevalence = count/total_fleet
+
+      | where first_seen(ParentImage,NewProcessName)=true OR prevalence < p01
+
+      | alert'
+- question: Does an inductive GraphSAGE GNN over the provenance graph flag any script-child node as anomalous
+    at node granularity for precise attribution?
+  context: Node-level provenance modeling (e.g., ThreaTrace) provides precise attribution of which specific
+    script-child process is anomalous, rather than only flagging a whole subgraph. Apply an inductive
+    GraphSAGE GNN over the provenance graph to score script-child nodes and surface the top-3 deviating
+    node features (path, signer, child fan-out). A positive result pinpoints a specific anomalous node
+    for the analyst to investigate -- useful when many benign children share the same logon parent. Tune
+    on labeled provenance datasets.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = provenance_graph(window=24h)
+
+      | model = GraphSAGE_inductive.load()
+
+      | node_scores = model.score(nodes where parent in logon_startup_hosts)
+
+      | where node_scores > p99
+
+      | emit node_id, top3_features(path,signer,child_fanout)'
+- question: Are cross-platform boot/logon-init hooks being written -- Linux shell-init files (~/.bashrc,
+    ~/.bash_profile, ~/.profile, /etc/profile.d/*), macOS Startup Items/LaunchAgents, ESXi /etc/rc.local.d/local.sh,
+    or network-device startup-config -- outside change windows?
+  context: 'T1037 spans non-Windows platforms: shell-init files, macOS Startup Items/LaunchAgents/login
+    hooks, ESXi rc.local.d, and network-device startup-config all execute automatically and are prime
+    persistence targets. Alert on auditd PATH writes to shell-init files and /etc/profile.d, on creation
+    of macOS Startup Items under /Library/StartupItems/, and apply identical path-based logic to ESXi
+    rc.local.d and network-device startup-config. A positive result is an init-file write outside an approved
+    change window -- capture the account/process and bytes/lines added; legitimate changes align with
+    provisioning/change records.'
+  answer_sources:
+  - auditd PATH
+  - auditd SYSCALL EXECVE
+  - macos:unifiedlog
+  - esxi:hostd
+  - networkdevice:syslog
+  - 'NAI: Linux Servers, macOS Endpoints, ESXi Hosts, Network Devices'
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: 'type=PATH name in (~/.bashrc,~/.bash_profile,~/.profile,/etc/profile.d/*,/etc/rc.local) AND
+      op=write
+
+      | join SYSCALL EXECVE for actor process+uid
+
+      | where not in change_window
+
+      | alert'
+  - technology: EDR/pseudocode
+    query: 'macos:unifiedlog OR fs:fsusage: file_create under /Library/StartupItems/ OR ~/Library/LaunchAgents/
+
+      | networkdevice:syslog: startup-config change events
+
+      | where outside_change_window
+
+      | alert'
+- question: Which shell-init/startup-item writes are performed by accounts or processes outside the admin
+    allow-list, by first-seen modifiers, or add a line volume exceeding the per-file 3-sigma baseline?
+  context: Statistical scoring extends cross-platform persistence detection beyond deterministic rules.
+    Flag shell-init/startup writes by non-allow-listed accounts/processes, first-seen modifiers, and writes
+    whose added-line volume exceeds the per-file three-sigma baseline. A positive result is an init-file
+    change by an unexpected identity adding an anomalously large block of code -- a strong persistence
+    indicator on Linux/macOS/ESXi/network devices; routine writes come from known admins with small, expected
+    diffs.
+  answer_sources:
+  - auditd PATH
+  - auditd SYSCALL EXECVE
+  - macos:unifiedlog
+  - esxi:hostd
+  - networkdevice:syslog
+  - 'NAI: Linux Servers, macOS Endpoints, ESXi Hosts, Network Devices'
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: 'type=PATH init_file_writes
+
+      | eventstats avg(lines_added) as mu, stdev(lines_added) as sd by file
+
+      | where actor_uid NOT in admin_allowlist OR first_seen(actor)=true OR lines_added>mu+3*sd
+
+      | alert'
+- question: Does a provenance-graph autoencoder flag any process that both writes a boot/logon-init file
+    and later spawns rare children, reconstructing a persistence chain?
+  context: 'The strongest cross-platform persistence signal is causal: a process writes an init file and
+    later that hook spawns anomalous children. Use a provenance-graph autoencoder (KAIROS-style) to flag
+    processes that both modify a boot/logon-init file and subsequently spawn rare children, reconstructing
+    the persistence chain and emitting the top-3 features for triage. A positive result is an end-to-end
+    write-then-execute chain the analyst can follow; this catches multi-stage persistence that single-event
+    rules miss on Linux/macOS/ESXi.'
+  answer_sources:
+  - auditd PATH
+  - auditd SYSCALL EXECVE
+  - macos:unifiedlog
+  - esxi:hostd
+  - networkdevice:syslog
+  - 'NAI: Linux Servers, macOS Endpoints, ESXi Hosts, Network Devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = provenance_graph(linux+macos+esxi, window=7d)
+
+      | model = ProvenanceAutoencoder.load()
+
+      | flag chains: (proc writes init_file) -> (later spawns child with low prevalence)
+
+      | where reconstruction_error > p99
+
+      | emit chain, top3_features'
+- question: Are processes spawned by logon/boot scripts running command lines matching credential-dumping
+    or escalation tooling (mimikatz, procdump, PsExec /s, runas, Invoke-AllChecks, net localgroup administrators,
+    lsass dump strings)?
+  context: Some logon/boot scripts run with elevated privileges, so an adversary can chain T1037 into
+    privilege escalation. A logon script should never invoke credential-dumping or escalation tooling.
+    Alert when logon-script children run command lines matching known escalation tools/commands (PsExec
+    /s, Invoke-AllChecks, net localgroup administrators, lsass dump strings). A positive result is a script-spawned
+    escalation/cred-theft command -- a high-confidence escalation attempt to triage urgently; legitimate
+    logon scripts perform mapping/config tasks, not credential operations.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Servers with local administrator accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=4688 OR Sysmon EventCode=1) where ParentImage in logon_startup_hosts
+
+      | where CommandLine matches /(mimikatz|procdump.*lsass|psexec.*-s|runas|Invoke-AllChecks|net\s+localgroup\s+administrators|sekurlsa)/i
+
+      | alert'
+- question: Do logon-script child command lines contain rare escalation terms (lsass, -s, -accepteula)
+    at high concentration, or show character-frequency/entropy deviation, placing them in the bottom percentile
+    of fleet-wide command prevalence?
+  context: Escalation commands can be obfuscated or vary slightly, evading exact regex. Score command
+    lines by rarity of escalation terms using fleet-wide frequency and by character-frequency/entropy
+    deviation; flag high concentrations of escalation tokens and bottom-percentile commands. A positive
+    result is a logon-script child command that is both rare across the fleet and dense in escalation
+    terminology -- a likely privilege-escalation attempt warranting review of the full command and resulting
+    token; common admin commands score as benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Servers with local administrator accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=4688 logon_script_children
+
+      | eval term_score = rarity(tokens in [lsass,-s,-accepteula,sekurlsa]), H=shannon_entropy(CommandLine)
+
+      | eventstats avg(H) as mu, stdev(H) as sd
+
+      | where command_prevalence<p01 OR (term_score high AND H>mu+3*sd)
+
+      | alert'
+- question: Does a command-line classifier trained on n-gram, length, and character-class features flag
+    any logon-script child command as a high-probability escalation command?
+  context: A supervised classifier generalizes beyond fixed signatures to catch novel escalation command
+    lines. Train on n-grams, length, and character-class features to score escalation likelihood, emitting
+    the top-3 contributing features per alert. A positive result is a high-probability escalation verdict
+    on a logon-script child command -- validate by checking what the command targets (LSASS, admin groups,
+    service config) and the resulting privilege; useful as a complement to the regex and rarity checks
+    above under Privilege Escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, Enterprise Workstations, Servers with local administrator accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = ngrams + length + char_class(CommandLine) for logon_script_children
+
+      | p = CommandLineClassifier.predict_proba(features)
+
+      | where p > 0.85
+
+      | emit top3_features'
+- question: Is a script process creation followed within ~2 minutes by a service ImagePath registry write
+    (HKLM\SYSTEM\CurrentControlSet\Services\<Service>\ImagePath) and then a start/restart of that same
+    service?
+  context: Editing a service's ImagePath and restarting it is a known privilege-escalation path because
+    services run as SYSTEM. Interpreters writing ImagePath are rare. Alert when a script process creation
+    (4688) is followed within two minutes by a service ImagePath registry write (4657) and a service start
+    (7040/7036) for the same service. Capture the timing delta and start success/failure State. A positive
+    result is the full script -> ImagePath-write -> service-start sequence on one host -- a strong escalation
+    indicator; benign service reconfiguration comes from installers/SCM, not script interpreters.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Windows Event ID 7040
+  - Windows Event ID 7036
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=4688 NewProcessName in interpreters AS t0
+
+      | followed_by (source=4657 ObjectName matches /Services\\.*\\ImagePath/) within 120s AS t1
+
+      | followed_by (source in (7040,7036) same Service) within 120s AS t2
+
+      | alert with delta=t2-t0'
+- question: Which processes modifying a service ImagePath are in the bottom 0.01% by historical prevalence,
+    and what are the service-start failure (7040/7036) rates that distinguish failed exploitation from
+    successful hijacks?
+  context: Statistical scoring separates rare, suspicious ImagePath edits from routine ones and distinguishes
+    failed from successful escalation. Score processes that modify service ImagePath by historical prevalence
+    (<0.01%) and profile service-start failure rates. A positive result is an extremely rare process editing
+    ImagePath; pairing with start-success State reveals whether the hijack succeeded (service started
+    as SYSTEM) or failed (start errors). This complements the deterministic sequence rule under Privilege
+    Escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Windows Event ID 7040
+  - Windows Event ID 7036
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=4657 ImagePath_writes
+
+      | eval prevalence = count(ProcessName)/total_fleet
+
+      | join 7040/7036 start_status by Service
+
+      | where prevalence < 0.0001
+
+      | stats start_fail_rate by ProcessName, Service
+
+      | alert'
+- question: Does a provenance-graph autoencoder flag the low-likelihood causal chain script -> registry
+    ImagePath write -> service start as anomalous?
+  context: A provenance autoencoder can detect the escalation chain even when timing or naming varies
+    from the deterministic rule. Model the causal chain script -> ImagePath registry write -> service
+    start and flag low-likelihood instances (KAIROS-style), reconstructing the sequence with top-3 features
+    for triage. A positive result is an anomalous service-hijack chain the analyst can walk end-to-end;
+    this captures stealthy or slow variants of the escalation that fixed time-window rules miss.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Windows Event ID 7040
+  - Windows Event ID 7036
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = provenance_graph(window=24h)
+
+      | model = ProvenanceAutoencoder.load()
+
+      | score chains matching (process)->(reg_write ImagePath)->(service_start)
+
+      | where reconstruction_error > p99
+
+      | emit chain, top3_features'
+- question: Do non-privileged interactive (Type 2) logons, joined by Logon ID, spawn processes with elevated
+    tokens (TokenElevationType Type1/Type2) or High/System integrity, and are they preceded by failed
+    logons (4625)?
+  context: If a logon script grants more privilege than the user should have, a non-privileged interactive
+    logon will spawn elevated processes -- a sign of escalation. Join 4624 logons with 4688 process creations
+    via Logon ID and alert when non-privileged Type 2 logons spawn TokenElevationType Type1/2 processes,
+    correlating preceding 4625 failed logons as an escalation-attempt State signal. A positive result
+    is a standard user obtaining an elevated token inconsistent with their baseline; benign elevation
+    comes from known admins/UAC consent.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4625
+  - 'NAI: Enterprise Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=4624 LogonType=2 SubjectUser in non_privileged
+
+      | join LogonId [ source=4688 TokenElevationType in (Type1,Type2) OR IntegrityLevel in (High,System)
+      ]
+
+      | append preceding 4625 same account as failed_attempts
+
+      | alert'
+- question: Which users launch processes at High/System integrity when their 30-day baseline is more than
+    99% Medium, and what are their failed-logon (4625) rates as a complementary anomaly signal?
+  context: A per-user shift in integrity level exposes anomalous elevation. Flag users launching High/System
+    integrity processes when their 30-day baseline is >99% Medium integrity, and profile per-user failed-logon
+    rates as a complementary signal. A positive result is a user whose process-integrity profile suddenly
+    jumps to High/System -- consistent with escalation via a logon hook; baselining from datasets like
+    LANL helps set thresholds. Normal users remain almost entirely at Medium integrity.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4625
+  - 'NAI: Enterprise Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=4688 per user
+
+      | eval pct_medium_30d = count(IntegrityLevel=Medium)/count(*)
+
+      | where pct_medium_30d>0.99 AND recent IntegrityLevel in (High,System)
+
+      | join per-user 4625 failed_logon_rate
+
+      | alert'
+- question: Does an Isolation Forest (or One-Class SVM where poisoning robustness is required) on user/logon-type/integrity/token
+    features flag any process as an elevation outlier?
+  context: Multivariate elevation anomalies are best caught with unsupervised outlier models. Train Isolation
+    Forest on user, logon type, integrity level, and token features and alert on outliers, using LIME
+    to emit the top-3 contributing features; prefer One-Class SVM where adversarial poisoning is a concern.
+    A positive result is a process the model deems jointly anomalous across identity and privilege features
+    -- a candidate escalation event under T1037 to correlate with the logon source and any preceding script
+    activity.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4625
+  - 'NAI: Enterprise Workstations, Terminal Servers, Virtual Desktop Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = [user, logon_type, integrity_level, token_elevation_type] per process
+
+      | model = IsolationForest.fit(baseline)  # or OneClassSVM
+
+      | where decision_function(X) < threshold
+
+      | emit LIME_top3_features'
+- question: Do processes spawned by machine startup scripts (parent services.exe/wininit.exe) request
+    PROCESS_VM_READ access to LSASS or write to the SAM/SYSTEM hives?
+  context: Startup-script children that read LSASS memory or write SAM/SYSTEM hives are attempting credential
+    theft, a core escalation objective. Alert when 4656/Sysmon-10 show lsass.exe handle requests with
+    PROCESS_VM_READ by script interpreters, or 4663 shows SAM/SYSTEM hive writes by startup-script children.
+    Capture access success/failure (granted vs. access-denied) as State. A positive result is a startup-spawned
+    process touching LSASS or the SAM -- treat as active credential access/escalation; legitimate startup
+    children do not access credential stores.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers, Credential Stores (LSASS process memory), Security Databases (SAM file)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=4656 OR Sysmon EventCode=10) TargetImage=lsass.exe GrantedAccess has 0x10 (PROCESS_VM_READ)
+
+      | OR (source=4663 ObjectName matches /(SAM|SYSTEM)$/ AccessMask has WriteData)
+
+      | where ParentImage in ("services.exe","wininit.exe") OR ProcessName in interpreters
+
+      | alert with access_status'
+- question: Which LSASS/SAM accesses come from processes outside the legitimate baseline or in the bottom
+    1% by prevalence, and what is the rate of access-denied (failed) handle requests as attempted-credential-theft
+    State?
+  context: Rarity and failure scoring distinguish real credential-access attempts from the few legitimate
+    LSASS consumers. Flag LSASS/SAM accesses from processes outside the legitimate baseline or in the
+    bottom 1% by prevalence, and separately profile access-denied handle requests as attempted-credential-theft
+    State. A positive result is a rare process requesting LSASS/SAM access (whether granted or denied)
+    -- a strong escalation/credential-access signal; common security tooling forms a known baseline that
+    is excluded.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers, Credential Stores (LSASS process memory), Security Databases (SAM file)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source in (4656,4663,Sysmon10) target in (lsass, SAM, SYSTEM)
+
+      | eval prevalence = count(ProcessName)/total_fleet
+
+      | where ProcessName NOT in lsass_access_baseline OR prevalence < p01
+
+      | stats access_denied_rate by ProcessName
+
+      | alert'
+- question: Does a node-level provenance GNN flag script subgraphs whose nodes access LSASS or the SAM,
+    providing node-granular attribution?
+  context: Node-level provenance modeling pinpoints exactly which script-spawned node accessed credential
+    stores. Apply a node-level provenance GNN (ThreaTrace/KAIROS-style) to flag script subgraphs whose
+    nodes access lsass/SAM, providing node-granular attribution and the top-3 deviating features. A positive
+    result identifies the specific anomalous node in the chain for precise investigation of credential-access
+    escalation; this is valuable when a startup host spawns many children and only one touches LSASS.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers, Credential Stores (LSASS process memory), Security Databases (SAM file)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = provenance_graph(window=24h)
+
+      | model = NodeProvenanceGNN.load()
+
+      | score nodes that access lsass/SAM within subgraphs rooted at startup scripts
+
+      | where node_score > p99
+
+      | emit node_id, top3_features'
