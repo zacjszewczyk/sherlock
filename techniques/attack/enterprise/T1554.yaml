@@ -1,0 +1,429 @@
+name: 'T1554: Compromise Host Software Binary'
+id: ea4f15a8-593a-49f2-a3e3-e18fee102ff1
+description: Investigate whether an adversary has compromised host software binaries to establish persistence,
+  persistently collect credentials, or evade defenses. This playbook helps an analyst hunt for integrity
+  violations in trusted executables and libraries (hash drift from known-good baselines, invalid or newly-missing
+  code signatures, image tampering, and high-entropy or repacked variants) across critical system and
+  application directories on Windows, Linux, macOS, and ESXi. It also guides detection of unauthorized
+  file writes/renames to executable and library files by non-installer processes, attempts to pin or block
+  updates of a tampered binary (e.g., yum-versionlock), anomalous outbound network activity from binaries
+  that should not communicate, and suspicious post-tamper behavior such as rare parent-child process chains
+  or modules loaded from user-writable paths. Approaches span symbolic-logic allowlisting, statistical
+  baselining of hash churn, write volume, port/byte usage and process prevalence, and machine-learning
+  models over static features, API-call sequences, network forecasts, and system provenance graphs.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any executed host binaries in critical system or application directories failing integrity
+    verification — a SHA256 that does not match the known-good allowlist, a signature status that is not
+    'Valid', or (on Linux/macOS) an on-disk binary that fails package-manager or codesign verification?
+  context: An adversary maintaining persistence under T1554 replaces or patches a legitimate, routinely-executed
+    binary (SSH/FTP/email clients, system utilities, server applications) with a backdoored version. Comparing
+    the running image against a curated hash/signature allowlist, and verifying on-disk binaries with
+    rpm -V, dpkg --verify, or codesign --verify, exposes the substitution even when the file name and
+    path look normal. A positive result — hash drift, an invalid/untrusted signature, anomalous linked
+    libraries or exported symbols, or a modification time outside the install/patch window (as in the
+    trojanized sshd/sftp/cat binaries of FontOnLake) — is a strong indicator of compromise. A clean match
+    across the fleet lowers suspicion for that path.
+  answer_sources: &id001
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Defender Event ID 1116
+  - Zeek pe.log
+  - 'NAI: Critical system directories (e.g., C:\Windows\System32, /usr/bin), application installation
+    directories (e.g., C:\Program Files), network file shares hosting executables, domain controllers,
+    application servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win (EventCode=4688 OR source=\"WinEventLog:Microsoft-Windows-Windows Defender\" EventCode=1116)\n\
+      \  | where Image IN (critical_binary_paths)\n  | lookup allowlist_binaries FilePath OUTPUT KnownGoodHash,\
+      \ ExpectedSigner\n  | where (FileHash!=KnownGoodHash) OR (SignatureStatus!=\"Valid\")\n  | table\
+      \ _time, host, Image, FileHash, KnownGoodHash, SignatureStatus"
+  - technology: auditd/pseudocode
+    query: "  # scheduled integrity check on Linux/macOS endpoints\n  rpm -Va || dpkg --verify ; codesign\
+      \ --verify --deep /Applications/*/Contents/MacOS/*\n  for each binary: if (on_disk_hash != package_manifest_hash)\n\
+      \     OR (verify_status != OK) OR (mtime outside patch_window)\n     OR (linked_libs/exported_symbols\
+      \ not in baseline): emit ALERT(path, host)"
+- question: Has Sysmon flagged a process image as replaced or changed (Event ID 25), and was an integrity
+    failure (hash drift or invalid signature) immediately followed by execution from that same modified
+    path or by suspicious child processes spawning from the binary?
+  context: Process tampering and the tight sequence of modify-then-execute are hallmarks of binary compromise
+    for persistence. Sysmon Event ID 25 fires when a process's on-disk image is overwritten or changed
+    after load, a direct signal of substitution or entry-point patching. Escalating cases where an integrity
+    failure is chained to immediate execution from the modified path, or to anomalous child-process spawning,
+    separates true tampering from benign file churn. This FIM-plus-correlation approach (as demonstrated
+    by Wazuh) turns a noisy single signal into a high-confidence persistence detection.
+  answer_sources: *id001
+  range: Last 90 days; pivot ±10 minutes around each integrity-failure event to capture the execution
+    chain
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win source=\"WinEventLog:Sysmon\" EventCode=25\n  | eval tamper_type=ProcessTamperingType\
+      \  # Image is replaced / Image is changed\n  | join host, Image [search EventCode=4688 OR EventCode=1\
+      \ integrity_status=\"fail\"]\n  | transaction host Image maxspan=10m\n  | where execution_from_modified_path=1\
+      \ OR suspicious_child=1\n  | table _time, host, Image, tamper_type, child_process"
+- question: Has any process pinned or blocked updates for a software package whose binary previously failed
+    integrity verification — for example new yum-versionlock entries, edits to versionlock.list, or held
+    dpkg packages?
+  context: After trojanizing a binary, adversaries often prevent it from being patched away, freezing
+    the malicious version in place. On Linux this looks like yum-versionlock additions, versionlock.list
+    modifications, or apt-mark hold of the affected package — a defense-evasion behavior MITRE ties directly
+    to T1554 (observed in FontOnLake and UNC3886 tradecraft). Correlating a new update-lock with a prior
+    integrity failure on the same package is a high-fidelity signal that the lock is protecting attacker
+    code rather than reflecting routine change control. Maintain tuned allowlists and profile suppressed/blocked
+    verification failures to avoid missing this (per Diaz-Verdejo et al.).
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: "  auditd watch: /etc/yum/pluginconf.d/versionlock.list, dpkg held set, `apt-mark hold`, `yum\
+      \ versionlock`\n  on modify/exec:\n    pkg = affected_package(event)\n    if prior_integrity_failure(pkg,\
+      \ lookback=90d):\n        ALERT(host, pkg, lock_action, time)"
+- question: Does the number of distinct SHA256 hashes observed for a given binary path in a day exceed
+    three standard deviations above that path's 30-day baseline, indicating abnormal churn for a normally-stable
+    system binary?
+  context: Stable system binaries should show essentially zero hash change between patch cycles. By counting
+    distinct SHA256 values per binary path per day and maintaining a per-path 30-day mean and standard
+    deviation, an analyst can flag the unexpected appearance of a new hash for a path that should not
+    change. A count exceeding 3σ above baseline is anomalous and may indicate a tampered or repeatedly-swapped
+    binary; expect ~0 churn between patches, so even a single unexpected new hash on a critical path warrants
+    review. Derive thresholds from your own fleet to control false positives during legitimate patch windows.
+  answer_sources: *id001
+  range: Last 90 days (with a rolling 30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  index=win (EventCode=4688 OR EventCode=1) Image IN (critical_binary_paths)\n  | bin _time\
+      \ span=1d | stats dc(FileHash) AS daily_hashes by Image, _time\n  | eventstats avg(daily_hashes)\
+      \ AS mu stdev(daily_hashes) AS sd by Image\n  | where daily_hashes > mu + 3*sd\n  | table _time,\
+      \ Image, daily_hashes, mu, sd"
+- question: Which hosts show a high weighted 'drift index' for critical binary paths — combining hash
+    novelty, signer changes, and execution frequency — placing them above the 99th percentile of the fleet?
+  context: No single integrity signal is decisive, but combining them sharpens detection. A per-host weighted
+    drift index that fuses hash novelty (a never-before-seen hash for a critical path), signer/issuer
+    changes (a previously-signed path now unsigned or signed by a new authority), and execution frequency
+    surfaces hosts whose critical binaries are quietly drifting from the known-good fleet state. Alerting
+    on index values above the 99th percentile prioritizes the small number of hosts most likely harboring
+    a compromised binary for persistence, while tolerating routine, fleet-wide patching that moves everyone
+    together.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  index=win Image IN (critical_binary_paths)\n  | stats values(FileHash) AS hashes values(Signer)\
+      \ AS signers count AS execs by host, Image\n  | eval hash_novelty=newhash_score(hashes), signer_change=signer_delta(signers)\n\
+      \  | eval drift_index = w1*hash_novelty + w2*signer_change + w3*normalize(execs)\n  | eventstats\
+      \ perc99(drift_index) AS p99\n  | where drift_index > p99 | sort - drift_index"
+- question: For any modified or replaced binary, do its section/whole-file Shannon entropy, import-table
+    novelty, or signer/issuer delta mark it as a high-entropy or newly-unsigned variant of a previously-signed
+    path?
+  context: Packed, encrypted, or patched binaries exhibit elevated Shannon entropy and unusual import
+    tables, and a tampered file often loses or changes its code signature. Computing section and whole-file
+    entropy, import-table novelty, and signer/issuer deltas for any modified/replaced binary lets the
+    analyst flag variants that no longer match the benign, signed version of that path. Entropy-driven
+    ensembles separate tampered/packed binaries from benign at roughly 98% accuracy in zero-day PE research,
+    so a high-entropy or newly-unsigned variant of a known-signed path is a strong tamper indicator deserving
+    deeper triage.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  input: modified_or_replaced_binaries\n  for each f:\n    e_file = shannon_entropy(f); e_sec\
+      \ = max(section_entropy(f))\n    imp_novelty = import_table_delta(f, baseline[f.path])\n    signer_delta\
+      \ = signer_issuer_change(f, baseline[f.path])\n    if (e_file>7.2 OR e_sec>7.5 OR imp_novelty high\
+      \ OR (was_signed AND now_unsigned)):\n        ALERT(f.path, host, e_file, e_sec, signer_delta)"
+- question: Does a supervised model (XGBoost over process-creation and static features such as SignatureStatus,
+    HashInAllowlist, section/file entropy, parent path, command-line and path entropy) score an execution
+    as a high-probability suspicious-binary-modification event?
+  context: When simple rules miss novel or zero-day tampering, a trained classifier can generalize across
+    many weak signals. An XGBoost model over process-creation and static features (signature status, allowlist
+    membership, section and file entropy, parent path, command-line entropy, path entropy) flags executions
+    that resemble known binary-modification attacks, following the static-feature ensembles in zero-day
+    PE studies. Surfacing the top-3 SHAP-contributing features (e.g., high entropy, missing signature,
+    suspicious import) in the alert text gives the analyst an immediate, explainable rationale for triage
+    and reduces blind trust in the model.
+  answer_sources: *id001
+  range: Last 90 days (score in near-real-time; retrain monthly)
+  queries:
+  - technology: ML/pseudocode
+    query: "  features = [SignatureStatus, HashInAllowlist, section_entropy, file_entropy,\n         \
+      \    parent_path, cmdline_entropy, path_entropy]\n  model = XGBoost.load(\"suspicious_binary_mod.model\"\
+      )\n  p = model.predict_proba(features)\n  if p > 0.85:\n      top3 = shap_top_features(model, features,\
+      \ k=3)\n      ALERT(host, Image, prob=p, drivers=top3)"
+- question: Does the runtime API-call sequence of an executed binary classify as backdoor-like behavior,
+    and can malicious behavior be predicted from its earliest calls before the payload completes?
+  context: A binary may pass static checks yet behave maliciously at runtime. Classifying the runtime
+    API-call sequence (RF/XGBoost over TF-IDF features, benchmarked on datasets like Mal-API-2019) detects
+    behavior characteristic of a backdoored binary, and early-prediction approaches such as EarlyMalDetect
+    can flag malice from the first calls before the payload finishes. A positive result on a normally-benign
+    trusted binary strongly suggests it has been trojanized for persistence; the early-warning aspect
+    supports intervention before damage is done.
+  answer_sources: *id001
+  range: Last 90 days (streaming API telemetry; alert intra-execution)
+  queries:
+  - technology: ML/pseudocode
+    query: "  seq = api_call_sequence(process)\n  X = tfidf(seq)\n  label = rf_xgb_model.predict(X)  \
+      \       # benign vs backdoor-like\n  early = early_maldetect(seq[:k])         # predict from first\
+      \ k calls\n  if label==\"malicious\" OR early.prob>0.8:\n      ALERT(host, Image, label, early.prob)"
+- question: Does a temporal provenance graph flag an anomalous file-write → hash/signature-change → execution
+    → child/network chain around a host binary, and can the surrounding attack subgraph be reconstructed
+    for triage?
+  context: 'The full compromise lifecycle leaves a connected trail: a write to a binary, a resulting hash/signature
+    change, execution of the modified image, and downstream child-process or network activity. Modeling
+    this provenance chain with a temporal graph autoencoder (as in KAIROS) or node-level scoring (ThreaTrace)
+    lets an analyst detect anomalous paths that no single rule captures, and reconstruct the surrounding
+    subgraph to understand scope and root cause quickly. Anomalous reconstruction error on this chain
+    for a critical binary is a high-value persistence signal.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "  G = build_provenance_graph(file_write, hash_change, exec, child, network)\n  model = TemporalGraphAutoencoder.load()\n\
+      \  scores = model.reconstruction_error(G.nodes)\n  for n in scores where score > threshold:\n  \
+      \    sub = extract_subgraph(G, n, radius=2)\n      ALERT(host, anchor=n, subgraph=sub)"
+- question: Has any process not on the trusted installer/updater allowlist written to or renamed an executable
+    or library file (.exe, .dll, .sys, .so, dylib) in a protected system or application directory?
+  context: Legitimate changes to binaries in protected directories come from a small, known set of installers
+    and update agents. Alerting when Windows Event ID 4663 (or auditd open/write on Linux) shows writes/renames
+    to executable/library files in protected directories by a source not on the trusted allowlist directly
+    surfaces unauthorized binary modification — the core T1554 action. Using maintained SigmaHQ rules
+    and Wazuh FIM logic, a positive result (e.g., a random process or shell overwriting a .dll in System32)
+    is a strong persistence indicator; legitimate installer activity is expected and allowlisted away.
+  answer_sources: &id002
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems of production servers and user endpoints, software deployment servers, code repositories,
+    and CI/CD pipeline build servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win EventCode=4663 ObjectName IN (\"*.exe\",\"*.dll\",\"*.sys\")\n  ObjectName IN\
+      \ (protected_dirs) AccessMask IN (WRITE, DELETE, RENAME)\n  | where ProcessName NOT IN (trusted_installer_allowlist)\n\
+      \  | table _time, host, ProcessName, ObjectName, AccessMask, SubjectUserName"
+  - technology: auditd/pseudocode
+    query: "  auditd -w /usr/bin -p wa ; -w /lib -p wa  # plus .so/dylib paths\n  alert if SYSCALL open/write/rename\
+      \ on (*.so, dylib, ELF in protected dirs)\n    AND exe NOT IN (apt,dpkg,rpm,yum,trusted_updaters)"
+- question: Did Sysmon Event ID 25 report 'Image is replaced' for any process whose on-disk image was
+    overwritten after it was loaded?
+  context: Sysmon Event ID 25 with the 'Image is replaced' subtype fires precisely when a running process's
+    backing file is overwritten on disk after load — a direct, low-noise indicator of binary substitution.
+    Adversaries patching or swapping a trusted binary in place trigger this signal. Because legitimate
+    software rarely replaces its own running image, any such event on a critical or unexpected process
+    (per Wazuh's tamper detection guidance) warrants immediate triage to determine whether a backdoor
+    has displaced the original binary.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win source=\"WinEventLog:Sysmon\" EventCode=25 ProcessTamperingType=\"Image is replaced\"\
+      \n  | table _time, host, Image, ProcessId, User\n  | where Image NOT IN (expected_self_updaters)"
+- question: Does the daily Shannon entropy of processes writing to protected directories exceed the host's
+    98th percentile baseline, or do bytes written per binary path deviate more than 3σ from baseline?
+  context: 'Tampering changes the diversity and volume of writers touching protected binary directories.
+    Computing the daily Shannon entropy of processes writing there (per host) catches an unusual spread
+    of writers, while tracking total bytes written per binary path catches an abnormally large overwrite.
+    Flagging entropy above the host''s 98th-percentile 30-day baseline, or byte-volume beyond 3σ, applies
+    a volume/frequency ''physics'' lens that complements allowlisting: a normally-quiet directory suddenly
+    written by many or by an unusually large payload is suspicious even if the writer is not yet known-bad.'
+  answer_sources: *id002
+  range: Last 90 days (rolling 30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  index=win EventCode=4663 ObjectName IN (protected_dirs) AccessMask=WRITE\n  | bin _time\
+      \ span=1d\n  | stats dc(ProcessName) AS writers sum(BytesWritten) AS bytes by host, _time, ObjectName\n\
+      \  | eval writer_entropy=shannon(writers_distribution)\n  | eventstats perc98(writer_entropy) AS\
+      \ p98 avg(bytes) AS mu stdev(bytes) AS sd by host, ObjectName\n  | where writer_entropy>p98 OR bytes>mu+3*sd"
+- question: Are there bursts of access-denied or failed write attempts (Event ID 4663 failure audits,
+    auditd EACCES) to protected binary paths, especially preceding a successful write?
+  context: 'Before successfully tampering with a binary, an adversary often probes for a writable persistence
+    target, generating access-denied or failed write attempts. Profiling these blocked writes (Windows
+    4663 failure audits, auditd EACCES) as a distinct signal exposes that reconnaissance: a burst of failed
+    writes to protected binary paths followed by a successful one is a classic probe-then-persist pattern.
+    Tune baselines and expected failure rates per directory (per Diaz-Verdejo et al.) so routine permission
+    noise does not drown the meaningful spike-then-success sequence.'
+  answer_sources: *id002
+  range: Last 90 days; correlate failure bursts with any subsequent success within 24 hours
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  index=win EventCode=4663 ObjectName IN (protected_dirs) (Keywords=\"Audit Failure\" OR Status=ACCESS_DENIED)\n\
+      \  | bin _time span=1h | stats count AS fails by host, ObjectName, _time\n  | eventstats avg(fails)\
+      \ AS mu stdev(fails) AS sd by host, ObjectName\n  | where fails > mu+3*sd\n  | append [search EventCode=4663\
+      \ success write same ObjectName within=24h]\n  | transaction host ObjectName"
+- question: Does an Isolation Forest over file-modification features (source path, target path, user,
+    parent process, bytes written) flag a write to a protected binary directory as an outlier indicating
+    unauthorized modification?
+  context: Unauthorized binary modifications are rare outliers in the high-volume stream of legitimate
+    file activity. Training an Isolation Forest on Windows Event ID 4663 / auditd features — source path,
+    target path, user, parent process, and bytes written — isolates these anomalies without needing labeled
+    attacks, catching novel writer/target combinations that escape static allowlists. Including the top-3
+    contributing features (e.g., a rare writer process, an unusual target path) makes each alert explainable
+    so the analyst can quickly judge whether the outlier is a real tampering attempt against a host binary.
+  answer_sources: *id002
+  range: Last 90 days (retrain periodically on benign baseline)
+  queries:
+  - technology: ML/pseudocode
+    query: "  X = features(4663/auditd: src_path, tgt_path, user, parent_proc, bytes_written)\n  iforest\
+      \ = IsolationForest(contamination=0.001).fit(baseline_X)\n  score = iforest.decision_function(X)\n\
+      \  if score < anomaly_cutoff:\n      drivers = feature_attribution(iforest, X, k=3)\n      ALERT(host,\
+      \ tgt_path, user, drivers)"
+- question: Are binaries that should never perform network I/O (e.g., notepad.exe, calc.exe, services.exe,
+    system utilities) initiating outbound network connections?
+  context: Many trusted utilities have no legitimate reason to open network sockets. Correlating process-creation
+    logs with Windows Event ID 5156 (or Zeek conn.log) and alerting when such binaries initiate outbound
+    connections — using SigmaHQ rules — reveals binaries that have been backdoored to beacon or exfiltrate.
+    A positive result (e.g., notepad.exe making an outbound TCP connection, especially to a non-standard
+    port or low-reputation IP) is a high-confidence sign the binary was tampered for command-and-control
+    or credential collection while masquerading as a benign tool.
+  answer_sources: &id003
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Endpoint process and network monitoring, network egress points (firewalls, web proxies), DNS
+    resolution logs, and Intrusion Detection Systems (IDS).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win EventCode=5156\n  | where Application IN (no_network_binaries)  # notepad.exe,\
+      \ calc.exe, services.exe, ...\n  | join host, Application [search EventCode=4688]\n  | table _time,\
+      \ host, Application, DestAddress, DestPort"
+  - technology: Zeek/pseudocode
+    query: "  conn.log: select uid, id.orig_h, id.resp_h, id.resp_p, orig_pcr\n  where originating_process\
+      \ IN (no_network_binaries)\n  -> alert with dest, port, bytes"
+- question: Does an outbound connection from a binary use a destination port outside its learned baseline,
+    or exceed the 99th percentile of bytes, and does a Mahalanobis-scored byte-frequency profile mark
+    the payload as abnormal?
+  context: A backdoored binary's C2 traffic often deviates from the application's normal destinations
+    and payload sizes. Baselining each process's destination ports and bytes-per-connection, then alerting
+    on a port outside the baseline or bytes above the 99th percentile, catches unexpected channels. Modeling
+    per-host/port/length byte-frequency profiles scored with Mahalanobis distance (as in PAYL) further
+    flags payloads whose byte distribution deviates from normal, surfacing signature-free C2 from a tampered
+    binary even when it reuses a common port.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  conn.log per (orig_process, resp_p):\n    baseline ports = learned set; baseline bytes dist\
+      \ per port/length\n  alert if resp_p NOT IN baseline_ports\n     OR orig_bytes > perc99(bytes_by_process)\n\
+      \     OR mahalanobis(byte_freq_profile, model[host,port,len]) > chi2_threshold"
+- question: Is a binary generating an outbound HTTP header fingerprint that has never been seen for that
+    host/application combination?
+  context: Backdoors frequently craft HTTP requests with header orderings, user-agents, and field sets
+    that differ from the legitimate application's traffic. Building per-host, per-application outbound
+    HTTP header fingerprints and flagging connections whose fingerprint has never been observed for that
+    host/application (as in DECANTeR) catches signature-free backdoor C2 hiding in HTTP. A never-before-seen
+    fingerprint emanating from a normally-quiet or trusted binary is a strong indication that the binary
+    has been modified to communicate with attacker infrastructure.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  http.log: fp = fingerprint(user_agent, header_order, header_set, method)\n  key = (host,\
+      \ originating_application)\n  if fp NOT IN known_fingerprints[key]:\n      ALERT(host, application,\
+      \ fp, resp_h)"
+- question: Is the suspect binary generating regular low-volume failed connections (Zeek S0/REJ), blocked
+    egress, or NXDOMAIN responses that deviate from the host's normal success/failure baseline — a sign
+    of beaconing to dead C2?
+  context: 'A backdoor whose C2 is offline still beacons, producing a distinctive trickle of failed connections
+    (Zeek conn.log S0/REJ), blocked egress, and NXDOMAIN lookups (Zeek dns.log). Profiling these failure
+    modes per binary as a distinct signal exposes beaconing that successful-connection analytics miss:
+    regular, low-volume failed beacons are anomalous against a host''s normal success/fail ratio (a failure-mode/state
+    ''physics'' view). This complements HTTP fingerprint deviation from DECANTeR and helps attribute the
+    beaconing to a specific modified binary.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  conn.log conn_state IN (S0, REJ) by orig_process\n  + dns.log rcode_name=NXDOMAIN by orig_process\n\
+      \  | bin time span=1h | stats count AS fails, regularity=interval_stddev\n  | baseline fail_rate\
+      \ per host/process\n  | alert if low-volume AND regular (small interval_stddev) AND fail_rate>>baseline"
+- question: Do forecasted source-host-by-port traffic volumes (Prophet/LSTM) show significant residual
+    deviations attributable, via provenance, to a modified binary process node?
+  context: Compromised binaries can shift a host's traffic volume in ways that emerge only against an
+    expected baseline. Forecasting source-host-by-port traffic with Prophet or an LSTM and flagging significant
+    residual deviations highlights unexpected communication — a spike or new sustained flow that the model
+    did not predict. Cross-referencing the anomalous flow with provenance (as in KAIROS) attributes it
+    to the specific modified-binary process node, turning a volume anomaly into an actionable, attributable
+    detection of C2 or exfiltration from a tampered host binary.
+  answer_sources: *id003
+  range: Last 90 days (train forecast on ≥30 days; evaluate residuals daily)
+  queries:
+  - technology: ML/pseudocode
+    query: "  series = volume(src_host, resp_p) over time\n  model = Prophet_or_LSTM.fit(series[train])\n\
+      \  resid = observed - model.predict(series[eval])\n  if abs(resid) > k*resid_std:\n      node =\
+      \ provenance_attribute(flow)  # link flow -> process node\n      ALERT(src_host, resp_p, resid,\
+      \ process=node)"
+- question: Did a known-bad parent-child chain execute (e.g., AcroRd32.exe→cmd.exe, outlook.exe→powershell.exe,
+    winword.exe→powershell.exe), or did a process load a module/library from a user-writable path (with
+    YARA confirming malicious content)?
+  context: A tampered or hijacked trusted binary often betrays itself by spawning an unexpected child
+    (Office/PDF readers launching shells) or by loading a module from a user-writable path. Alerting on
+    known-bad parent-child chains and on Windows Event ID 4663 showing module/library loads from user-writable
+    directories — using maintained SigmaHQ signatures and YARA content checks from signature-base on the
+    loaded module — catches both behavioral and content indicators of compromise. A match indicates the
+    binary is executing attacker logic, supporting persistence or follow-on actions.
+  answer_sources: &id004
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Process execution logs on all endpoints and servers, system memory where modules are loaded,
+    user profile directories (e.g., %APPDATA%, %TEMP%), and application plugin directories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  index=win EventCode=4688\n  | where (parent==\"AcroRd32.exe\" AND child==\"cmd.exe\")\n\
+      \       OR (parent==\"outlook.exe\" AND child==\"powershell.exe\")\n       OR (parent==\"winword.exe\"\
+      \ AND child==\"powershell.exe\")\n  | append [search EventCode=4663 ObjectName IN (\"*.dll\",\"\
+      *.so\") path IN (user_writable_dirs)\n            | where yara_scan(ObjectName)==MATCH]\n  | table\
+      \ _time, host, parent, child, ObjectName"
+- question: Which process-creation events involve parent-child pairs whose enterprise prevalence is below
+    0.1%, marking them as rare relationships that may stem from a tampered binary?
+  context: Rare parent-child relationships are a reliable proxy for anomalous execution. Computing the
+    enterprise-wide prevalence of each parent-child pair and flagging creation events below a 0.1% frequency
+    cutoff surfaces unusual chains — such as a trusted binary suddenly spawning an interpreter or network
+    tool it normally never launches. Derive the cutoff from your own fleet distribution and allowlist
+    rare-but-benign admin tooling, so the remaining low-prevalence pairs concentrate on genuinely suspicious
+    behavior consistent with a compromised host binary.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  index=win EventCode=4688\n  | stats count by ParentImage, Image\n  | eventstats sum(count)\
+      \ AS total\n  | eval prevalence = count/total\n  | where prevalence < 0.001 AND NOT (ParentImage,Image)\
+      \ IN admin_allowlist\n  | sort prevalence"
+- question: Does a graph model of parent-child and whole-system provenance score a specific process node
+    as anomalous, identifying a tampered-binary node whose subgraph can be reconstructed for triage?
+  context: Whole-system provenance captures the relationships a single rule cannot. Embedding parent-child
+    and system-wide provenance graphs and scoring nodes for anomaly (node-level ThreaTrace, KAIROS) pinpoints
+    the specific tampered-binary process node and reconstructs its subgraph — the files it touched, processes
+    it spawned, and connections it made — for rapid triage. Reporting the top-3 contributing edges/features
+    in the alert explains why the node scored high, helping the analyst confirm compromise and scope the
+    incident around the modified host binary.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "  G = provenance_graph(process, file, module, network events)\n  emb = graph_embed(G); scores\
+      \ = anomaly_score(emb, G.nodes)\n  for n in scores where score>threshold:\n      sub = reconstruct_subgraph(G,\
+      \ n)\n      ALERT(host, node=n, top_edges=top3(n), subgraph=sub)"
+- question: Does an LSTM model of normal process/file/module event sequences flag a trusted binary that
+    begins emitting an out-of-profile sequence or parameters after tampering?
+  context: A tampered binary changes the order and content of the events it generates. Modeling the normal
+    sequence of process/file/module events with an LSTM (as in DeepLog) and flagging deviating execution
+    paths or anomalous parameters per-event catches a trusted binary that starts behaving differently
+    after being modified — for example loading unusual modules, touching unexpected files, or running
+    steps out of its established order. A sequence anomaly on a normally-predictable binary is a behavioral
+    indicator that its code path has been altered for persistence.
+  answer_sources: *id004
+  range: Last 90 days (train on benign sequences; score continuously)
+  queries:
+  - technology: ML/pseudocode
+    query: "  seq = ordered_events(process)  # process/file/module event tokens\n  model = DeepLog_LSTM.load()\n\
+      \  for i, ev in enumerate(seq):\n      if ev NOT IN model.topk_predicted(seq[:i]):\n          ALERT(host,\
+      \ Image, position=i, observed=ev, expected=model.topk)"
