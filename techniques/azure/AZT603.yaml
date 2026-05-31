@@ -1,0 +1,288 @@
+name: 'AZT603: Service Principal Secret Reveal'
+id: eb4e2243-6a1d-4af0-b98a-979ec75a1d0d
+description: Investigate whether an adversary has revealed or extracted a service principal secret from
+  an Azure Function App configuration, then reused that credential to authenticate and act under the application's
+  identity. This playbook helps an analyst surface management-plane ARM operations that return secrets
+  (for example listAppSettings and connection-string reads), correlate reads or changes to Function App
+  settings, site config, deployment slots, or function code with console, application-log, or HTTP output
+  that exposes connection strings or client secrets in plaintext, and connect any such disclosure to subsequent
+  service-principal sign-ins from new IPs, ASNs, devices, or user agents that indicate the secret was
+  revealed and reused outside the app's normal execution path. It combines deterministic detection of
+  secret-returning operations with statistical baselining of administrator and operation rarity, new-edge
+  sign-in scoring, disclosure-output and failure-rate novelty, and machine-learning rare-population, sequence,
+  and explainable UEBA classifiers, while watching for follow-on persistence such as new credentials added
+  to the application or service principal.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there management-plane ARM operations against Function Apps that return secrets in their
+    response — specifically Microsoft.Web/sites/config/list/action (listAppSettings or list connection
+    strings), Microsoft.Web/sites/config/list, and Microsoft.Web/sites/read or functions/read — targeting
+    apps whose app settings hold client-secret-like keys such as *CLIENTSECRET*, *AADClientSecret*, or
+    stored connection strings?
+  context: This is the primary deterministic anchor for AZT603 under Credential Access. The data-plane
+    retrieval of settings is unlogged, so the AzureActivity config/list/action event is the strongest
+    first-party signal that someone pulled a secret-bearing configuration. Tradecraft such as Get-AzFunctionAppSetting
+    and `az functionapp config appsettings list` map directly to these operations. Treat any such read
+    as suspicious because hardened Function Apps use managed identities rather than stored secrets, so
+    a config-list against an app that still holds a client secret is a meaningful credential-access indicator.
+    A positive result is a management operation returning secrets against a secret-bearing app from a
+    principal or location that is not part of normal CI/CD or administration; a negative result is routine,
+    expected configuration reads by known automation.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: SEARCH AzureActivity WHERE OperationName IN ['Microsoft.Web/sites/config/list/action','Microsoft.Web/sites/config/list','Microsoft.Web/sites/read','Microsoft.Web/sites/functions/read']
+      AND ResourceType=='Function App' AND app_settings_keys MATCH ['*CLIENTSECRET*','*AADClientSecret*','connectionstring*'];
+      ALERT on each read; OUTPUT caller, callerIpAddress, resource, operation, time.
+- question: Within a single correlation window, do reads or changes to a Function App's settings, site
+    config, deployment slots, or function code coincide with console output, application logs, or HTTP
+    responses that expose connection strings, client secrets, or serialized settings (matching patterns
+    like client_secret, AccountKey=, Password=, or base64/secret-shaped tokens)?
+  context: This question links a configuration or code change to an actual plaintext disclosure of the
+    secret, which is the heart of a Service Principal Secret Reveal. The analyst looks for a function
+    revision whose runtime output emits a secret-bearing string within the same window as a config or
+    code change, indicating the change was made to surface the secret rather than for legitimate maintenance.
+    Apply regex over console, app, and HTTP logs for client_secret, AccountKey=, Password=, and high-entropy/base64
+    tokens. A positive result is a config/code change followed closely by secret-shaped output; a negative
+    result is benign logging without secret material.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days, with a tight correlation window (e.g., 30 minutes) between config/code changes
+    and secret-bearing output.
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: JOIN (AzureActivity config/code/slot/deploy changes) TO (AppServiceConsoleLogs OR AppServiceAppLogs
+      OR AppServiceHTTPLogs) ON site, time_window<=30m WHERE output MATCHES regex['client_secret','AccountKey=','Password=','[A-Za-z0-9+/]{40,}={0,2}'];
+      FLAG revision; OUTPUT site, change_op, matched_string, timestamps.
+- question: After settings access or code changes on a Function App, are there subsequent AADServicePrincipalSignInLogs
+    events for that app's service principal originating from a new IP range, ASN, device, or user agent
+    — and is a new credential then added to the application or service principal?
+  context: 'This correlation confirms that a revealed secret was actually reused outside the app''s normal
+    execution path, which elevates a possible disclosure to a likely credential compromise. Baseline the
+    service principal''s normal sign-in origins (KQL: AADServicePrincipalSignInLogs | where ServicePrincipalName
+    == ''<FunctionApp>'') and flag sign-ins from previously unseen IP/ASN/device/user-agent shortly after
+    the config or code access. Raise severity if a new credential (client secret or certificate) is then
+    added to the application or SP, which indicates the actor is establishing persistence. A positive
+    result is a post-access SP sign-in from novel infrastructure, optionally followed by credential addition;
+    a negative result is continued sign-ins only from the app''s expected runtime origins.'
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days, correlating config/code access with SP sign-ins and credential-add events over
+    the following days.
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: BASELINE AADServicePrincipalSignInLogs per ServicePrincipalName for known IP/ASN/device/UA;
+      JOIN settings_or_code_access TO later SP sign-ins where origin NOT IN baseline; ESCALATE if AuditLogs
+      shows 'Add credential'/KeyCredential/PasswordCredential added to same app/SP; OUTPUT sp, new_origin,
+      signin_time, credential_add_time.
+- question: Does graph modeling of identities, applications, and resources reveal a new permission-flow
+    edge in which a Function App's service principal secret is read and then used by a different actor
+    or host to authenticate and act?
+  context: 'Modeling identities, applications, and resources as a graph lets the analyst detect the privilege-escalation
+    edge that AZT603 creates: the secret read followed by the same credential being exercised by an actor
+    or host distinct from the app''s normal runtime. The greybox variant infers these flows from API and
+    activity logs without full configuration access, which fits first-party Azure Activity plus Entra
+    ID telemetry. A positive result is a reachable edge connecting a secret-read event to authentication/action
+    by a different principal or host; a negative result shows the credential only ever exercised by the
+    app itself.'
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days
+  queries:
+  - technology: Graph analytics pseudocode
+    query: BUILD graph(nodes=[identities,apps,resources,hosts], edges=[reads,authenticates,acts]) from
+      AzureActivity + AADServicePrincipalSignInLogs; ADD edge when SP_secret_read(app) THEN auth_or_act_by(actor!=app_runtime);
+      FLAG cross-actor permission-flow paths; OUTPUT path, source_event, reuse_event.
+- question: For each Function App, which principals perform config-list/read and code-deploy operations,
+    and do per-principal config-list counts per hour or per-app management-operation counts spike, occur
+    off-hours, or come from first-time administrators relative to the tenant's trailing baseline?
+  context: Baselining who normally manages each Function App and how often config-list/read and deploy
+    operations occur lets the analyst flag anomalous administrative behavior that precedes secret disclosure.
+    Apply a robust median/MAD modified z-score (M = 0.6745*(x-median)/MAD, flag |M| > 3.5) to per-principal
+    config-list actions per hour and per-app management-operation counts, deriving thresholds from each
+    tenant's trailing 30-day medians. This surfaces first-time administrators, off-hours access, and volume
+    spikes that a static rule would miss. A positive result is a principal whose config activity is a
+    robust outlier; a negative result is activity within the established per-app/per-principal norm.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days, with trailing 30-day medians for baselining.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each (principal,app): count config_list/read and code_deploy ops per hour; compute median,MAD
+      over trailing 30d; M=0.6745*(x-median)/MAD; ALERT when |M|>3.5 OR first_seen_principal_for_app OR
+      off_hours; OUTPUT principal, app, count, M, baseline.'
+- question: Do never-before-seen edges — service-principal to IP/ASN/device, or user to Function-App-settings
+    — score as anomalous under a Bayesian new-edge model rather than merely being absent from a static
+    allowlist?
+  context: A Bayesian new-edge model distinguishes genuinely anomalous first connections from expected
+    organic growth, which reduces false positives versus a static allowlist when scoring novel SP-to-infrastructure
+    and user-to-settings relationships. Couple it with UEBA peer-group and historical baselining and impossible-travel
+    / infrequent-IP policies so that a new edge with low prior probability and corroborating risk signals
+    is prioritized. A positive result is a high-scoring new edge such as the SP authenticating from a
+    wholly new ASN right after a settings read; a negative result is a new but statistically expected
+    edge consistent with growth.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days for edge history, scoring new edges as they appear.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: TRACK edges {SP->IP/ASN/device, user->FunctionApp_settings}; score new_edge with bayesian_model(prior_edge_history);
+      ALERT when posterior_anomaly high AND (UEBA_peer_outlier OR impossible_travel OR infrequent_IP);
+      OUTPUT edge, score, corroborating_signals.
+- question: How often does each Function App emit secret-like strings, configuration dumps, or unusually
+    large HTTP/console output after deployment events, and are there bursts of denied/403 ARM actions
+    (config/list AuthorizationFailed) or failed SP sign-ins (ResultType != 0) preceding a successful read
+    or logon?
+  context: This profiles both the disclosure output and the failure signals around it. Measure per-app
+    rates of secret-shaped output, config dumps, and oversized responses after deployments, and explicitly
+    profile denied config reads and failed SP sign-ins per principal. A burst of denied config-list actions
+    or failed SP logons immediately preceding a successful one is a distinct enumeration/credential-test
+    indicator. Prioritize apps whose output size or denied/failed rate abruptly diverges from baseline.
+    A positive result is an abnormal jump in secret-bearing output or a denied-then-allowed access pattern;
+    a negative result is stable output volume and no failure clustering.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days, with baselines on output size and denied/failed rates.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'BASELINE per app: secret_like_output_count, output_bytes, denied_config_list_rate(AuthorizationFailed),
+      failed_SP_signin_rate(ResultType!=0); ALERT when output_size or denied/failed rate >> baseline OR
+      denied/failed burst precedes success; OUTPUT app, metric, baseline, current.'
+- question: Does an unsupervised rare/population model over Azure Activity and AADServicePrincipalSignInLogs
+    flag unusual management API calls (such as rare config/list per principal), rare geographies or ASNs,
+    anomalous user-operation pairs, or elevated denied-operation rates, with the top contributing fields
+    surfaced?
+  context: Unsupervised rare-by-population models learn what is normal across the tenant and flag deviations
+    without labeled data, which is well suited to detecting one-off secret reads hidden in routine cloud
+    activity. Deploy entirely on first-party logs, surface influencer (top contributing) fields for triage,
+    and keep the deterministic config-list rules running in parallel as a detection floor. A positive
+    result is an event scored rare on operation, geography/ASN, user-operation pairing, or denial rate;
+    a negative result is activity that fits established population norms.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days for training, scoring current activity.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: TRAIN rare/population_model on [operation, principal, geo, asn, user_operation_pair, denied_rate]
+      from AzureActivity+AADServicePrincipalSignInLogs; SCORE events; ALERT on rare config/list per principal,
+      rare geo/ASN, anomalous pairs, high denied_rate; OUTPUT score, top_influencers; KEEP deterministic
+      config-list rule as floor.
+- question: Does an LSTM/DeepLog-style sequence model over ordered ARM management operations and Function
+    App console/app logs flag anomalous sequences (for example config read -> code revision -> SP sign-in
+    from a new IP) or anomalous parameter values such as oversized responses or secret-shaped console
+    output?
+  context: Sequence modeling captures the ordered progression characteristic of a secret reveal and reuse,
+    which individual rules can miss. A DeepLog-style model trained on normal ordered ARM operations and
+    console/app log keys detects both anomalous sequences and anomalous parameter values (oversized response,
+    secret-shaped output), supports online updating for drift, and identifies the offending log key for
+    explainability. A positive result is a low-probability operation sequence ending in SP authentication
+    from new infrastructure; a negative result is a sequence consistent with learned normal workflows.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days for training, scoring current operation sequences.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: seq = ordered_ARM_ops + console/app_log_keys per app; model = deeplog_lstm.train(normal_seq);
+      SCORE current_seq and parameter_values; ALERT when sequence_prob low (e.g., config_read->code_revision->SP_signin_new_IP)
+      OR parameter anomalous (oversized/secret-shaped); OUTPUT offending_log_key, sequence.
+- question: Does an explainable UEBA classifier — using peer-group/blast-radius scoring plus deployment
+    metadata, route characteristics, runtime output tokens, and post-change authentication behavior —
+    mark a Function App revision as more consistent with service-principal secret disclosure than legitimate
+    maintenance, and does each alert surface its top-3 contributing features?
+  context: This classifier combines UEBA peer-group and blast-radius context with revision-level features
+    (deployment metadata, route characteristics, runtime output tokens, post-change authentication behavior)
+    to separate disclosure-driven revisions from routine maintenance. Requiring each alert to surface
+    its top-3 contributing features via SHAP attribution (for example rare operation, new SP ASN, denied-response
+    spike) gives analysts an explanation rather than a bare score, which supports faster and more defensible
+    triage. A positive result is a high-scoring revision whose attributions point to disclosure-like behavior;
+    a negative result is a revision explained by ordinary maintenance features.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - AppServiceHTTPLogs
+  - AppServiceConsoleLogs
+  - AppServiceAppLogs
+  - AADServicePrincipalSignInLogs
+  - 'NAI: Function Apps using service principal credentials, deployment slots, and administrator workstations
+    that manage App Service resources'
+  range: Last 90 days for training and feature baselining, scoring revisions as they occur.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: features = [ueba_peer_score, blast_radius, deployment_metadata, route_chars, runtime_output_tokens,
+      post_change_auth_behavior]; p = disclosure_classifier.predict_proba(features); ALERT when p high;
+      REQUIRE shap_top3 (e.g., rare_operation, new_SP_ASN, denied_response_spike); OUTPUT revision, score,
+      top3_features.
