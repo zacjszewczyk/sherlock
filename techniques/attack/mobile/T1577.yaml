@@ -1,0 +1,408 @@
+name: 'T1577: Compromise Application Executable'
+id: b7827f87-4587-4c0b-8a5a-972544ad8345
+description: 'Hunt for adversary persistence achieved by compromising a legitimate application executable
+  on managed Android devices (MITRE ATT&CK T1577), where attackers inject malicious code into trusted
+  apps so the apps carry out adversary tasks while in use. This playbook helps an analyst investigate
+  the full chain of repackaging tradecraft: cryptographic hash and APK Signature Scheme v2/v3 signer-lineage
+  mismatches against the organizational application manifest; Janus (CVE-2017-13156) style appended-DEX
+  artifacts and v1-only signing on modern apps; abnormal APK file-size deltas and high-entropy DEX/native
+  sections indicating packed or encrypted injected payloads; clone/near-duplicate packages that match
+  an official app but carry a different signer or extra components (e.g., Agent Smith); on-device integrity-attestation
+  and anti-repackaging self-check failures; trusted-app network behavior inconsistent with baseline (C2/IOC
+  contact, DGA-like DNS, volume and failure-rate outliers); and post-update runtime drift in API/permission
+  usage or execution while the device is locked or without recent user interaction. It combines deterministic
+  symbolic-logic rules, statistical baselining, and explainable machine-learning models so the analyst
+  can confirm tampering, quarantine affected devices, and scope fleet-wide repackaging campaigns.'
+type: technique
+related:
+- tactic_id: TA0028
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does any application package reported by the MDM/EDR inventory have a SHA-256 hash that fails
+    to match the known-good value recorded in the organizational application manifest for the same app
+    id and version?
+  context: For the Persistence tactic, a hash mismatch on a store-distributed app is the most direct deterministic
+    indicator that a trusted executable has been repackaged with grafted code. The analyst joins the MDM/EDR
+    app inventory to the organizational manifest by (app id, version) and alerts on any divergence between
+    the reported and known-good SHA-256. Because APK Signature Scheme v2 hashes the entire archive, any
+    byte-level modification or rebuild necessarily invalidates the hash, so a mismatch is high-confidence
+    evidence of a repackage candidate rather than a benign variation. A positive result means treat the
+    package as untrusted and pull the raw APK for deeper static analysis; a clean match across the fleet
+    for that app id/version is strong evidence the executable is intact. Keep this exact-match rule as
+    the deterministic floor.
+  answer_sources: &id001
+  - MDM application inventory report
+  - Mobile EDR agent logs
+  - Organizational application manifest
+  - 'NAI: Managed mobile device fleet (iOS, Android); Mobile Device Management (MDM) or Unified Endpoint
+    Management (UEM) server; Organizational application manifest repository.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "inventory = mdm_app_inventory JOIN edr_app_inventory\njoined = inventory JOIN org_manifest\
+      \ ON (app_id, version)\nfor row in joined:\n  if row.reported_sha256 != row.known_good_sha256:\n\
+      \    alert(severity=\"high\", reason=\"manifest hash mismatch / repackage candidate\",\n       \
+      \   app_id=row.app_id, version=row.version, device=row.device_id)"
+- question: Does an installed package present a signer certificate digest or v3 proof-of-rotation lineage
+    that is absent from the approved-signer manifest, or advertise only a v1 (JAR) signature with no v2/v3
+    signing block?
+  context: Signer identity is the cryptographic root of trust for an app, so for Persistence an unexpected
+    signer or a broken rotation lineage indicates an unauthorized rebuild masquerading as a legitimate
+    app. The analyst compares the installed package's signer certificate digest and APK Signature Scheme
+    v3 key-rotation lineage against the approved-signer manifest and alerts when the signer is not part
+    of the expected lineage, or when a modern app advertises only a v1 (JAR) signature without a v2/v3
+    APK Signing Block. A signer outside the lineage is a strong repackage signal; a v1-only app on Android
+    7.0+ is suspicious because whole-file v2/v3 signing would otherwise detect appended bytes. A positive
+    result warrants quarantine and raw-APK retrieval; a matching, lineage-consistent signer corroborates
+    authenticity.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for pkg in installed_packages:\n  if pkg.signer_digest not in approved_signer_lineage[pkg.app_id]:\n\
+      \    alert(\"high\", reason=\"signer not in approved v3 lineage\", pkg)\n  if pkg.has_v1_signature\
+      \ and not (pkg.has_v2_block or pkg.has_v3_block)\n     and pkg.target_sdk >= 24:\n    alert(\"high\"\
+      , reason=\"v1-only signing on modern app\", pkg)"
+- question: Across the managed fleet, which (app id, version, signer, hash) tuples appear at a prevalence
+    below 0.5% or in the bottom 1st percentile, indicating a rare and possibly repackaged build?
+  context: Legitimate app versions and signers are widely distributed across a fleet, so for Persistence
+    a rare version, signer, or hash is a statistical tell of a targeted repackage that was pushed to only
+    a few devices. The analyst computes fleet prevalence per (app id, version, signer, hash) tuple and
+    flags those below 0.5% or in the bottom 1st percentile, emitting the offending field and its measured
+    prevalence in the alert for triage. Baselines can be enriched with AV-scored corpora (e.g., AndroZoo)
+    plus the organization's own fleet history. A low-prevalence signer or hash on a popular app is a high-value
+    hunting lead; a common, widely-deployed tuple reduces suspicion. This statistical signal complements
+    the deterministic hash/signer rules.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "counts = count(devices) by (app_id, version, signer, hash)\ntotal  = count(distinct devices)\
+      \ per app_id\nprev   = counts / total\nfor tuple, p in prev:\n  if p < 0.005 or p <= percentile(prev[app_id],\
+      \ 1):\n    alert(\"medium\", reason=\"rare version/signer/hash\", tuple, prevalence=p)"
+- question: Do any per-app static feature vectors (permissions, API calls, components, embedded network
+    addresses) produce a high anomaly score under an Isolation Forest / linear SVM, indicating an app
+    profile inconsistent with known-good builds?
+  context: A grafted payload changes an app's static footprint even when hashes or signers are manipulated,
+    so for Persistence anomaly detection over static features can surface repackaged executables that
+    evade exact-match rules. The analyst trains an Isolation Forest or linear SVM on per-app static feature
+    vectors -- requested permissions, declared API calls, components (activities/services/receivers),
+    and embedded network addresses, following the Drebin approach -- and alerts on apps with high anomaly
+    scores. Critically, the alert must surface the top-3 contributing features (via linear weights or
+    SHAP) so an analyst can triage why the app looks anomalous. A high score with explanatory features
+    (e.g., an unexpected SMS/accessibility permission or a hardcoded IP) is a strong lead for reverse
+    engineering; a low score reduces but does not eliminate concern. Retrain on rolling baselines to counter
+    concept drift.
+  answer_sources: *id001
+  range: Last 90 days, scored against current fleet/static baseline.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "X = static_features(app)  // permissions, api_calls, components, net_addrs\nmodel = IsolationForest().fit(known_good_app_corpus)\n\
+      score = model.anomaly_score(X)\nif score in top_1pct(fleet):\n  alert(\"medium\", app, top3_features(X))\
+      \  // linear weights / SHAP"
+- question: Does any APK's ZIP structure contain a DEX magic ('dex\n035') at file offset 0, or non-zero
+    bytes between the ZIP central directory and the end-of-central-directory record, indicating Janus-style
+    appended code?
+  context: Janus (CVE-2017-13156) lets an attacker prepend a malicious DEX to a valid APK so Android loads
+    the DEX as code while the v1 signature still validates -- a direct route to Persistence via a trusted
+    app. The analyst parses APK ZIP structures and alerts when a DEX magic ('dex\n035') appears at offset
+    0, or when non-zero bytes exist between the central directory and the end-of-central-directory record,
+    both being the known structural artifacts of Janus exploitation. A positive result is strong evidence
+    of an appended-payload repackage and should trigger device quarantine and full reverse engineering;
+    a clean ZIP/DEX layout argues against this specific exploit. This deterministic structural check is
+    a high-confidence floor signal.
+  answer_sources: &id002
+  - Raw APK files from endpoints
+  - Mobile App Vetting (MAV) static analysis reports
+  - Digital forensic image of device storage
+  - 'NAI: Managed Android device fleet; Application sandbox environment; Mobile security analysis platforms.'
+  range: Last 90 days; run on each raw APK acquired.
+  queries:
+  - technology: Static-analysis/pseudocode
+    query: "for apk in raw_apks:\n  if bytes_at(apk, offset=0)[:8] == b'dex\\n035\\0':\n    alert(\"high\"\
+      , reason=\"DEX magic at offset 0 (Janus)\", apk)\n  gap = bytes_between(apk.central_directory_end,\
+      \ apk.eocd_record)\n  if any(b != 0 for b in gap):\n    alert(\"high\", reason=\"non-zero bytes\
+      \ before EOCD (appended payload)\", apk)"
+- question: Does any app targeting Android 7.0+ present only a v1 (JAR) signature and lack a v2/v3 APK
+    Signing Block, leaving it vulnerable to Janus-style appended-byte modification?
+  context: Whole-file APK Signature Scheme v2/v3 detects any appended or modified bytes, so for Persistence
+    a modern app that ships only a legacy v1 (JAR) signature is both anomalous and exploitable via Janus.
+    The analyst alerts when an app with targetSdk >= 24 (Android 7.0+) presents only a v1 signature and
+    has no v2/v3 APK Signing Block. A positive result flags an app whose integrity cannot be guaranteed
+    against appended-DEX attacks and should be re-vetted from a trusted source; presence of a valid v2/v3
+    block argues the archive is intact. This deterministic rule pairs with the Janus structural scan as
+    an early warning.
+  answer_sources: *id002
+  range: Last 90 days; evaluated per package on inventory/ingest.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for pkg in installed_packages:\n  if pkg.target_sdk >= 24 and pkg.has_v1_signature\n     and\
+      \ not (pkg.has_v2_block or pkg.has_v3_block):\n    alert(\"high\", reason=\"v1-only signing on Android\
+      \ 7.0+ app (Janus-exposed)\", pkg)"
+- question: For any APK, is the delta between the on-disk file size and the size implied by the ZIP central
+    directory above the 99.9th-percentile baseline, indicating appended or hidden data?
+  context: Appended payloads (as in Janus) inflate an APK beyond the size its ZIP central directory accounts
+    for, so for Persistence a large size delta is a cheap statistical detector of hidden injected bytes.
+    The analyst computes the delta between the on-disk APK size and the size implied by summing the ZIP
+    central directory entries, and alerts on values above a 99.9th-percentile baseline built from clean
+    apps, reporting the byte delta in the alert. A large positive delta indicates data outside the legitimate
+    archive structure (a strong appended-payload signal); a delta within baseline argues the file contains
+    no hidden trailing data. Use alongside the deterministic Janus structural scan to prioritize which
+    APKs to fully analyze.
+  answer_sources: *id002
+  range: Last 90 days; baseline from clean-app corpus.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for apk in raw_apks:\n  implied = sum(entry.size for entry in apk.central_directory)\n  delta\
+      \ = apk.on_disk_size - implied\n  if delta > percentile(clean_baseline_delta, 99.9):\n    alert(\"\
+      medium\", reason=\"APK size delta outlier\", apk, byte_delta=delta)"
+- question: Do any DEX or native .so regions in an app exhibit Shannon entropy above ~7.2 (versus typical
+    native code 5.0-6.5), suggesting a packed or encrypted injected payload?
+  context: Packed or encrypted injected code has near-random byte distributions, so for Persistence high
+    Shannon entropy in DEX or native sections reveals concealed payloads grafted into a trusted app. The
+    analyst computes Shannon entropy of DEX and native .so regions and flags sections with entropy above
+    ~7.2 (well above typical native code at 5.0-6.5) as candidate packed/encrypted payloads, deriving
+    the precise cutoff from the organization's own clean-app baseline to control false positives on legitimately
+    compressed assets. A high-entropy outlier section warrants manual unpacking or ML review; entropy
+    within baseline reduces suspicion for that section. This statistical signal complements structural
+    and hash-based detection.
+  answer_sources: *id002
+  range: Last 90 days; entropy baseline from clean firmware/app corpus.
+  queries:
+  - technology: Static-analysis/Stats pseudocode
+    query: "for apk in raw_apks:\n  for sec in apk.dex_sections + apk.native_so_sections:\n    e = shannon_entropy(bytes(sec))\n\
+      \    if e > 7.2:  // tune vs clean baseline\n      flag(apk, sec, entropy=e, reason=\"packed/encrypted\
+      \ injected payload\")"
+- question: Does a classifier trained on structural features (ZIP/DEX layout, size delta, section entropy,
+    static feature set) score an APK as a Janus/repacked sample, and does that verdict hold under semantics-preserving
+    metamorphic transforms?
+  context: Single heuristics miss obfuscated repackages, so for Persistence a classifier combining structural
+    and static features generalizes detection of Janus/repacked APKs. The analyst trains on features such
+    as ZIP/DEX layout, on-disk-vs-implied size delta, section entropy, and the Drebin-style static feature
+    set, then validates robustness with semantics-preserving metamorphic transforms so obfuscation cannot
+    silently flip the output. The alert should surface the top-3 contributing features per decision for
+    triage. A high-confidence repacked verdict prioritizes the APK for reverse engineering; a benign verdict
+    still leaves the deterministic hash and Janus structural checks as the floor. Retrain and re-validate
+    against labeled corpora to manage drift.
+  answer_sources: *id002
+  range: Last 90 days; model validated with metamorphic transforms.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feat = {zip_dex_layout, size_delta, section_entropy, static_feature_set}\np = RepackClassifier.predict_proba(feat)\n\
+      p_metamorphic = RepackClassifier.predict_proba(metamorphic_transform(feat))\nif p_malicious > 0.90\
+      \ and stable(p, p_metamorphic):\n  alert(\"high\", reason=\"repacked/Janus APK\", top3_features(feat))"
+- question: Does network traffic attributed to a trusted application connect to known C2 indicators (malicious
+    domains/IPs) found in threat intelligence, as joined against Zeek conn/dns logs?
+  context: A repackaged app betrays itself when its grafted payload calls home, so for Persistence correlating
+    per-app network context with C2 indicators catches active implants. The analyst joins application
+    context (which app owns a flow, from EDR/CASB attribution) with Zeek conn.log and dns.log and alerts
+    when a trusted app connects to threat-intel C2 indicators. Drebin shows embedded network addresses
+    are stable static features that can be pre-extracted from the APK and matched against observed traffic.
+    A trusted app contacting a known-bad domain/IP is high-confidence evidence of compromise and warrants
+    immediate device isolation; absence of IOC contact does not clear the app, since C2 may be novel.
+    Pair with the per-app outlier and failure-rate analytics below.
+  answer_sources: &id003
+  - Zeek conn.log
+  - Zeek dns.log
+  - CASB logs
+  - Mobile EDR network logs
+  - Threat intelligence indicators
+  - 'NAI: Corporate Wi-Fi network gateways; VPN egress points; DNS resolvers; Cloud Access Security Broker
+    (CASB).'
+  range: Last 90 days; correlate around app-update/replacement events.
+  queries:
+  - technology: Zeek/pseudocode
+    query: "flows = conn.log JOIN app_attribution(edr, casb) ON (device, src_port/uid)\nfor flow in flows\
+      \ where flow.app in trusted_apps:\n  if flow.dst_ip in ti.c2_ips or dns.log.query[flow] in ti.c2_domains:\n\
+      \    alert(\"critical\", reason=\"trusted app contacted C2 IOC\", flow.app, flow.dst)"
+- question: Does any trusted app generate session byte volume or connections/min above its 95th-percentile
+    baseline, or DNS query-name entropy more than 3 standard deviations above baseline?
+  context: A grafted payload changes an app's network rhythm, so for Persistence baselining per-app volume,
+    frequency, and DNS entropy exposes exfiltration and DGA behavior even without a known IOC. The analyst
+    baselines per-app session bytes (volume) and connections/min (frequency) and alerts on sessions above
+    the 95th percentile, and separately baselines DNS query-name Shannon entropy and alerts beyond 3 standard
+    deviations (a hallmark of domain-generation algorithms). A volume or frequency spike suggests data
+    transfer or beaconing; high DNS entropy suggests DGA-driven C2 fallback. Positive results give concrete
+    pivots (which app, which sessions); in-baseline behavior lowers suspicion. These statistical signals
+    corroborate the deterministic IOC join.
+  answer_sources: *id003
+  range: Last 90 days; per-app rolling baseline.
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "for app in trusted_apps:\n  if session.bytes > p95(baseline[app].bytes)\n     or session.conns_per_min\
+      \ > p95(baseline[app].conn_rate):\n    alert(\"medium\", reason=\"per-app network volume/freq outlier\"\
+      , app, session)\n  if shannon(dns.query_names[app]) > mean+3*sd(baseline[app].dns_entropy):\n  \
+      \  alert(\"medium\", reason=\"DGA-like DNS entropy\", app)"
+- question: Does any trusted app's rate of NXDOMAIN responses, failed/blocked connections, or failed TLS
+    handshakes exceed its historical baseline (e.g., >3 standard deviations), suggesting DGA/C2 fallback?
+  context: Grafted payloads often cycle through dead C2 endpoints before finding a live one, so for Persistence
+    elevated failure rates precede successful C2 contact. The analyst tracks, per app, NXDOMAIN counts,
+    failed/blocked connection ratios, and failed TLS handshakes as distinct state signals, and alerts
+    when an app's failure rate exceeds its historical baseline (e.g., >3 standard deviations) -- a pattern
+    characteristic of DGA/C2 fallback in grafted payloads, as observed in MaMaDroid-style behavioral studies.
+    A spike in NXDOMAINs or failed handshakes for a normally reliable app is a strong lead; baseline-level
+    failures argue normal operation. This complements volume/entropy outliers and the IOC join for a fuller
+    network picture.
+  answer_sources: *id003
+  range: Last 90 days; per-app rolling baseline.
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "for app in trusted_apps:\n  nx   = count(dns.log.rcode==NXDOMAIN by app)\n  fail = count(conn.log.conn_state\
+      \ in [S0,REJ,RSTO] by app) / count(SF by app)\n  tlsf = count(ssl.log failed_handshake by app)\n\
+      \  for metric,val in {nx, fail, tlsf}:\n    if val > mean+3*sd(baseline[app][metric]):\n      alert(\"\
+      medium\", reason=\"app failure-rate spike (DGA/C2 fallback)\", app, metric)"
+- question: Does an LSTM autoencoder over per-app network time series, or a MaMaDroid-style Markov/Random-Forest
+    model of API package transitions, flag a trusted app via high reconstruction error or anomalous behavior?
+  context: Sophisticated implants evade single thresholds, so for Persistence sequence models capture
+    the temporal and behavioral shape of a compromised app's activity. The analyst trains an LSTM autoencoder
+    on per-app time series (bytes sent/received, connections/min) and a MaMaDroid-style Markov chain or
+    Random Forest on API package transition behavior, alerting on high reconstruction error or low-probability
+    transitions. The alert should report the top-3 contributing features or time-steps so the analyst
+    knows what drove the score. High reconstruction error indicates the app's recent behavior departs
+    from its learned normal profile; in-distribution behavior lowers suspicion. Retrain periodically to
+    manage drift. This ML layer corroborates the deterministic and statistical network analytics.
+  answer_sources: *id003
+  range: Last 90 days; models retrained on rolling per-app baselines.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "ts = per_app_timeseries(bytes_sent, bytes_recv, conns_per_min)\nerr = LSTM_autoencoder.reconstruction_error(ts)\n\
+      mk  = MaMaDroid_markov(api_package_transitions)\nif err > threshold or mk.min_transition_prob <\
+      \ eps:\n  alert(\"medium\", app, top3_features_or_timesteps(ts, mk))"
+- question: Does any installed package share high resource/asset and method-level fingerprint similarity
+    with an official baseline app while carrying a different signer or new components/DEX, indicating
+    a clone with a different author?
+  context: Repackaging via decompile-merge-recompile (e.g., Agent Smith) yields a near-duplicate of a
+    legitimate app with altered authorship, so for Persistence pairwise similarity matching against official
+    baselines exposes clones. The analyst computes resource/asset and method-level fingerprints between
+    installed packages and official baselines and alerts when similarity is high but the signer differs
+    or new components/DEX exist. High similarity with a mismatched signer is a strong clone indicator;
+    identical-and-same-signer packages are legitimate. A positive result should trigger raw-APK retrieval
+    and reverse engineering. This deterministic matching pairs with the statistical similarity scoring
+    below.
+  answer_sources: &id004
+  - Raw APK files from endpoints
+  - Mobile App Vetting (MAV) static analysis reports
+  - MDM application inventory report
+  - On-device integrity attestation results
+  - 'NAI: Managed Android device fleet; application sandbox/vetting environment; organizational application
+    manifest repository; Play Integrity / on-device attestation pipeline.'
+  range: Last 90 days; compared against official app baselines.
+  queries:
+  - technology: Static-analysis/pseudocode
+    query: "for pkg in installed_packages:\n  base = official_baseline[pkg.app_id]\n  sim = fingerprint_similarity(pkg,\
+      \ base)  // resources + method-level\n  if sim > 0.85 and (pkg.signer != base.signer\n     or pkg.has_new_components\
+      \ or pkg.has_extra_dex):\n    alert(\"high\", reason=\"clone with different author\", pkg, matched=base)"
+- question: Did any in-app integrity/anti-repackaging self-verification (CRC/hash/native tamper detection)
+    or device attestation (e.g., Play Integrity) report a tamper or attestation failure?
+  context: Apps that ship their own anti-repackaging checks and platform attestation provide authoritative
+    tamper signals, so for Persistence ingesting these results catches repackages the defender's static
+    pipeline might miss. The analyst ingests results of in-app integrity/anti-repackaging self-verification
+    (CRC/hash/native tamper detection) and on-device attestation, and alerts on any reported tamper or
+    attestation failure. A self-check or attestation failure is high-confidence evidence the executable
+    was modified at rest or runtime and warrants immediate quarantine; a clean attestation corroborates
+    integrity but should not override other positive signals (attestation can be evaded on rooted devices).
+    Treat reported tamper as a deterministic floor.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for r in app_integrity_results + attestation_results:\n  if r.tamper_detected or r.integrity_verdict\
+      \ == FAIL\n     or isempty(r.play_integrity.appIntegrity):\n    alert(\"high\", reason=\"on-device\
+      \ integrity/attestation failure\", r.app, r.device)"
+- question: Which package pairs show Jaccard/fuzzy-hash resource and code similarity above ~0.85 while
+    having a mismatched signer or low fleet prevalence, scoring as likely repackaged clones?
+  context: Clones are statistically rare yet near-identical to their originals, so for Persistence combining
+    similarity scoring with prevalence separates legitimate widely-deployed apps from targeted repackages.
+    The analyst computes Jaccard/fuzzy-hash similarity of resource and code fingerprints and flags pairs
+    above a high-similarity threshold (e.g., >0.85) that also have a mismatched signer or low fleet prevalence,
+    reporting the similarity score and the matched original in the alert. A high-similarity, low-prevalence,
+    signer-mismatched pair is a strong clone lead; a high-prevalence identical-signer match is benign.
+    This statistical view corroborates the deterministic baseline matching.
+  answer_sources: *id004
+  range: Last 90 days; against official baselines and fleet prevalence.
+  queries:
+  - technology: Static-analysis/Stats pseudocode
+    query: "for (pkg, base) in candidate_pairs:\n  sim = max(jaccard(pkg.resources, base.resources), fuzzy_hash_sim(pkg,\
+      \ base))\n  prev = fleet_prevalence(pkg.hash)\n  if sim > 0.85 and (pkg.signer != base.signer or\
+      \ prev < 0.005):\n    alert(\"medium\", similarity=sim, matched=base, prevalence=prev)"
+- question: Does a supervised classifier trained on similarity, structural, and static features score
+    a package as a repackaged clone, using temporally split and family-balanced training to avoid leakage?
+  context: Manual thresholds miss novel clone families, so for Persistence a supervised classifier over
+    labeled repackaged pairs generalizes clone detection. The analyst trains on similarity, structural,
+    and static features using temporally split, family-balanced data to avoid leakage and over-optimistic
+    accuracy, then scores installed packages for clone likelihood and surfaces the top-3 features per
+    alert. A high-confidence clone verdict with feature explanations prioritizes reverse engineering;
+    a benign verdict still leaves the deterministic baseline-matching and integrity self-checks as the
+    floor. Monitor for concept drift and retrain on refreshed labeled corpora.
+  answer_sources: *id004
+  range: Last 90 days; temporally split, family-balanced training.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feat = {similarity_features, structural_features, static_features}\np = CloneClassifier.predict_proba(feat)\
+      \  // trained temporally-split, family-balanced\nif p_repackaged > 0.90:\n  alert(\"high\", reason=\"\
+      repackaged clone\", top3_features(feat))"
+- question: Does a replaced or updated app invoke APIs or permissions outside its known-good allowlist
+    (e.g., dynamic code loading, SMS, accessibility), especially while device_locked=true or recent_user_interaction=false?
+  context: A payload grafted into a trusted app reveals itself at runtime through new capability usage,
+    so for Persistence an allowlist of expected APIs/permissions exposes behavior the legitimate build
+    never had. The analyst maintains a per-app allowlist of expected APIs/permissions from the known-good
+    build and alerts when a replaced app invokes APIs (e.g., dynamic code loading, SMS, accessibility
+    services) or permissions outside that allowlist -- with heightened severity when execution occurs
+    while device_locked=true or recent_user_interaction=false, since covert background activity is a hallmark
+    of grafted payloads. A disallowed API call under lock/no-interaction is a strong runtime indicator
+    of compromise; activity within the allowlist during normal use lowers suspicion. Keep this allowlist
+    rule as the deterministic floor.
+  answer_sources: &id005
+  - MobileEDR:telemetry (OS API Execution)
+  - MobileEDR:telemetry (Application State)
+  - Dynamic analysis / sandbox traces
+  - 'NAI: Managed Android device fleet with mobile EDR runtime telemetry; dynamic analysis sandbox with
+    UI stimulation.'
+  range: Last 90 days; event-centered on each app replacement/update.
+  queries:
+  - technology: MobileEDR/Rule pseudocode
+    query: "for ev in edr.os_api_execution:\n  app = ev.app_id\n  if ev.api not in allowlist[app].apis\
+      \ or ev.permission not in allowlist[app].perms:\n    sev = (ev.device_locked or not ev.recent_user_interaction)\
+      \ ? \"high\" : \"medium\"\n    alert(sev, reason=\"out-of-baseline runtime API/permission\", app,\
+      \ ev.api)"
+- question: After an app update, does the post-update API-package transition distribution diverge from
+    the app's baseline beyond a derived threshold (e.g., count/min of new transitions)?
+  context: Even without a single disallowed API, a grafted payload shifts the overall pattern of API usage,
+    so for Persistence modeling API-package transition probabilities quantifies behavioral drift after
+    a replacement. The analyst models per-app API package transition probabilities (MaMaDroid-style) and
+    alerts when the post-update transition distribution diverges from baseline beyond a derived threshold,
+    such as a count/min of newly-observed transitions. Significant divergence after an update suggests
+    new code paths were introduced; a distribution matching baseline argues the update behaved like the
+    known-good app. This statistical signal corroborates the deterministic allowlist rule and the ML stimulation
+    approach below.
+  answer_sources: *id005
+  range: Last 90 days; compare pre/post each update.
+  queries:
+  - technology: MobileEDR/Stats pseudocode
+    query: "base = markov_transition_matrix(api_packages[app], window=pre_update)\npost = markov_transition_matrix(api_packages[app],\
+      \ window=post_update)\ndiv  = distribution_divergence(base, post)  // e.g., KL / new-transition\
+      \ count/min\nif div > derived_threshold:\n  alert(\"medium\", reason=\"post-update runtime behavior\
+      \ drift\", app, divergence=div)"
+- question: When hidden code paths are triggered via UI stimulation in a sandbox, does an active-learning
+    classifier over the extracted dynamic behavioral features flag the app as a repackaged payload?
+  context: Grafted payloads frequently hide behind specific UI events, so for Persistence sandbox stimulation
+    forces those paths to execute where they can be observed and classified with few labels. The analyst
+    triggers hidden code paths via UI stimulation in a sandbox, extracts dynamic behavioral features,
+    and applies an active-learning classifier to flag repackaged payloads with minimal labeling effort,
+    reporting the triggering UI event or behavior in the alert. A positive verdict with the triggering
+    behavior identified is a strong, explainable lead for reverse engineering; a benign result in the
+    sandbox does not fully clear an app, since stimulation may not have exercised the malicious path.
+    This ML approach complements the runtime allowlist and drift analytics.
+  answer_sources: *id005
+  range: Point-in-time per sandbox detonation of each suspect app.
+  queries:
+  - technology: Sandbox/ML pseudocode
+    query: "traces = sandbox.stimulate_ui(app)  // exercise hidden code paths\nfeat = dynamic_behavioral_features(traces)\n\
+      p = ActiveLearningClassifier.predict_proba(feat)\nif p_repackaged > 0.85:\n  alert(\"high\", reason=\"\
+      grafted payload (stimulated)\", app, triggering_ui=traces.trigger)"
