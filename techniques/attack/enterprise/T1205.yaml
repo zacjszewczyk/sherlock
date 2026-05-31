@@ -1,0 +1,2102 @@
+name: 'T1205: Traffic Signaling'
+id: df9d4b61-7d83-40bc-8ac6-6917601ad4d8
+description: Investigate whether an adversary is using traffic signaling (port knocking, crafted/unusual-flag
+  packets, magic-value payloads, Wake-on-LAN magic packets, or libpcap/raw-socket sniffers) to covertly
+  open closed ports, activate dormant implants, enable services on network devices, or power on systems
+  for follow-on access. This playbook helps an analyst correlate network evidence (closed-port knock bursts
+  followed by a successful connect, high-entropy small packets to non-listening ports, WoL magic packets,
+  unusual TCP flag combinations, trigger-then-callback sequences, and post-signal beaconing) with host
+  evidence (non-analyst processes loading packet-capture libraries, host-based firewall allow rules appearing
+  right after block bursts, and off-hours boots without authorized wakes). It spans the Stealth, Command
+  and Control, and Persistence tactics and combines deterministic signatures, statistical baselines, and
+  explainable machine-learning detections across Zeek/network logs, Windows Event Logs, Sysmon, auditd,
+  macOS unified logs, and network-device syslog.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0011
+  tactic_name: Command and Control
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any UDP or TCP packet carry a known magic-value byte sequence, Cobalt Strike artifact,
+    or matching JA3/JA3S fingerprint that activates a dormant implant?
+  context: This is the deterministic signature floor. Deploy Zeek/Suricata content rules that match known
+    magic-value byte sequences in UDP/TCP payloads, apply the Cobalt Strike YARA rules (signature-base
+    apt_cobaltstrike.yar) to files.log-extracted content and HTTP POST bodies, and fingerprint the encrypted
+    callback with JA3/JA3S. A match means a non-standard trigger or implant artifact crossed the sensor
+    and warrants immediate host triage; keep concrete byte/JA3 patterns and tune rather than delete them.
+    Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it blends
+    in with normal traffic; this question helps an analyst surface the concealed trigger/activation behavior
+    that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Suricata signature
+    query: |-
+      rule match: payload =~ known_magic_value_regex OR ja3 IN known_c2_ja3 OR ja3s IN known_c2_ja3s
+        OR yara_match(files.log.extracted, apt_cobaltstrike.yar)
+      => alert(severity=high, evidence={src,dst,dport,proto,match_name})
+- question: Did a small inbound packet (<64 bytes) to a closed/non-listening port show abnormally high
+    Shannon entropy from a rarely-seen source IP?
+  context: For inbound packets with payloads under 64 bytes compute Shannon entropy; flag when entropy
+    exceeds the 98th percentile for that destination port AND the connection ends in a failed/non-listening
+    state (Zeek conn_state REJ/S0/RSTO, the probing failure-mode discriminator from Jung et al. TRW).
+    Then check source rarity and alert if the source IP was seen fewer than 5 times in the last 30 days.
+    High entropy in a tiny failed packet from a stranger is the fingerprint of a crafted/encrypted trigger;
+    surface the entropy value, port, conn_state and source frequency. Under the Stealth tactic the adversary
+    tries to hide and conceal their signaling so that it blends in with normal traffic; this question
+    helps an analyst surface the concealed trigger/activation behavior that the actor is relying on to
+    stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for pkt in inbound where payload_len < 64:
+        e = shannon_entropy(pkt.payload)
+        if e > pctl98(entropy_by_dport[pkt.dport]) and pkt.conn_state in [REJ,S0,RSTO]
+           and count_30d(src_ip) < 5:
+           alert(entropy=e, dport=pkt.dport, conn_state=pkt.conn_state, src_freq=count_30d(src_ip))
+- question: Does a supervised classifier plus an unsupervised autoencoder flag an inbound packet as a
+    likely crafted trigger, with SHAP explaining why?
+  context: Train a Gradient Boosting classifier on labeled sessions using payload entropy, packet size,
+    protocol, src/dst-port rarity, success/fail state, source reputation and JA3/JA3S, and in parallel
+    run a Kitsune/KitNET packet-reconstruction-error autoencoder to catch novel crafted packets without
+    labels. Every alert must list the top-3 contributing features (e.g., entropy, port rarity, fail-state)
+    per the SHAP-in-IDS review so analysts can trust and triage it. The ML layer catches signals that
+    evade fixed byte signatures. Under the Stealth tactic the adversary tries to hide and conceal their
+    signaling so that it blends in with normal traffic; this question helps an analyst surface the concealed
+    trigger/activation behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      score_s = gbm.predict_proba(features=[entropy,size,proto,sport_rarity,dport_rarity,state,src_rep,ja3])
+      score_u = kitnet.reconstruction_error(packet)
+      if score_s > thr_s or score_u > thr_u:
+        alert(prob=score_s, recon_err=score_u, top3=shap_top3(features))
+- question: Did a process load wpcap.dll/npcap.dll or open a raw/AF_PACKET socket when its user is not
+    an authorized network analyst?
+  context: Alert when a process loads wpcap.dll or npcap.dll (Sysmon Event ID 7) and the user is not in
+    an authorized network-analyst group, or on Linux when auditd shows a non-allowlisted process running
+    tcpdump/tshark or opening an AF_PACKET/raw socket. Sniffer-based observation of trigger packets is
+    the original cd00r/libpcap technique (deGraaf et al.); a non-analyst process gaining packet-capture
+    capability is a strong sign of a signal-listening implant. Under the Stealth tactic the adversary
+    tries to hide and conceal their signaling so that it blends in with normal traffic; this question
+    helps an analyst surface the concealed trigger/activation behavior that the actor is relying on to
+    stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      win: Sysmon EID7 where ImageLoaded in [wpcap.dll,npcap.dll] and User not in NetAnalystGroup => alert
+      linux: auditd execve in [tcpdump,tshark] or socket(AF_PACKET|SOCK_RAW) and proc not in allowlist => alert
+- question: Is the (process, loaded-library) pair enterprise-rare, such as outlook.exe loading wpcap.dll?
+  context: Baseline (process name, loaded DLL/library) pairs per host and across the enterprise, then
+    alert on pairs in the bottom 1st percentile of observed frequency. A capture library bound to a process
+    that has no business sniffing traffic (e.g., outlook.exe -> wpcap.dll) is anomalous. Report the pair,
+    the count of distinct hosts where it has been seen, and the user context. Under the Stealth tactic
+    the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = freq(process_name, loaded_library) over enterprise
+      for ev in EID7:
+        if baseline[(ev.process,ev.library)] <= pctl1(baseline):
+          alert(pair=(ev.process,ev.library), host_count=distinct_hosts(pair), user=ev.user)
+- question: Does an Isolation Forest flag an unusual process loading a capture library, with SHAP showing
+    the drivers?
+  context: Train an Isolation Forest on Sysmon Event ID 7 events using process-hash, parent-process-hash,
+    loaded-library-hash and user account, then flag unusual processes loading capture libraries. Attach
+    the top-3 features driving the anomaly score (e.g., rare parent, non-admin user) per the SHAP-in-IDS
+    review so the analyst sees why the load is suspicious before pivoting to the host. Under the Stealth
+    tactic the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      model = IsolationForest(features=[proc_hash,parent_hash,lib_hash,user])
+      score = model.anomaly_score(EID7_event)
+      if score > thr: alert(score=score, top3=shap_top3(features))
+- question: Did a single source make N failed attempts to distinct closed ports then a successful connect
+    to a newly opened port within T seconds?
+  context: Track per source->destination connection outcomes. If N failed attempts (Zeek conn_state REJ/S0
+    or TCP RST) to distinct closed ports are followed by one successful connect (SF) within a T-second
+    window (default N=3, T=15), alert. This encodes the canonical port-knock artifact (closed-port burst
+    -> firewall opens port -> successful connect) from deGraaf et al. Keep N/T as tunable deterministic
+    thresholds; a positive is the textbook knock-then-open and demands host investigation. Under the Stealth
+    tactic the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days, event-centered correlation within a 15-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) order by ts:
+        fails = [c for c in window if c.conn_state in [REJ,S0] and c.dport closed and distinct]
+        if len(fails) >= N and exists success(SF) within T sec after last fail:
+          alert(src,dst,knock_ports=fails.dports,open_port=success.dport)
+- question: Does a Threshold Random Walk/SPRT plus destination-port entropy identify a source as a probing
+    knocker?
+  context: Apply a Threshold Random Walk / SPRT over each source's ordered connection success-vs-failure
+    outcomes (Jung et al. TRW); probing sources show a far higher fail:success ratio and are flagged within
+    ~4-5 events with tunable likelihood ratios, more robustly than raw counts. Additionally compute Shannon
+    entropy of destination ports per source in a sliding 1-minute window; high entropy (>99th pct for
+    the host) followed by a successful connect confirms a likely knock. Report fail:success ratio and
+    port-entropy. Under the Stealth tactic the adversary tries to hide and conceal their signaling so
+    that it blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src: run SPRT(outcomes=success/fail, theta0,theta1) -> if walk crosses upper bound: suspect
+        dport_entropy = shannon(dport_counts in 60s)
+        if suspect and dport_entropy > pctl99(host) and later_success(src):
+          alert(fail_success_ratio, dport_entropy)
+- question: Does a seasonal spike model plus Kitsune flag an un-forecast failed-connect burst from one
+    source followed by a success?
+  context: Model the per-host stream of failed connections (Windows 5157 / Zeek REJ) with a seasonal anomaly
+    detector (S-H-ESD) and in parallel score packet-rate/jitter bursts with Kitsune. A sharp un-forecast
+    failed-connect spike from one source immediately followed by a success is high-confidence knocking.
+    Surface the top-3 features (fail-count delta, distinct closed ports, time-to-success) per the SHAP-in-IDS
+    review. Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it
+    blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      resid = SH_ESD(failed_connects_per_host_timeseries)
+      if resid.is_anomaly and kitsune.score(packet_burst) > thr and success_follows(src):
+        alert(top3=shap_top3([fail_delta,distinct_closed_ports,time_to_success]))
+- question: Did a host boot outside business hours without an authorized Wake-on-LAN magic packet from
+    an allowlisted management server in the prior 5 minutes?
+  context: Correlate boot events (Windows Event ID 6005) with network logs. Alert if a boot occurs outside
+    business hours and is NOT preceded within 5 minutes by a valid WoL magic packet (6x0xFF + 16xMAC per
+    the AMD Magic Packet spec) from an allowlisted management/SCCM server. Keep the authorized-source
+    allowlist as the deterministic gate. An unauthorized off-hours wake suggests an adversary turning
+    on a system to enable lateral movement. Under the Stealth tactic the adversary tries to hide and conceal
+    their signaling so that it blends in with normal traffic; this question helps an analyst surface the
+    concealed trigger/activation behavior that the actor is relying on to stay indistinguishable from
+    benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for boot in WinEID6005 where boot.time outside business_hours:
+        wol = find WoL_magic(target_mac==boot.host.mac) within [boot-5m, boot]
+        if not wol or wol.src_ip not in mgmt_allowlist:
+          alert(host=boot.host, time=boot.time)
+- question: Did a host initiate traffic during an hour whose historical active-probability is below 5
+    percent?
+  context: Profile each host's per-hour probability of being active from historical traffic, then alert
+    when a host initiates traffic in an hour whose historical active-probability is below 5 percent. Report
+    the hour, the historical probability, and the first-packet byte volume to distinguish a brief wake
+    from sustained activity. A host coming alive in a normally-dead hour is a candidate for a remote wake.
+    Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it blends
+    in with normal traffic; this question helps an analyst surface the concealed trigger/activation behavior
+    that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      P = active_probability_by_hour[host][hour]
+      if host emits traffic at hour and P < 0.05:
+        alert(host, hour, hist_prob=P, first_bytes=first_packet_bytes)
+- question: Does an LSTM over each host's active/inactive state flag an unpredicted inactive->active transition?
+  context: Model each host's active/inactive state as a binary time series and train an LSTM (cf. Gupta
+    et al.) to predict the next state from time-of-day and day-of-week; an unpredicted inactive->active
+    transition is a high-confidence anomaly indicating the host was woken outside its normal cycle. Surface
+    the top-3 drivers (hours-since-last-active, expected-state probability, preceding inbound packet)
+    per the SHAP-in-IDS review. Under the Stealth tactic the adversary tries to hide and conceal their
+    signaling so that it blends in with normal traffic; this question helps an analyst surface the concealed
+    trigger/activation behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.predict_next_state(host, tod, dow)
+      if observed_state==active and pred==inactive and pred.prob>thr:
+        alert(host, top3=shap_top3([hours_since_active,expected_state_prob,preceding_inbound]))
+- question: Was a Wake-on-LAN magic packet (6x0xFF + 16xMAC) seen on broadcast UDP port 7/9 from a source
+    not on the management allowlist?
+  context: Detect the exact magic-packet structure - 6 bytes of 0xFF followed by 16 repetitions of a target
+    MAC, typically broadcast UDP destination port 7 or 9 per the AMD Magic Packet spec (e.g., Zeek WakeOnLan::Found).
+    Alert for any such packet whose source IP is not on the allowlist of authorized network-management
+    servers. Keep the byte pattern and allowlist as the deterministic floor; an unauthorized WoL is an
+    adversary powering on a target for lateral movement. Under the Stealth tactic the adversary tries
+    to hide and conceal their signaling so that it blends in with normal traffic; this question helps
+    an analyst surface the concealed trigger/activation behavior that the actor is relying on to stay
+    indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      event WakeOnLan::Found(src_ip, target_mac):
+        if payload starts FFx6 + MACx16 and dport in [7,9] and src_ip not in mgmt_allowlist:
+          alert(src_ip, target_mac)
+- question: Did a single source exceed the per-VLAN WoL baseline by 3 standard deviations, or wake a MAC
+    that never subsequently booted?
+  context: Per VLAN, baseline UDP broadcast volume on ports 7/9 and alert when a single source exceeds
+    3 standard deviations above the 30-day moving average (Volume/Frequency). As a distinct failure-mode
+    signal, flag WoL packets targeting a MAC that does NOT subsequently boot or appear in DHCP/conn logs
+    - repeated unanswered wakes suggest reconnaissance or spoofed targets. Under the Stealth tactic the
+    adversary tries to hide and conceal their signaling so that it blends in with normal traffic; this
+    question helps an analyst surface the concealed trigger/activation behavior that the actor is relying
+    on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = moving_avg_30d(wol_count[vlan]); sd = stddev_30d
+      if src.wol_count > base + 3*sd: alert(volume_anomaly)
+      if wol.target_mac not in (boots ∪ dhcp ∪ conn within 10m): alert(unanswered_wake, target_mac)
+- question: Does a supervised WoL classifier output a high maliciousness probability with SHAP feature
+    attribution?
+  context: Train a classifier (Logistic Regression / Gradient Boosting) on WoL events using source-is-management-server,
+    time-of-day, day-of-week, WoL count in a 5-minute window, and whether the target MAC is expected to
+    be woken remotely. Output a maliciousness probability and the top-3 contributing features per the
+    SHAP-in-IDS review so the analyst can quickly judge whether the wake is legitimate automation or adversary
+    action. Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it
+    blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([src_is_mgmt,tod,dow,wol_count_5m,target_expected])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Did a single source send more than 10 connections with unusual flag combinations (Zeek conn_state
+    OTH, history S2/S3, NULL/XMAS/FIN-SYN) to one destination within a minute?
+  context: Alert when a single source generates more than 10 connections with Zeek conn_state 'OTH' or
+    a history containing 'S2'/'S3' (unusual flag combinations such as FIN/SYN, NULL, XMAS) to one destination
+    within 1 minute. Unusual-flag probes are an explicit traffic-signaling variant noted in deGraaf et
+    al.; keep the count threshold tunable. Crafted flags are often the signal itself or firewall-rule
+    discovery preceding it. Under the Stealth tactic the adversary tries to hide and conceal their signaling
+    so that it blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) in 60s:
+        weird = [c for c in group if c.conn_state=='OTH' or 'S2' in c.history or 'S3' in c.history]
+        if len(weird) > 10: alert(src,dst,count=len(weird))
+- question: Is a source's failed-to-successful connection ratio above the 98th percentile across all sources?
+  context: For each source IP compute the ratio of failed/rejected to successful connections across destinations
+    over 5 minutes, then alert when the ratio exceeds the 98th percentile for all sources - the failure-rate
+    discriminator established by Jung et al. TRW for distinguishing probing from legitimate use. Report
+    the ratio, distinct-port count and dominant conn_state. Under the Stealth tactic the adversary tries
+    to hide and conceal their signaling so that it blends in with normal traffic; this question helps
+    an analyst surface the concealed trigger/activation behavior that the actor is relying on to stay
+    indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src in 5m window:
+        ratio = failed(src)/max(success(src),1)
+        if ratio > pctl98(all_sources_ratio):
+          alert(ratio, distinct_ports=count_dports(src), dominant_state=mode(conn_state))
+- question: Does DBSCAN clustering plus a Kitsune autoencoder isolate a small dense scanning cluster,
+    explained by SHAP?
+  context: Cluster connections with DBSCAN on source IP, destination-port distribution, TCP flags and
+    conn_state; small/dense outlier clusters indicate scanning. Run Kitsune in parallel for online packet-level
+    outliers, and surface the top-3 features per the SHAP-in-IDS review. This catches scanning/discovery
+    patterns that fixed flag rules miss. Under the Stealth tactic the adversary tries to hide and conceal
+    their signaling so that it blends in with normal traffic; this question helps an analyst surface the
+    concealed trigger/activation behavior that the actor is relying on to stay indistinguishable from
+    benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      clusters = DBSCAN(features=[src_ip,dport_dist,tcp_flags,conn_state])
+      for c in clusters where small_and_dense(c):
+        alert(cluster=c, kitsune=kitsune.score(c.packets), top3=shap_top3(features))
+- question: Did a host-based firewall add an allow rule or new permit within 5 minutes of a block burst
+    from the same source IP that is now permitted?
+  context: Alert when a Windows Firewall rule add (Event ID 4950) or new permit (5156) - or a Linux auditd
+    execve of iptables/nft/ufw/firewall-cmd adding an allow rule - occurs within 5 minutes of a burst
+    of block events (5157) from the same source IP that is now permitted. This is the knock->firewall-open
+    pivot from deGraaf et al., using first-party host logs only; a source that was being blocked and is
+    suddenly allowed is the smoking gun of a port-knock-driven firewall change. Under the Stealth tactic
+    the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for allow in (WinEID4950 add | WinEID5156 permit | auditd[iptables/nft/ufw/firewall-cmd add]):
+        blocks = WinEID5157 deny from same src to same host within [allow-5m, allow]
+        if blocks and allow now permits that src: alert(src, port=allow.port, host)
+- question: Did a port with a historically high block rate (top 10 percent) suddenly appear in allow logs?
+  context: Baseline denied-connection counts per port per critical host, then alert when a port with a
+    historically high block rate (top 10 percent of blocked ports) suddenly appears in allow logs (5156)
+    - a measurable shift in the block:allow distribution (State metric). Report the port, the prior block
+    rate, and the source now permitted. A high-block port flipping to allow indicates a covert firewall
+    change. Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it
+    blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      high_block = ports where block_rate[host][port] in top10pct
+      for permit in WinEID5156:
+        if permit.port in high_block: alert(port=permit.port, prior_block_rate, src=permit.src)
+- question: Does an LSTM flag a sudden un-forecast drop to zero in block counts for a normally-blocked
+    port?
+  context: Model the per-port time series of block counts (5157) with an LSTM anomaly detector; a sudden
+    un-forecast drop to zero for a normally-frequently-blocked port is high-confidence and should auto-trigger
+    a check for a rule change or a subsequent successful connect. Surface the top-3 features (forecast
+    error, port, recent rule-change event) per the SHAP-in-IDS review. Under the Stealth tactic the adversary
+    tries to hide and conceal their signaling so that it blends in with normal traffic; this question
+    helps an analyst surface the concealed trigger/activation behavior that the actor is relying on to
+    stay indistinguishable from benign activity.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.forecast(block_counts[port])
+      if observed≈0 and pred>>0 and forecast_error>thr:
+        check rule_change(port); alert(port, top3=shap_top3([forecast_err,port,recent_rule_change]))
+- question: Did an internally-observed signaling pattern (port-knock/magic packet) involve an IP that
+    also matches the Zeek Intelligence Framework C2 feed?
+  context: The primary trigger is the internally-observed signaling pattern (port-knock/magic packet)
+    from first-party Zeek/firewall logs; CTI is enrichment only. Where available, match the involved IP
+    against the Zeek Intelligence Framework (intel.log) and raise a critical alert when a signaling pattern
+    and a CTI hit coincide - but never require the external lookup for the base detection. Long-connection/rare-destination
+    context from RITA supports first-party triage. Under the Stealth tactic the adversary tries to hide
+    and conceal their signaling so that it blends in with normal traffic; this question helps an analyst
+    surface the concealed trigger/activation behavior that the actor is relying on to stay indistinguishable
+    from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if signaling_pattern(src,dst) detected:    // first-party trigger
+         sev = high
+         if (src in intel.log) or (dst in intel.log): sev = critical
+         alert(src,dst,severity=sev, rita_context=long_conn|rare_dst)
+- question: Does a composite risk score combining signaling, IP reputation, port rarity and data volume
+    exceed the 99.5th percentile?
+  context: Enrich outbound connections with IP reputation, port rarity and data volume, compute a composite
+    risk score, and alert above the 99.5th percentile. A poor-reputation destination preceded by inbound
+    signaling scores highest. Report the contributing terms (reputation, port rarity, byte volume) so
+    the analyst understands the drivers. Under the Stealth tactic the adversary tries to hide and conceal
+    their signaling so that it blends in with normal traffic; this question helps an analyst surface the
+    concealed trigger/activation behavior that the actor is relying on to stay indistinguishable from
+    benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      score = w1*reputation + w2*port_rarity + w3*volume + w4*preceded_by_signal
+      if score > pctl995(all_scores): alert(score, terms={reputation,port_rarity,byte_volume})
+- question: Does a C2 classifier using reputation, JA3/JA3S, byte ratios and prior-signaling output a
+    high C2 probability with SHAP?
+  context: Train a classifier to predict C2 using IP/ASN reputation, JA3/JA3S hash, byte ratios, and whether
+    the connection was preceded by a known signaling pattern. Output a probability and the top-3 features
+    per the SHAP-in-IDS review. This fuses external reputation with the first-party signaling observation
+    to identify the activated channel. Under the Stealth tactic the adversary tries to hide and conceal
+    their signaling so that it blends in with normal traffic; this question helps an analyst surface the
+    concealed trigger/activation behavior that the actor is relying on to stay indistinguishable from
+    benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([ip_rep,asn_rep,ja3,ja3s,byte_ratio,preceded_by_signal])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Was an inbound UDP magic-value packet to a host followed within 30 seconds by an outbound
+    TCP from that host back to the source on a non-standard port?
+  context: 'Detect the multi-stage sequence: (1) inbound UDP to host A from source B with a magic-value
+    payload signature, then (2) within 30 seconds an outbound TCP from A to B on a non-standard port.
+    Alert on the ordered pair. This encodes the activation->callback artifact of signaled implants analyzed
+    in deGraaf et al.; the ordered trigger-then-callback is far more specific than either event alone.
+    Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it blends
+    in with normal traffic; this question helps an analyst surface the concealed trigger/activation behavior
+    that the actor is relying on to stay indistinguishable from benign activity.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days, event-centered correlation within a 30-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for t in inbound_udp where magic_value(t.payload):  // stage 1
+        cb = outbound_tcp(src=t.dst, dst=t.src, dport not in standard) within 30s after t
+        if cb: alert(host=t.dst, peer=t.src, trigger=t, callback=cb)
+- question: Does a host's (inbound-UDP, outbound-TCP) pair frequency to one external IP within 60s exceed
+    the 99th percentile?
+  context: For each internal host track (inbound UDP from external X, outbound TCP to X) pairs within
+    a 60-second window, compute the frequency per external IP, and alert when it exceeds the 99th percentile
+    of all such frequencies. Report the external IP, the pair count, and the inter-event delay; a repeating
+    trigger/callback pair to one external entity is characteristic of signaled C2. Under the Stealth tactic
+    the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      pairs = count((udp_in_from_X, tcp_out_to_X) within 60s) per (host,X)
+      if pairs[host,X] > pctl99(all_pairs): alert(ext_ip=X, pair_count=pairs, delay=inter_event_delay)
+- question: Do an LSTM sequence model and a GNN expose a (UDP-in, TCP-out) trigger/callback relationship
+    to a new external entity?
+  context: Use an LSTM over per-host (protocol, direction, port) sequences to flag (UDP-in, TCP-out) to
+    a new external entity, and a graph model (GNN-MTC) over host/flow nodes to expose the trigger->callback
+    relationship and shared infrastructure that flow-only models miss. Surface the top-3 contributing
+    edges/features per the SHAP-in-IDS review. Under the Stealth tactic the adversary tries to hide and
+    conceal their signaling so that it blends in with normal traffic; this question helps an analyst surface
+    the concealed trigger/activation behavior that the actor is relying on to stay indistinguishable from
+    benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      seq_flag = lstm.flag(seq=[(proto,dir,port)...], pattern=(UDP_in,TCP_out), new_entity=True)
+      graph_flag = gnn_mtc(nodes=hosts+flows).trigger_callback_edge()
+      if seq_flag or graph_flag: alert(top3=shap_top3(edges/features))
+- question: Did a host inactive for more than 24 hours send outbound traffic within 5 minutes of an unsolicited
+    inbound packet from an external source?
+  context: Maintain a state table of active hosts. If a host marked inactive for more than 24 hours sends
+    outbound traffic within 5 minutes of receiving an unsolicited inbound packet from an external source,
+    raise a high-priority alert. Keep the 24h/5min thresholds tunable. A dormant host springing to life
+    right after an unsolicited inbound packet is the wake/activation signature of a signaled implant.
+    Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it blends
+    in with normal traffic; this question helps an analyst surface the concealed trigger/activation behavior
+    that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if host.inactive_for > 24h and unsolicited_inbound(host, src=external):
+        if host.outbound within 5m after inbound:
+          alert(host, inbound_src=src, severity=high)
+- question: Did a host end a silent period exceeding its mean + 4 standard deviations, suggesting it was
+    awakened?
+  context: For each host compute the mean and standard deviation of 'silent time' (the gap between consecutive
+    outbound connections), then alert when an ended silent period exceeded mean + 4 standard deviations,
+    suggesting the host was 'awakened' rather than operating on its normal cycle. Report the silent duration
+    and the preceding inbound packet's entropy/port. Under the Stealth tactic the adversary tries to hide
+    and conceal their signaling so that it blends in with normal traffic; this question helps an analyst
+    surface the concealed trigger/activation behavior that the actor is relying on to stay indistinguishable
+    from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      mu,sd = mean_std(silent_gaps[host])
+      if ended_silent_gap > mu + 4*sd:
+        alert(host, silent_dur=ended_gap, prior_inbound={entropy,port})
+- question: Does a per-host bytes_out forecast (Prophet/LSTM) flag non-zero traffic during a predicted-zero
+    window, especially after a signaling packet?
+  context: Forecast each host's bytes_out (e.g., Prophet / LSTM per Gupta et al.); a non-zero value during
+    a period the forecast interval predicts zero is an anomaly, scored higher if it follows an inbound
+    packet with signaling characteristics. Use benign-periodicity baselines from Mack et al. to avoid
+    alerting on scheduled wakes, and surface the top-3 features per the SHAP-in-IDS review. Under the
+    Stealth tactic the adversary tries to hide and conceal their signaling so that it blends in with normal
+    traffic; this question helps an analyst surface the concealed trigger/activation behavior that the
+    actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = forecast_bytes_out(host)
+      if observed>0 and pred.interval≈0 and not scheduled_wake(host):
+        score = base + signal_bonus(preceding_inbound)
+        alert(host, score, top3=shap_top3(features))
+- question: After a signaling event, did the host make >10 connections to a newly-contacted destination
+    with near-identical intervals (within 10 percent) and sizes (within 10 bytes)?
+  context: Flag any destination first contacted immediately after a signaling event, then alert if more
+    than 10 subsequent connections from the same source show near-identical intervals (within 10 percent)
+    and payload sizes (within 10 bytes) - the low-CV regularity used by RITA. Keep the count/regularity
+    thresholds tunable. A regular low-volume beacon born right after a signal is the activated C2 channel.
+    Under the Stealth tactic the adversary tries to hide and conceal their signaling so that it blends
+    in with normal traffic; this question helps an analyst surface the concealed trigger/activation behavior
+    that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      dst = first_contact_after(signal_event)
+      conns = conns(src->dst)
+      if len(conns)>10 and cv(intervals)<0.10 and cv(sizes within 10B):
+        alert(src,dst,beacon_period=median(intervals))
+- question: Do cadence statistics (low interval CV, low size entropy, sharp FFT peak) confirm beaconing
+    on a post-signal destination?
+  context: For destinations activated after a signal, compute the standard deviation/coefficient of variation
+    of inter-arrival deltas and the entropy of payload sizes (both low for beacons), and apply an FFT
+    to connection-start times - a sharp frequency peak with high power-to-noise indicates beaconing, per
+    BAYWATCH and RITA. Tune against benign periodic-traffic baselines from Mack et al. Report CV, dominant
+    period and FFT power. Under the Stealth tactic the adversary tries to hide and conceal their signaling
+    so that it blends in with normal traffic; this question helps an analyst surface the concealed trigger/activation
+    behavior that the actor is relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      cv_t = std(deltas)/mean(deltas); size_ent = entropy(payload_sizes)
+      spec = FFT(conn_start_times)
+      if cv_t < thr and size_ent < thr and spec.peak_power/noise > thr:
+        alert(cv=cv_t, period=1/spec.peak_freq, fft_power=spec.peak_power)
+- question: Do jitter-tolerant models (CT-HMM, LSTM/transformer) detect an evasive jittered callback that
+    defeats CV/FFT?
+  context: For evasive/jittered callbacks that defeat CV/FFT, apply a Continuous-Time HMM (NetSpectra
+    CT-HMM) and LSTM/transformer time-series models (Gupta et al.) over inter-arrival and byte-count sequences.
+    Surface the top-3 features (interval CV, byte-ratio, dominant period) per the SHAP-in-IDS review.
+    This catches deliberately randomized beacons that simple cadence statistics miss. Under the Stealth
+    tactic the adversary tries to hide and conceal their signaling so that it blends in with normal traffic;
+    this question helps an analyst surface the concealed trigger/activation behavior that the actor is
+    relying on to stay indistinguishable from benign activity.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = max(ct_hmm.score(seq), lstm.score(seq)) over [inter_arrival, byte_count]
+      if p > thr: alert(prob=p, top3=shap_top3([interval_cv,byte_ratio,dominant_period]))
+- question: Did any UDP or TCP packet carry a known magic-value byte sequence, Cobalt Strike artifact,
+    or matching JA3/JA3S fingerprint that activates a dormant implant?
+  context: This is the deterministic signature floor. Deploy Zeek/Suricata content rules that match known
+    magic-value byte sequences in UDP/TCP payloads, apply the Cobalt Strike YARA rules (signature-base
+    apt_cobaltstrike.yar) to files.log-extracted content and HTTP POST bodies, and fingerprint the encrypted
+    callback with JA3/JA3S. A match means a non-standard trigger or implant artifact crossed the sensor
+    and warrants immediate host triage; keep concrete byte/JA3 patterns and tune rather than delete them.
+    Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Suricata signature
+    query: |-
+      rule match: payload =~ known_magic_value_regex OR ja3 IN known_c2_ja3 OR ja3s IN known_c2_ja3s
+        OR yara_match(files.log.extracted, apt_cobaltstrike.yar)
+      => alert(severity=high, evidence={src,dst,dport,proto,match_name})
+- question: Did a small inbound packet (<64 bytes) to a closed/non-listening port show abnormally high
+    Shannon entropy from a rarely-seen source IP?
+  context: For inbound packets with payloads under 64 bytes compute Shannon entropy; flag when entropy
+    exceeds the 98th percentile for that destination port AND the connection ends in a failed/non-listening
+    state (Zeek conn_state REJ/S0/RSTO, the probing failure-mode discriminator from Jung et al. TRW).
+    Then check source rarity and alert if the source IP was seen fewer than 5 times in the last 30 days.
+    High entropy in a tiny failed packet from a stranger is the fingerprint of a crafted/encrypted trigger;
+    surface the entropy value, port, conn_state and source frequency. Under the Command and Control tactic
+    the signal is the on-switch for a covert channel; confirming it here ties the trigger to the implant's
+    callback/beacon so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for pkt in inbound where payload_len < 64:
+        e = shannon_entropy(pkt.payload)
+        if e > pctl98(entropy_by_dport[pkt.dport]) and pkt.conn_state in [REJ,S0,RSTO]
+           and count_30d(src_ip) < 5:
+           alert(entropy=e, dport=pkt.dport, conn_state=pkt.conn_state, src_freq=count_30d(src_ip))
+- question: Does a supervised classifier plus an unsupervised autoencoder flag an inbound packet as a
+    likely crafted trigger, with SHAP explaining why?
+  context: Train a Gradient Boosting classifier on labeled sessions using payload entropy, packet size,
+    protocol, src/dst-port rarity, success/fail state, source reputation and JA3/JA3S, and in parallel
+    run a Kitsune/KitNET packet-reconstruction-error autoencoder to catch novel crafted packets without
+    labels. Every alert must list the top-3 contributing features (e.g., entropy, port rarity, fail-state)
+    per the SHAP-in-IDS review so analysts can trust and triage it. The ML layer catches signals that
+    evade fixed byte signatures. Under the Command and Control tactic the signal is the on-switch for
+    a covert channel; confirming it here ties the trigger to the implant's callback/beacon so the analyst
+    can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      score_s = gbm.predict_proba(features=[entropy,size,proto,sport_rarity,dport_rarity,state,src_rep,ja3])
+      score_u = kitnet.reconstruction_error(packet)
+      if score_s > thr_s or score_u > thr_u:
+        alert(prob=score_s, recon_err=score_u, top3=shap_top3(features))
+- question: Did a process load wpcap.dll/npcap.dll or open a raw/AF_PACKET socket when its user is not
+    an authorized network analyst?
+  context: Alert when a process loads wpcap.dll or npcap.dll (Sysmon Event ID 7) and the user is not in
+    an authorized network-analyst group, or on Linux when auditd shows a non-allowlisted process running
+    tcpdump/tshark or opening an AF_PACKET/raw socket. Sniffer-based observation of trigger packets is
+    the original cd00r/libpcap technique (deGraaf et al.); a non-analyst process gaining packet-capture
+    capability is a strong sign of a signal-listening implant. Under the Command and Control tactic the
+    signal is the on-switch for a covert channel; confirming it here ties the trigger to the implant's
+    callback/beacon so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      win: Sysmon EID7 where ImageLoaded in [wpcap.dll,npcap.dll] and User not in NetAnalystGroup => alert
+      linux: auditd execve in [tcpdump,tshark] or socket(AF_PACKET|SOCK_RAW) and proc not in allowlist => alert
+- question: Is the (process, loaded-library) pair enterprise-rare, such as outlook.exe loading wpcap.dll?
+  context: Baseline (process name, loaded DLL/library) pairs per host and across the enterprise, then
+    alert on pairs in the bottom 1st percentile of observed frequency. A capture library bound to a process
+    that has no business sniffing traffic (e.g., outlook.exe -> wpcap.dll) is anomalous. Report the pair,
+    the count of distinct hosts where it has been seen, and the user context. Under the Command and Control
+    tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger to the
+    implant's callback/beacon so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = freq(process_name, loaded_library) over enterprise
+      for ev in EID7:
+        if baseline[(ev.process,ev.library)] <= pctl1(baseline):
+          alert(pair=(ev.process,ev.library), host_count=distinct_hosts(pair), user=ev.user)
+- question: Does an Isolation Forest flag an unusual process loading a capture library, with SHAP showing
+    the drivers?
+  context: Train an Isolation Forest on Sysmon Event ID 7 events using process-hash, parent-process-hash,
+    loaded-library-hash and user account, then flag unusual processes loading capture libraries. Attach
+    the top-3 features driving the anomaly score (e.g., rare parent, non-admin user) per the SHAP-in-IDS
+    review so the analyst sees why the load is suspicious before pivoting to the host. Under the Command
+    and Control tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger
+    to the implant's callback/beacon so the analyst can scope and sever active adversary control of the
+    host.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      model = IsolationForest(features=[proc_hash,parent_hash,lib_hash,user])
+      score = model.anomaly_score(EID7_event)
+      if score > thr: alert(score=score, top3=shap_top3(features))
+- question: Did a single source make N failed attempts to distinct closed ports then a successful connect
+    to a newly opened port within T seconds?
+  context: Track per source->destination connection outcomes. If N failed attempts (Zeek conn_state REJ/S0
+    or TCP RST) to distinct closed ports are followed by one successful connect (SF) within a T-second
+    window (default N=3, T=15), alert. This encodes the canonical port-knock artifact (closed-port burst
+    -> firewall opens port -> successful connect) from deGraaf et al. Keep N/T as tunable deterministic
+    thresholds; a positive is the textbook knock-then-open and demands host investigation. Under the Command
+    and Control tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger
+    to the implant's callback/beacon so the analyst can scope and sever active adversary control of the
+    host.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days, event-centered correlation within a 15-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) order by ts:
+        fails = [c for c in window if c.conn_state in [REJ,S0] and c.dport closed and distinct]
+        if len(fails) >= N and exists success(SF) within T sec after last fail:
+          alert(src,dst,knock_ports=fails.dports,open_port=success.dport)
+- question: Does a Threshold Random Walk/SPRT plus destination-port entropy identify a source as a probing
+    knocker?
+  context: Apply a Threshold Random Walk / SPRT over each source's ordered connection success-vs-failure
+    outcomes (Jung et al. TRW); probing sources show a far higher fail:success ratio and are flagged within
+    ~4-5 events with tunable likelihood ratios, more robustly than raw counts. Additionally compute Shannon
+    entropy of destination ports per source in a sliding 1-minute window; high entropy (>99th pct for
+    the host) followed by a successful connect confirms a likely knock. Report fail:success ratio and
+    port-entropy. Under the Command and Control tactic the signal is the on-switch for a covert channel;
+    confirming it here ties the trigger to the implant's callback/beacon so the analyst can scope and
+    sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src: run SPRT(outcomes=success/fail, theta0,theta1) -> if walk crosses upper bound: suspect
+        dport_entropy = shannon(dport_counts in 60s)
+        if suspect and dport_entropy > pctl99(host) and later_success(src):
+          alert(fail_success_ratio, dport_entropy)
+- question: Does a seasonal spike model plus Kitsune flag an un-forecast failed-connect burst from one
+    source followed by a success?
+  context: Model the per-host stream of failed connections (Windows 5157 / Zeek REJ) with a seasonal anomaly
+    detector (S-H-ESD) and in parallel score packet-rate/jitter bursts with Kitsune. A sharp un-forecast
+    failed-connect spike from one source immediately followed by a success is high-confidence knocking.
+    Surface the top-3 features (fail-count delta, distinct closed ports, time-to-success) per the SHAP-in-IDS
+    review. Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      resid = SH_ESD(failed_connects_per_host_timeseries)
+      if resid.is_anomaly and kitsune.score(packet_burst) > thr and success_follows(src):
+        alert(top3=shap_top3([fail_delta,distinct_closed_ports,time_to_success]))
+- question: Did a host boot outside business hours without an authorized Wake-on-LAN magic packet from
+    an allowlisted management server in the prior 5 minutes?
+  context: Correlate boot events (Windows Event ID 6005) with network logs. Alert if a boot occurs outside
+    business hours and is NOT preceded within 5 minutes by a valid WoL magic packet (6x0xFF + 16xMAC per
+    the AMD Magic Packet spec) from an allowlisted management/SCCM server. Keep the authorized-source
+    allowlist as the deterministic gate. An unauthorized off-hours wake suggests an adversary turning
+    on a system to enable lateral movement. Under the Command and Control tactic the signal is the on-switch
+    for a covert channel; confirming it here ties the trigger to the implant's callback/beacon so the
+    analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for boot in WinEID6005 where boot.time outside business_hours:
+        wol = find WoL_magic(target_mac==boot.host.mac) within [boot-5m, boot]
+        if not wol or wol.src_ip not in mgmt_allowlist:
+          alert(host=boot.host, time=boot.time)
+- question: Did a host initiate traffic during an hour whose historical active-probability is below 5
+    percent?
+  context: Profile each host's per-hour probability of being active from historical traffic, then alert
+    when a host initiates traffic in an hour whose historical active-probability is below 5 percent. Report
+    the hour, the historical probability, and the first-packet byte volume to distinguish a brief wake
+    from sustained activity. A host coming alive in a normally-dead hour is a candidate for a remote wake.
+    Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      P = active_probability_by_hour[host][hour]
+      if host emits traffic at hour and P < 0.05:
+        alert(host, hour, hist_prob=P, first_bytes=first_packet_bytes)
+- question: Does an LSTM over each host's active/inactive state flag an unpredicted inactive->active transition?
+  context: Model each host's active/inactive state as a binary time series and train an LSTM (cf. Gupta
+    et al.) to predict the next state from time-of-day and day-of-week; an unpredicted inactive->active
+    transition is a high-confidence anomaly indicating the host was woken outside its normal cycle. Surface
+    the top-3 drivers (hours-since-last-active, expected-state probability, preceding inbound packet)
+    per the SHAP-in-IDS review. Under the Command and Control tactic the signal is the on-switch for a
+    covert channel; confirming it here ties the trigger to the implant's callback/beacon so the analyst
+    can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.predict_next_state(host, tod, dow)
+      if observed_state==active and pred==inactive and pred.prob>thr:
+        alert(host, top3=shap_top3([hours_since_active,expected_state_prob,preceding_inbound]))
+- question: Was a Wake-on-LAN magic packet (6x0xFF + 16xMAC) seen on broadcast UDP port 7/9 from a source
+    not on the management allowlist?
+  context: Detect the exact magic-packet structure - 6 bytes of 0xFF followed by 16 repetitions of a target
+    MAC, typically broadcast UDP destination port 7 or 9 per the AMD Magic Packet spec (e.g., Zeek WakeOnLan::Found).
+    Alert for any such packet whose source IP is not on the allowlist of authorized network-management
+    servers. Keep the byte pattern and allowlist as the deterministic floor; an unauthorized WoL is an
+    adversary powering on a target for lateral movement. Under the Command and Control tactic the signal
+    is the on-switch for a covert channel; confirming it here ties the trigger to the implant's callback/beacon
+    so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      event WakeOnLan::Found(src_ip, target_mac):
+        if payload starts FFx6 + MACx16 and dport in [7,9] and src_ip not in mgmt_allowlist:
+          alert(src_ip, target_mac)
+- question: Did a single source exceed the per-VLAN WoL baseline by 3 standard deviations, or wake a MAC
+    that never subsequently booted?
+  context: Per VLAN, baseline UDP broadcast volume on ports 7/9 and alert when a single source exceeds
+    3 standard deviations above the 30-day moving average (Volume/Frequency). As a distinct failure-mode
+    signal, flag WoL packets targeting a MAC that does NOT subsequently boot or appear in DHCP/conn logs
+    - repeated unanswered wakes suggest reconnaissance or spoofed targets. Under the Command and Control
+    tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger to the
+    implant's callback/beacon so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = moving_avg_30d(wol_count[vlan]); sd = stddev_30d
+      if src.wol_count > base + 3*sd: alert(volume_anomaly)
+      if wol.target_mac not in (boots ∪ dhcp ∪ conn within 10m): alert(unanswered_wake, target_mac)
+- question: Does a supervised WoL classifier output a high maliciousness probability with SHAP feature
+    attribution?
+  context: Train a classifier (Logistic Regression / Gradient Boosting) on WoL events using source-is-management-server,
+    time-of-day, day-of-week, WoL count in a 5-minute window, and whether the target MAC is expected to
+    be woken remotely. Output a maliciousness probability and the top-3 contributing features per the
+    SHAP-in-IDS review so the analyst can quickly judge whether the wake is legitimate automation or adversary
+    action. Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([src_is_mgmt,tod,dow,wol_count_5m,target_expected])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Did a single source send more than 10 connections with unusual flag combinations (Zeek conn_state
+    OTH, history S2/S3, NULL/XMAS/FIN-SYN) to one destination within a minute?
+  context: Alert when a single source generates more than 10 connections with Zeek conn_state 'OTH' or
+    a history containing 'S2'/'S3' (unusual flag combinations such as FIN/SYN, NULL, XMAS) to one destination
+    within 1 minute. Unusual-flag probes are an explicit traffic-signaling variant noted in deGraaf et
+    al.; keep the count threshold tunable. Crafted flags are often the signal itself or firewall-rule
+    discovery preceding it. Under the Command and Control tactic the signal is the on-switch for a covert
+    channel; confirming it here ties the trigger to the implant's callback/beacon so the analyst can scope
+    and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) in 60s:
+        weird = [c for c in group if c.conn_state=='OTH' or 'S2' in c.history or 'S3' in c.history]
+        if len(weird) > 10: alert(src,dst,count=len(weird))
+- question: Is a source's failed-to-successful connection ratio above the 98th percentile across all sources?
+  context: For each source IP compute the ratio of failed/rejected to successful connections across destinations
+    over 5 minutes, then alert when the ratio exceeds the 98th percentile for all sources - the failure-rate
+    discriminator established by Jung et al. TRW for distinguishing probing from legitimate use. Report
+    the ratio, distinct-port count and dominant conn_state. Under the Command and Control tactic the signal
+    is the on-switch for a covert channel; confirming it here ties the trigger to the implant's callback/beacon
+    so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src in 5m window:
+        ratio = failed(src)/max(success(src),1)
+        if ratio > pctl98(all_sources_ratio):
+          alert(ratio, distinct_ports=count_dports(src), dominant_state=mode(conn_state))
+- question: Does DBSCAN clustering plus a Kitsune autoencoder isolate a small dense scanning cluster,
+    explained by SHAP?
+  context: Cluster connections with DBSCAN on source IP, destination-port distribution, TCP flags and
+    conn_state; small/dense outlier clusters indicate scanning. Run Kitsune in parallel for online packet-level
+    outliers, and surface the top-3 features per the SHAP-in-IDS review. This catches scanning/discovery
+    patterns that fixed flag rules miss. Under the Command and Control tactic the signal is the on-switch
+    for a covert channel; confirming it here ties the trigger to the implant's callback/beacon so the
+    analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      clusters = DBSCAN(features=[src_ip,dport_dist,tcp_flags,conn_state])
+      for c in clusters where small_and_dense(c):
+        alert(cluster=c, kitsune=kitsune.score(c.packets), top3=shap_top3(features))
+- question: Did a host-based firewall add an allow rule or new permit within 5 minutes of a block burst
+    from the same source IP that is now permitted?
+  context: Alert when a Windows Firewall rule add (Event ID 4950) or new permit (5156) - or a Linux auditd
+    execve of iptables/nft/ufw/firewall-cmd adding an allow rule - occurs within 5 minutes of a burst
+    of block events (5157) from the same source IP that is now permitted. This is the knock->firewall-open
+    pivot from deGraaf et al., using first-party host logs only; a source that was being blocked and is
+    suddenly allowed is the smoking gun of a port-knock-driven firewall change. Under the Command and
+    Control tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger
+    to the implant's callback/beacon so the analyst can scope and sever active adversary control of the
+    host.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for allow in (WinEID4950 add | WinEID5156 permit | auditd[iptables/nft/ufw/firewall-cmd add]):
+        blocks = WinEID5157 deny from same src to same host within [allow-5m, allow]
+        if blocks and allow now permits that src: alert(src, port=allow.port, host)
+- question: Did a port with a historically high block rate (top 10 percent) suddenly appear in allow logs?
+  context: Baseline denied-connection counts per port per critical host, then alert when a port with a
+    historically high block rate (top 10 percent of blocked ports) suddenly appears in allow logs (5156)
+    - a measurable shift in the block:allow distribution (State metric). Report the port, the prior block
+    rate, and the source now permitted. A high-block port flipping to allow indicates a covert firewall
+    change. Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      high_block = ports where block_rate[host][port] in top10pct
+      for permit in WinEID5156:
+        if permit.port in high_block: alert(port=permit.port, prior_block_rate, src=permit.src)
+- question: Does an LSTM flag a sudden un-forecast drop to zero in block counts for a normally-blocked
+    port?
+  context: Model the per-port time series of block counts (5157) with an LSTM anomaly detector; a sudden
+    un-forecast drop to zero for a normally-frequently-blocked port is high-confidence and should auto-trigger
+    a check for a rule change or a subsequent successful connect. Surface the top-3 features (forecast
+    error, port, recent rule-change event) per the SHAP-in-IDS review. Under the Command and Control tactic
+    the signal is the on-switch for a covert channel; confirming it here ties the trigger to the implant's
+    callback/beacon so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.forecast(block_counts[port])
+      if observed≈0 and pred>>0 and forecast_error>thr:
+        check rule_change(port); alert(port, top3=shap_top3([forecast_err,port,recent_rule_change]))
+- question: Did an internally-observed signaling pattern (port-knock/magic packet) involve an IP that
+    also matches the Zeek Intelligence Framework C2 feed?
+  context: The primary trigger is the internally-observed signaling pattern (port-knock/magic packet)
+    from first-party Zeek/firewall logs; CTI is enrichment only. Where available, match the involved IP
+    against the Zeek Intelligence Framework (intel.log) and raise a critical alert when a signaling pattern
+    and a CTI hit coincide - but never require the external lookup for the base detection. Long-connection/rare-destination
+    context from RITA supports first-party triage. Under the Command and Control tactic the signal is
+    the on-switch for a covert channel; confirming it here ties the trigger to the implant's callback/beacon
+    so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if signaling_pattern(src,dst) detected:    // first-party trigger
+         sev = high
+         if (src in intel.log) or (dst in intel.log): sev = critical
+         alert(src,dst,severity=sev, rita_context=long_conn|rare_dst)
+- question: Does a composite risk score combining signaling, IP reputation, port rarity and data volume
+    exceed the 99.5th percentile?
+  context: Enrich outbound connections with IP reputation, port rarity and data volume, compute a composite
+    risk score, and alert above the 99.5th percentile. A poor-reputation destination preceded by inbound
+    signaling scores highest. Report the contributing terms (reputation, port rarity, byte volume) so
+    the analyst understands the drivers. Under the Command and Control tactic the signal is the on-switch
+    for a covert channel; confirming it here ties the trigger to the implant's callback/beacon so the
+    analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      score = w1*reputation + w2*port_rarity + w3*volume + w4*preceded_by_signal
+      if score > pctl995(all_scores): alert(score, terms={reputation,port_rarity,byte_volume})
+- question: Does a C2 classifier using reputation, JA3/JA3S, byte ratios and prior-signaling output a
+    high C2 probability with SHAP?
+  context: Train a classifier to predict C2 using IP/ASN reputation, JA3/JA3S hash, byte ratios, and whether
+    the connection was preceded by a known signaling pattern. Output a probability and the top-3 features
+    per the SHAP-in-IDS review. This fuses external reputation with the first-party signaling observation
+    to identify the activated channel. Under the Command and Control tactic the signal is the on-switch
+    for a covert channel; confirming it here ties the trigger to the implant's callback/beacon so the
+    analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([ip_rep,asn_rep,ja3,ja3s,byte_ratio,preceded_by_signal])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Was an inbound UDP magic-value packet to a host followed within 30 seconds by an outbound
+    TCP from that host back to the source on a non-standard port?
+  context: 'Detect the multi-stage sequence: (1) inbound UDP to host A from source B with a magic-value
+    payload signature, then (2) within 30 seconds an outbound TCP from A to B on a non-standard port.
+    Alert on the ordered pair. This encodes the activation->callback artifact of signaled implants analyzed
+    in deGraaf et al.; the ordered trigger-then-callback is far more specific than either event alone.
+    Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant''s callback/beacon so the analyst can scope and sever active
+    adversary control of the host.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days, event-centered correlation within a 30-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for t in inbound_udp where magic_value(t.payload):  // stage 1
+        cb = outbound_tcp(src=t.dst, dst=t.src, dport not in standard) within 30s after t
+        if cb: alert(host=t.dst, peer=t.src, trigger=t, callback=cb)
+- question: Does a host's (inbound-UDP, outbound-TCP) pair frequency to one external IP within 60s exceed
+    the 99th percentile?
+  context: For each internal host track (inbound UDP from external X, outbound TCP to X) pairs within
+    a 60-second window, compute the frequency per external IP, and alert when it exceeds the 99th percentile
+    of all such frequencies. Report the external IP, the pair count, and the inter-event delay; a repeating
+    trigger/callback pair to one external entity is characteristic of signaled C2. Under the Command and
+    Control tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger
+    to the implant's callback/beacon so the analyst can scope and sever active adversary control of the
+    host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      pairs = count((udp_in_from_X, tcp_out_to_X) within 60s) per (host,X)
+      if pairs[host,X] > pctl99(all_pairs): alert(ext_ip=X, pair_count=pairs, delay=inter_event_delay)
+- question: Do an LSTM sequence model and a GNN expose a (UDP-in, TCP-out) trigger/callback relationship
+    to a new external entity?
+  context: Use an LSTM over per-host (protocol, direction, port) sequences to flag (UDP-in, TCP-out) to
+    a new external entity, and a graph model (GNN-MTC) over host/flow nodes to expose the trigger->callback
+    relationship and shared infrastructure that flow-only models miss. Surface the top-3 contributing
+    edges/features per the SHAP-in-IDS review. Under the Command and Control tactic the signal is the
+    on-switch for a covert channel; confirming it here ties the trigger to the implant's callback/beacon
+    so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      seq_flag = lstm.flag(seq=[(proto,dir,port)...], pattern=(UDP_in,TCP_out), new_entity=True)
+      graph_flag = gnn_mtc(nodes=hosts+flows).trigger_callback_edge()
+      if seq_flag or graph_flag: alert(top3=shap_top3(edges/features))
+- question: Did a host inactive for more than 24 hours send outbound traffic within 5 minutes of an unsolicited
+    inbound packet from an external source?
+  context: Maintain a state table of active hosts. If a host marked inactive for more than 24 hours sends
+    outbound traffic within 5 minutes of receiving an unsolicited inbound packet from an external source,
+    raise a high-priority alert. Keep the 24h/5min thresholds tunable. A dormant host springing to life
+    right after an unsolicited inbound packet is the wake/activation signature of a signaled implant.
+    Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if host.inactive_for > 24h and unsolicited_inbound(host, src=external):
+        if host.outbound within 5m after inbound:
+          alert(host, inbound_src=src, severity=high)
+- question: Did a host end a silent period exceeding its mean + 4 standard deviations, suggesting it was
+    awakened?
+  context: For each host compute the mean and standard deviation of 'silent time' (the gap between consecutive
+    outbound connections), then alert when an ended silent period exceeded mean + 4 standard deviations,
+    suggesting the host was 'awakened' rather than operating on its normal cycle. Report the silent duration
+    and the preceding inbound packet's entropy/port. Under the Command and Control tactic the signal is
+    the on-switch for a covert channel; confirming it here ties the trigger to the implant's callback/beacon
+    so the analyst can scope and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      mu,sd = mean_std(silent_gaps[host])
+      if ended_silent_gap > mu + 4*sd:
+        alert(host, silent_dur=ended_gap, prior_inbound={entropy,port})
+- question: Does a per-host bytes_out forecast (Prophet/LSTM) flag non-zero traffic during a predicted-zero
+    window, especially after a signaling packet?
+  context: Forecast each host's bytes_out (e.g., Prophet / LSTM per Gupta et al.); a non-zero value during
+    a period the forecast interval predicts zero is an anomaly, scored higher if it follows an inbound
+    packet with signaling characteristics. Use benign-periodicity baselines from Mack et al. to avoid
+    alerting on scheduled wakes, and surface the top-3 features per the SHAP-in-IDS review. Under the
+    Command and Control tactic the signal is the on-switch for a covert channel; confirming it here ties
+    the trigger to the implant's callback/beacon so the analyst can scope and sever active adversary control
+    of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = forecast_bytes_out(host)
+      if observed>0 and pred.interval≈0 and not scheduled_wake(host):
+        score = base + signal_bonus(preceding_inbound)
+        alert(host, score, top3=shap_top3(features))
+- question: After a signaling event, did the host make >10 connections to a newly-contacted destination
+    with near-identical intervals (within 10 percent) and sizes (within 10 bytes)?
+  context: Flag any destination first contacted immediately after a signaling event, then alert if more
+    than 10 subsequent connections from the same source show near-identical intervals (within 10 percent)
+    and payload sizes (within 10 bytes) - the low-CV regularity used by RITA. Keep the count/regularity
+    thresholds tunable. A regular low-volume beacon born right after a signal is the activated C2 channel.
+    Under the Command and Control tactic the signal is the on-switch for a covert channel; confirming
+    it here ties the trigger to the implant's callback/beacon so the analyst can scope and sever active
+    adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      dst = first_contact_after(signal_event)
+      conns = conns(src->dst)
+      if len(conns)>10 and cv(intervals)<0.10 and cv(sizes within 10B):
+        alert(src,dst,beacon_period=median(intervals))
+- question: Do cadence statistics (low interval CV, low size entropy, sharp FFT peak) confirm beaconing
+    on a post-signal destination?
+  context: For destinations activated after a signal, compute the standard deviation/coefficient of variation
+    of inter-arrival deltas and the entropy of payload sizes (both low for beacons), and apply an FFT
+    to connection-start times - a sharp frequency peak with high power-to-noise indicates beaconing, per
+    BAYWATCH and RITA. Tune against benign periodic-traffic baselines from Mack et al. Report CV, dominant
+    period and FFT power. Under the Command and Control tactic the signal is the on-switch for a covert
+    channel; confirming it here ties the trigger to the implant's callback/beacon so the analyst can scope
+    and sever active adversary control of the host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      cv_t = std(deltas)/mean(deltas); size_ent = entropy(payload_sizes)
+      spec = FFT(conn_start_times)
+      if cv_t < thr and size_ent < thr and spec.peak_power/noise > thr:
+        alert(cv=cv_t, period=1/spec.peak_freq, fft_power=spec.peak_power)
+- question: Do jitter-tolerant models (CT-HMM, LSTM/transformer) detect an evasive jittered callback that
+    defeats CV/FFT?
+  context: For evasive/jittered callbacks that defeat CV/FFT, apply a Continuous-Time HMM (NetSpectra
+    CT-HMM) and LSTM/transformer time-series models (Gupta et al.) over inter-arrival and byte-count sequences.
+    Surface the top-3 features (interval CV, byte-ratio, dominant period) per the SHAP-in-IDS review.
+    This catches deliberately randomized beacons that simple cadence statistics miss. Under the Command
+    and Control tactic the signal is the on-switch for a covert channel; confirming it here ties the trigger
+    to the implant's callback/beacon so the analyst can scope and sever active adversary control of the
+    host.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = max(ct_hmm.score(seq), lstm.score(seq)) over [inter_arrival, byte_count]
+      if p > thr: alert(prob=p, top3=shap_top3([interval_cv,byte_ratio,dominant_period]))
+- question: Did any UDP or TCP packet carry a known magic-value byte sequence, Cobalt Strike artifact,
+    or matching JA3/JA3S fingerprint that activates a dormant implant?
+  context: This is the deterministic signature floor. Deploy Zeek/Suricata content rules that match known
+    magic-value byte sequences in UDP/TCP payloads, apply the Cobalt Strike YARA rules (signature-base
+    apt_cobaltstrike.yar) to files.log-extracted content and HTTP POST bodies, and fingerprint the encrypted
+    callback with JA3/JA3S. A match means a non-standard trigger or implant artifact crossed the sensor
+    and warrants immediate host triage; keep concrete byte/JA3 patterns and tune rather than delete them.
+    Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain
+    access across restarts and credential changes; confirming it shows how the foothold is maintained
+    even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Suricata signature
+    query: |-
+      rule match: payload =~ known_magic_value_regex OR ja3 IN known_c2_ja3 OR ja3s IN known_c2_ja3s
+        OR yara_match(files.log.extracted, apt_cobaltstrike.yar)
+      => alert(severity=high, evidence={src,dst,dport,proto,match_name})
+- question: Did a small inbound packet (<64 bytes) to a closed/non-listening port show abnormally high
+    Shannon entropy from a rarely-seen source IP?
+  context: For inbound packets with payloads under 64 bytes compute Shannon entropy; flag when entropy
+    exceeds the 98th percentile for that destination port AND the connection ends in a failed/non-listening
+    state (Zeek conn_state REJ/S0/RSTO, the probing failure-mode discriminator from Jung et al. TRW).
+    Then check source rarity and alert if the source IP was seen fewer than 5 times in the last 30 days.
+    High entropy in a tiny failed packet from a stranger is the fingerprint of a crafted/encrypted trigger;
+    surface the entropy value, port, conn_state and source frequency. Under the Persistence tactic the
+    signal re-opens a dormant backdoor or service so the actor can regain access across restarts and credential
+    changes; confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for pkt in inbound where payload_len < 64:
+        e = shannon_entropy(pkt.payload)
+        if e > pctl98(entropy_by_dport[pkt.dport]) and pkt.conn_state in [REJ,S0,RSTO]
+           and count_30d(src_ip) < 5:
+           alert(entropy=e, dport=pkt.dport, conn_state=pkt.conn_state, src_freq=count_30d(src_ip))
+- question: Does a supervised classifier plus an unsupervised autoencoder flag an inbound packet as a
+    likely crafted trigger, with SHAP explaining why?
+  context: Train a Gradient Boosting classifier on labeled sessions using payload entropy, packet size,
+    protocol, src/dst-port rarity, success/fail state, source reputation and JA3/JA3S, and in parallel
+    run a Kitsune/KitNET packet-reconstruction-error autoencoder to catch novel crafted packets without
+    labels. Every alert must list the top-3 contributing features (e.g., entropy, port rarity, fail-state)
+    per the SHAP-in-IDS review so analysts can trust and triage it. The ML layer catches signals that
+    evade fixed byte signatures. Under the Persistence tactic the signal re-opens a dormant backdoor or
+    service so the actor can regain access across restarts and credential changes; confirming it shows
+    how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek notice.log
+  - 'NAI: Network traffic sensors at internet gateways, traffic between VLANs (especially server/workstation
+    segments), and on host endpoints themselves.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      score_s = gbm.predict_proba(features=[entropy,size,proto,sport_rarity,dport_rarity,state,src_rep,ja3])
+      score_u = kitnet.reconstruction_error(packet)
+      if score_s > thr_s or score_u > thr_u:
+        alert(prob=score_s, recon_err=score_u, top3=shap_top3(features))
+- question: Did a process load wpcap.dll/npcap.dll or open a raw/AF_PACKET socket when its user is not
+    an authorized network analyst?
+  context: Alert when a process loads wpcap.dll or npcap.dll (Sysmon Event ID 7) and the user is not in
+    an authorized network-analyst group, or on Linux when auditd shows a non-allowlisted process running
+    tcpdump/tshark or opening an AF_PACKET/raw socket. Sniffer-based observation of trigger packets is
+    the original cd00r/libpcap technique (deGraaf et al.); a non-analyst process gaining packet-capture
+    capability is a strong sign of a signal-listening implant. Under the Persistence tactic the signal
+    re-opens a dormant backdoor or service so the actor can regain access across restarts and credential
+    changes; confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      win: Sysmon EID7 where ImageLoaded in [wpcap.dll,npcap.dll] and User not in NetAnalystGroup => alert
+      linux: auditd execve in [tcpdump,tshark] or socket(AF_PACKET|SOCK_RAW) and proc not in allowlist => alert
+- question: Is the (process, loaded-library) pair enterprise-rare, such as outlook.exe loading wpcap.dll?
+  context: Baseline (process name, loaded DLL/library) pairs per host and across the enterprise, then
+    alert on pairs in the bottom 1st percentile of observed frequency. A capture library bound to a process
+    that has no business sniffing traffic (e.g., outlook.exe -> wpcap.dll) is anomalous. Report the pair,
+    the count of distinct hosts where it has been seen, and the user context. Under the Persistence tactic
+    the signal re-opens a dormant backdoor or service so the actor can regain access across restarts and
+    credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = freq(process_name, loaded_library) over enterprise
+      for ev in EID7:
+        if baseline[(ev.process,ev.library)] <= pctl1(baseline):
+          alert(pair=(ev.process,ev.library), host_count=distinct_hosts(pair), user=ev.user)
+- question: Does an Isolation Forest flag an unusual process loading a capture library, with SHAP showing
+    the drivers?
+  context: Train an Isolation Forest on Sysmon Event ID 7 events using process-hash, parent-process-hash,
+    loaded-library-hash and user account, then flag unusual processes loading capture libraries. Attach
+    the top-3 features driving the anomaly score (e.g., rare parent, non-admin user) per the SHAP-in-IDS
+    review so the analyst sees why the load is suspicious before pivoting to the host. Under the Persistence
+    tactic the signal re-opens a dormant backdoor or service so the actor can regain access across restarts
+    and credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, application servers, administrator workstations, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      model = IsolationForest(features=[proc_hash,parent_hash,lib_hash,user])
+      score = model.anomaly_score(EID7_event)
+      if score > thr: alert(score=score, top3=shap_top3(features))
+- question: Did a single source make N failed attempts to distinct closed ports then a successful connect
+    to a newly opened port within T seconds?
+  context: Track per source->destination connection outcomes. If N failed attempts (Zeek conn_state REJ/S0
+    or TCP RST) to distinct closed ports are followed by one successful connect (SF) within a T-second
+    window (default N=3, T=15), alert. This encodes the canonical port-knock artifact (closed-port burst
+    -> firewall opens port -> successful connect) from deGraaf et al. Keep N/T as tunable deterministic
+    thresholds; a positive is the textbook knock-then-open and demands host investigation. Under the Persistence
+    tactic the signal re-opens a dormant backdoor or service so the actor can regain access across restarts
+    and credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days, event-centered correlation within a 15-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) order by ts:
+        fails = [c for c in window if c.conn_state in [REJ,S0] and c.dport closed and distinct]
+        if len(fails) >= N and exists success(SF) within T sec after last fail:
+          alert(src,dst,knock_ports=fails.dports,open_port=success.dport)
+- question: Does a Threshold Random Walk/SPRT plus destination-port entropy identify a source as a probing
+    knocker?
+  context: Apply a Threshold Random Walk / SPRT over each source's ordered connection success-vs-failure
+    outcomes (Jung et al. TRW); probing sources show a far higher fail:success ratio and are flagged within
+    ~4-5 events with tunable likelihood ratios, more robustly than raw counts. Additionally compute Shannon
+    entropy of destination ports per source in a sliding 1-minute window; high entropy (>99th pct for
+    the host) followed by a successful connect confirms a likely knock. Report fail:success ratio and
+    port-entropy. Under the Persistence tactic the signal re-opens a dormant backdoor or service so the
+    actor can regain access across restarts and credential changes; confirming it shows how the foothold
+    is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src: run SPRT(outcomes=success/fail, theta0,theta1) -> if walk crosses upper bound: suspect
+        dport_entropy = shannon(dport_counts in 60s)
+        if suspect and dport_entropy > pctl99(host) and later_success(src):
+          alert(fail_success_ratio, dport_entropy)
+- question: Does a seasonal spike model plus Kitsune flag an un-forecast failed-connect burst from one
+    source followed by a success?
+  context: Model the per-host stream of failed connections (Windows 5157 / Zeek REJ) with a seasonal anomaly
+    detector (S-H-ESD) and in parallel score packet-rate/jitter bursts with Kitsune. A sharp un-forecast
+    failed-connect spike from one source immediately followed by a success is high-confidence knocking.
+    Surface the top-3 features (fail-count delta, distinct closed ports, time-to-success) per the SHAP-in-IDS
+    review. Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor
+    can regain access across restarts and credential changes; confirming it shows how the foothold is
+    maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - 'NAI: Externally facing servers (e.g., web servers, VPN concentrators), DMZ bastion hosts, and critical
+    internal servers that should have a very restricted set of open ports.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      resid = SH_ESD(failed_connects_per_host_timeseries)
+      if resid.is_anomaly and kitsune.score(packet_burst) > thr and success_follows(src):
+        alert(top3=shap_top3([fail_delta,distinct_closed_ports,time_to_success]))
+- question: Did a host boot outside business hours without an authorized Wake-on-LAN magic packet from
+    an allowlisted management server in the prior 5 minutes?
+  context: Correlate boot events (Windows Event ID 6005) with network logs. Alert if a boot occurs outside
+    business hours and is NOT preceded within 5 minutes by a valid WoL magic packet (6x0xFF + 16xMAC per
+    the AMD Magic Packet spec) from an allowlisted management/SCCM server. Keep the authorized-source
+    allowlist as the deterministic gate. An unauthorized off-hours wake suggests an adversary turning
+    on a system to enable lateral movement. Under the Persistence tactic the signal re-opens a dormant
+    backdoor or service so the actor can regain access across restarts and credential changes; confirming
+    it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for boot in WinEID6005 where boot.time outside business_hours:
+        wol = find WoL_magic(target_mac==boot.host.mac) within [boot-5m, boot]
+        if not wol or wol.src_ip not in mgmt_allowlist:
+          alert(host=boot.host, time=boot.time)
+- question: Did a host initiate traffic during an hour whose historical active-probability is below 5
+    percent?
+  context: Profile each host's per-hour probability of being active from historical traffic, then alert
+    when a host initiates traffic in an hour whose historical active-probability is below 5 percent. Report
+    the hour, the historical probability, and the first-packet byte volume to distinguish a brief wake
+    from sustained activity. A host coming alive in a normally-dead hour is a candidate for a remote wake.
+    Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain
+    access across restarts and credential changes; confirming it shows how the foothold is maintained
+    even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      P = active_probability_by_hour[host][hour]
+      if host emits traffic at hour and P < 0.05:
+        alert(host, hour, hist_prob=P, first_bytes=first_packet_bytes)
+- question: Does an LSTM over each host's active/inactive state flag an unpredicted inactive->active transition?
+  context: Model each host's active/inactive state as a binary time series and train an LSTM (cf. Gupta
+    et al.) to predict the next state from time-of-day and day-of-week; an unpredicted inactive->active
+    transition is a high-confidence anomaly indicating the host was woken outside its normal cycle. Surface
+    the top-3 drivers (hours-since-last-active, expected-state probability, preceding inbound packet)
+    per the SHAP-in-IDS review. Under the Persistence tactic the signal re-opens a dormant backdoor or
+    service so the actor can regain access across restarts and credential changes; confirming it shows
+    how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 6005
+  - Zeek notice.log
+  - 'NAI: All endpoint subnets, especially those containing workstations that are regularly powered down
+    overnight, and server subnets where systems are expected to be online 24/7.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.predict_next_state(host, tod, dow)
+      if observed_state==active and pred==inactive and pred.prob>thr:
+        alert(host, top3=shap_top3([hours_since_active,expected_state_prob,preceding_inbound]))
+- question: Was a Wake-on-LAN magic packet (6x0xFF + 16xMAC) seen on broadcast UDP port 7/9 from a source
+    not on the management allowlist?
+  context: Detect the exact magic-packet structure - 6 bytes of 0xFF followed by 16 repetitions of a target
+    MAC, typically broadcast UDP destination port 7 or 9 per the AMD Magic Packet spec (e.g., Zeek WakeOnLan::Found).
+    Alert for any such packet whose source IP is not on the allowlist of authorized network-management
+    servers. Keep the byte pattern and allowlist as the deterministic floor; an unauthorized WoL is an
+    adversary powering on a target for lateral movement. Under the Persistence tactic the signal re-opens
+    a dormant backdoor or service so the actor can regain access across restarts and credential changes;
+    confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      event WakeOnLan::Found(src_ip, target_mac):
+        if payload starts FFx6 + MACx16 and dport in [7,9] and src_ip not in mgmt_allowlist:
+          alert(src_ip, target_mac)
+- question: Did a single source exceed the per-VLAN WoL baseline by 3 standard deviations, or wake a MAC
+    that never subsequently booted?
+  context: Per VLAN, baseline UDP broadcast volume on ports 7/9 and alert when a single source exceeds
+    3 standard deviations above the 30-day moving average (Volume/Frequency). As a distinct failure-mode
+    signal, flag WoL packets targeting a MAC that does NOT subsequently boot or appear in DHCP/conn logs
+    - repeated unanswered wakes suggest reconnaissance or spoofed targets. Under the Persistence tactic
+    the signal re-opens a dormant backdoor or service so the actor can regain access across restarts and
+    credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = moving_avg_30d(wol_count[vlan]); sd = stddev_30d
+      if src.wol_count > base + 3*sd: alert(volume_anomaly)
+      if wol.target_mac not in (boots ∪ dhcp ∪ conn within 10m): alert(unanswered_wake, target_mac)
+- question: Does a supervised WoL classifier output a high maliciousness probability with SHAP feature
+    attribution?
+  context: Train a classifier (Logistic Regression / Gradient Boosting) on WoL events using source-is-management-server,
+    time-of-day, day-of-week, WoL count in a 5-minute window, and whether the target MAC is expected to
+    be woken remotely. Output a maliciousness probability and the top-3 contributing features per the
+    SHAP-in-IDS review so the analyst can quickly judge whether the wake is legitimate automation or adversary
+    action. Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor
+    can regain access across restarts and credential changes; confirming it shows how the foothold is
+    maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors monitoring broadcast traffic on all internal VLANs.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([src_is_mgmt,tod,dow,wol_count_5m,target_expected])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Did a single source send more than 10 connections with unusual flag combinations (Zeek conn_state
+    OTH, history S2/S3, NULL/XMAS/FIN-SYN) to one destination within a minute?
+  context: Alert when a single source generates more than 10 connections with Zeek conn_state 'OTH' or
+    a history containing 'S2'/'S3' (unusual flag combinations such as FIN/SYN, NULL, XMAS) to one destination
+    within 1 minute. Unusual-flag probes are an explicit traffic-signaling variant noted in deGraaf et
+    al.; keep the count threshold tunable. Crafted flags are often the signal itself or firewall-rule
+    discovery preceding it. Under the Persistence tactic the signal re-opens a dormant backdoor or service
+    so the actor can regain access across restarts and credential changes; confirming it shows how the
+    foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      group conn by (src,dst) in 60s:
+        weird = [c for c in group if c.conn_state=='OTH' or 'S2' in c.history or 'S3' in c.history]
+        if len(weird) > 10: alert(src,dst,count=len(weird))
+- question: Is a source's failed-to-successful connection ratio above the 98th percentile across all sources?
+  context: For each source IP compute the ratio of failed/rejected to successful connections across destinations
+    over 5 minutes, then alert when the ratio exceeds the 98th percentile for all sources - the failure-rate
+    discriminator established by Jung et al. TRW for distinguishing probing from legitimate use. Report
+    the ratio, distinct-port count and dominant conn_state. Under the Persistence tactic the signal re-opens
+    a dormant backdoor or service so the actor can regain access across restarts and credential changes;
+    confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for src in 5m window:
+        ratio = failed(src)/max(success(src),1)
+        if ratio > pctl98(all_sources_ratio):
+          alert(ratio, distinct_ports=count_dports(src), dominant_state=mode(conn_state))
+- question: Does DBSCAN clustering plus a Kitsune autoencoder isolate a small dense scanning cluster,
+    explained by SHAP?
+  context: Cluster connections with DBSCAN on source IP, destination-port distribution, TCP flags and
+    conn_state; small/dense outlier clusters indicate scanning. Run Kitsune in parallel for online packet-level
+    outliers, and surface the top-3 features per the SHAP-in-IDS review. This catches scanning/discovery
+    patterns that fixed flag rules miss. Under the Persistence tactic the signal re-opens a dormant backdoor
+    or service so the actor can regain access across restarts and credential changes; confirming it shows
+    how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network firewalls, intrusion detection systems, externally facing hosts, and internal network
+    choke points between security zones.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      clusters = DBSCAN(features=[src_ip,dport_dist,tcp_flags,conn_state])
+      for c in clusters where small_and_dense(c):
+        alert(cluster=c, kitsune=kitsune.score(c.packets), top3=shap_top3(features))
+- question: Did a host-based firewall add an allow rule or new permit within 5 minutes of a block burst
+    from the same source IP that is now permitted?
+  context: Alert when a Windows Firewall rule add (Event ID 4950) or new permit (5156) - or a Linux auditd
+    execve of iptables/nft/ufw/firewall-cmd adding an allow rule - occurs within 5 minutes of a burst
+    of block events (5157) from the same source IP that is now permitted. This is the knock->firewall-open
+    pivot from deGraaf et al., using first-party host logs only; a source that was being blocked and is
+    suddenly allowed is the smoking gun of a port-knock-driven firewall change. Under the Persistence
+    tactic the signal re-opens a dormant backdoor or service so the actor can regain access across restarts
+    and credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for allow in (WinEID4950 add | WinEID5156 permit | auditd[iptables/nft/ufw/firewall-cmd add]):
+        blocks = WinEID5157 deny from same src to same host within [allow-5m, allow]
+        if blocks and allow now permits that src: alert(src, port=allow.port, host)
+- question: Did a port with a historically high block rate (top 10 percent) suddenly appear in allow logs?
+  context: Baseline denied-connection counts per port per critical host, then alert when a port with a
+    historically high block rate (top 10 percent of blocked ports) suddenly appears in allow logs (5156)
+    - a measurable shift in the block:allow distribution (State metric). Report the port, the prior block
+    rate, and the source now permitted. A high-block port flipping to allow indicates a covert firewall
+    change. Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor
+    can regain access across restarts and credential changes; confirming it shows how the foothold is
+    maintained even when no port is normally listening.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      high_block = ports where block_rate[host][port] in top10pct
+      for permit in WinEID5156:
+        if permit.port in high_block: alert(port=permit.port, prior_block_rate, src=permit.src)
+- question: Does an LSTM flag a sudden un-forecast drop to zero in block counts for a normally-blocked
+    port?
+  context: Model the per-port time series of block counts (5157) with an LSTM anomaly detector; a sudden
+    un-forecast drop to zero for a normally-frequently-blocked port is high-confidence and should auto-trigger
+    a check for a rule change or a subsequent successful connect. Surface the top-3 features (forecast
+    error, port, recent rule-change event) per the SHAP-in-IDS review. Under the Persistence tactic the
+    signal re-opens a dormant backdoor or service so the actor can regain access across restarts and credential
+    changes; confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Windows Event ID 5157
+  - Windows Event ID 5156
+  - Windows Event ID 4950
+  - 'NAI: Host-based firewalls on critical servers (e.g., Domain Controllers, database servers) and administrator
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = lstm.forecast(block_counts[port])
+      if observed≈0 and pred>>0 and forecast_error>thr:
+        check rule_change(port); alert(port, top3=shap_top3([forecast_err,port,recent_rule_change]))
+- question: Did an internally-observed signaling pattern (port-knock/magic packet) involve an IP that
+    also matches the Zeek Intelligence Framework C2 feed?
+  context: The primary trigger is the internally-observed signaling pattern (port-knock/magic packet)
+    from first-party Zeek/firewall logs; CTI is enrichment only. Where available, match the involved IP
+    against the Zeek Intelligence Framework (intel.log) and raise a critical alert when a signaling pattern
+    and a CTI hit coincide - but never require the external lookup for the base detection. Long-connection/rare-destination
+    context from RITA supports first-party triage. Under the Persistence tactic the signal re-opens a
+    dormant backdoor or service so the actor can regain access across restarts and credential changes;
+    confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if signaling_pattern(src,dst) detected:    // first-party trigger
+         sev = high
+         if (src in intel.log) or (dst in intel.log): sev = critical
+         alert(src,dst,severity=sev, rita_context=long_conn|rare_dst)
+- question: Does a composite risk score combining signaling, IP reputation, port rarity and data volume
+    exceed the 99.5th percentile?
+  context: Enrich outbound connections with IP reputation, port rarity and data volume, compute a composite
+    risk score, and alert above the 99.5th percentile. A poor-reputation destination preceded by inbound
+    signaling scores highest. Report the contributing terms (reputation, port rarity, byte volume) so
+    the analyst understands the drivers. Under the Persistence tactic the signal re-opens a dormant backdoor
+    or service so the actor can regain access across restarts and credential changes; confirming it shows
+    how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      score = w1*reputation + w2*port_rarity + w3*volume + w4*preceded_by_signal
+      if score > pctl995(all_scores): alert(score, terms={reputation,port_rarity,byte_volume})
+- question: Does a C2 classifier using reputation, JA3/JA3S, byte ratios and prior-signaling output a
+    high C2 probability with SHAP?
+  context: Train a classifier to predict C2 using IP/ASN reputation, JA3/JA3S hash, byte ratios, and whether
+    the connection was preceded by a known signaling pattern. Output a probability and the top-3 features
+    per the SHAP-in-IDS review. This fuses external reputation with the first-party signaling observation
+    to identify the activated channel. Under the Persistence tactic the signal re-opens a dormant backdoor
+    or service so the actor can regain access across restarts and credential changes; confirming it shows
+    how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek intel.log
+  - Windows Event ID 5157
+  - 'NAI: Network egress points, DNS servers, and proxy servers where outbound connections are logged.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = clf.predict_proba([ip_rep,asn_rep,ja3,ja3s,byte_ratio,preceded_by_signal])
+      if p > thr: alert(prob=p, top3=shap_top3(features))
+- question: Was an inbound UDP magic-value packet to a host followed within 30 seconds by an outbound
+    TCP from that host back to the source on a non-standard port?
+  context: 'Detect the multi-stage sequence: (1) inbound UDP to host A from source B with a magic-value
+    payload signature, then (2) within 30 seconds an outbound TCP from A to B on a non-standard port.
+    Alert on the ordered pair. This encodes the activation->callback artifact of signaled implants analyzed
+    in deGraaf et al.; the ordered trigger-then-callback is far more specific than either event alone.
+    Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain
+    access across restarts and credential changes; confirming it shows how the foothold is maintained
+    even when no port is normally listening.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days, event-centered correlation within a 30-second window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for t in inbound_udp where magic_value(t.payload):  // stage 1
+        cb = outbound_tcp(src=t.dst, dst=t.src, dport not in standard) within 30s after t
+        if cb: alert(host=t.dst, peer=t.src, trigger=t, callback=cb)
+- question: Does a host's (inbound-UDP, outbound-TCP) pair frequency to one external IP within 60s exceed
+    the 99th percentile?
+  context: For each internal host track (inbound UDP from external X, outbound TCP to X) pairs within
+    a 60-second window, compute the frequency per external IP, and alert when it exceeds the 99th percentile
+    of all such frequencies. Report the external IP, the pair count, and the inter-event delay; a repeating
+    trigger/callback pair to one external entity is characteristic of signaled C2. Under the Persistence
+    tactic the signal re-opens a dormant backdoor or service so the actor can regain access across restarts
+    and credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      pairs = count((udp_in_from_X, tcp_out_to_X) within 60s) per (host,X)
+      if pairs[host,X] > pctl99(all_pairs): alert(ext_ip=X, pair_count=pairs, delay=inter_event_delay)
+- question: Do an LSTM sequence model and a GNN expose a (UDP-in, TCP-out) trigger/callback relationship
+    to a new external entity?
+  context: Use an LSTM over per-host (protocol, direction, port) sequences to flag (UDP-in, TCP-out) to
+    a new external entity, and a graph model (GNN-MTC) over host/flow nodes to expose the trigger->callback
+    relationship and shared infrastructure that flow-only models miss. Surface the top-3 contributing
+    edges/features per the SHAP-in-IDS review. Under the Persistence tactic the signal re-opens a dormant
+    backdoor or service so the actor can regain access across restarts and credential changes; confirming
+    it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points and internal network segments monitoring traffic between endpoints and
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      seq_flag = lstm.flag(seq=[(proto,dir,port)...], pattern=(UDP_in,TCP_out), new_entity=True)
+      graph_flag = gnn_mtc(nodes=hosts+flows).trigger_callback_edge()
+      if seq_flag or graph_flag: alert(top3=shap_top3(edges/features))
+- question: Did a host inactive for more than 24 hours send outbound traffic within 5 minutes of an unsolicited
+    inbound packet from an external source?
+  context: Maintain a state table of active hosts. If a host marked inactive for more than 24 hours sends
+    outbound traffic within 5 minutes of receiving an unsolicited inbound packet from an external source,
+    raise a high-priority alert. Keep the 24h/5min thresholds tunable. A dormant host springing to life
+    right after an unsolicited inbound packet is the wake/activation signature of a signaled implant.
+    Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain
+    access across restarts and credential changes; confirming it shows how the foothold is maintained
+    even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days, event-centered correlation within a 5-minute window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      if host.inactive_for > 24h and unsolicited_inbound(host, src=external):
+        if host.outbound within 5m after inbound:
+          alert(host, inbound_src=src, severity=high)
+- question: Did a host end a silent period exceeding its mean + 4 standard deviations, suggesting it was
+    awakened?
+  context: For each host compute the mean and standard deviation of 'silent time' (the gap between consecutive
+    outbound connections), then alert when an ended silent period exceeded mean + 4 standard deviations,
+    suggesting the host was 'awakened' rather than operating on its normal cycle. Report the silent duration
+    and the preceding inbound packet's entropy/port. Under the Persistence tactic the signal re-opens
+    a dormant backdoor or service so the actor can regain access across restarts and credential changes;
+    confirming it shows how the foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      mu,sd = mean_std(silent_gaps[host])
+      if ended_silent_gap > mu + 4*sd:
+        alert(host, silent_dur=ended_gap, prior_inbound={entropy,port})
+- question: Does a per-host bytes_out forecast (Prophet/LSTM) flag non-zero traffic during a predicted-zero
+    window, especially after a signaling packet?
+  context: Forecast each host's bytes_out (e.g., Prophet / LSTM per Gupta et al.); a non-zero value during
+    a period the forecast interval predicts zero is an anomaly, scored higher if it follows an inbound
+    packet with signaling characteristics. Use benign-periodicity baselines from Mack et al. to avoid
+    alerting on scheduled wakes, and surface the top-3 features per the SHAP-in-IDS review. Under the
+    Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain access
+    across restarts and credential changes; confirming it shows how the foothold is maintained even when
+    no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Endpoint subnets, especially for user workstations and servers that have predictable on/off
+    cycles.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      pred = forecast_bytes_out(host)
+      if observed>0 and pred.interval≈0 and not scheduled_wake(host):
+        score = base + signal_bonus(preceding_inbound)
+        alert(host, score, top3=shap_top3(features))
+- question: After a signaling event, did the host make >10 connections to a newly-contacted destination
+    with near-identical intervals (within 10 percent) and sizes (within 10 bytes)?
+  context: Flag any destination first contacted immediately after a signaling event, then alert if more
+    than 10 subsequent connections from the same source show near-identical intervals (within 10 percent)
+    and payload sizes (within 10 bytes) - the low-CV regularity used by RITA. Keep the count/regularity
+    thresholds tunable. A regular low-volume beacon born right after a signal is the activated C2 channel.
+    Under the Persistence tactic the signal re-opens a dormant backdoor or service so the actor can regain
+    access across restarts and credential changes; confirming it shows how the foothold is maintained
+    even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      dst = first_contact_after(signal_event)
+      conns = conns(src->dst)
+      if len(conns)>10 and cv(intervals)<0.10 and cv(sizes within 10B):
+        alert(src,dst,beacon_period=median(intervals))
+- question: Do cadence statistics (low interval CV, low size entropy, sharp FFT peak) confirm beaconing
+    on a post-signal destination?
+  context: For destinations activated after a signal, compute the standard deviation/coefficient of variation
+    of inter-arrival deltas and the entropy of payload sizes (both low for beacons), and apply an FFT
+    to connection-start times - a sharp frequency peak with high power-to-noise indicates beaconing, per
+    BAYWATCH and RITA. Tune against benign periodic-traffic baselines from Mack et al. Report CV, dominant
+    period and FFT power. Under the Persistence tactic the signal re-opens a dormant backdoor or service
+    so the actor can regain access across restarts and credential changes; confirming it shows how the
+    foothold is maintained even when no port is normally listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      cv_t = std(deltas)/mean(deltas); size_ent = entropy(payload_sizes)
+      spec = FFT(conn_start_times)
+      if cv_t < thr and size_ent < thr and spec.peak_power/noise > thr:
+        alert(cv=cv_t, period=1/spec.peak_freq, fft_power=spec.peak_power)
+- question: Do jitter-tolerant models (CT-HMM, LSTM/transformer) detect an evasive jittered callback that
+    defeats CV/FFT?
+  context: For evasive/jittered callbacks that defeat CV/FFT, apply a Continuous-Time HMM (NetSpectra
+    CT-HMM) and LSTM/transformer time-series models (Gupta et al.) over inter-arrival and byte-count sequences.
+    Surface the top-3 features (interval CV, byte-ratio, dominant period) per the SHAP-in-IDS review.
+    This catches deliberately randomized beacons that simple cadence statistics miss. Under the Persistence
+    tactic the signal re-opens a dormant backdoor or service so the actor can regain access across restarts
+    and credential changes; confirming it shows how the foothold is maintained even when no port is normally
+    listening.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points (firewalls, proxies) where outbound C2 traffic would be visible.'
+  range: Last 90 days
+  queries:
+  - technology: ML pseudocode
+    query: |-
+      p = max(ct_hmm.score(seq), lstm.score(seq)) over [inter_arrival, byte_count]
+      if p > thr: alert(prob=p, top3=shap_top3([interval_cv,byte_ratio,dominant_period]))
