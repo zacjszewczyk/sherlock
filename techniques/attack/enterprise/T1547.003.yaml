@@ -1,0 +1,493 @@
+name: 'T1547.003: Time Providers'
+id: 011eac35-f605-4cf4-90ae-fea5c788fdcd
+description: 'Investigate potential abuse of the Windows Time service (W32Time) Time Providers mechanism,
+  where adversaries register a malicious DLL under HKLM\System\CurrentControlSet\Services\W32Time\TimeProviders\
+  so it is loaded by the time provider manager (svchost hosting W32Time) at boot or on configuration change,
+  executing in the Local Service context. This playbook helps an analyst hunt for both persistence and
+  privilege-escalation use of this technique: registry writes to a Time Provider ''DllName'' that point
+  to non-legitimate, unsigned, world-writable, or low-prevalence DLLs; w32tm.exe /register or /config
+  invocations correlated with W32Time service restarts; unauthorized or unusual accounts/processes modifying
+  the TimeProviders keys; create->register->load chains spanning integrity levels; and anomalous network
+  behavior from the W32Time svchost beyond normal NTP (UDP/123) to the approved server list. Detection
+  guidance spans symbolic-logic allowlist/correlation rules, statistical prevalence/frequency/standard-deviation
+  baselining, and machine-learning models (DLL/PE classifiers, isolation forests, sequence/provenance
+  models).'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any Time Provider 'DllName' value under HKLM\System\CurrentControlSet\Services\W32Time\TimeProviders\
+    been set to a DLL that is not the approved provider (w32time.dll / documented OS providers), is unsigned,
+    loads from an abnormal path, or matches a known-malicious hash?
+  context: Legitimate W32Time providers point to %SystemRoot%\System32\w32time.dll (plus documented OS-supplied
+    providers). For persistence, an adversary registers an arbitrarily named subkey whose DllName references
+    a malicious DLL that the time provider manager loads at boot under the Local Service account, giving
+    them a stealthy foothold that survives reboots. Monitor Windows 4657 / Sysmon 13 writes to '\W32Time\TimeProviders\*\DllName'
+    and alert (high) when the new value is not on the approved-provider allowlist, when the corresponding
+    Sysmon 7 module load by the W32Time svchost is unsigned or from an abnormal path, or when the DllName
+    hash matches a threat-intel feed. A positive result is strong evidence of a planted persistence mechanism;
+    a negative result confirms only approved provider DLLs are registered. Deploy as portable SigmaHQ
+    registry-set rules.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 11
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=win (EventCode=4657 OR (sourcetype=Sysmon EventCode=13))
+
+      | where match(ObjectName,"\\W32Time\\TimeProviders\\.*\\DllName$")
+
+      | eval bad=if(lower(NewValue) IN ("%systemroot%\\system32\\w32time.dll",approved_provider_list),0,1)
+
+      | join host,DllPath [search sourcetype=Sysmon EventCode=7 Image=*svchost* | eval unsigned=if(Signed="false",1,0)]
+
+      | eval ioc=if(SHA256 IN (ti_feed_hashes),1,0)
+
+      | where bad=1 OR unsigned=1 OR ioc=1 | table _time host ObjectName NewValue Signed SHA256'
+- question: Are any registered or loaded Time Provider DLLs rare across the fleet, located outside %SystemRoot%\System32,
+    or anomalous in file size / signature status relative to the legitimate w32time.dll?
+  context: Malicious time-provider DLLs are typically unique to a single or handful of compromised hosts
+    and reside in non-standard directories, whereas the legitimate provider is present on nearly every
+    Windows host in System32. Baseline every registered/loaded Time Provider DLL's enterprise prevalence
+    and path entropy using a fleet-wide DLL frequency model, then flag DLLs below ~0.5% prevalence (derive
+    a per-fleet cutoff, typically fewer than 5 hosts) or located outside %SystemRoot%\System32 (e.g.,
+    C:\Users\*, C:\ProgramData\*). Track file size versus the legitimate w32time.dll and signed-vs-unsigned
+    state as additional features. A low-prevalence, unsigned DLL in a user-writable path is highly suspicious
+    for persistence; ubiquitous signed System32 DLLs are benign.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 11
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=win (Sysmon EventCode=7 Image=*svchost*) OR (EventCode=4657 ObjectName=*W32Time\\TimeProviders*)
+
+      | stats dc(host) as host_count by ImageLoaded
+
+      | eventstats sum(host_count) as total
+
+      | eval prevalence=host_count/total, outside_system32=if(match(ImageLoaded,"(?i)\\System32\\"),0,1)
+
+      | where prevalence<0.005 OR host_count<5 OR outside_system32=1
+
+      | table ImageLoaded host_count prevalence outside_system32'
+- question: When a Time Provider DLL is classified by a trained PE/behavioral model, does its malicious
+    probability exceed the tuned threshold, and which features (e.g., unsigned, high .text entropy, rare
+    path) drive that verdict?
+  context: Static and behavioral features of a DLL — PE metadata, section entropy, imports, signature
+    status, and user/process context — distinguish malicious time-provider payloads from legitimate ones.
+    Train a Random Forest/XGBoost classifier on these features and alert when the malicious probability
+    exceeds the tuned threshold, emitting the top-3 contributing features (LIME-style attribution) so
+    an analyst can immediately judge the verdict. In the persistence context this catches novel malicious
+    provider DLLs that evade simple allowlists; the feature attribution accelerates triage by explaining
+    why the DLL looks malicious. A high-probability alert warrants DLL acquisition and host isolation;
+    a low score with benign features is reassuring.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 11
+  - Sysmon Event ID 7
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: "features = extract_pe(dll)  # entropy, imports, signature, path_rarity, proc_ctx\np = rf_xgb_model.predict_proba(features)[malicious]\n\
+      if p > tuned_threshold:\n    top3 = lime_explain(rf_xgb_model, features)[:3]\n    alert(dll, prob=p,\
+      \ top_features=top3)"
+- question: Was w32tm.exe launched with /register or /config arguments and followed within five minutes
+    by a W32Time service state change to running on the same host?
+  context: Registering a new time provider is commonly done via w32tm.exe /register or /config, and the
+    change takes effect when the W32Time service restarts. Correlate Windows 4688 / Sysmon 1 process creations
+    of w32tm.exe with /register or /config against a subsequent Windows 7036 'W32Time' state-change-to-running
+    event within a five-minute window on the same host. A matched sequence indicates an actor (or script)
+    (re)registering a time provider — a key step in establishing W32Time persistence. Treat failed or
+    access-denied registry writes as a separate, lower-confidence signal of an attempted but unsuccessful
+    registration. Codify as a portable SigmaHQ correlation rule.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 7036
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=win ((EventCode=4688 OR (Sysmon EventCode=1)) Image=*w32tm.exe* (CommandLine=*/register*
+      OR CommandLine=*/config*))
+
+      | join host [search index=win EventCode=7036 Message="*W32Time*running*"]
+
+      | transaction host maxspan=5m
+
+      | table _time host ParentImage CommandLine svc_state
+
+      // also flag access-denied registry writes (4657 fail / 4656) as lower-confidence'
+- question: Is w32tm.exe being spawned by an unusual parent process or at an abnormal frequency relative
+    to its 30-90 day baseline?
+  context: Legitimate w32tm.exe invocations come from a small, predictable set of parents (services.exe,
+    admin shells, management tooling) at low frequency. Maintain rolling 30-90 day baselines of w32tm.exe
+    parent processes and per-host invocation counts, then alert when a bottom-5th-percentile or never-before-seen
+    parent (winword.exe, encoded PowerShell, cmd) spawns w32tm.exe or when invocation count exceeds mean+3sigma.
+    An anomalous parent such as an Office app or obfuscated PowerShell strongly suggests adversary-driven
+    time-provider configuration for persistence, while spikes in invocation count can indicate scripted
+    tampering. Routine service-driven launches are expected and should baseline out.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 7036
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=win (EventCode=4688 OR Sysmon EventCode=1) Image=*w32tm.exe*
+
+      | stats count by host ParentImage
+
+      | eventstats avg(count) as mu stdev(count) as sd
+
+      | eval newparent=if(isnull(baseline_parent_lookup(ParentImage)),1,0)
+
+      | where newparent=1 OR count > mu+3*sd OR ParentImage IN ("winword.exe","cmd.exe","powershell.exe")
+
+      | table host ParentImage count'
+- question: Does the observed event sequence (process launch -> registry write -> service restart -> module
+    load) deviate from learned legitimate W32Time administration sequences?
+  context: Legitimate time-service administration follows predictable event orderings. Model these with
+    an LSTM next-event predictor (DeepLog-style) and flag sequences whose next-event probability falls
+    outside the top-k, surfacing the improbable transition. For example, a chain of powershell -> w32tm.exe
+    /register -> unsigned DLL load -> service restart would score as highly improbable and indicate scripted
+    persistence setup. The model captures temporal context that point rules miss; an out-of-distribution
+    sequence merits investigation, while expected admin orderings stay quiet.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Windows Event ID 7036
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: "seq = sessionize(events, key=host, order=_time)  # proc->reg->svc->module\nfor s in seq:\n\
+      \    p_next = lstm_deeplog.predict(s)\n    if observed_next not in top_k(p_next):\n        alert(host,\
+      \ improbable_transition=s, k=top_k)"
+- question: Is the svchost.exe instance hosting W32Time making network connections that are not UDP/123
+    to an approved NTP server, including spikes in blocked/denied flows?
+  context: 'The W32Time service should only talk NTP (UDP/123) to the authorized NTP server list. Correlate
+    Zeek conn.log with Sysmon 3 / Windows 5156 flows for the W32Time svchost instance and alert when the
+    protocol is not UDP, the destination port is not 123, or the destination IP is not on the approved
+    NTP allowlist. Explicitly profile failure modes: a spike in blocked/denied flows (Windows 5157) or
+    NTP-failure events is a distinct signal that the time service is being abused for exfiltration or
+    C2. Because a malicious time provider runs inside this svchost, off-policy connections can reveal
+    beaconing. Approved UDP/123 traffic to known servers is benign.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=netflow (sourcetype=zeek_conn OR EventCode=5156 OR Sysmon EventCode=3) Image=*svchost*
+      svc=W32Time
+
+      | eval offpolicy=if(proto="udp" AND dest_port=123 AND dest_ip IN (ntp_allowlist),0,1)
+
+      | append [search EventCode=5157 Image=*svchost* svc=W32Time | stats count as denied by host]
+
+      | where offpolicy=1 OR denied>denied_baseline
+
+      | table _time host dest_ip dest_port proto orig_bytes resp_bytes denied'
+- question: Do the W32Time svchost network flows exceed mean+3sigma for byte volume, connection frequency,
+    or destination rarity relative to a 30-day baseline?
+  context: NTP traffic is low-volume and periodic, so deviations stand out. Maintain 30-day rolling mean+standard-deviation
+    baselines per host for W32Time flow volume (orig_bytes/resp_bytes), frequency (conns/hour), and destination
+    rarity, then alert on any feature exceeding mean+3sigma — especially connections to rare geographies.
+    A surge in bytes or connection frequency, or contact with a rarely seen destination, is a strong indicator
+    that the time service is carrying C2 or exfiltration on behalf of a malicious provider. Steady, small
+    periodic syncs to known servers stay within baseline.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek_conn svc=W32Time
+
+      | bin _time span=1h | stats sum(orig_bytes) as ob sum(resp_bytes) as rb count as conns dc(dest_ip)
+      as dests by host _time
+
+      | eventstats avg(ob) as mu_b stdev(ob) as sd_b avg(conns) as mu_c stdev(conns) as sd_c by host
+
+      | where ob > mu_b+3*sd_b OR conns > mu_c+3*sd_c OR dest_rarity_score>threshold
+
+      | table host _time ob rb conns dests'
+- question: When W32Time svchost flows are scored by an unsupervised anomaly model, do any exceed the
+    anomaly threshold, and which features (resp_bytes, non-123 port, rare ASN) explain them?
+  context: Train an Isolation Forest or autoencoder on legitimate W32Time Zeek conn features (duration,
+    orig_bytes, resp_bytes, proto, port, dest ASN) and flag flows whose anomaly score or reconstruction
+    error exceeds the dynamic threshold, reporting the top-3 contributing features for triage. This catches
+    subtle off-profile connections that fixed thresholds miss — for instance a small but persistent TCP
+    flow to an unusual ASN. In the persistence context, anomalous W32Time network behavior points to a
+    malicious provider DLL beaconing; the feature attribution tells the analyst what made the flow stand
+    out.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, Internet Gateway, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'X = zeek_conn[W32Time][[duration,orig_bytes,resp_bytes,proto,port,dest_asn]]
+
+      model = IsolationForest().fit(X_legit)  # or autoencoder
+
+      score = model.decision_function(X)
+
+      flag = score < dynamic_threshold
+
+      for f in flag: alert(flow, top3=shap_features(model,f))'
+- question: Has a Time Provider 'DllName' been pointed at a world-writable or non-standard directory (C:\Users\,
+    C:\ProgramData\, C:\Windows\Temp\, C:\PerfLogs\), and did the W32Time svchost then load an unsigned
+    DLL from that path?
+  context: Privilege escalation via Time Providers hinges on getting code that a low-privilege user can
+    write to be loaded and executed in the elevated Local Service context. Monitor 4657 / Sysmon 13 writes
+    to '\W32Time\TimeProviders\*\DllName', regex the data for user-writable locations (C:\Users\*, C:\ProgramData\*,
+    C:\PerfLogs\*, C:\Windows\Temp\*), and corroborate with a Sysmon 7 unsigned or abnormal-path module
+    load by the W32Time svchost. A DllName pointing into a world-writable path that is then loaded unsigned
+    is a hallmark of privilege escalation; legitimate providers reside in %SystemRoot%\System32 and are
+    signed. Ship as a portable SigmaHQ rule.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Multi-user Workstations, Terminal Servers, Member Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=win (EventCode=4657 OR Sysmon EventCode=13)
+
+      | where match(ObjectName,"\\W32Time\\TimeProviders\\.*\\DllName$")
+
+      | where match(NewValue,"(?i)C:\\\\(Users|ProgramData|PerfLogs|Windows\\\\Temp)\\\\")
+
+      | join host [search Sysmon EventCode=7 Image=*svchost* Signed=false]
+
+      | table _time host ObjectName NewValue ImageLoaded Signed'
+- question: Are any Time Provider DLL parent directories rare across the fleet, appearing on fewer hosts
+    than the derived rarity threshold (typically <1% of the fleet)?
+  context: Legitimate time-provider DLLs share one ubiquitous parent directory (System32), so any other
+    parent directory is inherently rare and suspicious. Count unique Time Provider DLL parent directories
+    enterprise-wide, assign rarity scores via fleet prevalence analysis, and alert when a path outside
+    %SystemRoot%\System32 appears on fewer hosts than the derived threshold (typically <1% of the fleet).
+    A rare, user-writable parent directory indicates a planted DLL leveraged for escalation. Ubiquitous
+    System32 paths score as common and benign.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Multi-user Workstations, Terminal Servers, Member Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=win (Sysmon EventCode=7 Image=*svchost*) OR (EventCode=4657 ObjectName=*W32Time\\TimeProviders*)
+
+      | eval parent_dir=replace(ImageLoaded,"[^\\\\]+$","")
+
+      | stats dc(host) as hosts by parent_dir | eventstats sum(hosts) as total
+
+      | eval pct=hosts/total | where parent_dir!="%SystemRoot%\\System32\\" AND pct<0.01
+
+      | table parent_dir hosts pct'
+- question: When a new Time Provider DLL path and its PE features are scored by an outlier model, is it
+    flagged as anomalous, and which features (user-writable dir, unsigned, rare) drive the verdict?
+  context: Train a one-class SVM or Isolation Forest on legitimate Time Provider DLL path and PE features
+    and classify each new path, emitting the top-3 contributing features with the outlier verdict. This
+    generalizes beyond hard-coded path lists to flag novel escalation attempts where the DLL sits in an
+    unusual, writable, or low-reputation location. A flagged outlier with features like 'user-writable
+    dir' and 'unsigned' is a strong escalation signal; an inlier matching the legitimate System32/signed
+    profile is benign.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Multi-user Workstations, Terminal Servers, Member Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: "X = features(path, pe)  # writable_dir, signed, rarity, entropy\nmodel = OneClassSVM().fit(X_legit)\
+      \  # or IsolationForest\nif model.predict(x) == -1:\n    alert(path, top3=attribution(model,x))"
+- question: Has any account or process that is not NT AUTHORITY\SYSTEM or an authorized administrator
+    successfully written to HKLM\...\W32Time\TimeProviders\, or repeatedly been denied when attempting
+    to?
+  context: 'Only SYSTEM and authorized administrators should modify the TimeProviders keys; a write by
+    any other principal is a privilege-abuse signal. Enforce an allowlist for the SubjectUserName/process
+    writing to ''\W32Time\TimeProviders\'' and alert when an unapproved account modifies these keys. Profile
+    the failure mode explicitly: repeated access-denied attempts (4656 failures) by non-admins indicate
+    attempted privilege abuse even without a successful write. A successful unauthorized write is high-severity
+    escalation evidence; a burst of denied attempts reveals probing. Separate 4657 successes from 4656
+    failures as distinct signals.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, All Windows Endpoints and Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=win (EventCode=4657 OR Sysmon EventCode=13) ObjectName=*W32Time\\TimeProviders*
+
+      | where NOT (SubjectUserName="SYSTEM" OR SubjectUserName IN (authorized_admins))
+
+      | append [search EventCode=4656 ObjectName=*W32Time\\TimeProviders* Keywords="Audit Failure" | stats
+      count as denied by SubjectUserName host]
+
+      | table _time host SubjectUserName ProcessName ObjectName denied'
+- question: Are brand-new or rare (user, process) tuples modifying Time Provider keys, or are there bursts
+    of failed write attempts, relative to a 90-day baseline?
+  context: The set of accounts and processes that legitimately touch TimeProviders keys is small and stable.
+    Track (user, process) tuples modifying these keys over 90 days, compute per-tuple frequency and per-host
+    write counts with mean+3sigma thresholds, and alert on brand-new tuples, those below the 1st percentile,
+    or bursts of failed write attempts. A never-before-seen modifying account/process, or a spike of denied
+    writes, suggests an actor attempting escalation through the time service. Established admin tooling
+    stays within baseline.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, All Windows Endpoints and Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=win (EventCode=4657 OR Sysmon EventCode=13) ObjectName=*W32Time\\TimeProviders*
+
+      | stats count by SubjectUserName ProcessName host
+
+      | eventstats avg(count) as mu stdev(count) as sd
+
+      | eval newtuple=if(isnull(baseline_tuple(SubjectUserName,ProcessName)),1,0)
+
+      | where newtuple=1 OR count>mu+3*sd | table host SubjectUserName ProcessName count'
+- question: When a TimeProviders registry modification is scored by an anomaly model on features like
+    username, process, integrity level, time-of-day, and success/fail, is it flagged, and what are the
+    top contributing features?
+  context: Train an Isolation Forest on legitimate modification features (UserName, ProcessName, integrity
+    level, time-of-day, success/fail) and score each event, surfacing the top-3 contributing features
+    for high anomaly scores. This captures multivariate context that a simple allowlist misses — e.g.,
+    an admin account used at an odd hour from a medium-integrity process. A high-anomaly modification
+    is a candidate privilege-escalation event meriting review; routine modifications matching the learned
+    profile score low.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4656
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, All Windows Endpoints and Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'X = events[[UserName,ProcessName,IntegrityLevel,hour,success]]
+
+      model = IsolationForest().fit(X_legit)
+
+      score = model.score_samples(X)
+
+      for e in where(score<thr): alert(e, top3=attribution(model,e))'
+- question: Did a Low/Medium integrity process create a DLL that a high-privilege process then registered
+    as a Time Provider DllName, followed by a W32Time svchost module load — all within ~10 minutes?
+  context: 'The create->register->load chain across integrity boundaries is the privilege-escalation signature
+    for this technique: a low-privilege foothold drops a DLL, an elevated action registers it under TimeProviders,
+    and the elevated W32Time svchost executes it. Detect a Low/Medium integrity process (Sysmon 1) creating
+    a DLL (Sysmon 11), followed within 10 minutes by a high-privilege process writing that DLL path to
+    ''\W32Time\TimeProviders\*\DllName'' (Sysmon 13) and a subsequent svchost module load (Sysmon 7).
+    Express as a portable SigmaHQ correlation rule. A matched chain is high-confidence escalation evidence;
+    isolated events without the full sequence are weaker.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Endpoints with UAC enabled, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=win Sysmon (EventCode=1 OR EventCode=11 OR EventCode=13 OR EventCode=7)
+
+      | transaction host maxspan=10m startswith=(EventCode=1 IntegrityLevel IN ("Low","Medium"))
+
+      | where create_dll=1 AND reg_write_dllname=1 AND svchost_module_load=1
+
+      | table _time host low_proc dll_path TimeProviderKey loaded_dll'
+- question: Is the time delta between a Time Provider DLL's creation and its registry registration unusually
+    short (e.g., under 5 minutes at the 1st percentile of the estate)?
+  context: Legitimate provider DLLs are installed and registered as part of slow, deliberate processes,
+    whereas an attacker's create->register sequence is tightly coupled in time. Measure the time delta
+    between DLL creation and registry registration across the estate, set a low-percentile threshold (e.g.,
+    <5 minutes at the 1st percentile) via standard-deviation/percentile baselining, and flag tightly-coupled
+    events below it. A very short create-to-register gap suggests automated, adversarial escalation; long,
+    naturally spaced installs are benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Endpoints with UAC enabled, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=win Sysmon (EventCode=11 OR EventCode=13)
+
+      | transaction dll_path host startswith=EventCode=11 endswith=EventCode=13
+
+      | eval delta=reg_time-create_time
+
+      | eventstats perc1(delta) as p1
+
+      | where delta < min(300,p1) | table host dll_path delta'
+- question: Does a process-file-registry provenance graph contain the create->register->load subgraph
+    as an anomalous structure, and can the specific malicious DLL/registry node be localized?
+  context: Build process-file-registry provenance graphs and detect the create->register->load subgraph
+    as anomalous using GNN-based provenance learning (KAIROS) with node-level anomaly localization (ThreaTrace).
+    KAIROS reconstructs the offending subgraph, and ThreaTrace names the specific anomalous DLL or registry
+    node for triage. This whole-chain view detects escalation even when individual events look benign
+    in isolation, and it gives the analyst the exact nodes to investigate. A reconstructed malicious subgraph
+    is strong escalation evidence; normal provenance produces no anomalous subgraph.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4657
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 7
+  - 'NAI: Endpoints with UAC enabled, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: "G = build_provenance_graph(proc,file,registry events)\nkairos = KAIROS().detect(G)       \
+      \ # reconstruct anomalous subgraph\nnodes = ThreaTrace().localize(G)   # name anomalous DLL/registry\
+      \ node\nif create_register_load_subgraph(kairos):\n    alert(subgraph=kairos, nodes=nodes)"
