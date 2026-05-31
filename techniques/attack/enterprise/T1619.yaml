@@ -1,0 +1,426 @@
+name: 'T1619: Cloud Storage Object Discovery'
+id: 66866da7-14c1-44ad-ad60-069fe624cb8a
+description: Investigate potential adversary enumeration of objects within cloud storage infrastructure
+  (e.g., AWS S3 ListObjectsV2/ListBuckets, Azure List Blobs, GCP storage.objects.list). This playbook
+  helps an analyst determine whether a user, role, or service principal is performing reconnaissance against
+  cloud storage to shape follow-on actions such as bulk data access, exfiltration, deletion, or permission
+  changes. It covers correlating enumeration API calls against threat intelligence on malicious IPs/proxies/TOR
+  nodes; detecting cloud-storage discovery tooling on endpoints (s3scanner, cloud_enum, gcpbucketbrute)
+  via process-creation and HTTP user-agent telemetry; identifying high-rate or burst enumeration from
+  a single identity or source IP; surfacing first-time or never-before-accessed enumeration by an identity;
+  chaining discovery to subsequent collection/impact actions (GetObject/DeleteObject/PutBucketPolicy);
+  and spotting bursts of failed (AccessDenied/403) enumeration that indicate credential probing. Each
+  question pairs a deterministic detection floor with statistical baselining and machine-learning anomaly
+  detection so analysts can triage anomalous cloud storage discovery activity quickly and defensibly.
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any cloud storage object-enumeration API call (ListObjectsV2, ListBuckets, List Blobs,
+    storage.objects.list) originate from a source IP address that matches a threat-intelligence feed for
+    known-malicious IPs, anonymizing proxies, or TOR exit nodes?
+  context: In the Discovery tactic, an adversary enumerates cloud storage objects to map what data exists
+    before requesting or exfiltrating it. Any enumeration sourced from a TI-flagged IP is a strong, low-false-positive
+    signal of unauthorized reconnaissance because legitimate administrators and automation rarely operate
+    from malicious infrastructure, proxies, or TOR. Cross-reference the source IP of every enumeration
+    call against current TI on malicious IPs, proxies, and TOR exit nodes (mirroring AWS GuardDuty S3
+    findings UnauthorizedAccess:S3/TorIPCaller and Exfiltration:S3/MaliciousIPCaller). A match should
+    be treated as a high-severity floor alert and pivoted to the associated identity, the buckets/containers
+    enumerated, and any follow-on GetObject activity. A negative result does not clear the activity—stealthy
+    actors use clean infrastructure—so pair this with the rarity and ML checks.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider management plane (for API logs), network egress points (for traffic logs), and
+    threat intelligence subscription services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FILTER cloudtrail WHERE eventName IN (\"ListObjectsV2\",\"ListBuckets\")\n  OR azure.operationName\
+      \ CONTAINS \"listKeys\" OR gcp.methodName==\"storage.objects.list\"\nLOOKUP sourceIPAddress IN threat_intel(malicious_ip,\
+      \ proxy, tor_exit)\nWHERE match == true\nALERT severity=high \"Cloud storage enumeration from TI-flagged\
+      \ source\""
+- question: For each cloud storage enumeration call, how rare is the source ASN and country compared with
+    the calling identity's own 30-90 day baseline, and is this a first-seen ASN/region for that identity?
+  context: Sophisticated actors often operate from clean infrastructure that evades TI feeds, so geographic
+    and ASN rarity provides a complementary Discovery-stage signal. Score each enumeration call's source
+    ASN and country against the identity's 30-90 day baseline using a robust modified Z-score (flag |M|>3.5)
+    and first-seen baselining (Netflix CloudTrail approach), flagging values below the 5th percentile
+    or never-before-seen ASN/region. A positive result means an identity is enumerating storage from an
+    unusual location or network it has not historically used—consistent with credential theft or session
+    hijacking. Surface the rare ASN/country and the prior baseline values in the alert so the analyst
+    can judge whether it reflects travel, a new VPN, or genuine compromise.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider management plane (for API logs), network egress points (for traffic logs), and
+    threat intelligence subscription services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER identity COMPUTE baseline_asn_set, baseline_country_freq OVER last 30-90d\nFOR each enumeration_call:\n\
+      \  m = modified_zscore(asn_or_country_freq, baseline)\n  firstseen = asn NOT IN baseline_asn_set\n\
+      \  IF abs(m) > 3.5 OR pct(country) < 5 OR firstseen:\n     ALERT surface(asn, country, baseline_value)"
+- question: Does an unsupervised/supervised model flag a cloud storage enumeration event as anomalous
+    based on source reputation, ASN, country, hour, user-agent, identity type, success/fail ratio, and
+    prior history?
+  context: Single-feature rules miss multivariate anomalies during Discovery. Train an Isolation Forest
+    or supervised classifier on enumeration features—source reputation, ASN, country, hour-of-day, user-agent,
+    identity type, success/fail ratio, and historical activity—and alert when the anomaly score or malicious
+    probability exceeds 0.85. This complements the deterministic TI rule by catching subtle combinations
+    (e.g., a rarely-used role enumerating at an odd hour from a novel ASN). A high-confidence flag should
+    surface the top-3 contributing features (such as rare ASN, TOR flag, or novel role) so the analyst
+    understands why the model fired and can confirm against the Discovery hypothesis. Retrain on analyst
+    feedback to control false positives.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider management plane (for API logs), network egress points (for traffic logs), and
+    threat intelligence subscription services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL IsolationForest/classifier ON features(\n  src_reputation, asn, country, hour, user_agent,\
+      \ identity_type, succ_fail_ratio, history)\nSCORE each enumeration_event\nIF anomaly_score > 0.85:\n\
+      \  ALERT with top3_contributing_features"
+- question: Were any processes created, or HTTP requests made, whose command lines or User-Agent strings
+    match known cloud-storage discovery tools such as s3scanner, cloud_enum, gcpbucketbrute, `aws s3 ls
+    --recursive`, or `az storage blob list`?
+  context: Adversaries frequently run dedicated tooling to enumerate cloud storage during Discovery. On
+    endpoints, DevOps/cloud workstations, CI/CD servers, and VDI, look at process-creation telemetry (Windows
+    Event ID 4688, auditd execve) and HTTP user-agent logs for exact matches to known discovery tools
+    and CLI patterns, using SigmaHQ cloud/process rules as a deterministic watchlist floor. A match indicates
+    someone is actively scanning for or listing storage resources—either an authorized assessment or an
+    intruder. Pivot to the executing user/host, the targeted cloud endpoints, and correlated cloud audit
+    events. A negative result is expected for actors using bespoke or API-direct methods, so combine with
+    entropy and UA-anomaly checks.
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, DevOps/Cloud Engineering Workstations, CI/CD Pipeline Servers, Virtual Desktop
+    Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FILTER (win_4688 OR auditd_execve) WHERE command_line MATCHES\n  /(s3scanner|cloud_enum|gcpbucketbrute|aws\
+      \ s3 ls .*--recursive|az storage blob list)/i\nOR http.user_agent MATCHES /(s3scanner|cloud_enum|gcpbucketbrute)/i\n\
+      ALERT \"Cloud storage discovery tool observed\""
+- question: Is the entropy and length of cloud-related command-line tokens for a given user anomalously
+    high relative to that user's own baseline, suggesting obfuscated or scripted enumeration?
+  context: Attackers may rename tools or obfuscate commands to evade exact-match rules during Discovery.
+    Score per-user CLI command-token entropy and length using a robust modified Z-score (flag |M|>3.5)
+    and a seasonality-aware method (Seasonal-Hybrid ESD / STL+MAD), alerting when a command is more than
+    3 standard deviations above the user's baseline. High entropy/length can indicate encoded or programmatically
+    generated enumeration commands that bypass signatures. Report the offending command and the user's
+    baseline mean so the analyst can confirm whether it is benign automation or suspicious activity tied
+    to storage discovery.
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, DevOps/Cloud Engineering Workstations, CI/CD Pipeline Servers, Virtual Desktop
+    Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER user COMPUTE baseline(entropy(cmd_tokens), len(cmd)) OVER history\nFOR each process_event:\n\
+      \  m = modified_zscore(entropy_len, baseline)\n  IF m > 3.5 (or SH-ESD flag):\n    ALERT report(command,\
+      \ baseline_mean)"
+- question: Does an anomaly model flag the User-Agent and request features seen at cloud storage endpoints
+    as inconsistent with historically observed clients?
+  context: Discovery tooling often presents unusual User-Agent strings and request patterns at cloud storage
+    API endpoints. Train a One-Class SVM or Isolation Forest on historical user agents and request features
+    (method, path, ASN, identity) at storage endpoints and flag anomalies. A flagged event indicates a
+    client or request shape never normally seen—consistent with a discovery tool or a non-standard SDK
+    used by an attacker. Surface the rare UA/ASN/method as the top contributing features so the analyst
+    can quickly judge whether it reflects a new legitimate integration or unauthorized enumeration, and
+    feed confirmations back to reduce noise.
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, DevOps/Cloud Engineering Workstations, CI/CD Pipeline Servers, Virtual Desktop
+    Infrastructure (VDI)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL OneClassSVM/IsolationForest ON storage_endpoint_requests(\n  user_agent, http_method,\
+      \ path, asn, identity)\nSCORE each request\nIF anomaly:\n  ALERT surface(rare_user_agent, asn, method)"
+- question: Did any single identity or source IP exceed a static enumeration threshold—for example more
+    than 50 paginated ListObjectsV2/List Blobs calls, more than 1000 returned keys in 5 minutes, or enumeration
+    spanning more than 10 distinct buckets/containers?
+  context: Bulk enumeration is the defining behavior of cloud storage object Discovery. A full-bucket
+    walk requires ceil(objects/1000) paginated calls using ContinuationToken/IsTruncated, so high call
+    volume, large returned-key counts, or breadth across many buckets in a short window indicates automated
+    reconnaissance. Alert when an identity or IP crosses a static threshold sized to exceed legitimate
+    inventory jobs. A positive result warrants pivoting to what was enumerated and any follow-on data
+    access. Tune thresholds to known inventory/backup automation to limit false positives while keeping
+    a deterministic high-volume floor.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs (VPC/NSG)
+  - 'NAI: Cloud provider audit logs (CloudTrail, etc.), identity and access management (IAM) services,
+    and network flow log collectors (e.g., Zeek sensors at internet egress).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "GROUP BY identity, sourceIP OVER 5min WINDOW\n  count_calls = count(eventName IN List*)\n\
+      \  keys_returned = sum(returned_object_count)\n  distinct_buckets = dcount(bucket)\nIF count_calls>50\
+      \ OR keys_returned>1000 OR distinct_buckets>10:\n  ALERT \"High-volume cloud storage enumeration\""
+- question: Is an identity's 60-minute enumeration count or calls-per-minute statistically anomalous compared
+    with its own 99th-percentile baseline, indicating a burst of listing activity?
+  context: Static thresholds can be too high or too low for different principals, so baseline each identity
+    individually. Score each identity's 60-minute enumeration volume and calls/min against their 99th-percentile
+    baseline using a robust modified Z-score and a seasonality-aware Seasonal-Hybrid ESD (STL+MAD) to
+    account for business-cycle patterns. Flag bursts that deviate from the principal's norm even if below
+    any global threshold—catching low-and-slow or context-relative spikes during Discovery. Report observed-vs-baseline
+    counts so the analyst can distinguish a genuine workload change from suspicious enumeration.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs (VPC/NSG)
+  - 'NAI: Cloud provider audit logs (CloudTrail, etc.), identity and access management (IAM) services,
+    and network flow log collectors (e.g., Zeek sensors at internet egress).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER identity COMPUTE p99_baseline(enum_count_60m, calls_per_min) OVER history\nFOR each window:\n\
+      \  m = modified_zscore(observed, baseline); shesd = SH_ESD(series)\n  IF m>3.5 OR shesd.flag:\n\
+      \    ALERT report(observed_count, baseline_count)"
+- question: Does observed aggregate or per-principal enumeration volume exceed the upper prediction interval
+    of a time-series forecast of normal listing activity?
+  context: Environment-wide enumeration trends follow predictable daily/weekly seasonality. Forecast aggregate
+    and per-principal enumeration volume with Prophet or SARIMA and alert when observed counts breach
+    the upper prediction interval. This catches coordinated or distributed Discovery that individual-identity
+    baselines might miss, and adapts to legitimate growth. A breach surfaces the forecast band and the
+    contributing principal, letting the analyst see how far activity departed from expectation and whether
+    a specific identity drove the spike.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs (VPC/NSG)
+  - 'NAI: Cloud provider audit logs (CloudTrail, etc.), identity and access management (IAM) services,
+    and network flow log collectors (e.g., Zeek sensors at internet egress).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL Prophet/SARIMA ON enumeration_volume(aggregate, per_principal) timeseries\nPREDICT upper_interval\
+      \ for current period\nIF observed > upper_interval:\n  ALERT surface(forecast_band, contributing_principal)"
+- question: Did an identity perform an object-enumeration API call for the first time ever, or enumerate
+    a storage resource it has never previously accessed (not present in the 90-day lookup table)?
+  context: A principal that has never enumerated storage suddenly doing so—or touching a bucket/container
+    it has never accessed—is a classic Discovery signal of compromised credentials or privilege misuse.
+    Maintain a 90-day lookup table of which identities perform enumeration and which resources they access
+    (per the Splunk Previously Unseen User Roles approach) and alert when a new identity issues a discovery
+    call or reaches a never-before-seen resource. A positive result narrows investigation to a specific
+    identity-resource pair; confirm against change tickets and onboarding/automation before escalating.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud audit logs, Identity and Access Management (IAM) role/policy configurations, and historical
+    user activity databases/look-up tables.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "MAINTAIN lookup enum_seen(identity, resource) OVER trailing 90d\nFOR each enumeration_event:\n\
+      \  IF identity NOT IN enum_seen.identities\n     OR (identity,resource) NOT IN enum_seen:\n    ALERT\
+      \ \"First-time enumeration by identity/resource\""
+- question: How similar is an identity's current enumeration action (API + resource + region) to its historical
+    activity set, and is it a zero/low-similarity (novel) event?
+  context: Beyond a binary first-seen check, measure novelty quantitatively. Score each new action by
+    Jaccard similarity against the identity's historical API+resource set and flag zero/low-similarity
+    events, complemented by first-seen baselining for new role/region/ASN (Netflix approach). Low similarity
+    indicates the identity is operating well outside its normal behavior—consistent with an attacker exploring
+    an unfamiliar environment during Discovery. Report the never-before-seen API, resource, or region
+    in the alert so the analyst can judge whether it reflects a legitimate new task or unauthorized exploration.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud audit logs, Identity and Access Management (IAM) role/policy configurations, and historical
+    user activity databases/look-up tables.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER identity BUILD historical_set{api+resource} OVER history\nFOR each event:\n  sim = jaccard(current_action,\
+      \ historical_set)\n  firstseen = role/region/asn NOT IN baseline\n  IF sim <= low_threshold OR firstseen:\n\
+      \    ALERT report(novel_api, resource, region)"
+- question: Do an identity's enumeration counts deviate sharply (>3 sigma) from its IAM-role peer group,
+    or does a relationship/graph model flag contextually-anomalous principal->bucket enumeration?
+  context: Identities with similar IAM roles should exhibit similar enumeration behavior; an outlier within
+    its peer group suggests misuse. Cluster identities by role/activity and flag those whose enumeration
+    counts exceed 3 sigma versus peers using Isolation Forest, and model principal->bucket->ListObjects
+    relationships with graph-based methods (GNN IAM-log detection, CS-GAD dynamic graph GNN) to catch
+    enumeration that is anomalous in context even if not in raw volume. A flagged principal indicates
+    behavior inconsistent with its role cohort or relationship history—surface the peer-group baseline
+    and the deviating features so the analyst can validate against the Discovery hypothesis.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud audit logs, Identity and Access Management (IAM) role/policy configurations, and historical
+    user activity databases/look-up tables.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "CLUSTER identities BY iam_role, activity_profile\nFOR each identity: IF enum_count > peer_mean\
+      \ + 3*peer_std: flag\nBUILD graph(principal -> bucket -> ListObjects); SCORE with GNN/CS-GAD\nIF\
+      \ peer_outlier OR graph_anomaly:\n  ALERT surface(peer_baseline, deviating_features)"
+- question: Was an enumeration call (ListObjectsV2/List Blobs) by an identity followed within 30 minutes
+    by more than 20 GetObject, DeleteObject, or PutBucketPolicy calls from that same identity?
+  context: 'Discovery rarely happens in isolation—an attacker enumerates storage and then acts on what
+    it finds, forming a recon->collection/impact chain. Alert when an enumeration call is followed within
+    30 minutes by a high volume (>20) of GetObject (collection/exfiltration), DeleteObject (impact), or
+    PutBucketPolicy (impact/permission change) calls by the same identity. This temporal correlation strongly
+    indicates that reconnaissance led directly to data access, destruction, or exposure. A positive result
+    is high priority: identify the objects accessed/deleted and any policy changes, and contain the identity.
+    Tie this directly to the transition out of Discovery into Collection/Exfiltration/Impact.'
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs
+  - 'NAI: Cloud Storage Buckets/Containers, Cloud Audit Logs, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "SEQUENCE BY identity WITHIN 30min:\n  A: eventName IN (ListObjectsV2, ListBuckets, ListBlobs)\n\
+      \  THEN B: count(eventName IN (GetObject, DeleteObject, PutBucketPolicy)) > 20\nALERT \"Enumeration\
+      \ followed by bulk access/impact\""
+- question: Is the volume of data egress (bytes and GetObject count) following an enumeration event statistically
+    anomalous compared with the identity's 30-minute baseline?
+  context: Even when the post-discovery action count is below a static threshold, the data volume removed
+    can reveal exfiltration. Score post-enumeration egress (bytes, GetObject count) against each identity's
+    30-minute baseline using a robust modified Z-score and flag events above the 99th percentile. This
+    catches an actor that enumerates then pulls an unusually large amount of data relative to its norm—a
+    hallmark of Discovery leading to Collection/Exfiltration. Report bytes-vs-baseline so the analyst
+    can gauge the magnitude of potential data loss and prioritize response.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs
+  - 'NAI: Cloud Storage Buckets/Containers, Cloud Audit Logs, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER identity COMPUTE baseline(post_enum_bytes, getobject_count) OVER 30min history\nFOR each\
+      \ post-enumeration window:\n  m = modified_zscore(observed_bytes, baseline)\n  IF observed > p99\
+      \ OR m>3.5:\n    ALERT report(bytes_observed, baseline_bytes)"
+- question: Does the observed sequence of cloud audit events for an identity deviate from the expected
+    benign event sequence (authenticate->ListBuckets->ListObjects->GetObject) as predicted by a log-sequence
+    model?
+  context: Legitimate cloud workflows produce predictable event orderings; attackers chaining Discovery
+    into action often break these patterns. Train a DeepLog LSTM log-sequence model on benign cloud audit-event
+    sequences and alert when an observed sequence falls outside the top-g predicted next events. This
+    catches abnormal recon-to-action chains that simple thresholds miss—e.g., enumeration immediately
+    followed by permission changes or mass deletes in an order the model has never seen. Surface the violating
+    event for triage and retrain on analyst feedback to keep the model aligned with evolving legitimate
+    workflows.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - Zeek conn.log
+  - Cloud flow logs
+  - 'NAI: Cloud Storage Buckets/Containers, Cloud Audit Logs, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL DeepLog(LSTM) ON benign_sequences(authenticate->ListBuckets->ListObjects->GetObject)\n\
+      FOR each identity event_stream:\n  IF next_event NOT IN top_g_predicted:\n    ALERT surface(violating_event);\
+      \ collect analyst_feedback for retrain"
+- question: Did a single identity or source IP generate a burst of failed enumeration calls (AccessDenied,
+    Client.UnauthorizedOperation, HTTP 403, or NoSuchBucket)—for example more than 20 such failures on
+    List* APIs within 5 minutes?
+  context: An actor with stolen or low-privilege credentials often probes to learn which storage resources
+    it can list, producing a burst of authorization failures during Discovery. Alert when an identity
+    exceeds a static failed-enumeration threshold (e.g., >20 AccessDenied/Client.UnauthorizedOperation/403
+    on List* APIs in 5 minutes), per the Splunk AWS IAM AccessDenied Discovery Events pattern. A burst
+    of denials indicates credential misuse or reconnaissance against resources the principal lacks rights
+    to. Pivot to the identity's recent authentication, the denied resources, and any subsequent successful
+    enumeration. Keep this as a deterministic failure-rate floor.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - IAM access-denied / authorization logs
+  - 'NAI: Cloud provider audit logs (CloudTrail, Azure Activity, GCP Audit), IAM/authorization services,
+    and storage access logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "GROUP BY identity, sourceIP OVER 5min\n  fails = count(errorCode IN (AccessDenied, Client.UnauthorizedOperation,\
+      \ NoSuchBucket)\n                OR http_status==403) AND eventName MATCHES /List/\nIF fails > 20:\n\
+      \  ALERT \"Burst of failed cloud storage enumeration\""
+- question: Treating each enumeration call as a success/failure trial, does sequential hypothesis testing
+    (Threshold Random Walk) classify an identity as an enumerator due to a high failure ratio after only
+    a handful of calls?
+  context: Rather than waiting for a fixed failure count, model each enumeration call as a Bernoulli success/failure
+    trial and apply Threshold Random Walk sequential hypothesis testing to declare a principal an enumerator
+    after roughly 4-5 calls when the failure ratio is high. This detects credential-probing reconnaissance
+    faster and with statistical rigor than a static threshold, adapting to the observed success/fail mix.
+    Report the success/fail tally and the decision likelihood in the alert so the analyst understands
+    the confidence behind the classification and can correlate with the identity's privilege level during
+    Discovery.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - IAM access-denied / authorization logs
+  - 'NAI: Cloud provider audit logs (CloudTrail, Azure Activity, GCP Audit), IAM/authorization services,
+    and storage access logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER identity RUN TRW sequential_test:\n  each List* call -> outcome in {success, failure}\n\
+      \  update log-likelihood ratio with P(fail|enumerator) vs P(fail|benign)\n  IF LLR crosses upper_threshold\
+      \ (~after 4-5 calls):\n    ALERT report(success_fail_tally, decision_likelihood)"
+- question: Is an identity's AccessDenied rate and the diversity of resources it is denied on anomalous
+    relative to the population, per an unsupervised failure-pattern model?
+  context: Beyond raw failure counts, the shape of an identity's failure profile reveals probing. Baseline
+    per-principal AccessDenied rate and denied-resource diversity with Isolation Forest and rare-by-population
+    ML jobs, flagging identities whose failure profile is anomalous compared with peers. An attacker systematically
+    testing access across many resources will show elevated denial rates and unusually broad denied-resource
+    diversity—distinct from a user hitting a single misconfigured permission. Surface the top denied APIs/resources
+    as contributing features so the analyst can confirm whether the pattern reflects reconnaissance or
+    a benign misconfiguration during Discovery.
+  answer_sources:
+  - 'AWS CloudTrail (S3 data events: ListObjectsV2, ListBuckets)'
+  - Azure Storage/Activity Logs (List Blobs)
+  - Google Cloud Audit Logs (storage.objects.list)
+  - IAM access-denied / authorization logs
+  - 'NAI: Cloud provider audit logs (CloudTrail, Azure Activity, GCP Audit), IAM/authorization services,
+    and storage access logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL IsolationForest + rare-by-population ON per_principal(\n  access_denied_rate, denied_resource_diversity)\n\
+      SCORE each identity\nIF anomalous_failure_profile:\n  ALERT surface(top_denied_apis, top_denied_resources)"
