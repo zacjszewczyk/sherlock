@@ -1,0 +1,559 @@
+name: 'T1686.001: Disable or Modify System Firewall: Cloud Firewall'
+id: 6dbe881d-2a7f-410b-9990-8395522aaf6f
+description: Investigate whether an adversary has disabled or modified a cloud firewall (security groups,
+  network security groups, or VPC firewall rules) to bypass network controls that restrict access to cloud
+  resources. This playbook helps an analyst hunt for attack-surface-expanding changes in the cloud control
+  plane and correlate them with the resulting reachability and host-based activity in the data plane.
+  It covers firewall rule changes whose newly allowed source IP/CIDR matches high-confidence threat intelligence;
+  rule metadata (user-agent, rule name, description) carrying offensive-tool or malicious signatures;
+  overly permissive rules that expose 0.0.0.0/0 or ::/0 and high-risk management ports (SSH, RDP, WinRM,
+  SMB) to the internet; firewall changes made by anomalous identities, ASNs, geographies, or times relative
+  to a user's baseline; and the canonical credential-abuse chain where a permissive change is rapidly
+  followed by inbound traffic, failed logons, and follow-on exploitation from a previously unseen source.
+  Each question pairs symbolic-logic, statistical, and machine-learning detection approaches across cloud
+  audit logs, network flow logs (Zeek), and endpoint authentication events so the analyst can confirm
+  or rule out malicious modification of cloud firewalls.
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any cloud firewall rule (AWS security group, Azure NSG, or GCP firewall) been created
+    or modified to allow a source IP address or CIDR range that matches an entry on a current, high-confidence
+    threat intelligence feed, and which identity made the change?
+  context: When an adversary opens the cloud perimeter to infrastructure they control, the newly allowed
+    source frequently appears on curated threat-intel feeds. Fire a baseline rule on CloudTrail AuthorizeSecurityGroupIngress/Egress
+    and CreateSecurityGroup events (and the Azure NSG / GCP firewall equivalents), extract the new source
+    IP/CIDR from requestParameters, and match it against a high-confidence indicator feed. A positive
+    match where a known-bad address is added as an allowed source is a strong signal of deliberate attack-surface
+    expansion supporting Defense Impairment; join the change to the userIdentity in the audit trail to
+    attribute who did it. A negative result (no feed match) does not clear the change but lowers urgency
+    and routes it to the volume/behavioral analytics below.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `eventName`, Azure Activity Logs `operationName`, GCP Audit
+    Logs `methodName`)
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, Organizational Threat Intelligence Platform, Network
+    Gateway/Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloud_audit eventName IN ("AuthorizeSecurityGroupIngress","AuthorizeSecurityGroupEgress","CreateSecurityGroup","createOrUpdateNSG","compute.firewalls.insert")
+
+      | extract new_cidr=requestParameters.ipPermissions.ipRanges.cidrIp
+
+      | lookup threat_intel cidr AS new_cidr OUTPUT confidence, source AS ti_source
+
+      | where ti_source!=null AND confidence>="high"
+
+      | table _time, userIdentity.arn, new_cidr, ti_source, eventName'
+- question: After a cloud firewall rule modification, does the newly allowed source IP transmit a volume
+    of bytes that exceeds the 95th percentile (MAD-robust) for that host or service, indicating staging
+    or exfiltration, and are there blocked or failed connections to the same destination?
+  context: Once a permissive rule is in place, the adversary's goal is often to move or exfiltrate data.
+    After a firewall change, query Zeek conn.log for the newly allowed source IP and compare transmitted
+    bytes against the historical 95th percentile for that host/service. Use median absolute deviation
+    (modified Z-score, |Mi|>3.5) instead of mean/standard deviation so routine batch transfers do not
+    inflate the threshold and mask the anomaly. Exceeded volume immediately after a perimeter change is
+    consistent with staging or exfiltration. As a separate state signal, count blocked or failed connections
+    to the same destination, which indicate probing or scanning of the freshly exposed service. This question
+    ties the configuration change to its data-plane consequence under Defense Impairment.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `eventName`, Azure Activity Logs `operationName`, GCP Audit
+    Logs `methodName`)
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, Organizational Threat Intelligence Platform, Network
+    Gateway/Egress Points'
+  range: Last 90 days; center analysis on a 24-hour window after each firewall change
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: '// after a firewall change, evaluate the new source IP in conn.log
+
+      source=zeek_conn id.orig_h=NEW_ALLOWED_SRC
+
+      | stats sum(orig_bytes+resp_bytes) AS bytes BY id.orig_h, id.resp_h, id.resp_p, bin(_time,1h)
+
+      | eventstats median(bytes) AS med, mad(bytes) AS mad BY id.resp_h, id.resp_p
+
+      | eval mzscore=0.6745*(bytes-med)/mad
+
+      | where mzscore>3.5
+
+      | append [ search source=zeek_conn id.orig_h=NEW_ALLOWED_SRC conn_state IN ("REJ","S0") | stats
+      count AS blocked BY id.resp_h ]'
+- question: When each cloud firewall change is scored by a logistic-regression risk model using features
+    such as threat-feed membership, user role, time of day, business-hours flag, source ASN reputation,
+    and post-change byte volume, does any change exceed a 0.85 risk probability warranting automated investigation?
+  context: Individual heuristics miss changes that are only suspicious in combination. Train a logistic-regression
+    model on labeled benign/malicious firewall changes using features including threat-feed membership
+    of the new source, the changer's IAM role, time of day, a business-hours flag, source ASN reputation,
+    and the post-change byte volume observed in flow logs. Score every new firewall change; when the probability
+    exceeds 0.85, trigger an automated investigation and emit the top-3 contributing features in the alert
+    text so the analyst can immediately understand what drove the score. A high score that combines threat-feed
+    membership with off-hours activity by an unusual role is a strong Defense Impairment indicator. Calibrate
+    the threshold against your false-positive tolerance.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `eventName`, Azure Activity Logs `operationName`, GCP Audit
+    Logs `methodName`)
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, Organizational Threat Intelligence Platform, Network
+    Gateway/Egress Points'
+  range: Last 90 days; retrain on at least 6-12 months of labeled history
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [ti_feed_member, user_role_priv, hour_of_day, business_hours_flag, src_asn_reputation,\
+      \ post_change_bytes]\nmodel = LogisticRegression.load(\"fw_change_risk.pkl\")\nfor change in firewall_changes(last=\"\
+      90d\"):\n    p = model.predict_proba(features(change))\n    if p > 0.85:\n        alert(change,\
+      \ score=p, top_features=model.top_contributions(change, n=3))"
+- question: Does any cloud firewall modification contain a user-agent string, rule name, or description
+    that matches a signature for known offensive security tooling (e.g., 'pacu', 'stratus-red-team', 'Prowler')
+    or generic malicious indicators (e.g., 'pwn', 'backdoor')?
+  context: 'Attackers and red teams often leave fingerprints in the metadata of the API calls they make.
+    Scan the userAgent field, the rule name, and the rule description of firewall change events against
+    a regex set covering known offensive-security tools (Pacu, Stratus Red Team, Prowler) and generic
+    malicious tokens such as ''pwn'' or ''backdoor''. A match strongly suggests the change was made with
+    attacker tooling rather than a legitimate administrative client, directly supporting the Defense Impairment
+    hypothesis. Maintain the signature list carefully: legitimate security teams also run Prowler/Stratus,
+    so corroborate matches with the identity and authorization context before escalating. Absence of a
+    match does not exonerate a change made through a standard SDK user-agent.'
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userAgent` field, Azure Activity Logs `httpRequest` field,
+    GCP Audit Logs `requestMetadata.callerSuppliedUserAgent` field)
+  - 'NAI: Cloud IAM and Network Management APIs, Cloud Service Provider API Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloud_audit eventName IN ("AuthorizeSecurityGroupIngress","CreateSecurityGroup","createOrUpdateNSG","compute.firewalls.insert")
+
+      | eval meta = userAgent." ".rule_name." ".rule_description
+
+      | regex meta="(?i)(pacu|stratus-red-team|prowler|pwn|backdoor)"
+
+      | table _time, userIdentity.arn, userAgent, rule_name, rule_description'
+- question: Do new cloud firewall rule names or descriptions show Shannon entropy or length that deviates
+    more than 3.5 MAD from the benign baseline, indicating tool-generated, random, or uniform naming?
+  context: Human administrators name rules descriptively ('allow-corp-vpn-443'), while automated attacker
+    tooling tends to generate names that are random (high entropy) or templated/uniform (low entropy,
+    repeated patterns). Compute Shannon entropy and string length for new rule metadata and compare to
+    the benign baseline using a modified Z-score; alert when the score deviates by more than 3.5 MAD.
+    This statistical method catches both high-entropy random names and suspiciously uniform machine-generated
+    names without relying on a fixed signature list, complementing the regex check. A flagged name warrants
+    reviewing who created the rule and what it exposes. Tune the baseline per cloud account, since naming
+    conventions differ between teams.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userAgent` field, Azure Activity Logs `httpRequest` field,
+    GCP Audit Logs `requestMetadata.callerSuppliedUserAgent` field)
+  - 'NAI: Cloud IAM and Network Management APIs, Cloud Service Provider API Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloud_audit eventName IN ("CreateSecurityGroup","AuthorizeSecurityGroupIngress","createOrUpdateNSG","compute.firewalls.insert")
+
+      | eval ent=shannon_entropy(rule_name), len=len(rule_name)
+
+      | eventstats median(ent) AS m_ent, mad(ent) AS d_ent, median(len) AS m_len, mad(len) AS d_len
+
+      | eval z_ent=0.6745*(ent-m_ent)/d_ent, z_len=0.6745*(len-m_len)/d_len
+
+      | where abs(z_ent)>3.5 OR abs(z_len)>3.5
+
+      | table _time, userIdentity.arn, rule_name, ent, len, z_ent, z_len'
+- question: When new cloud firewall rule text is classified by an NLP / rare-token model trained on labeled
+    benign and malicious names, does any rule exceed 0.90 confidence of being malicious, and which tokens
+    drove that classification?
+  context: 'Beyond fixed regexes and entropy, an NLP/rare-token classifier can learn the subtle lexical
+    patterns that distinguish attacker-generated rule text from legitimate descriptions. Train the model
+    on labeled benign/malicious rule names and descriptions, then classify each new rule; alert when the
+    malicious confidence exceeds 0.90 and surface the highest-weighted tokens so the analyst can validate
+    the decision. This catches novel tool output and obfuscated names that evade static signatures, supporting
+    the Defense Impairment hypothesis. Treat the model as a triage aid: corroborate high-confidence classifications
+    with the change''s identity, scope, and exposed ports before acting, and periodically retrain to track
+    new tooling.'
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userAgent` field, Azure Activity Logs `httpRequest` field,
+    GCP Audit Logs `requestMetadata.callerSuppliedUserAgent` field)
+  - 'NAI: Cloud IAM and Network Management APIs, Cloud Service Provider API Endpoints'
+  range: Last 90 days; retrain on labeled corpus periodically
+  queries:
+  - technology: ML/pseudocode
+    query: "model = NlpRareTokenClassifier.load(\"rule_text_clf.pkl\")\nfor change in firewall_changes(last=\"\
+      90d\"):\n    text = change.rule_name + \" \" + change.rule_description\n    conf = model.predict_proba(text,\
+      \ label=\"malicious\")\n    if conf > 0.90:\n        alert(change, confidence=conf, top_tokens=model.explain(text,\
+      \ n=5))"
+- question: Has any cloud firewall rule been created or modified to allow ingress from 0.0.0.0/0 or ::/0
+    to sensitive management ports (21, 22, 23, 445, 3389, 5985, 5986), across AWS security groups, Azure
+    NSGs, or GCP firewall rules?
+  context: Exposing management ports to the entire internet is rarely a legitimate configuration and is
+    a hallmark of adversaries opening a path for remote access, brute force, or lateral movement. Implement
+    a never-allow policy that fires high-severity when a firewall modification introduces 0.0.0.0/0 or
+    ::/0 (any-source) to high-risk ports such as FTP (21), SSH (22), Telnet (23), SMB (445), RDP (3389),
+    and WinRM (5985/5986). Flatten the nested requestParameters/properties/metadata to evaluate the source
+    CIDR and port range robustly, mirroring the Elastic VPC SG ingress rule logic, and apply the same
+    logic to all three cloud providers. A hit is an immediate-action Defense Impairment finding; validate
+    against approved change tickets and isolate the exposed instance if unauthorized.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `requestParameters`, Azure Activity Logs `properties`, GCP
+    Audit Logs `metadata`)
+  - Zeek conn.log
+  - 'NAI: Cloud Security Group and Firewall Rule Configurations, Virtual Private Cloud (VPC) Firewall
+    Rules, Network Gateway/Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=cloud_audit eventName IN (\"AuthorizeSecurityGroupIngress\",\"createOrUpdateNSG\",\"\
+      compute.firewalls.insert\")\n| flatten requestParameters\n| eval src=ipRanges.cidrIp, fromP=fromPort,\
+      \ toP=toPort\n| where src IN (\"0.0.0.0/0\",\"::/0\")\n  AND ( inrange(21,fromP,toP) OR inrange(22,fromP,toP)\
+      \ OR inrange(23,fromP,toP)\n     OR inrange(445,fromP,toP) OR inrange(3389,fromP,toP)\n     OR inrange(5985,fromP,toP)\
+      \ OR inrange(5986,fromP,toP) )\n| eval severity=\"high\"\n| table _time, userIdentity.arn, src,\
+      \ fromP, toP, eventName, severity"
+- question: Is a cloud firewall change exposing a port that falls in the bottom 5th percentile of historical
+    exposure frequency (e.g., first-ever SMB/445 exposure to the internet), or is it the first time this
+    principal has opened any port?
+  context: Rare exposures and first-of-their-kind actions are disproportionately likely to be malicious.
+    Maintain per-service and per-principal baselines of which ports have historically been exposed and
+    how often, then flag exposures in the bottom 5th percentile (such as a first-time SMB/445 internet
+    exposure) and the first time a given principal opens any port at all, using per-principal first-seen
+    baselining as in Netflix's cloudtrail-anomaly with MAD-based thresholds. This statistical rarity scoring
+    catches dangerous-but-unsignatured exposures the never-allow list might not enumerate, and it surfaces
+    accounts acting outside their normal role. A flagged rarity is most concerning when combined with
+    a privileged role change or off-hours timing.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `requestParameters`, Azure Activity Logs `properties`, GCP
+    Audit Logs `metadata`)
+  - Zeek conn.log
+  - 'NAI: Cloud Security Group and Firewall Rule Configurations, Virtual Private Cloud (VPC) Firewall
+    Rules, Network Gateway/Egress Points'
+  range: Last 90 days; baseline over preceding 6-12 months
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloud_audit eventName IN ("AuthorizeSecurityGroupIngress","compute.firewalls.insert","createOrUpdateNSG")
+
+      | eval port=requestParameters.fromPort, principal=userIdentity.arn
+
+      | join type=left port [ search earliest=-365d source=cloud_audit | stats count AS hist_freq, perc5(count)
+      AS p5 BY port ]
+
+      | eval first_seen_principal_port=is_first_seen(principal, port)
+
+      | where hist_freq<=p5 OR first_seen_principal_port=true OR is_first_seen_any_port(principal)=true
+
+      | table _time, principal, port, hist_freq, first_seen_principal_port'
+- question: When new cloud firewall rules are represented as tuples of (Port, Protocol, Source_CIDR_is_Any,
+    CIDR_breadth, Direction) and scored by an Isolation Forest, does any rule isolate quickly as an outlier,
+    and which tuple fields drove the score?
+  context: An Isolation Forest learns the shape of normal firewall rules and isolates anomalies with short
+    tree paths, without needing labeled malicious examples. Encode each new rule as a tuple of (Port,
+    Protocol, whether the source CIDR is 'any', CIDR breadth, and Direction), train the forest on historical
+    rules, and alert when a new rule has an unusually short isolation path (high anomaly score), reporting
+    which tuple fields contributed most. This unsupervised method captures unusual combinations - for
+    example a broad CIDR opening an uncommon port outbound - that escape both signature and rarity checks.
+    Use it as a discovery layer for Defense Impairment, then triage flagged rules with the identity and
+    post-change traffic evidence.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `requestParameters`, Azure Activity Logs `properties`, GCP
+    Audit Logs `metadata`)
+  - Zeek conn.log
+  - 'NAI: Cloud Security Group and Firewall Rule Configurations, Virtual Private Cloud (VPC) Firewall
+    Rules, Network Gateway/Egress Points'
+  range: Last 90 days; train on historical rule corpus
+  queries:
+  - technology: ML/pseudocode
+    query: "X = featurize(rule -> [port, protocol, src_cidr_is_any, cidr_breadth, direction])\nmodel =\
+      \ IsolationForest(n_estimators=200, contamination=\"auto\").fit(history_rules)\nfor rule in new_rules(last=\"\
+      90d\"):\n    score = model.score_samples(featurize(rule))  # short path = outlier\n    if score\
+      \ < threshold:\n        alert(rule, anomaly_score=score, drivers=top_tuple_fields(rule))"
+- question: Was any cloud firewall modification performed by a user or service principal that is not on
+    the authorized-changer allow-list?
+  context: Firewall changes should come only from a small set of approved administrators, automation principals,
+    or change pipelines. Maintain an allow-list of authorized changers and alert whenever a firewall modification
+    event is attributed to any identity outside that list, joining the change event to its userIdentity/caller/authenticationInfo.
+    An unauthorized identity making perimeter changes is a high-fidelity Defense Impairment indicator,
+    often the first observable sign of a compromised credential or over-permissioned role. Keep the allow-list
+    current to avoid alert fatigue from legitimate new admins or pipelines, and treat service-principal
+    changes outside normal automation windows with particular suspicion.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userIdentity`, Azure Activity Logs `caller`, GCP Audit Logs
+    `authenticationInfo`)
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, VPN/Zero Trust Network Access (ZTNA) Concentrators, Active
+    Directory Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloud_audit eventName IN ("AuthorizeSecurityGroupIngress","AuthorizeSecurityGroupEgress","CreateSecurityGroup","RevokeSecurityGroupIngress","createOrUpdateNSG","compute.firewalls.insert")
+
+      | eval principal=coalesce(userIdentity.arn, caller, authenticationInfo.principalEmail)
+
+      | lookup authorized_fw_changers principal OUTPUT approved
+
+      | where approved!="yes"
+
+      | table _time, principal, eventName, sourceIPAddress'
+- question: Does a principal's cloud firewall-change behavior deviate from its own baseline in time-of-day,
+    source ASN/geo, or change frequency beyond the 98th percentile (modified Z-score), and are there bursts
+    of AccessDenied/UnauthorizedOperation on firewall APIs?
+  context: Compromised or misused identities tend to act at unusual times, from unusual networks, or at
+    unusual rates. Score per-user deviations across time-of-day, source ASN/geolocation, and change frequency
+    (changes per hour) using a modified Z-score, and alert when cumulative risk exceeds the 98th percentile.
+    As a distinct failure-mode signal, treat bursts of AccessDenied/UnauthorizedOperation responses on
+    firewall APIs as probing - an adversary testing which calls their stolen credentials permit before
+    a successful change. Together these reveal both successful anomalous changes and the reconnaissance
+    that precedes them, strengthening the Defense Impairment picture. Build per-principal baselines so
+    that naturally high-volume automation isn't penalized.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userIdentity`, Azure Activity Logs `caller`, GCP Audit Logs
+    `authenticationInfo`)
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, VPN/Zero Trust Network Access (ZTNA) Concentrators, Active
+    Directory Domain Controllers'
+  range: Last 90 days; baseline over preceding 90 days per principal
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloud_audit eventName LIKE "%SecurityGroup%" OR eventName LIKE "%firewall%"
+
+      | eval principal=userIdentity.arn, hour=strftime(_time,"%H"), asn=src_asn
+
+      | eventstats median(hour) AS m_h, mad(hour) AS d_h, median(changes_per_hour) AS m_f, mad(changes_per_hour)
+      AS d_f BY principal
+
+      | eval z_time=0.6745*(hour-m_h)/d_h, z_freq=0.6745*(changes_per_hour-m_f)/d_f, new_asn=is_first_seen(principal,asn)
+
+      | eval risk=abs(z_time)+abs(z_freq)+if(new_asn,3,0)
+
+      | where risk>perc98(risk)
+
+      | append [ search source=cloud_audit errorCode IN ("AccessDenied","Client.UnauthorizedOperation")
+      eventName LIKE "%SecurityGroup%" | stats count AS denied BY userIdentity.arn | where denied>5 ]'
+- question: Does the ordered control-plane sequence for any principal contain low-probability transitions
+    - such as enumerate -> AuthorizeSecurityGroupIngress -> run-instances within minutes - as scored by
+    a multi-order Markov chain?
+  context: Attacks unfold as a recognizable sequence of API calls, and the order and tempo of those calls
+    is itself a signal. Model the ordered control-plane sequence per principal with a multi-order Markov
+    chain trained on normal behavior, then flag low-probability transitions such as rapid enumeration
+    followed by AuthorizeSecurityGroupIngress followed by run-instances within minutes - the kind of fast-burst
+    chain seen in cloud intrusions that reach admin access in minutes. This sequence-plausibility scoring
+    catches the choreography of an attack even when each individual call looks permissible, supporting
+    Defense Impairment by linking a firewall change to suspicious preceding and following actions. Tune
+    for legitimate automation, which is highly repetitive and thus high-probability.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userIdentity`, Azure Activity Logs `caller`, GCP Audit Logs
+    `authenticationInfo`)
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, VPN/Zero Trust Network Access (ZTNA) Concentrators, Active
+    Directory Domain Controllers'
+  range: Last 90 days; correlate sequences within minute-scale windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloud_audit
+
+      | sort 0 userIdentity.arn, _time
+
+      | streamstats current=f window=3 list(eventName) AS seq BY userIdentity.arn
+
+      | eval p_transition=markov_prob(seq)  // multi-order chain trained on benign sequences
+
+      | where p_transition < 0.01
+
+      | where match(join(seq), "(Describe|List).*AuthorizeSecurityGroupIngress.*RunInstances")
+
+      | table _time, userIdentity.arn, seq, p_transition'
+- question: Does a UEBA or graph model over identity, geolocation, ASN, time-since-last-change, and change
+    type, or over IAM user-role-resource-action edges, flag any cloud firewall change with high deviation
+    confidence?
+  context: User and entity behavior analytics combine many behavioral dimensions into a single deviation
+    score that catches subtle, multi-factor anomalies. Run a UEBA model monitoring identity, geolocation,
+    ASN, time since last change, and change type - or a graph model over IAM user-role-resource-action
+    edges - and alert on high deviation confidence, emitting the top-3 contributing factors. The graph
+    approach is particularly effective for spotting an identity touching resources or actions it never
+    normally touches, a frequent sign of lateral movement from the control plane. Use the emitted factors
+    for rapid triage and corroborate with the symbolic allow-list and threat-feed checks before escalating
+    a Defense Impairment finding.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail `userIdentity`, Azure Activity Logs `caller`, GCP Audit Logs
+    `authenticationInfo`)
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Cloud IAM and Network Management APIs, VPN/Zero Trust Network Access (ZTNA) Concentrators, Active
+    Directory Domain Controllers'
+  range: Last 90 days; continuous behavioral baselining
+  queries:
+  - technology: ML/pseudocode
+    query: "ueba = UEBAModel(features=[identity, geo, asn, time_since_last_change, change_type])\ngraph\
+      \ = IAMGraph(edges=\"user-role-resource-action\")\nfor change in firewall_changes(last=\"90d\"):\n\
+      \    s1 = ueba.deviation(change)\n    s2 = graph.anomaly(change)\n    if max(s1,s2) > confidence_threshold:\n\
+      \        alert(change, top_factors=ueba.top_contributions(change, n=3))"
+- question: Within 15 minutes of a cloud firewall rule opening a new port, is there matching Zeek conn.log
+    traffic on that port plus a failed logon (Windows Event ID 4625) from the same source IP - the canonical
+    credential-abuse-into-cloud chain?
+  context: 'The most convincing evidence of malicious intent links the configuration change to immediate
+    exploitation. Alert when a new firewall rule opening a port is followed within 15 minutes by Zeek
+    conn.log traffic on that port and a failed login (Event ID 4625) from the same source IP. This sequence
+    - open the port, connect, attempt to authenticate - is the canonical chain documented in Unit 42''s
+    compromised-cloud-credentials research and Expel''s AWS hunting. A positive correlation is high-fidelity
+    and time-critical: it shows the adversary acting on the freshly opened path. Also watch for successful
+    logons (4624) from the same source as confirmation of access. Negative results push investigation
+    back to baseline anomaly methods.'
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Cloud Network Gateways, Targeted Virtual Machines or Container Hosts, Authentication Log Aggregators'
+  range: Last 90 days; 15-30 minute correlation window after each change
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=cloud_audit eventName IN (\"AuthorizeSecurityGroupIngress\",\"compute.firewalls.insert\"\
+      ,\"createOrUpdateNSG\")\n| eval port=requestParameters.fromPort, change_time=_time\n| join type=inner\
+      \ src=requestParameters.ipRanges.cidrIp\n   [ search source=zeek_conn | eval src=id.orig_h | where\
+      \ id.resp_p=port ]\n| where conn_time>=change_time AND conn_time<=change_time+15m\n| join src\n\
+      \   [ search source=wineventlog EventCode=4625 | eval src=IpAddress ]\n| table change_time, src,\
+      \ port, userIdentity.arn, TargetUserName"
+- question: Do failed logins (Event ID 4625) or blocked connections from a newly allowed source exceed
+    the 99th percentile within one hour of a new port exposure, using MAD-robust thresholds?
+  context: After opening a port, adversaries frequently launch brute-force or credential-stuffing attempts
+    that produce a spike in failed authentications or blocked connections. Within one hour of a new port
+    exposure, measure failed logins (Event ID 4625) and blocked connections from the newly allowed source
+    against historical rates, and flag when they exceed the 99th percentile using median-absolute-deviation-robust
+    thresholds so a single noisy host doesn't distort the baseline. A post-change failure spike is strong
+    evidence the exposed service is being actively attacked, tying Defense Impairment directly to follow-on
+    Brute Force or denial-of-service activity. Correlate the spiking source IP with the identity that
+    made the firewall change to assess whether it is the same actor.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Cloud Network Gateways, Targeted Virtual Machines or Container Hosts, Authentication Log Aggregators'
+  range: Last 90 days; 1-hour window after each new port exposure
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '// within 1h of a new port exposure from NEW_ALLOWED_SRC
+
+      source=wineventlog EventCode=4625 IpAddress=NEW_ALLOWED_SRC earliest=change_time latest=change_time+1h
+
+      | stats count AS fails BY IpAddress, bin(_time,5m)
+
+      | eventstats median(fails) AS med, mad(fails) AS mad
+
+      | eval mz=0.6745*(fails-med)/mad
+
+      | where mz>3.5 OR fails>perc99(fails)
+
+      | append [ search source=zeek_conn id.orig_h=NEW_ALLOWED_SRC conn_state IN ("REJ","S0") | stats
+      count AS blocked ]'
+- question: Does observed traffic or login volume on a service exceed the 99% upper confidence bound of
+    an ARIMA/SARIMA/Prophet forecast after a firewall change, indicating abnormal post-change activity?
+  context: Normal services have predictable traffic and login rhythms; an attack manifests as a departure
+    from that forecast. Build per-service time-series models (ARIMA, SARIMA, or Prophet) of expected traffic
+    and login volume, then after a firewall change compare observed values to the 99% upper confidence
+    bound and alert on exceedances. This forecasting approach distinguishes a genuine surge caused by
+    newly allowed malicious traffic from normal seasonal variation, which fixed thresholds cannot. An
+    exceedance immediately following a perimeter change strengthens the Defense Impairment hypothesis
+    and points to active exploitation or resource abuse such as cryptomining. Maintain enough history
+    to capture weekly and daily seasonality for accurate bounds.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Cloud Network Gateways, Targeted Virtual Machines or Container Hosts, Authentication Log Aggregators'
+  range: Last 90 days; forecast trained on 6-12 months of per-service history
+  queries:
+  - technology: ML/pseudocode
+    query: "for service in services:\n    model = Prophet().fit(history(service, metric=\"conn_count|login_count\"\
+      ))\n    fc = model.predict(horizon=\"post_change_window\")\n    obs = observed(service, after=change_time)\n\
+      \    if obs > fc.upper_99:\n        alert(service, observed=obs, bound=fc.upper_99, change_time=change_time)"
+- question: Is a cloud firewall change followed by Zeek conn.log traffic from a source ASN never previously
+    observed for the exposed service, with that new source attempting the newly opened port within a short
+    correlation window?
+  context: A firewall change that immediately produces inbound traffic from a brand-new autonomous system
+    is a textbook attack-surface-expansion-then-access pattern. Baseline the source ASNs historically
+    seen reaching each service, then alert when a firewall change is followed by conn.log traffic from
+    a previously unseen ASN that targets the newly opened port within a short correlation window. This
+    links the control-plane change to the data-plane reachability change across the cloud perimeter, capturing
+    the precise moment an adversary's infrastructure first connects through the path they just created.
+    A new-ASN hit on a freshly opened port is high-fidelity for Defense Impairment; corroborate with the
+    identity that made the change and with any follow-on authentication activity.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - 'NAI: Cloud control plane audit trail, VPC/VNet firewall management plane, Internet edge sensors,
+    and target services newly exposed to the internet'
+  range: Last 90 days; short (minutes-to-hour) correlation window after each change
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=cloud_audit eventName IN (\"AuthorizeSecurityGroupIngress\",\"compute.firewalls.insert\"\
+      ,\"createOrUpdateNSG\")\n| eval port=requestParameters.fromPort, change_time=_time, service=resource\n\
+      | join type=inner service\n   [ search source=zeek_conn | iplookup id.orig_h OUTPUT asn AS src_asn\
+      \ | where id.resp_p=port ]\n| where conn_time>=change_time AND conn_time<=change_time+60m\n| where\
+      \ NOT [ search earliest=-90d latest=change_time source=zeek_conn | iplookup id.orig_h OUTPUT asn\
+      \ | stats values(asn) AS known BY service ]\n| table change_time, service, port, src_asn, userIdentity.arn"
+- question: Does a firewall change introduce an inbound source ASN, country, or port combination below
+    the 5th percentile of a service's 30-day historical exposure, or produce a forecast-exceeding rise
+    in connection attempts?
+  context: Quantifying how unusual a new exposure is helps prioritize the flood of routine firewall changes.
+    For each service, baseline the inbound source ASNs, countries, and unique inbound ports over the last
+    30 days, then alert when a change introduces a combination below the 5th percentile of historical
+    exposure frequency or when the resulting connection-attempt rate exceeds a forecast bound. This statistical
+    reachability scoring combines first-seen rarity (per Netflix cloudtrail-anomaly) with time-series
+    forecasting to flag exposures that are both novel and actively used. A low-percentile, high-traffic
+    exposure is the strongest combination for Defense Impairment; route it to immediate triage with the
+    change identity and any threat-feed match.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - 'NAI: Cloud control plane audit trail, VPC/VNet firewall management plane, Internet edge sensors,
+    and target services newly exposed to the internet'
+  range: Last 90 days; baseline reachability over preceding 30 days
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: '// baseline per-service inbound ASN/country/port over 30d
+
+      source=zeek_conn earliest=-30d
+
+      | iplookup id.orig_h OUTPUT asn, country
+
+      | stats count BY service, asn, country, id.resp_p
+
+      | eventstats perc5(count) AS p5 BY service
+
+      | join service [ search source=zeek_conn earliest=change_time | iplookup id.orig_h OUTPUT asn,country
+      | stats count AS now_cnt BY service, asn, country, id.resp_p ]
+
+      | where now_cnt<=p5 OR now_cnt>forecast_upper99(service)
+
+      | table service, asn, country, id.resp_p, now_cnt, p5'
+- question: When a supervised model scores firewall changes on audit and flow features (rule scope, source-CIDR
+    breadth, rule age, administrator identity, post-change traffic volume), does any change classify as
+    attack-surface-expanding rather than routine, and what are the top-3 driving features?
+  context: Distinguishing the handful of genuinely dangerous changes from thousands of routine ones is
+    a classification problem well suited to supervised learning. Train a model on audit and flow features
+    - rule scope, source-CIDR breadth, rule age, administrator identity, and post-change traffic volume
+    - labeled by whether changes expanded the attack surface maliciously, then classify each new change
+    and emit the top-3 features per alert. Augment with cross-service graph anomaly scoring (e.g., CS-GAD)
+    that links the change to anomalous follow-on activity across services. This is the capstone analytic
+    that fuses the configuration, identity, and traffic evidence into a single prioritized Defense Impairment
+    verdict; use the emitted features and the linked graph context to drive analyst triage and retrain
+    as attacker tradecraft evolves.
+  answer_sources:
+  - Cloud Audit Logs (e.g., AWS CloudTrail, Azure Activity Logs, GCP Audit Logs)
+  - Zeek conn.log
+  - 'NAI: Cloud control plane audit trail, VPC/VNet firewall management plane, Internet edge sensors,
+    and target services newly exposed to the internet'
+  range: Last 90 days; retrain on labeled history periodically
+  queries:
+  - technology: ML/pseudocode
+    query: "clf = SupervisedModel.load(\"risky_fw_change.pkl\")  # features: rule_scope, src_cidr_breadth,\
+      \ rule_age, admin_identity, post_change_bytes\ngad = CSGAD.load(\"cross_service_graph.pkl\")\nfor\
+      \ change in firewall_changes(last=\"90d\"):\n    label = clf.predict(features(change))\n    g =\
+      \ gad.score(change)  # links change to anomalous follow-on activity\n    if label==\"attack_surface_expanding\"\
+      \ or g>threshold:\n        alert(change, top_features=clf.top_contributions(change, n=3), graph_score=g)"
