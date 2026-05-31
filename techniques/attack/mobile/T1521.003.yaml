@@ -1,0 +1,332 @@
+name: 'T1521.003: SSL Pinning'
+id: 4f4ccf1c-1d0f-4404-8030-6c15b3157b14
+description: Investigate whether an adversary is abusing SSL/TLS certificate or public-key pinning on
+  managed mobile devices (Android and iOS) to shield Command-and-Control (C2) traffic from enterprise
+  TLS inspection. Legitimate apps pin certificates to harden communications, but the same mechanism lets
+  malicious apps refuse the enterprise interception certificate and tunnel C2 inside opaque, un-inspectable
+  TLS sessions. This playbook helps an analyst hunt the network-side fingerprint of pinning — a measurable
+  spike in TLS handshake/validation failures that occur ONLY under the enterprise inspecting proxy, followed
+  by a direct (uninspected) retry to the same endpoint within a short correlation window — using Zeek
+  ssl.log/x509.log/conn.log enriched with MDM application context and threat intelligence. It guides certificate-centric
+  hunting for self-signed or statistically rare issuers, short-validity certs, high-entropy server names,
+  and abnormal JA3/JA4/JA4X fingerprints; statistical and ML scoring of opaque-TLS beaconing (inter-arrival
+  regularity, payload dispersion, byte ratios, destination rarity); time-series anomaly detection of per-app/per-server
+  failure spikes; and static analysis of mobile application packages (APK/IPA) for pinning constructs
+  (Android network_security_config <pin-set>, OkHttp CertificatePinner, custom TrustManager/HostnameVerifier,
+  TrustKit; iOS NSPinnedDomains/ATS, AFNetworking trust evaluation). Together these questions surface
+  the fail-under-inspection-then-bypass primitive that distinguishes adversary pinning of C2 from benign
+  app pinning across both Android and iOS fleets.
+type: technique
+related:
+- tactic_id: TA0037
+  tactic_name: Command and Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are mobile applications producing TLS handshakes that fail certificate validation (non-'ok'
+    validation_status such as 'self signed certificate in certificate chain' or 'unable to get local issuer
+    certificate') with a failed or reset connection state on the enterprise inspecting egress, especially
+    to domains or certificate hashes that match C2 threat intelligence?
+  context: 'Command and Control: the defining signature of adversary SSL pinning is a TLS session that
+    fails ONLY when the enterprise interception certificate is presented — a pinned client rejects the
+    proxy''s substituted cert. Join Zeek ssl.log and conn.log for mobile-subnet source IPs and alert when
+    validation_status is non-''ok'' together with a failed/reset conn_state on the inspecting egress,
+    while excluding apps approved to pin. Raise priority when server_name, certificate hash, or issuer
+    matches known C2 indicators. A positive result is an app whose inspected TLS fails deterministically
+    to a suspect destination, indicating pin-induced inspection bypass of C2; a negative result (clean
+    ''ok'' validation or approved app) lowers suspicion. Use MDM context to attribute the flow to a specific
+    managed app and device.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - MDM application context
+  - Threat intelligence indicators
+  - 'NAI: Network traffic egress points for mobile device VLANs (both corporate-managed and guest Wi-Fi)
+    where a TLS-inspecting proxy is deployed; Zeek sensors monitoring pre- and post-proxy traffic; DHCP
+    server logs to map IP addresses to mobile device hostnames; Mobile Device Management (MDM) logs for
+    device and application context.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "JOIN ssl.log s, conn.log c ON s.uid==c.uid\nWHERE c.id.orig_h IN mobile_subnets\nAND s.validation_status\
+      \ != 'ok'\n  (e.g. 'self signed certificate in certificate chain',\n       'unable to get local\
+      \ issuer certificate')\nAND c.conn_state IN ('REJ','RSTO','RSTR','S0')\nAND s.is_inspecting_egress\
+      \ == true\nAND app NOT IN approved_pinning_apps\nSET priority=high IF s.server_name IN ti_c2_domains\
+      \ OR x509.cert_hash IN ti_c2_hashes\n=> alert 'pinned TLS fails only under enterprise inspection'"
+- question: Is the hourly rate of TLS validation failures for a given (application, server_name) pair
+    spiking beyond its established baseline — exceeding mean + 3 standard deviations or the 95th-percentile
+    failure ratio derived from clean inspected traffic?
+  context: 'Command and Control: a sudden, sustained increase in handshake failures per app/destination,
+    relative to a 30-day baseline of clean inspected traffic, distinguishes pinning-driven bypass from
+    incidental cert errors. Baseline hourly validation-failure counts per (app, server_name) from ssl.log
+    and alert when counts exceed mean + 3 sigma or the failure ratio crosses the 95th percentile; derive
+    thresholds per environment. Self-signed and short-validity handshakes are disproportionately malicious,
+    so a failure spike concentrated on rare/self-signed certs is higher-fidelity. A positive result is
+    an app/server pair whose inspected-failure rate departs sharply from baseline — pivot to certificate
+    and beaconing analysis to confirm C2.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - MDM application context
+  - Threat intelligence indicators
+  - 'NAI: Network traffic egress points for mobile device VLANs (both corporate-managed and guest Wi-Fi)
+    where a TLS-inspecting proxy is deployed; Zeek sensors monitoring pre- and post-proxy traffic; DHCP
+    server logs to map IP addresses to mobile device hostnames; Mobile Device Management (MDM) logs for
+    device and application context.'
+  range: Last 90 days (30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline per (app, server_name) over 30d clean traffic:\n  mu, sigma = hourly_failure_count\n\
+      \  p95 = failure_ratio_95th\nfor each hour:\n  if fail_count > mu + 3*sigma or failure_ratio > p95:\n\
+      \    alert 'TLS failure-rate spike (possible pin-induced bypass)'"
+- question: Does any (mobile_ip, app, destination) tuple generate repeated inspected-TLS rejections/resets
+    and then establish a stable DIRECT opaque TLS session (or repeated short-lived retries) to the SAME
+    endpoint within a ~10-minute window?
+  context: 'Command and Control: the strongest behavioral tell of pinning abuse is the state transition
+    — fail under inspection, then immediately succeed directly. Treat this explicitly as a failure-mode
+    signal: a (mobile_ip, app, dst) that produces repeated inspected-TLS rejections/resets followed by
+    a stable direct opaque TLS session, or a burst of short-lived retries, to the same endpoint inside
+    a 10-minute window indicates pin-induced inspection bypass. Correlate the retry regularity to score
+    beacon-like behavior. A positive result is a clear fail-then-direct-retry chain to one endpoint, which
+    is difficult to explain benignly and warrants device isolation and C2 destination tracing; a negative
+    result shows failures with no subsequent direct success.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - MDM application context
+  - Threat intelligence indicators
+  - 'NAI: Network traffic egress points for mobile device VLANs (both corporate-managed and guest Wi-Fi)
+    where a TLS-inspecting proxy is deployed; Zeek sensors monitoring pre- and post-proxy traffic; DHCP
+    server logs to map IP addresses to mobile device hostnames; Mobile Device Management (MDM) logs for
+    device and application context.'
+  range: 'Last 90 days (event-centered: inspected failure +/- 10 min of direct retry)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for each (mobile_ip, app, dst):\n  if count(inspected_tls_fail/reset within 10m) >= N\n  and\
+      \ exists(direct_opaque_tls_established to same dst within 10m of failures)\n     or repeated_short_lived_retries(same\
+      \ dst, 10m):\n    alert 'fail-under-inspection then direct-retry = pin bypass'"
+- question: Does a seasonal time-series model (Seasonal ARIMA/Prophet) on hourly TLS failure counts per
+    server_name flag an anomalous spike beyond the prediction interval, corroborated by an unsupervised
+    encrypted-flow anomaly model — and which features (failure ratio, destination rarity, byte ratio)
+    drive the score?
+  context: 'Command and Control: pinning-driven failure spikes are often periodic or bursty and can be
+    missed by static thresholds, so a seasonal model captures expected daily/weekly rhythm and flags true
+    deviations. Train Seasonal ARIMA or Prophet on hourly failure counts per server_name and alert on
+    spikes outside the prediction interval; corroborate with an unsupervised flow-anomaly model over encrypted-flow
+    metadata that needs no decryption, and surface the top-3 contributing features (failure ratio, destination
+    rarity, byte ratio) via SHAP attribution so analysts can triage. A positive result is a model-confirmed
+    anomalous failure spike with interpretable drivers pointing at a rare destination — pivot to certificate
+    and beaconing evidence; a negative result is a spike fully explained by seasonality.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - MDM application context
+  - Threat intelligence indicators
+  - 'NAI: Network traffic egress points for mobile device VLANs (both corporate-managed and guest Wi-Fi)
+    where a TLS-inspecting proxy is deployed; Zeek sensors monitoring pre- and post-proxy traffic; DHCP
+    server logs to map IP addresses to mobile device hostnames; Mobile Device Management (MDM) logs for
+    device and application context.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = SeasonalARIMA_or_Prophet(train=hourly_failures[server_name])\nif observed_failures\
+      \ > prediction_interval_upper:\n  flow_anom = unsupervised_flow_model(encrypted_flow_metadata) \
+      \ # ET-SSL, no decryption\n  if flow_anom.anomalous:\n    alert 'anomalous TLS failure spike' with\
+      \ shap_top3(failure_ratio, dest_rarity, byte_ratio)"
+- question: Are mobile applications completing successful TLS connections that use self-signed certificates
+    (issuer == subject) or short-validity certificates, particularly when the certificate hash, issuer
+    DN, or server_name matches threat intelligence or carries an abnormal JA4X issuer structure?
+  context: 'Command and Control: pinned malicious clients frequently trust self-signed or short-lived
+    certificates outside the device trust store, which are strong deterministic malware-TLS indicators.
+    Join Zeek conn/ssl/x509 logs and alert on self-signed certs (issuer==subject) or short-validity certs
+    originating from mobile IPs; raise priority when the certificate hash, issuer DN, or server_name matches
+    threat intelligence. Fingerprint abnormal issuer structure with JA4X and the pinned client stack with
+    JA3/JA3S to attribute the malware family. A positive result is a successful opaque TLS session bound
+    to a self-signed/rare cert with a suspicious fingerprint — a high-confidence C2 lead; a negative result
+    (well-known CA, common fingerprint) reduces but does not eliminate suspicion.'
+  answer_sources:
+  - Zeek x509.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - JA3/JA4 fingerprints
+  - Threat intelligence indicators
+  - 'NAI: Zeek sensors at internet egress points monitoring all outbound traffic from designated mobile
+    device subnets; Certificate Transparency (CT) logs for external validation of observed certificates;
+    Mobile Device Management (MDM) platforms to correlate application names with network activity; Threat
+    intelligence platform containing known malicious certificate hashes and C2 domains.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "JOIN conn.log c, ssl.log s, x509.log x ON uid\nWHERE c.id.orig_h IN mobile_subnets\nAND (x.certificate.issuer\
+      \ == x.certificate.subject  # self-signed\n     OR validity_days(x) < short_validity_threshold)\n\
+      SET priority=high IF x.cert_hash IN ti\n  OR x.issuer IN ti OR s.server_name IN ti\nENRICH ja4x(x.issuer),\
+      \ ja3/ja3s(s)\n=> alert 'self-signed/short-validity or TI-linked cert from mobile app'"
+- question: Is any mobile app trusting a certificate from a statistically rare issuer — one seen in fewer
+    than 0.05% of unique certs over the last 90 days — paired with a high-entropy server_name (>3.5 bits/char),
+    and is that rarity backed by volume/state context to avoid false positives?
+  context: 'Command and Control: adversary C2 often uses rare/private issuing infrastructure and algorithmically-generated
+    (high-entropy) domains. Flag certificate issuers appearing in <0.05% of unique certs over 90 days
+    and alert when paired with a high-entropy server_name (>3.5 bits/char); derive the rarity cutoff from
+    your own cert-prevalence distribution. Crucially, accompany the rarity score with volume/state context
+    — total bytes, session count, established ratio — because fingerprint- or rarity-only alerting produces
+    high false positives. A positive result is a rare issuer + high-entropy domain with substantive, established
+    sessions, consistent with pinned C2; a negative result is a rare issuer that is low-volume/benign
+    or has a normal-entropy name.'
+  answer_sources:
+  - Zeek x509.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - JA3/JA4 fingerprints
+  - Threat intelligence indicators
+  - 'NAI: Zeek sensors at internet egress points monitoring all outbound traffic from designated mobile
+    device subnets; Certificate Transparency (CT) logs for external validation of observed certificates;
+    Mobile Device Management (MDM) platforms to correlate application names with network activity; Threat
+    intelligence platform containing known malicious certificate hashes and C2 domains.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "issuer_prevalence = count(unique_certs by issuer) / total_unique_certs over 90d\nrare = issuer_prevalence\
+      \ < 0.0005\nfor each session:\n  if rare and shannon_entropy(server_name) > 3.5:\n    require volume_context(bytes,\
+      \ session_count, established_ratio)\n    alert 'rare issuer + high-entropy domain (pinned C2 candidate)'"
+- question: For app-to-endpoint pairs communicating over opaque TLS, do inter-arrival-time regularity
+    (coefficient of variation, Bowley skew, MAD), payload-size dispersion, bytes/session, and connection
+    frequency indicate highly regular, low-variance, long-lived, or rare-destination beaconing?
+  context: 'Command and Control: once pinning blocks payload inspection, beaconing must be detected from
+    encrypted-flow metadata alone. For each app->endpoint pair over opaque TLS, compute inter-arrival-time
+    regularity (coefficient of variation, Bowley skew, MAD), payload-size dispersion, total bytes per
+    session, and connection frequency (count/min); alert on flows that are highly regular, low-variance,
+    long-lived, or to rare destinations. These payload-agnostic features survive TLS 1.3/ECH and pinning.
+    A positive result is a metronomic, low-jitter beacon to a rare endpoint from a managed app — classic
+    C2 cadence; a negative result is bursty, human-driven, variable traffic to common destinations.'
+  answer_sources:
+  - Zeek x509.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - JA3/JA4 fingerprints
+  - Threat intelligence indicators
+  - 'NAI: Zeek sensors at internet egress points monitoring all outbound traffic from designated mobile
+    device subnets; Certificate Transparency (CT) logs for external validation of observed certificates;
+    Mobile Device Management (MDM) platforms to correlate application names with network activity; Threat
+    intelligence platform containing known malicious certificate hashes and C2 domains.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each (app, dst) over opaque TLS:\n  iat_cv = std(iat)/mean(iat); skew = bowley(iat); mad\
+      \ = MAD(iat)\n  size_disp = dispersion(payload_sizes); bps = bytes/session; freq = conn_count/min\n\
+      \  if iat_cv < cv_thresh and (long_lived or dst_rarity_high):\n    alert 'regular opaque-TLS beaconing\
+      \ (RITA-style)'"
+- question: Does a Random Forest trained on certificate and flow features (self-signed flag, issuer rarity,
+    validity period, server_name entropy, JA3/JA4 frequency, flow duration, byte counts/ratios) classify
+    an opaque TLS session as malicious with probability > 0.9, and what are its top-3 SHAP features?
+  context: 'Command and Control: combining certificate provenance with flow behavior classifies pinned
+    C2 better than any single indicator. Train a Random Forest on self-signed flag, issuer rarity, certificate
+    validity period, server_name entropy, JA3/JA4 frequency, flow duration, byte counts and byte ratios;
+    alert on probability > 0.9 and surface the top-3 SHAP features in the alert for triage. Augment with
+    an encrypted-traffic representation model (ET-BERT) or per-app encrypted-flow baseline to flag managed
+    apps talking to non-baselined destinations. A positive result is a high-probability classification
+    whose drivers (e.g., self-signed + rare issuer + high-entropy name) align with pinning abuse; pivot
+    to MDM app context and destination reputation to confirm.'
+  answer_sources:
+  - Zeek x509.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - JA3/JA4 fingerprints
+  - Threat intelligence indicators
+  - 'NAI: Zeek sensors at internet egress points monitoring all outbound traffic from designated mobile
+    device subnets; Certificate Transparency (CT) logs for external validation of observed certificates;
+    Mobile Device Management (MDM) platforms to correlate application names with network activity; Threat
+    intelligence platform containing known malicious certificate hashes and C2 domains.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = [self_signed, issuer_rarity, validity_days, server_name_entropy,\n            ja3_ja4_freq,\
+      \ flow_duration, bytes_in, bytes_out, byte_ratio]\nclf = RandomForest(train=labeled_tls_sessions)\n\
+      p = clf.predict_proba(session)\nif p > 0.9:\n  alert 'malicious pinned TLS' with shap_top3(session)"
+- question: Does static analysis of a mobile application package (APK/IPA) reveal pinning constructs —
+    Android network_security_config <pin-set>/<pin digest>, OkHttp CertificatePinner, custom TrustManager/HostnameVerifier,
+    TrustKit; or iOS NSPinnedDomains/App Transport Security and TrustKit/AFNetworking trust evaluation
+    — in a non-approved app?
+  context: 'Command and Control: the most direct evidence of pinning is the pinning code/config inside
+    the app itself. Decompile the package and scan code and configuration for pinning constructs, alerting
+    when found in non-approved apps: on Android look for network_security_config <pin-set>/<pin digest>,
+    OkHttp CertificatePinner, custom TrustManager or HostnameVerifier overrides, and TrustKit; on iOS
+    look for NSPinnedDomains/ATS settings and TrustKit/AFNetworking trust evaluation. Use MobSF indicator
+    catalogs and the OWASP MASTG network-communication chapters. A positive result is a non-allowlisted
+    app that ships pinning logic — combine with rare embedded domains and undeclared background networking
+    to prioritize; a negative result is no pinning constructs or an app explicitly approved to pin.'
+  answer_sources:
+  - Mobile application package (APK/IPA)
+  - Static analysis tool output (MobSF)
+  - Application manifest / network_security_config
+  - MDM/MAM app inventory
+  - 'NAI: Mobile Device Management (MDM) or Mobile Application Management (MAM) platform used for app
+    distribution; Internal corporate app store; Analyst sandbox environment equipped with static analysis
+    tools (e.g., MobSF, jadx).'
+  range: Last 90 days
+  queries:
+  - technology: Static-analysis/pseudocode
+    query: "for each app NOT IN approved_pinning_apps:\n  src = decompile(apk_or_ipa)  # jadx / MobSF\n\
+      \  hits = scan(src, patterns=[\n    'network_security_config:<pin-set>/<pin digest>', 'OkHttp CertificatePinner',\n\
+      \    'custom TrustManager', 'HostnameVerifier override', 'TrustKit',\n    'NSPinnedDomains', 'App\
+      \ Transport Security', 'AFNetworking trust eval'])\n  if hits: alert 'pinning construct in non-approved\
+      \ app'"
+- question: Is an app a category outlier for pinning usage — pinning present where fewer than ~5% of its
+    peers in the same app category pin — particularly when correlated with low-reputation or rare embedded
+    domains?
+  context: 'Command and Control: pinning is normal for banking/finance apps but suspicious for app categories
+    where peers do not pin, so category-relative prevalence exposes abusers. Baseline the prevalence of
+    pinning directives per app category across the managed fleet and alert when an app is a category outlier
+    (e.g., pinning present where <5% of category peers pin). Correlate with low-reputation or rare embedded
+    domains for higher fidelity, consistent with rarity-based malware-TLS logic. A positive result is,
+    for example, a flashlight or utility app that pins to a rare domain while no peers pin — a strong
+    lead for malicious C2 protection; a negative result is pinning that is normative for the app''s category.'
+  answer_sources:
+  - Mobile application package (APK/IPA)
+  - Static analysis tool output (MobSF)
+  - Application manifest / network_security_config
+  - MDM/MAM app inventory
+  - 'NAI: Mobile Device Management (MDM) or Mobile Application Management (MAM) platform used for app
+    distribution; Internal corporate app store; Analyst sandbox environment equipped with static analysis
+    tools (e.g., MobSF, jadx).'
+  range: Last 90 days
+  queries:
+  - technology: Static-analysis/Stats pseudocode
+    query: "for each category: pin_rate = pinning_apps / total_apps_in_category\nfor each app with pinning:\n\
+      \  if pin_rate[app.category] < 0.05:\n    sev = base; if app.embedded_domains low_reputation or\
+      \ rare: sev += 1\n    alert 'pinning category outlier' severity=sev"
+- question: Does a classifier trained on static app features (pinning libraries, declared permissions,
+    obfuscation/binary entropy, network_security_config trust-anchor/cleartext rules, embedded-domain
+    reputation, undeclared background-network behavior) flag an app as a high-risk pinning implementation,
+    and what are the top-3 contributing features?
+  context: 'Command and Control: risky pinning is multivariate — it combines pinning code with broad permissions,
+    obfuscation, suspicious trust-anchor rules, and shady embedded domains. Train a classifier on static
+    features (pinning libraries, declared permissions, obfuscation/binary entropy, network_security_config
+    trust-anchor/cleartext rules, embedded-domain reputation, undeclared background-network behavior)
+    and alert on high-risk scores, surfacing the top-3 contributing features for triage; feature extraction
+    follows MobSF and OWASP MASTG. A positive result is a high-risk app whose drivers (e.g., custom TrustManager
+    + obfuscation + rare embedded domain + background networking) indicate deliberate concealment of C2;
+    prioritize it for sandbox review and fleet-wide prevalence checks. A negative result is a low score
+    with benign drivers.'
+  answer_sources:
+  - Mobile application package (APK/IPA)
+  - Static analysis tool output (MobSF)
+  - Application manifest / network_security_config
+  - MDM/MAM app inventory
+  - 'NAI: Mobile Device Management (MDM) or Mobile Application Management (MAM) platform used for app
+    distribution; Internal corporate app store; Analyst sandbox environment equipped with static analysis
+    tools (e.g., MobSF, jadx).'
+  range: Last 90 days
+  queries:
+  - technology: Static-analysis/ML pseudocode
+    query: "features = [pinning_libs, declared_permissions, obfuscation_entropy,\n            nsc_trust_anchor_cleartext_rules,\
+      \ embedded_domain_reputation,\n            undeclared_background_network]\nclf = Classifier(train=labeled_apps)\n\
+      score = clf.predict_proba(app)\nif score > risk_threshold:\n  alert 'risky pinning implementation'\
+      \ with top3_features(app)"
