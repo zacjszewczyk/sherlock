@@ -1,0 +1,1394 @@
+name: 'T1550.002: Use Alternate Authentication Material: Pass the Hash'
+id: 5edf82cb-fd4a-4869-915d-7f3585c9000c
+description: 'This playbook helps an analyst investigate whether an adversary is using stolen NTLM password
+  hashes to authenticate as a user without the cleartext password (Pass the Hash, T1550.002) to move laterally
+  and bypass normal access controls, including the ''overpass the hash'' variant where a hash is used
+  to mint a Kerberos TGT. It centers on Windows NTLM network logons (Event ID 4624, LogonType 3) and correlates
+  them with downstream behaviors to surface hash-based authentication that lacks an accompanying interactive
+  logon or domain credential entry. Across ten evidence angles it guides the hunt for: NTLM logons involving
+  threat-intel/watchlisted source or destination IPs; service or process creation (7045/4688/Sysmon 1)
+  shortly after a network logon with high-entropy or known tool names (PSEXESVC, PAExec, remcom, Impacket/Mimikatz);
+  NTLM logons from hosts with no recent interactive (Type 2/10) logon by the same user; machine-account
+  (''$'') NTLM logons from non-approved sources; first-seen user source->destination logon edges; NTLM
+  logons into high-value assets from unauthorized sources; remote service/scheduled-task/process execution
+  chains following a logon (PsExec/WMI patterns); fan-out logons to many unique destinations in a short
+  window; multi-hop logon chains that violate network segmentation; and NTLM logons immediately followed
+  by Kerberos TGT/service-ticket requests (the overpass-the-hash signature). Detection methods combine
+  symbolic-logic rules (watchlist joins, post-logon correlation, allow-list and segmentation checks, first-seen
+  edges, fan-out thresholds), statistical baselining (reputation/criticality risk scoring, entropy and
+  time-delta outliers, interactive-vs-network ratios, MAD/percentile rarity, Bayesian new-edge scoring,
+  change-point and graph statistics), and machine learning (supervised classifiers with SHAP, LSTM/DeepLog
+  sequence models, DBSCAN/one-class anomaly detection, graph link prediction and embeddings, forecasting),
+  applied to Windows Security and Sysmon events (4624/4625/4648/4688/4698/4768/4769/7045, Sysmon 1/3/22)
+  and Zeek telemetry (conn.log, dce_rpc.log, smb_files.log) so the analyst can confirm suspected pass-the-hash
+  activity against authentication context, host criticality, account privilege, and downstream lateral
+  execution.'
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: '[Lateral Movement] Match NTLM logons to watchlists: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) involves a source or destination IP address
+    that is present on a threat intelligence feed or an internal watchlist of known malicious or compromised
+    hosts. -- specifically, using the ''Match NTLM logons to watchlists'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    involves a source or destination IP address that is present on a threat intelligence feed or an internal
+    watchlist of known malicious or compromised hosts. This Symbolic Logic approach works as follows:
+    Join source/destination IPs from all NTLM LogonType 3 events (Event ID 4624, AuthenticationPackageName=NTLM,
+    target not ''ANONYMOUS LOGON'') against TI and internal-IR watchlists; exact match raises high-severity
+    alert. Anchor on the canonical PtH signature (Type 3 + NTLM + local/non-domain account) from [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/).
+    State metric: separately flag whether the logon SUCCEEDED (4624) vs FAILED (4625) against a watchlisted
+    IP - repeated failures then a success indicate hash spraying. Enrich with Zeek conn.log to confirm
+    SMB/445 or 135 byte volume. A positive result -- a rule match, statistical outlier, or model alert
+    -- is consistent with hash-based authentication rather than legitimate, interactive credential use;
+    pivot to the source and destination hosts, the acting account and its privilege level, the authentication
+    package and logon type, any preceding failed logons (4625), and the downstream process/service/ticket
+    activity to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id001
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Threat Intelligence Platforms, SIEM, Network Egress/Ingress
+    Points'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Match NTLM logons to watchlists
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Match
+      NTLM logons to watchlists")
+
+      // Join source/destination IPs from all NTLM LogonType 3 events (Event ID 4624, AuthenticationPackageName=NTLM,
+      t
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Match NTLM logons to watchlists
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Score logon risk by reputation: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) involves a source or destination IP address
+    that is present on a threat intelligence feed or an internal watchlist of known malicious or compromised
+    hosts. -- specifically, using the ''Score logon risk by reputation'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    involves a source or destination IP address that is present on a threat intelligence feed or an internal
+    watchlist of known malicious or compromised hosts. This Statistical Method approach works as follows:
+    Compute a per-logon risk score from source/destination IP reputation (number of TI feeds, list age,
+    internal incident recency). Profile the score distribution over a >=30-day baseline and alert above
+    the 95th percentile, per outlier-scoring practice in [Bohara et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf).
+    Include volume (bytes to destination) and frequency (logons/min from source) so a high-reputation
+    match plus abnormal volume escalates. Alert text must list the top-3 contributors (e.g., feed count,
+    first-time edge, bytes). A positive result -- a rule match, statistical outlier, or model alert --
+    is consistent with hash-based authentication rather than legitimate, interactive credential use; pivot
+    to the source and destination hosts, the acting account and its privilege level, the authentication
+    package and logon type, any preceding failed logons (4625), and the downstream process/service/ticket
+    activity to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id001
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Score logon risk by reputation
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Compute a per-logon risk score from source/destination IP reputation (number of TI feeds, list
+      age, internal i
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Score logon risk by reputation
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Classifier for malicious logons: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) involves a source or destination IP address
+    that is present on a threat intelligence feed or an internal watchlist of known malicious or compromised
+    hosts. -- specifically, using the ''Classifier for malicious logons'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    involves a source or destination IP address that is present on a threat intelligence feed or an internal
+    watchlist of known malicious or compromised hosts. This Machine Learning approach works as follows:
+    Train a classifier (e.g., logistic regression / gradient boosting) on features IsSourceOnThreatList,
+    IsDestinationOnThreatList, UserPrivilegeLevel, IsFirstTimeEdge, BytesTransferred, FailedLogonCountLast1h;
+    probability >0.85 flags likely PtH. Validate on red-team-labeled [LANL auth dataset](https://csr.lanl.gov/data/auth/)
+    and surface SHAP top-3 features in the alert, complementing (not replacing) the deterministic [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/)
+    rule. A positive result -- a rule match, statistical outlier, or model alert -- is consistent with
+    hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id001
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Classifier for malicious logons
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Train a classifier (e.g., logistic regression / gradient boosting) on features IsSourceOnThreatList,
+      IsDestina
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Classifier for malicious logons
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Detect service/process creation after NTLM logon: Can you determine whether
+    following a successful NTLM network logon (Windows Event ID 4624, LogonType 3), a new service (Windows
+    Event ID 7045) or process (Windows Event ID 4688) is created on the target host within a short time
+    window (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching known malicious tool
+    patterns (e.g., ''PSEXESVC''). -- specifically, using the ''Detect service/process creation after
+    NTLM logon'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that following a successful NTLM network logon (Windows Event ID 4624, LogonType
+    3), a new service (Windows Event ID 7045) or process (Windows Event ID 4688) is created on the target
+    host within a short time window (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching
+    known malicious tool patterns (e.g., ''PSEXESVC''). This Symbolic Logic approach works as follows:
+    After a successful NTLM LogonType 3 (Event ID 4624) on a target, alert if Service Creation (7045)
+    or Process Creation (4688/Sysmon 1) occurs within 5 minutes with a name matching known tools (regex
+    ''PSEXESVC'', ''PAExec'', ''remcom'', named pipes atsvc/svcctl/winreg) or Impacket/Mimikatz command-lines;
+    corroborate with Zeek dce_rpc.log svcctl/atsvc calls and smb_files.log named-pipe writes. Mirrors
+    the explicit-credential lateral-execution signal in [Sigma explicit-credentials rule](https://detection.fyi/sigmahq/sigma/windows/builtin/security/win_security_susp_logon_explicit_credentials/).
+    A positive result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based
+    authentication rather than legitimate, interactive credential use; pivot to the source and destination
+    hosts, the acting account and its privilege level, the authentication package and logon type, any
+    preceding failed logons (4625), and the downstream process/service/ticket activity to confirm or refute
+    pass-the-hash. A negative result helps rule out this vector on the inspected telemetry but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id002
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 7045
+  - Zeek dce_rpc.log
+  - Zeek smb_files.log
+  - 'NAI: Authentication, process creation, and service creation logs from all servers and workstations;
+    network traffic inspection points.'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Detect service/process creation after NTLM logon
+
+      source IN [Windows Event ID 4624, Windows Event ID 4688, Windows Event ID 7045, Zeek dce_rpc.log,
+      Zeek smb_files.log]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Detect
+      service/process creation after NTLM logon")
+
+      // After a successful NTLM LogonType 3 (Event ID 4624) on a target, alert if Service Creation (7045)
+      or Process C
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Detect service/process creation after NTLM logon
+
+      Zeek dce_rpc.log, Zeek smb_files.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Entropy outliers for service names: Can you determine whether following
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3), a new service (Windows Event
+    ID 7045) or process (Windows Event ID 4688) is created on the target host within a short time window
+    (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching known malicious tool patterns
+    (e.g., ''PSEXESVC''). -- specifically, using the ''Entropy outliers for service names'' (Statistical
+    Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that following a successful NTLM network logon (Windows Event ID 4624, LogonType
+    3), a new service (Windows Event ID 7045) or process (Windows Event ID 4688) is created on the target
+    host within a short time window (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching
+    known malicious tool patterns (e.g., ''PSEXESVC''). This Statistical Method approach works as follows:
+    For each new service/named-pipe created after a network logon, compute Shannon entropy of the name
+    and baseline legitimate-name entropy. Alert when entropy is >3 sigma above mean or absolute >4.0,
+    per outlier scoring in [Bohara et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf).
+    Pair with frequency (new-service count/host/day) and state (creation success vs access-denied 0x5)
+    to reduce false positives on legitimate software installs. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id002
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Entropy outliers for service names
+
+      source IN [Windows Event ID 4624, Windows Event ID 4688, Windows Event ID 7045, Zeek dce_rpc.log,
+      Zeek smb_files.log]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // For each new service/named-pipe created after a network logon, compute Shannon entropy of the
+      name and baselin
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Entropy outliers for service names
+
+      Zeek dce_rpc.log, Zeek smb_files.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Sequence modeling for anomalous post-logon events: Can you determine whether
+    following a successful NTLM network logon (Windows Event ID 4624, LogonType 3), a new service (Windows
+    Event ID 7045) or process (Windows Event ID 4688) is created on the target host within a short time
+    window (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching known malicious tool
+    patterns (e.g., ''PSEXESVC''). -- specifically, using the ''Sequence modeling for anomalous post-logon
+    events'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that following a successful NTLM network logon (Windows Event ID 4624, LogonType
+    3), a new service (Windows Event ID 7045) or process (Windows Event ID 4688) is created on the target
+    host within a short time window (e.g., < 2 minutes) that exhibits a high-entropy name or a name matching
+    known malicious tool patterns (e.g., ''PSEXESVC''). This Machine Learning approach works as follows:
+    Train an LSTM log-key sequence model per [DeepLog, Du et al.](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)
+    on normal post-logon event streams; flag sequences like [LogonType3 -> Service Create(high-entropy)
+    -> Process Create cmd.exe] that fall outside the top-g predicted next-keys. Use online retraining
+    from analyst feedback and surface the 3 most-anomalous transitions in the alert for explainability.
+    A positive result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based
+    authentication rather than legitimate, interactive credential use; pivot to the source and destination
+    hosts, the acting account and its privilege level, the authentication package and logon type, any
+    preceding failed logons (4625), and the downstream process/service/ticket activity to confirm or refute
+    pass-the-hash. A negative result helps rule out this vector on the inspected telemetry but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id002
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Sequence modeling for anomalous post-logon events
+
+      source IN [Windows Event ID 4624, Windows Event ID 4688, Windows Event ID 7045, Zeek dce_rpc.log,
+      Zeek smb_files.log]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Train an LSTM log-key sequence model per [DeepLog, Du et al.](https://www.cs.utah.edu/~lifeifei/papers/deeplog
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Sequence modeling for anomalous post-logon events
+
+      Zeek dce_rpc.log, Zeek smb_files.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Alert on NTLM logons without recent interactive logins: Can you determine
+    whether a user account successfully authenticates via NTLM network logon (Windows Event ID 4624, LogonType
+    3) from a source workstation where there is no record of a recent interactive logon (LogonType 2 or
+    10) by the same user account within a defined lookback period (e.g., 24 hours). -- specifically, using
+    the ''Alert on NTLM logons without recent interactive logins'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account successfully authenticates via NTLM network logon (Windows
+    Event ID 4624, LogonType 3) from a source workstation where there is no record of a recent interactive
+    logon (LogonType 2 or 10) by the same user account within a defined lookback period (e.g., 24 hours).
+    This Symbolic Logic approach works as follows: For every successful NTLM LogonType 3 for a user from
+    source S, query S''s logs for an interactive logon (Type 2/10) by the same user in the last 24h; if
+    absent, alert. This isolates hash-based authentication that bypasses interactive credential entry,
+    consistent with the PtH primitive in [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/).
+    Also record failed-logon (4625) volume for the user as a distinct spray signal. A positive result
+    -- a rule match, statistical outlier, or model alert -- is consistent with hash-based authentication
+    rather than legitimate, interactive credential use; pivot to the source and destination hosts, the
+    acting account and its privilege level, the authentication package and logon type, any preceding failed
+    logons (4625), and the downstream process/service/ticket activity to confirm or refute pass-the-hash.
+    A negative result helps rule out this vector on the inspected telemetry but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land hash reuse.'
+  answer_sources: &id003
+  - Windows Event ID 4624
+  - 'NAI: Centralized authentication logs (Windows Event ID 4624) from all domain-joined workstations
+    and servers.'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "# Alert on NTLM logons without recent interactive logins\nsource IN [Windows Event ID 4624]\n\
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria(\"\
+      Alert on NTLM logons without recent interactive logins\")\n// For every successful NTLM LogonType\
+      \ 3 for a user from source S, query S's logs for an interactive logon (Type \n| CORRELATE/JOIN per\
+      \ action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg, status)"
+- question: '[Lateral Movement] Track interactive vs network logon ratios: Can you determine whether a
+    user account successfully authenticates via NTLM network logon (Windows Event ID 4624, LogonType 3)
+    from a source workstation where there is no record of a recent interactive logon (LogonType 2 or 10)
+    by the same user account within a defined lookback period (e.g., 24 hours). -- specifically, using
+    the ''Track interactive vs network logon ratios'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account successfully authenticates via NTLM network logon (Windows
+    Event ID 4624, LogonType 3) from a source workstation where there is no record of a recent interactive
+    logon (LogonType 2 or 10) by the same user account within a defined lookback period (e.g., 24 hours).
+    This Statistical Method approach works as follows: Baseline each user''s daily interactive(2/10):network(3)
+    logon ratio; alert when it falls below the 5th percentile of their history, indicating network logons
+    without a user present. Apply change-point detection (CUSUM/PELT) per [change-point survey, Aminikhanghahi
+    & Cook](https://pmc.ncbi.nlm.nih.gov/articles/PMC5464762/) to catch the abrupt ratio shift, and include
+    frequency (Type-3 count/hour). Alert text lists the contributing day, baseline ratio, and observed
+    ratio. A positive result -- a rule match, statistical outlier, or model alert -- is consistent with
+    hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id003
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Track interactive vs network logon ratios
+
+      source IN [Windows Event ID 4624]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Baseline each user''s daily interactive(2/10):network(3) logon ratio; alert when it falls below
+      the 5th percent
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] Cluster deviations in logon patterns: Can you determine whether a user
+    account successfully authenticates via NTLM network logon (Windows Event ID 4624, LogonType 3) from
+    a source workstation where there is no record of a recent interactive logon (LogonType 2 or 10) by
+    the same user account within a defined lookback period (e.g., 24 hours). -- specifically, using the
+    ''Cluster deviations in logon patterns'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account successfully authenticates via NTLM network logon (Windows
+    Event ID 4624, LogonType 3) from a source workstation where there is no record of a recent interactive
+    logon (LogonType 2 or 10) by the same user account within a defined lookback period (e.g., 24 hours).
+    This Machine Learning approach works as follows: Cluster logon events (features: user, source, logon
+    type, hour, auth package) with DBSCAN; a cluster of Type-3 events with no corresponding Type-2/10
+    cluster for the same user/host is anomalous, following the structural-anomaly approach of [Siadati
+    & Memon](https://dl.acm.org/doi/10.1145/3133956.3134003). Report top-3 features driving cluster membership.
+    A positive result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based
+    authentication rather than legitimate, interactive credential use; pivot to the source and destination
+    hosts, the acting account and its privilege level, the authentication package and logon type, any
+    preceding failed logons (4625), and the downstream process/service/ticket activity to confirm or refute
+    pass-the-hash. A negative result helps rule out this vector on the inspected telemetry but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id003
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Cluster deviations in logon patterns
+
+      source IN [Windows Event ID 4624]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Cluster logon events (features: user, source, logon type, hour, auth package) with DBSCAN; a
+      cluster of Type-3
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+- question: '[Lateral Movement] Listen for machine account logins from non-approved hosts: Can you determine
+    whether a machine account (account name ending in ''$'') performs a successful NTLM network logon
+    (Windows Event ID 4624, LogonType 3) from a source host that is not on a pre-defined allow-list of
+    Domain Controllers or authorized management servers. -- specifically, using the ''Listen for machine
+    account logins from non-approved hosts'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a machine account (account name ending in ''$'') performs a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) from a source host that is not on a pre-defined
+    allow-list of Domain Controllers or authorized management servers. This Symbolic Logic approach works
+    as follows: Maintain an allow-list of DC/admin-server hostnames+IPs. Alert on any 4624 where LogonType=3,
+    Account Name ends with ''$'', AuthenticationPackageName=NTLM (machine accounts normally use Kerberos),
+    and Source Network Address not in the allow-list. Machine-account NTLM misuse is a strong PtH/overpass
+    signal surfaced by [LogonTracer, JPCERT/CC](https://github.com/JPCERTCC/LogonTracer). A positive result
+    -- a rule match, statistical outlier, or model alert -- is consistent with hash-based authentication
+    rather than legitimate, interactive credential use; pivot to the source and destination hosts, the
+    acting account and its privilege level, the authentication package and logon type, any preceding failed
+    logons (4625), and the downstream process/service/ticket activity to confirm or refute pass-the-hash.
+    A negative result helps rule out this vector on the inspected telemetry but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land hash reuse.'
+  answer_sources: &id004
+  - Windows Event ID 4624
+  - 'NAI: Domain Controller and Member Server Authentication Logs, Asset Inventory/CMDB'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Listen for machine account logins from non-approved hosts
+
+      source IN [Windows Event ID 4624]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Listen
+      for machine account logins from non-approved hosts")
+
+      // Maintain an allow-list of DC/admin-server hostnames+IPs. Alert on any 4624 where LogonType=3,
+      Account Name end
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+- question: '[Lateral Movement] Flag statistically rare machine sources: Can you determine whether a machine
+    account (account name ending in ''$'') performs a successful NTLM network logon (Windows Event ID
+    4624, LogonType 3) from a source host that is not on a pre-defined allow-list of Domain Controllers
+    or authorized management servers. -- specifically, using the ''Flag statistically rare machine sources''
+    (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a machine account (account name ending in ''$'') performs a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) from a source host that is not on a pre-defined
+    allow-list of Domain Controllers or authorized management servers. This Statistical Method approach
+    works as follows: Profile frequency of source hosts performing machine-account network logons; flag
+    sources in the bottom 1st percentile (rarely-seen) using robust MAD outlier scoring per [Bohara et
+    al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf). Add volume (bytes) and state
+    (success/fail) and apply new-edge scoring from [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286)
+    so a first-time machine-account source pair escalates. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id004
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Flag statistically rare machine sources
+
+      source IN [Windows Event ID 4624]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Profile frequency of source hosts performing machine-account network logons; flag sources in
+      the bottom 1st pe
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] One-class modeling for machine logons: Can you determine whether a machine
+    account (account name ending in ''$'') performs a successful NTLM network logon (Windows Event ID
+    4624, LogonType 3) from a source host that is not on a pre-defined allow-list of Domain Controllers
+    or authorized management servers. -- specifically, using the ''One-class modeling for machine logons''
+    (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a machine account (account name ending in ''$'') performs a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) from a source host that is not on a pre-defined
+    allow-list of Domain Controllers or authorized management servers. This Machine Learning approach
+    works as follows: Train a one-class SVM (or isolation forest) on legitimate machine-account logon
+    features (source/dest host, subnet, hour, auth package); anomalies outside the learned boundary flag
+    malicious machine-account use. Validate on [LANL auth dataset](https://csr.lanl.gov/data/auth/) and
+    surface the top-3 deviating features in the alert. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id004
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# One-class modeling for machine logons
+
+      source IN [Windows Event ID 4624]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Train a one-class SVM (or isolation forest) on legitimate machine-account logon features (source/dest
+      host, su
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+- question: '[Lateral Movement] Baseline user host pairs: Can you determine whether a user account performs
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) between a source and destination
+    host pair for the first time, relative to a long-term historical baseline (e.g., 90+ days). The significance
+    is elevated if the account is privileged. -- specifically, using the ''Baseline user host pairs''
+    (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account performs a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) between a source and destination host pair for the first time, relative to a
+    long-term historical baseline (e.g., 90+ days). The significance is elevated if the account is privileged.
+    This Symbolic Logic approach works as follows: For each user, maintain the set of historically-seen
+    source->destination NTLM Type-3 pairs over 90 days; alert on any new pair, escalating severity for
+    privileged accounts. This first-seen-edge rule is the deterministic floor; combine with [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/)
+    PtH signature for high confidence. A positive result -- a rule match, statistical outlier, or model
+    alert -- is consistent with hash-based authentication rather than legitimate, interactive credential
+    use; pivot to the source and destination hosts, the acting account and its privilege level, the authentication
+    package and logon type, any preceding failed logons (4625), and the downstream process/service/ticket
+    activity to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id005
+  - Windows Event ID 4624
+  - 'NAI: Centralized, long-term historical authentication logs (e.g., >90 days); Identity and Access
+    Management (IAM) database; CMDB.'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Baseline user host pairs
+
+      source IN [Windows Event ID 4624]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Baseline
+      user host pairs")
+
+      // For each user, maintain the set of historically-seen source->destination NTLM Type-3 pairs over
+      90 days; alert
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+- question: '[Lateral Movement] Bayesian new-edge scoring: Can you determine whether a user account performs
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) between a source and destination
+    host pair for the first time, relative to a long-term historical baseline (e.g., 90+ days). The significance
+    is elevated if the account is privileged. -- specifically, using the ''Bayesian new-edge scoring''
+    (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account performs a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) between a source and destination host pair for the first time, relative to a
+    long-term historical baseline (e.g., 90+ days). The significance is elevated if the account is privileged.
+    This Statistical Method approach works as follows: Replace naive first-seen with the Bayesian new-edge
+    model of [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286),
+    scoring each first-time source->destination pair by historical connection propensity to suppress benign
+    novelty; alert on low-probability new edges. Track Jaccard similarity of each user''s daily host-set
+    vs baseline (alert < 0.5) and include logon frequency. Report the prior probability and contributing
+    hosts. A positive result -- a rule match, statistical outlier, or model alert -- is consistent with
+    hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id005
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Bayesian new-edge scoring
+
+      source IN [Windows Event ID 4624]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Replace naive first-seen with the Bayesian new-edge model of [Metelli & Heard](https://projecteuclid.org/journ
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] Graph-based link prediction: Can you determine whether a user account
+    performs a successful NTLM network logon (Windows Event ID 4624, LogonType 3) between a source and
+    destination host pair for the first time, relative to a long-term historical baseline (e.g., 90+ days).
+    The significance is elevated if the account is privileged. -- specifically, using the ''Graph-based
+    link prediction'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a user account performs a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) between a source and destination host pair for the first time, relative to a
+    long-term historical baseline (e.g., 90+ days). The significance is elevated if the account is privileged.
+    This Machine Learning approach works as follows: Model user-host logon relationships as a temporal
+    graph and use GNN+recurrent link prediction per [Euler, King & Huang](https://dl.acm.org/doi/10.1145/3588771)
+    (or unsupervised embeddings per [CyberGraph, Bowman et al.](https://www2.seas.gwu.edu/~howie/publications/CyberGraph-RAID20.pdf));
+    an observed logon the model assigns very low probability is flagged. Surface the 3 nearest learned
+    edges/features explaining why the edge is improbable. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id005
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Graph-based link prediction
+
+      source IN [Windows Event ID 4624]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Model user-host logon relationships as a temporal graph and use GNN+recurrent link prediction
+      per [Euler, King
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+- question: '[Lateral Movement] Alert on unauthorized access to high-value assets: Can you determine whether
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) is directed at a high-value asset
+    (e.g., Domain Controller, database server) from a source host not designated as an authorized administrative
+    workstation or jump box. -- specifically, using the ''Alert on unauthorized access to high-value assets''
+    (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    is directed at a high-value asset (e.g., Domain Controller, database server) from a source host not
+    designated as an authorized administrative workstation or jump box. This Symbolic Logic approach works
+    as follows: Maintain lists of high-value asset IPs and authorized admin/jump-box source IPs. High-severity
+    alert on any NTLM LogonType 3 where destination is high-value and source is not authorized, matching
+    the local-admin-monitoring intent of [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/).
+    Include logon state (success/fail) and preceding 4625 failures against the asset. A positive result
+    -- a rule match, statistical outlier, or model alert -- is consistent with hash-based authentication
+    rather than legitimate, interactive credential use; pivot to the source and destination hosts, the
+    acting account and its privilege level, the authentication package and logon type, any preceding failed
+    logons (4625), and the downstream process/service/ticket activity to confirm or refute pass-the-hash.
+    A negative result helps rule out this vector on the inspected telemetry but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land hash reuse.'
+  answer_sources: &id006
+  - Windows Event ID 4624
+  - 'NAI: High-Value Asset Inventory (CMDB), Domain Controller Security Logs, Critical Server Security
+    Logs'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Alert on unauthorized access to high-value assets
+
+      source IN [Windows Event ID 4624]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Alert
+      on unauthorized access to high-value assets")
+
+      // Maintain lists of high-value asset IPs and authorized admin/jump-box source IPs. High-severity
+      alert on any NT
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+- question: '[Lateral Movement] Score logons by asset criticality tiers: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) is directed at a high-value asset (e.g., Domain
+    Controller, database server) from a source host not designated as an authorized administrative workstation
+    or jump box. -- specifically, using the ''Score logons by asset criticality tiers'' (Statistical Method)
+    approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    is directed at a high-value asset (e.g., Domain Controller, database server) from a source host not
+    designated as an authorized administrative workstation or jump box. This Statistical Method approach
+    works as follows: Assign criticality tiers (1-5) to assets; risk = source_tier * dest_tier. Monitor
+    the score distribution and alert above the 99th percentile (dynamic) per outlier scoring in [Bohara
+    et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf). Weight by connection rarity
+    using new-edge propensity from [Metelli & Heard](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286)
+    and include byte volume to the asset. A positive result -- a rule match, statistical outlier, or model
+    alert -- is consistent with hash-based authentication rather than legitimate, interactive credential
+    use; pivot to the source and destination hosts, the acting account and its privilege level, the authentication
+    package and logon type, any preceding failed logons (4625), and the downstream process/service/ticket
+    activity to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id006
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Score logons by asset criticality tiers
+
+      source IN [Windows Event ID 4624]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Assign criticality tiers (1-5) to assets; risk = source_tier * dest_tier. Monitor the score distribution
+      and a
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] ML classification of lateral risk: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) is directed at a high-value asset (e.g., Domain
+    Controller, database server) from a source host not designated as an authorized administrative workstation
+    or jump box. -- specifically, using the ''ML classification of lateral risk'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    is directed at a high-value asset (e.g., Domain Controller, database server) from a source host not
+    designated as an authorized administrative workstation or jump box. This Machine Learning approach
+    works as follows: Train a classifier on source criticality, dest criticality, user privilege, historical
+    path frequency, first-time-edge, and bytes; flag high predicted-risk logons. Benchmark with red-team
+    labels in [LANL auth dataset](https://csr.lanl.gov/data/auth/) and list the top-3 risk drivers in
+    the alert. A positive result -- a rule match, statistical outlier, or model alert -- is consistent
+    with hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id006
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# ML classification of lateral risk
+
+      source IN [Windows Event ID 4624]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Train a classifier on source criticality, dest criticality, user privilege, historical path frequency,
+      first-t
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+- question: '[Lateral Movement] Correlate NTLM logons to service/process events: Can you determine whether
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) from a source host to a target
+    host is immediately followed by remote service creation (Windows Event ID 7045), scheduled task creation
+    (Windows Event ID 4698), or remote process execution (Windows Event ID 4688 with parent like ''wmiprvse.exe'')
+    on the target host, initiated from the source host. -- specifically, using the ''Correlate NTLM logons
+    to service/process events'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    from a source host to a target host is immediately followed by remote service creation (Windows Event
+    ID 7045), scheduled task creation (Windows Event ID 4698), or remote process execution (Windows Event
+    ID 4688 with parent like ''wmiprvse.exe'') on the target host, initiated from the source host. This
+    Symbolic Logic approach works as follows: Time-series rule: Event A (NTLM Type-3 from S to T) followed
+    within 2 minutes by Event B (Process Create on T for cmd.exe/powershell.exe with parent services.exe/wmiprvse.exe)
+    or Event C (Zeek dce_rpc.log svcctl/atsvc create from S to T) or 4698 scheduled-task create. This
+    remote-execution-after-logon chain is the PsExec/WMI PtH pattern, corroborated by [Sigma explicit-credentials
+    rule](https://detection.fyi/sigmahq/sigma/windows/builtin/security/win_security_susp_logon_explicit_credentials/)
+    and causal-path reasoning in [Hopper, Ho et al.](https://www.usenix.org/system/files/sec21-ho.pdf).
+    A positive result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based
+    authentication rather than legitimate, interactive credential use; pivot to the source and destination
+    hosts, the acting account and its privilege level, the authentication package and logon type, any
+    preceding failed logons (4625), and the downstream process/service/ticket activity to confirm or refute
+    pass-the-hash. A negative result helps rule out this vector on the inspected telemetry but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id007
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 7045
+  - Windows Event ID 4698
+  - Zeek dce_rpc.log
+  - 'NAI: Endpoint Process Creation, Service, and Task Scheduler Logs; Network Inspection Points (for
+    DCE/RPC traffic); Server Authentication Logs'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "# Correlate NTLM logons to service/process events\nsource IN [Windows Event ID 4624, Windows\
+      \ Event ID 4688, Windows Event ID 7045, Windows Event ID 4698, Zeek dce_rpc.log]\n| WHERE event=NTLM_LogonType3\
+      \ (4624, AuthenticationPackageName=NTLM) and matches_action_criteria(\"Correlate NTLM logons to\
+      \ service/process events\")\n// Time-series rule: Event A (NTLM Type-3 from S to T) followed within\
+      \ 2 minutes by Event B (Process Create on T \n| CORRELATE/JOIN per action criteria | ALERT enrich(src_host,\
+      \ dst_host, user, logon_type, auth_pkg, status)"
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Correlate NTLM logons to service/process events
+
+      Zeek dce_rpc.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Detect outlier time deltas: Can you determine whether a successful NTLM
+    network logon (Windows Event ID 4624, LogonType 3) from a source host to a target host is immediately
+    followed by remote service creation (Windows Event ID 7045), scheduled task creation (Windows Event
+    ID 4698), or remote process execution (Windows Event ID 4688 with parent like ''wmiprvse.exe'') on
+    the target host, initiated from the source host. -- specifically, using the ''Detect outlier time
+    deltas'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    from a source host to a target host is immediately followed by remote service creation (Windows Event
+    ID 7045), scheduled task creation (Windows Event ID 4698), or remote process execution (Windows Event
+    ID 4688 with parent like ''wmiprvse.exe'') on the target host, initiated from the source host. This
+    Statistical Method approach works as follows: Measure the logon->remote-execution time delta per source-target
+    pair; automation yields very short, consistent deltas. Flag pairs in the lowest 1st percentile (e.g.,
+    <1s) using robust outlier scoring per [Bohara et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf)
+    and change-point monitoring per [change-point survey, Aminikhanghahi & Cook](https://pmc.ncbi.nlm.nih.gov/articles/PMC5464762/).
+    Include execution success/fail state and command count/min. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id007
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Detect outlier time deltas
+
+      source IN [Windows Event ID 4624, Windows Event ID 4688, Windows Event ID 7045, Windows Event ID
+      4698, Zeek dce_rpc.log]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Measure the logon->remote-execution time delta per source-target pair; automation yields very
+      short, consisten
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Detect outlier time deltas
+
+      Zeek dce_rpc.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Sequence modeling for lateral patterns: Can you determine whether a successful
+    NTLM network logon (Windows Event ID 4624, LogonType 3) from a source host to a target host is immediately
+    followed by remote service creation (Windows Event ID 7045), scheduled task creation (Windows Event
+    ID 4698), or remote process execution (Windows Event ID 4688 with parent like ''wmiprvse.exe'') on
+    the target host, initiated from the source host. -- specifically, using the ''Sequence modeling for
+    lateral patterns'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a successful NTLM network logon (Windows Event ID 4624, LogonType 3)
+    from a source host to a target host is immediately followed by remote service creation (Windows Event
+    ID 7045), scheduled task creation (Windows Event ID 4698), or remote process execution (Windows Event
+    ID 4688 with parent like ''wmiprvse.exe'') on the target host, initiated from the source host. This
+    Machine Learning approach works as follows: Train an LSTM per [DeepLog, Du et al.](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)
+    on per-host event streams; sequences like [NTLM_Logon, DCE_RPC_SVC_Create, Process_Create_From_Service]
+    outside learned norms are flagged. Surface the 3 most-anomalous events; run in parallel with the deterministic
+    correlation rule. A positive result -- a rule match, statistical outlier, or model alert -- is consistent
+    with hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id007
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Sequence modeling for lateral patterns
+
+      source IN [Windows Event ID 4624, Windows Event ID 4688, Windows Event ID 7045, Windows Event ID
+      4698, Zeek dce_rpc.log]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Train an LSTM per [DeepLog, Du et al.](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)
+      on per-host event
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Sequence modeling for lateral patterns
+
+      Zeek dce_rpc.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Detect fan-out logons via thresholds: Can you determine whether a single
+    user account or source host performs an anomalously high number of successful NTLM network logons
+    (Windows Event ID 4624, LogonType 3) to unique destination hosts within a short time window (e.g.,
+    >20 hosts in 10 minutes), indicating a ''fan-out'' pattern. -- specifically, using the ''Detect fan-out
+    logons via thresholds'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a single user account or source host performs an anomalously high number
+    of successful NTLM network logons (Windows Event ID 4624, LogonType 3) to unique destination hosts
+    within a short time window (e.g., >20 hosts in 10 minutes), indicating a ''fan-out'' pattern. This
+    Symbolic Logic approach works as follows: Alert if a single source IP or user generates successful
+    NTLM LogonType 3 events to >20 unique destinations within 10 minutes (tune per environment). This
+    volume/frequency threshold captures automated PtH sweeps; the multi-destination credential-reuse pattern
+    is the basis of the [Azure Sentinel 4648 query](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/Windows%20Security%20Events/Hunting%20Queries/MultipleExplicitCredentialUsage4648Events.yaml)
+    4648 hunt. A positive result -- a rule match, statistical outlier, or model alert -- is consistent
+    with hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id008
+  - Windows Event ID 4624
+  - 'NAI: Centralized Authentication Logs from all Endpoints and Servers'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Detect fan-out logons via thresholds
+
+      source IN [Windows Event ID 4624]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Detect
+      fan-out logons via thresholds")
+
+      // Alert if a single source IP or user generates successful NTLM LogonType 3 events to >20 unique
+      destinations wi
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+- question: '[Lateral Movement] Baseline unique destination counts: Can you determine whether a single
+    user account or source host performs an anomalously high number of successful NTLM network logons
+    (Windows Event ID 4624, LogonType 3) to unique destination hosts within a short time window (e.g.,
+    >20 hosts in 10 minutes), indicating a ''fan-out'' pattern. -- specifically, using the ''Baseline
+    unique destination counts'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a single user account or source host performs an anomalously high number
+    of successful NTLM network logons (Windows Event ID 4624, LogonType 3) to unique destination hosts
+    within a short time window (e.g., >20 hosts in 10 minutes), indicating a ''fan-out'' pattern. This
+    Statistical Method approach works as follows: Per source host, baseline unique NTLM Type-3 destinations/hour;
+    alert when the count exceeds mean+3 sigma of the host''s own and peer-group history, and use change-point
+    detection (CUSUM/PELT) per [change-point survey, Aminikhanghahi & Cook](https://pmc.ncbi.nlm.nih.gov/articles/PMC5464762/)
+    to catch the abrupt spike. Add failed-logon (4625) destination count as a distinct spray signal. Derive
+    thresholds from >=30-day baselines. A positive result -- a rule match, statistical outlier, or model
+    alert -- is consistent with hash-based authentication rather than legitimate, interactive credential
+    use; pivot to the source and destination hosts, the acting account and its privilege level, the authentication
+    package and logon type, any preceding failed logons (4625), and the downstream process/service/ticket
+    activity to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id008
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline unique destination counts
+
+      source IN [Windows Event ID 4624]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Per source host, baseline unique NTLM Type-3 destinations/hour; alert when the count exceeds
+      mean+3 sigma of t
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] Forecast fan-out spikes: Can you determine whether a single user account
+    or source host performs an anomalously high number of successful NTLM network logons (Windows Event
+    ID 4624, LogonType 3) to unique destination hosts within a short time window (e.g., >20 hosts in 10
+    minutes), indicating a ''fan-out'' pattern. -- specifically, using the ''Forecast fan-out spikes''
+    (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a single user account or source host performs an anomalously high number
+    of successful NTLM network logons (Windows Event ID 4624, LogonType 3) to unique destination hosts
+    within a short time window (e.g., >20 hosts in 10 minutes), indicating a ''fan-out'' pattern. This
+    Machine Learning approach works as follows: Forecast unique-destination counts per source with SARIMA/Prophet;
+    alert when observed exceeds the predicted upper confidence bound. Cross-check with unsupervised PCA/k-means
+    ensemble scoring per [Bohara et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf)
+    and report observed-vs-forecast and the top contributing destinations. A positive result -- a rule
+    match, statistical outlier, or model alert -- is consistent with hash-based authentication rather
+    than legitimate, interactive credential use; pivot to the source and destination hosts, the acting
+    account and its privilege level, the authentication package and logon type, any preceding failed logons
+    (4625), and the downstream process/service/ticket activity to confirm or refute pass-the-hash. A negative
+    result helps rule out this vector on the inspected telemetry but should be corroborated with the other
+    questions in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land
+    hash reuse.'
+  answer_sources: *id008
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Forecast fan-out spikes
+
+      source IN [Windows Event ID 4624]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Forecast unique-destination counts per source with SARIMA/Prophet; alert when observed exceeds
+      the predicted u
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+- question: '[Lateral Movement] Alert on segmentation violations: Can you determine whether a chain of
+    sequential NTLM network logons (Windows Event ID 4624, LogonType 3) is observed across multiple hosts
+    (e.g., Host A logs into Host B, then Host B logs into Host C), particularly when such a path traverses
+    different network segments or violates established access control policies. -- specifically, using
+    the ''Alert on segmentation violations'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a chain of sequential NTLM network logons (Windows Event ID 4624, LogonType
+    3) is observed across multiple hosts (e.g., Host A logs into Host B, then Host B logs into Host C),
+    particularly when such a path traverses different network segments or violates established access
+    control policies. This Symbolic Logic approach works as follows: Codify segmentation rules (e.g.,
+    UserVLAN !-> ServerVLAN); enrich logon events with source/dest zone and alert on any NTLM Type-3 logon
+    violating a rule. Combine with allowed user-group->host-group structures per [Siadati & Memon](https://dl.acm.org/doi/10.1145/3133956.3134003)
+    so structural violations of valid-credential logons raise alerts. A positive result -- a rule match,
+    statistical outlier, or model alert -- is consistent with hash-based authentication rather than legitimate,
+    interactive credential use; pivot to the source and destination hosts, the acting account and its
+    privilege level, the authentication package and logon type, any preceding failed logons (4625), and
+    the downstream process/service/ticket activity to confirm or refute pass-the-hash. A negative result
+    helps rule out this vector on the inspected telemetry but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash
+    reuse.'
+  answer_sources: &id009
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Network Flow Logs, Firewall Logs, Centralized Authentication Logs, Network Architecture Policies'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Alert on segmentation violations
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Alert
+      on segmentation violations")
+
+      // Codify segmentation rules (e.g., UserVLAN !-> ServerVLAN); enrich logon events with source/dest
+      zone and alert
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Alert on segmentation violations
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Graph statistics for chain detection: Can you determine whether a chain
+    of sequential NTLM network logons (Windows Event ID 4624, LogonType 3) is observed across multiple
+    hosts (e.g., Host A logs into Host B, then Host B logs into Host C), particularly when such a path
+    traverses different network segments or violates established access control policies. -- specifically,
+    using the ''Graph statistics for chain detection'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a chain of sequential NTLM network logons (Windows Event ID 4624, LogonType
+    3) is observed across multiple hosts (e.g., Host A logs into Host B, then Host B logs into Host C),
+    particularly when such a path traverses different network segments or violates established access
+    control policies. This Statistical Method approach works as follows: Build a directed NTLM-logon graph
+    (Zeek conn.log + 4624) and enumerate paths length >1; alert on chains exceeding a baseline max (>2
+    hops) or statistically rare paths, ranking pivots by PageRank/centrality as in [LogonTracer, JPCERT/CC](https://github.com/JPCERTCC/LogonTracer).
+    Include per-edge frequency and byte volume; treat blocked/failed hops as distinct signals. A positive
+    result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based authentication
+    rather than legitimate, interactive credential use; pivot to the source and destination hosts, the
+    acting account and its privilege level, the authentication package and logon type, any preceding failed
+    logons (4625), and the downstream process/service/ticket activity to confirm or refute pass-the-hash.
+    A negative result helps rule out this vector on the inspected telemetry but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land hash reuse.'
+  answer_sources: *id009
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Graph statistics for chain detection
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Build a directed NTLM-logon graph (Zeek conn.log + 4624) and enumerate paths length >1; alert
+      on chains exceed
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Graph statistics for chain detection
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Host embedding anomalies: Can you determine whether a chain of sequential
+    NTLM network logons (Windows Event ID 4624, LogonType 3) is observed across multiple hosts (e.g.,
+    Host A logs into Host B, then Host B logs into Host C), particularly when such a path traverses different
+    network segments or violates established access control policies. -- specifically, using the ''Host
+    embedding anomalies'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that a chain of sequential NTLM network logons (Windows Event ID 4624, LogonType
+    3) is observed across multiple hosts (e.g., Host A logs into Host B, then Host B logs into Host C),
+    particularly when such a path traverses different network segments or violates established access
+    control policies. This Machine Learning approach works as follows: Learn host vectors with graph embeddings
+    (Node2Vec / GNN per [CyberGraph, Bowman et al.](https://www2.seas.gwu.edu/~howie/publications/CyberGraph-RAID20.pdf));
+    a compromised pivot''s vector shifts as it connects to new host clusters. Apply anomaly detection
+    on embedding drift, or temporal link prediction per [Euler, King & Huang](https://dl.acm.org/doi/10.1145/3588771),
+    and surface the 3 new clusters/edges driving the shift. A positive result -- a rule match, statistical
+    outlier, or model alert -- is consistent with hash-based authentication rather than legitimate, interactive
+    credential use; pivot to the source and destination hosts, the acting account and its privilege level,
+    the authentication package and logon type, any preceding failed logons (4625), and the downstream
+    process/service/ticket activity to confirm or refute pass-the-hash. A negative result helps rule out
+    this vector on the inspected telemetry but should be corroborated with the other questions in this
+    playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id009
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Host embedding anomalies
+
+      source IN [Windows Event ID 4624, Zeek conn.log]
+
+      | FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing, logon sequence)
+
+      | SCORE model.predict(features)
+
+      // Learn host vectors with graph embeddings (Node2Vec / GNN per [CyberGraph, Bowman et al.](https://www2.seas.gwu
+
+      | WHERE score > threshold | ALERT with top contributing features (SHAP/LIME)'
+  - technology: Zeek/pseudocode
+    query: '# Network corroboration for: Host embedding anomalies
+
+      Zeek conn.log
+
+      | FILTER SMB/445, DCE-RPC/135 (svcctl, atsvc, winreg), named-pipe writes around the NTLM logon
+
+      | JOIN to authentication events on (src_ip, dst_ip, time-window)
+
+      | flag watchlisted/novel/bursty flows and remote-service/named-pipe activity per action criteria'
+- question: '[Lateral Movement] Detect NTLM logon followed by Kerberos request: Can you determine whether
+    on a Domain Controller, a successful NTLM network logon (Windows Event ID 4624, LogonType 3) for a
+    specific user from a source IP is followed within seconds by a Kerberos Ticket-Granting-Ticket request
+    (Windows Event ID 4768) from the same user and source IP, which is characteristic of an Overpass-the-Hash
+    attack. -- specifically, using the ''Detect NTLM logon followed by Kerberos request'' (Symbolic Logic)
+    approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that on a Domain Controller, a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) for a specific user from a source IP is followed within seconds by a Kerberos
+    Ticket-Granting-Ticket request (Windows Event ID 4768) from the same user and source IP, which is
+    characteristic of an Overpass-the-Hash attack. This Symbolic Logic approach works as follows: On a
+    DC, alert if a successful NTLM LogonType 3 (4624) for a user from source IP is followed within 10s
+    by a Kerberos TGT (4768) or service-ticket (4769) request from the same user/source - the overpass-the-hash
+    signature where a hash mints a TGT. Corroborate with explicit-credential reuse per [Sigma explicit-credentials
+    rule](https://detection.fyi/sigmahq/sigma/windows/builtin/security/win_security_susp_logon_explicit_credentials/)
+    and the PtH base signature in [CAR-2016-04-004](https://car.mitre.org/analytics/CAR-2016-04-004/).
+    A positive result -- a rule match, statistical outlier, or model alert -- is consistent with hash-based
+    authentication rather than legitimate, interactive credential use; pivot to the source and destination
+    hosts, the acting account and its privilege level, the authentication package and logon type, any
+    preceding failed logons (4625), and the downstream process/service/ticket activity to confirm or refute
+    pass-the-hash. A negative result helps rule out this vector on the inspected telemetry but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: &id010
+  - Windows Event ID 4624
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - 'NAI: Domain Controller Security Logs'
+  range: Last 90 days (correlate around each NTLM LogonType 3 event)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Detect NTLM logon followed by Kerberos request
+
+      source IN [Windows Event ID 4624, Windows Event ID 4768, Windows Event ID 4769]
+
+      | WHERE event=NTLM_LogonType3 (4624, AuthenticationPackageName=NTLM) and matches_action_criteria("Detect
+      NTLM logon followed by Kerberos request")
+
+      // On a DC, alert if a successful NTLM LogonType 3 (4624) for a user from source IP is followed
+      within 10s by a K
+
+      | CORRELATE/JOIN per action criteria | ALERT enrich(src_host, dst_host, user, logon_type, auth_pkg,
+      status)'
+- question: '[Lateral Movement] Time-delay outlier detection: Can you determine whether on a Domain Controller,
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) for a specific user from a source
+    IP is followed within seconds by a Kerberos Ticket-Granting-Ticket request (Windows Event ID 4768)
+    from the same user and source IP, which is characteristic of an Overpass-the-Hash attack. -- specifically,
+    using the ''Time-delay outlier detection'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that on a Domain Controller, a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) for a specific user from a source IP is followed within seconds by a Kerberos
+    Ticket-Granting-Ticket request (Windows Event ID 4768) from the same user and source IP, which is
+    characteristic of an Overpass-the-Hash attack. This Statistical Method approach works as follows:
+    Measure the NTLM-logon->Kerberos-request delay per source; automated overpass yields very small consistent
+    delays. Flag sources whose average delay is <1st percentile (<1s) via robust outlier scoring per [Bohara
+    et al.](https://www.perform.illinois.edu/Papers/USAN_papers/17BOH01.pdf), with change-point detection
+    per [change-point survey, Aminikhanghahi & Cook](https://pmc.ncbi.nlm.nih.gov/articles/PMC5464762/)
+    for abrupt onset. Include TGT request success/fail (e.g., 4768 with failure codes) as a distinct state
+    signal. A positive result -- a rule match, statistical outlier, or model alert -- is consistent with
+    hash-based authentication rather than legitimate, interactive credential use; pivot to the source
+    and destination hosts, the acting account and its privilege level, the authentication package and
+    logon type, any preceding failed logons (4625), and the downstream process/service/ticket activity
+    to confirm or refute pass-the-hash. A negative result helps rule out this vector on the inspected
+    telemetry but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land hash reuse.'
+  answer_sources: *id010
+  range: Last 90 days (baseline >=30 days; evaluate per-host/day and event-centered windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Time-delay outlier detection
+
+      source IN [Windows Event ID 4624, Windows Event ID 4768, Windows Event ID 4769]
+
+      | STATS baseline over >=30d per (user, source, destination)
+
+      | COMPUTE deviation (percentile / modified-Z (MAD) / change-point / new-edge probability)
+
+      // Measure the NTLM-logon->Kerberos-request delay per source; automated overpass yields very small
+      consistent del
+
+      | WHERE deviation > threshold | ALERT enrich(src_host, dst_host, user, top_contributors)'
+- question: '[Lateral Movement] Bayesian sequence scoring: Can you determine whether on a Domain Controller,
+    a successful NTLM network logon (Windows Event ID 4624, LogonType 3) for a specific user from a source
+    IP is followed within seconds by a Kerberos Ticket-Granting-Ticket request (Windows Event ID 4768)
+    from the same user and source IP, which is characteristic of an Overpass-the-Hash attack. -- specifically,
+    using the ''Bayesian sequence scoring'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Lateral Movement tactic (TA0008), the mission question is "Is
+    the adversary bypassing authentication mechanisms using stolen hashes?" Pass the Hash (and overpass-the-hash)
+    lets an adversary authenticate with a stolen NTLM hash instead of a cleartext password, bypassing
+    interactive credential entry and enabling stealthy lateral movement with valid-but-stolen credentials;
+    catching it early limits how far an intruder can pivot toward sensitive systems and data. This evidence
+    focuses on the condition that on a Domain Controller, a successful NTLM network logon (Windows Event
+    ID 4624, LogonType 3) for a specific user from a source IP is followed within seconds by a Kerberos
+    Ticket-Granting-Ticket request (Windows Event ID 4768) from the same user and source IP, which is
+    characteristic of an Overpass-the-Hash attack. This Machine Learning approach works as follows: Model
+    conditional probabilities of DC authentication-event sequences (Bayesian network, or LSTM per [DeepLog,
+    Du et al.](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)); a sequence where P(KerberosRequest
+    | NTLM_Logon) is anomalously high for a user/source is flagged. Validate on [LANL auth dataset](https://csr.lanl.gov/data/auth/)
+    and surface the contributing sequence transitions in the alert. A positive result -- a rule match,
+    statistical outlier, or model alert -- is consistent with hash-based authentication rather than legitimate,
+    interactive credential use; pivot to the source and destination hosts, the acting account and its
+    privilege level, the authentication package and logon type, any preceding failed logons (4625), and
+    the downstream process/service/ticket activity to confirm or refute pass-the-hash. A negative result
+    helps rule out this vector on the inspected telemetry but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land hash
+    reuse.'
+  answer_sources: *id010
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "# Bayesian sequence scoring\nsource IN [Windows Event ID 4624, Windows Event ID 4768, Windows\
+      \ Event ID 4769]\n| FEATURIZE events (IP reputation, privilege, first-time-edge, bytes, timing,\
+      \ logon sequence)\n| SCORE model.predict(features)\n// Model conditional probabilities of DC authentication-event\
+      \ sequences (Bayesian network, or LSTM per [DeepLog, \n| WHERE score > threshold | ALERT with top\
+      \ contributing features (SHAP/LIME)"
