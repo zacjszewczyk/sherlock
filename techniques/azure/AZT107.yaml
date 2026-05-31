@@ -1,0 +1,426 @@
+name: 'AZT107: Gather Resource Data'
+id: 66136028-eb95-4464-8cc3-015114e9c48c
+description: Investigate whether an adversary is gathering Azure resource data to understand the configuration,
+  sensitivity, or access paths of cloud resources in support of later execution, collection, or impact.
+  This playbook helps an analyst examine broad read, list, and show operations against Azure Resource
+  Manager and service-specific APIs that extract configuration and metadata from compute, networking,
+  storage, identity, and platform services, and to distinguish detailed cloud reconnaissance from routine
+  administration. It then follows how resource-data gathering narrows onto data-bearing or security-relevant
+  services such as storage, key vaults, app configuration, automation, and compute configuration, indicating
+  target prioritization for follow-on abuse or collection. Questions span deterministic symbolic-logic
+  rules (cross-resource read bursts, service-detail chaining, first-seen reads, sensitive-service focus),
+  statistical baselining (read-volume expansion, production/crown-jewel coverage skew, failed-read bursts),
+  and machine-learning models (rare-function, UEBA, and graph-based scoring of identity-to-resource read
+  behavior) so a SOC analyst can detect and triage Azure resource-data reconnaissance.
+type: technique
+related:
+- tactic_id: TA0043
+  tactic_name: Reconnaissance
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a single principal issue a burst of read, list, or show operations spanning many distinct
+    Azure resource providers and resource IDs within a short window, consistent with broad cloud infrastructure
+    or service enumeration?
+  context: This deterministic floor looks for one identity or session performing `Microsoft.*/read`, `az
+    resource show`, `Get-AzResource`, or service-level GET calls across >=3 distinct resource providers
+    AND >=25 distinct resource IDs within a 10-minute window from a single session or source IP. In the
+    Reconnaissance tactic this pattern is the hallmark of an actor mapping the tenant before selecting
+    targets, going well beyond a simple inventory pull. Derive per-tenant count and provider thresholds
+    from the trailing 30-day per-principal distribution (p99) and translate provider read event names
+    into rules using published Sigma cloud rule sets. A positive result is a principal fanning out across
+    the environment in a single burst; keep the rule as a tunable deterministic floor rather than deleting
+    it, and validate against legitimate automation that may legitimately enumerate broadly.
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with 10-minute burst windows and a trailing 30-day per-principal baseline.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'reads = AzureActivity where operation matches ''Microsoft.*/read'' or action in [''az resource
+      show'',''Get-AzResource''] or service_GET=true;
+
+      win = group reads by principal, session_or_ip over 10m;
+
+      alert when distinct(resource_provider) >= 3 and distinct(resource_id) >= 25 and counts > p99(trailing_30d_per_principal);
+
+      output principal, source_ip, provider_count, resource_count, sample_operations.'
+- question: Did a session pivot from generic, subscription- or resource-group-scoped resource listings
+    into detailed configuration reads across multiple resource families, suggesting deliberate operational
+    mapping of the tenant?
+  context: 'Adversaries performing reconnaissance frequently start with broad `*/read` listings at subscription
+    or resource-group scope and then drill into detailed configuration: tags, endpoints, managed identities,
+    diagnostic settings, and network rules. Flag sessions that make this transition across >=3 resource
+    families within one session. This ordered behavior distinguishes an actor building a map of how the
+    tenant is wired (and where control or data lives) from a routine operator working a single resource.
+    Encode it as ordered, Sigma-style sequence rules over AzureActivity. A positive result is a listing-then-detailed-read
+    sequence spanning several families; a negative result is isolated, single-family activity.'
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with per-session sequence correlation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'list_ops = AzureActivity where scope in [''subscription'',''resourceGroup''] and op matches
+      ''*/read'';
+
+      detail_ops = AzureActivity where op reads [tags,endpoints,managedIdentity,diagnosticSettings,networkRules];
+
+      alert when within one session list_ops precede detail_ops across distinct(resource_family) >= 3;
+
+      output principal, session_id, family_sequence, ordered_operations.'
+- question: Did an identity perform a read action or touch a resource type it has never used before in
+    its trailing baseline, especially first-time reads against many providers in one session?
+  context: 'Maintain a per-(principal, role) lookup of historically observed read operations and resource
+    types over a trailing >=30-day baseline, then alert deterministically when an identity issues a read
+    action/resource-type combination never seen before. In the Reconnaissance tactic, novelty is a high-fidelity
+    signal: legitimate administrators tend to revisit the same resources, while an actor exploring a compromised
+    identity reaches into resource types outside the account''s normal footprint. First-time-ever reads
+    against many providers in a single session are especially strong. A positive result is a brand-new
+    action/resource-type pairing (or a cluster of them); validate against genuine role changes or onboarding.'
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with a trailing 30-day per-identity baseline.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'baseline = lookup observed(read_action, resource_type) by principal,role over trailing_30d;
+
+      current = AzureActivity read ops;
+
+      alert when (current.action, current.resource_type) not_in baseline;
+
+      escalate when first_seen_count across providers high in one session;
+
+      output principal, role, new_action, resource_type, session_id.'
+- question: Has a principal's daily volume of distinct resource IDs, provider families, or resource groups
+    read expanded sharply above its own statistical baseline?
+  context: Baseline per actor the daily counts of distinct resource IDs, provider families, and resource
+    groups read, and apply a MAD-based modified Z-score (flag |Mi| > 3.5) rather than mean/stddev so batch
+    automation does not mask genuine outliers. Forecast expected per-window read volume and alert on residual
+    spikes. Include Volume (total read ops, bytes returned where logged), Frequency (reads/min), and State
+    (success vs failure) features. In Reconnaissance this catches an identity whose read footprint suddenly
+    balloons, consistent with enumeration. Sentinel's customizable volume/resource-access anomalies provide
+    a managed implementation; tune thresholds against enterprise baselines. A positive result is a sustained
+    residual or modified Z-score breach.
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with daily per-actor baselining and per-window forecasting.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'features = per actor daily [distinct_resource_ids, distinct_providers, distinct_resource_groups,
+      read_ops, bytes_returned, reads_per_min, success, failure];
+
+      mz = modified_zscore_MAD(features);
+
+      forecast = timeseries_forecast(read_volume per window);
+
+      alert when |mz| > 3.5 or residual > expected_band;
+
+      output principal, feature, observed, expected, mz_score.'
+- question: Is the share of inspected resources belonging to production, regulated, or crown-jewel subscriptions
+    and resource groups abnormally high for this actor or its peer cohort?
+  context: Compute the share of inspected resources that belong to production/regulated subscriptions
+    or crown-jewel resource groups (identified by tag) and compare it to the actor's trailing-30-day norm
+    and to a peer cohort. Escalate when production share or sensitivity-weighted coverage exceeds the
+    actor's p95. During Reconnaissance, an actor disproportionately reading sensitive subscriptions signals
+    targeting of high-value assets rather than incidental administration. Defender for Cloud Apps anomaly
+    policies and Sentinel anomalies can implement this. A positive result is a session whose production/sensitive
+    coverage skews well above the actor's normal mix; a negative result mirrors the actor's usual distribution
+    across environments.
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with a trailing 30-day actor norm and peer-cohort comparison.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'share = inspected_resources with tag in [''production'',''regulated'',''critical''] / all_inspected
+      by session;
+
+      weighted = sum(sensitivity_weight) per session;
+
+      alert when share or weighted > p95(actor trailing_30d) or > peer_cohort_norm;
+
+      output principal, production_share, sensitivity_weight, top_resource_groups.'
+- question: Is a principal generating a burst of AuthorizationFailed or 403 read responses, or an unusually
+    high failed-to-success read ratio, consistent with scripted enumeration of resources it cannot access?
+  context: Profile per-principal AuthorizationFailed/403 read responses as a distinct signal. Scripted
+    enumeration probes resources the identity cannot read, producing failed-read bursts. Alert when the
+    failed-read count or failed:success ratio exceeds the trailing-30-day p99 (for example, >20 AuthorizationFailed
+    reads in 10 minutes). In Reconnaissance, denied reads reveal an actor casting a wide net regardless
+    of granted permissions, which is often noisier and earlier than successful enumeration. A positive
+    result is a spike of denials clustered in time from one identity; validate against misconfigured automation
+    that may legitimately hit permission errors.
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days, with 10-minute failure windows and a trailing 30-day p99 baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'fails = AzureActivity where result in [''AuthorizationFailed'',''403''] and op is read;
+
+      win = count fails by principal over 10m; ratio = fails / successes by principal;
+
+      alert when win > p99(trailing_30d) or ratio > p99(trailing_30d) or win > 20 in 10m;
+
+      output principal, source_ip, failed_count, failed_success_ratio, denied_resources.'
+- question: Does a machine-learning model score an Azure read session as anomalous resource-data harvesting
+    based on rare actions, rare user-action pairs, rare source geography/ASN, and abnormal cross-service
+    read fan-out?
+  context: Score sessions with a rare-function/population model over AzureActivity (rare action, rare
+    user-action pair, rare source geo/ASN) combined with per-entity and peer-group UEBA baselines, and
+    a graph neural network modeling identity->resource read edges to catch abnormal cross-service fan-out.
+    Features include service diversity, distinct-resource count, read depth, production share, first-seen
+    ratio, failed-read ratio, and adjacency to prior identity/role reconnaissance. In Reconnaissance this
+    fuses many weak signals into one risk score that separates routine administration from data harvesting.
+    The alert MUST list the top-3 contributing features (e.g., SHAP attributions) in its text, not just
+    a score, so analysts can validate the driver.
+  answer_sources:
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - AAD/Entra sign-in logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Administrative endpoints querying ARM and service-specific APIs, high-value subscriptions, and
+    resource groups hosting sensitive data or management infrastructure'
+  range: Last 90 days for model training, with per-session scoring.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [service_diversity, distinct_resource_count, read_depth, production_share, first_seen_ratio,
+      failed_read_ratio, prior_recon_adjacency, rare_action, rare_user_action, rare_geo_asn];
+
+      score = ensemble(rare_function_model, peer_UEBA, identity_resource_GNN)(features);
+
+      explain = shap_top3(features);
+
+      alert when score >= threshold; output principal, score, explain, session_summary.'
+- question: Did broad reads transition into detailed inspection of storage settings, key vault metadata
+    or access policies, app configuration values, backup vault properties, or VM extension state, and
+    did the same actor then reach secret or blob data-plane reads?
+  context: Alert when broad reads narrow into detailed inspection of sensitive control-plane configuration
+    (storage settings, key vault metadata/access policies, app configuration values, backup vault properties,
+    VM extension state), and raise severity when the same actor subsequently performs secret or blob data-plane
+    reads visible in KeyVaultAuditEvents and StorageBlobLogs. Pair control-plane reads with data-plane
+    access through cross-plane correlation. In Reconnaissance this shows resource-data gathering narrowing
+    onto data-bearing or security-relevant services, a strong precursor to collection or credential theft.
+    A positive result is a control-plane-to-data-plane progression on sensitive services by one actor.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with cross-plane (control-plane to data-plane) correlation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'cp = AzureActivity reads on [storageSettings,keyVaultPolicy,appConfig,backupVaultProps,vmExtension];
+
+      dp = KeyVaultAuditEvents or StorageBlobLogs where op is secret_get or blob_read;
+
+      alert when same principal does cp then dp; raise_severity when dp present;
+
+      output principal, sensitive_service, cp_ops, dp_ops, timeline.'
+- question: After broad discovery, did an actor focus reads on key vault access policies, blob container
+    ACLs, app configuration, backup vault config, or VM extension settings, indicating selection of resources
+    that enable collection or control?
+  context: Detect focused reads on key vault access policies, blob container ACLs, app configuration,
+    backup vault configuration, or VM extension settings that follow broad discovery, indicating the actor
+    is selecting resources that would enable collection or control. Translate provider event names into
+    Sigma rules. In Reconnaissance this is the narrowing step where an adversary identifies exactly which
+    resources expose secrets, data, or footholds. A positive result is concentrated reads on these access-and-control
+    surfaces after a broad sweep; a negative result is routine config review consistent with the actor's
+    normal duties.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with discovery-to-narrowing sequence correlation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'broad = AzureActivity prior broad ''*/read'' discovery by principal;
+
+      narrow = AzureActivity reads on [keyVaultAccessPolicy,blobContainerACL,appConfig,backupVaultConfig,vmExtensionSettings];
+
+      alert when narrow follows broad by same principal;
+
+      output principal, narrowed_targets, preceding_discovery, sequence.'
+- question: Did an identity perform a first-ever read against a key vault, storage data-plane, or app
+    configuration store it has not touched in the trailing baseline?
+  context: Maintain a per-(principal, sensitive-service) baseline and deterministically alert when an
+    identity performs a first-ever read against a key vault, storage data-plane, or app-config resource
+    it has never touched in >=30 days. In Reconnaissance, first contact with a sensitive service is a
+    high-fidelity novelty signal because access to secrets and data stores is usually tightly scoped to
+    specific principals. A positive result is a brand-new principal-to-sensitive-service pairing; validate
+    against legitimate onboarding, new application deployments, or role changes.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with a trailing 30-day per-identity sensitive-service baseline.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'baseline = observed(sensitive_service) by principal over trailing_30d;
+
+      current = reads where service in [KeyVault, storage_data_plane, appConfig];
+
+      alert when current.service not_in baseline for principal;
+
+      output principal, sensitive_service, resource_id, first_seen=true.'
+- question: Is the proportion of an actor's reads targeting sensitive or control-enabling services such
+    as Key Vault, Storage, automation, and identity abnormally high versus its own norm and peer cohort?
+  context: Measure the proportion of reads targeting sensitive/control-enabling services (Key Vault, Storage,
+    automation, identity) and compare to the actor's norm and peer cohort using a MAD-based modified Z-score
+    (|Mi| > 3.5). Include Frequency (sensitive reads/min) and State (success vs AccessDenied) features.
+    In Reconnaissance, a bias toward high-value services indicates target prioritization rather than broad
+    housekeeping. A positive result is a session whose sensitive-service read share is a statistical outlier
+    for the actor; a negative result tracks the actor's usual service mix.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with actor and peer-cohort baselining.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'share = reads where service in [KeyVault,Storage,automation,identity] / all_reads by actor;
+
+      features = [share, sensitive_reads_per_min, success, access_denied];
+
+      mz = modified_zscore_MAD(features vs actor_norm and peer_cohort);
+
+      alert when |mz| > 3.5; output principal, sensitive_share, mz_score, service_breakdown.'
+- question: Does the business criticality of resources inspected in a session skew toward production,
+    regulated, or critical assets beyond the actor's historical concentration?
+  context: 'Compare the business criticality (tags: production/regulated/critical) of resources inspected
+    in a session against the actor''s history, and alert when the sensitivity-weighted concentration exceeds
+    p95. Forecast expected sensitive-read volume and flag residual spikes. In Reconnaissance this highlights
+    sessions that disproportionately probe crown-jewel resources, a sign of deliberate targeting of mission-critical
+    or regulated data. A positive result is a session with sensitivity concentration above the actor''s
+    p95 or a forecast residual breach; a negative result matches the actor''s normal criticality mix.'
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with per-actor history and sensitive-read forecasting.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'weight = sum(criticality_weight(tag)) for inspected_resources by session;
+
+      alert when weight > p95(actor_history) or forecast_residual(sensitive_reads) > band;
+
+      output principal, session_id, sensitivity_concentration, top_critical_resources.'
+- question: Is a principal producing a burst of Key Vault or Storage 403/Forbidden and AuthorizationFailed
+    responses, or an elevated failed-to-success ratio, indicating enumeration of sensitive resources it
+    cannot access?
+  context: Treat Key Vault/Storage 403/Forbidden and AuthorizationFailed responses as a distinct enumeration
+    signal, and alert when the failed sensitive-read count or failed:success ratio exceeds the trailing-30-day
+    p99. In Reconnaissance, denied reads against secrets and data stores reveal an actor probing high-value
+    services regardless of granted permissions, often before any successful access. A positive result
+    is a clustered spike of denied sensitive reads from one identity; validate against broken automation
+    or expired credentials that may legitimately fail.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days, with a trailing 30-day p99 baseline on sensitive-service failures.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'fails = KeyVaultAuditEvents or StorageBlobLogs where result in [''403'',''Forbidden'',''AuthorizationFailed''];
+
+      win = count fails by principal; ratio = fails/successes by principal;
+
+      alert when win > p99(trailing_30d) or ratio > p99(trailing_30d);
+
+      output principal, failed_sensitive_reads, ratio, denied_resources.'
+- question: Does a sequence or graph machine-learning model distinguish routine administration from adversary
+    target selection by combining resource sensitivity, service progression, first-time access, failed-read
+    ratio, and follow-on data-plane actions into one explainable risk score?
+  context: Apply a sequence/graph model (a dynamic user-service-action GNN) that distinguishes routine
+    administration from adversary target selection by combining resource sensitivity, service progression,
+    first-time access, failed-read ratio, and follow-on data-plane actions into one risk score. Add rare-function
+    scoring over audit logs and peer-group UEBA. In Reconnaissance this captures the full narrowing behavior,
+    from broad discovery to focused selection of data- and control-bearing services. The alert MUST surface
+    the top-3 contributing features (SHAP) so the analyst can validate the driver. A positive result is
+    a high-scoring session whose drivers reflect sensitive-target selection rather than ordinary operations.
+  answer_sources:
+  - StorageBlobLogs
+  - KeyVaultAuditEvents
+  - AzureActivity
+  - Azure resource diagnostic logs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - 'NAI: Storage accounts, key vaults, application configuration stores, automation resources, and subscriptions
+    containing regulated or mission-sensitive data'
+  range: Last 90 days for model training, with per-session scoring.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [resource_sensitivity, service_progression, first_time_access, failed_read_ratio,
+      followon_data_plane, rare_function];
+
+      score = dynamic_user_service_action_GNN(features) + rare_function_score + peer_UEBA;
+
+      explain = shap_top3(features);
+
+      alert when score >= threshold; output principal, score, explain, target_sequence.'
