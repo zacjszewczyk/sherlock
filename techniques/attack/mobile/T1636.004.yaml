@@ -1,0 +1,333 @@
+name: 'T1636.004: SMS Messages'
+id: cf1e9d5a-9076-4ebd-9a61-5f67903ca223
+description: Investigate whether an adversary is collecting and exfiltrating SMS messages from corporate
+  mobile devices and the workstations that sync with them. On Android, the standard route to SMS is the
+  content://sms Content Provider, which requires the dangerous READ_SMS/RECEIVE_SMS permissions normally
+  held only by the default SMS handler; on jailbroken/rooted iOS devices an attacker may read messages
+  directly. This playbook helps an analyst (1) identify Android apps that request, retain, or exercise
+  SMS permissions or content://sms access without being the default SMS handler, including permission-less
+  covert-channel access and proven SMS-source to network-sink data flows; (2) detect anomalous outbound
+  traffic from SMS-capable mobile devices to malicious, low-reputation, rare-ASN, or otherwise anomalous
+  destinations, including low-and-slow exfiltration and egress-failure bursts; and (3) catch host-side
+  staging where mobile-sync tooling (Your Phone / iTunes) spawns network or encoding utilities. It combines
+  symbolic-logic rules, statistical baselining, and machine-learning models across MDM, application-vetting,
+  network (Zeek), and Windows endpoint telemetry.
+type: technique
+related:
+- tactic_id: TA0035
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does a corporate mobile device that runs an application holding READ_SMS/RECEIVE_SMS (per
+    MDM) make outbound connections to domains or IPs on a known-malicious C2 threat-intelligence feed,
+    and do those connections show evidence of data transfer?
+  context: 'This question hunts for the Collection-to-exfiltration handoff: an app with the only standard
+    permissions that grant access to content://sms reaching out to attacker infrastructure. First confirm
+    the device runs an app holding READ_SMS/RECEIVE_SMS from MDM logs — these dangerous permissions should
+    legitimately exist only on the default SMS handler. Then join Zeek dns.log requests from the mobile
+    DHCP range against a curated malicious-C2 feed; for any hit, pivot to conn.log on source IP plus timestamp
+    to confirm a real connection and inspect orig_bytes/resp_bytes to confirm data left the device. A
+    positive result (SMS-capable device + C2 resolution + non-trivial upload) is high-fidelity evidence
+    of SMS exfiltration; a negative result narrows the hunt to anomaly-based methods.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Mobile Device Management (MDM) logs
+  - 'NAI: Corporate Wi-Fi network egress points, VPN concentrators, and the Mobile Device Management (MDM)
+    platform.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "SMS_DEVICES = MDM.devices where app.permission in (READ_SMS, RECEIVE_SMS)\nmalicious = dns.log\
+      \ where id.orig_h in MOBILE_DHCP_RANGE\n  and query in THREATINTEL_C2_DOMAINS\nfor hit in malicious:\n\
+      \  join conn.log on id.orig_h == hit.id.orig_h\n    and ts within [hit.ts, hit.ts+5m]\n  where id.orig_h\
+      \ in SMS_DEVICES.ip and (orig_bytes > 0 or resp_bytes > 0)\n  -> alert(device, hit.query, orig_bytes)"
+- question: Over a rolling window, has any single mobile device uploaded a cumulative volume of bytes
+    to one external (non-corporate) destination that exceeds an analyst-set budget, indicating low-and-slow
+    SMS exfiltration that per-event rules miss?
+  context: 'Per-event volume rules miss patient adversaries who trickle SMS content out in small chunks.
+    Maintain a deterministic per-(device,destination) cumulative byte budget over a rolling window and
+    alert when uploaded bytes to a single endpoint exceed an analyst floor (e.g., 1 MB to a non-corporate
+    ASN in 24h). This applies the lossless-compression information bound: the total information that can
+    have crossed the channel is bounded by cumulative compressed bytes, so a sustained accumulation toward
+    an untrusted ASN is suspicious regardless of how it is paced. A positive result is a device steadily
+    feeding one external endpoint; tune the floor per fleet to balance noise against sensitivity.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Mobile Device Management (MDM) logs
+  - 'NAI: Corporate Wi-Fi network egress points, VPN concentrators, and the Mobile Device Management (MDM)
+    platform.'
+  range: Last 90 days (rolling 24h cumulative windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for (device, dst_asn) in conn.log where dst_asn not in CORP_ASNS:\n  budget[device,dst_asn]\
+      \ += orig_bytes  // rolling 24h window\nalert where budget[device,dst_asn] > FLOOR_BYTES  // e.g.,\
+      \ 1_000_000\n  and device.ip in SMS_CAPABLE_DEVICES"
+- question: Does a mobile device's hourly outbound volume exceed its own seasonally-adjusted 95th percentile
+    while simultaneously communicating with a destination country or ASN that is rare (<5% frequency)
+    for that device?
+  context: Phone traffic is strongly diurnal, so naive volume thresholds drown in time-of-day false positives.
+    Build a 30-day rolling baseline of outbound orig_bytes, destination countries, and destination ASNs
+    per device, and decompose the volume series with Seasonal-Hybrid ESD (STL plus robust median/MAD)
+    to strip the daily cycle. Alert when hourly outbound volume exceeds the device's 95th percentile AND
+    the destination country/ASN is rare for that device. The combination — an unusual spike going somewhere
+    the device rarely talks to — is far more specific than either signal alone, and points to bulk SMS
+    collection being shipped to attacker infrastructure.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Mobile Device Management (MDM) logs
+  - 'NAI: Corporate Wi-Fi network egress points, VPN concentrators, and the Mobile Device Management (MDM)
+    platform.'
+  range: Last 90 days (30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "series = hourly_sum(conn.log.orig_bytes) per device, 30d\nresid = STL_SeasonalHybridESD(series)\
+      \  // remove diurnal cycle\nthresh = p95(device.orig_bytes)\nasn_freq = freq(dst_asn) per device\
+      \ over 30d\nalert where hour.orig_bytes > thresh\n  and asn_freq[dst_asn] < 0.05"
+- question: Is a READ_SMS-capable mobile device generating a burst of failed outbound connections, DNS
+    NXDOMAIN responses, or TLS handshake failures that exceeds its baseline, suggesting attempts to reach
+    a C2 endpoint that is down or being rotated?
+  context: Failure is a first-class signal. An exfiltration client repeatedly trying to reach dead or
+    rotating C2 infrastructure produces a tell-tale burst of blocked/dropped egress connections, DNS NXDOMAIN
+    answers (dns.log), and TLS handshake failures (ssl.log). Count these per device per hour and alert
+    when the rate exceeds the device baseline by a modified Z-score |score|>3.5 (MAD-based, robust to
+    skew). A spike of failed attempts to new external hosts from an SMS-capable device strongly suggests
+    beaconing to infrastructure that is being cycled — an early indicator that often precedes successful
+    exfiltration.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Mobile Device Management (MDM) logs
+  - 'NAI: Corporate Wi-Fi network egress points, VPN concentrators, and the Mobile Device Management (MDM)
+    platform.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = per device,hour count(\n  conn.log where conn_state in (S0,REJ,RSTO)\n  + dns.log\
+      \ where rcode_name == NXDOMAIN\n  + ssl.log where tls_handshake_failed)\nmz = 0.6745*(fails - median(fails))/MAD(fails)\n\
+      alert where abs(mz) > 3.5 and device in SMS_CAPABLE_DEVICES"
+- question: Do machine-learning models of a mobile device's outbound traffic flag anomalous behavior —
+    high autoencoder reconstruction error or Isolation Forest outlier score — driven by features such
+    as bytes to rare ASNs, off-hours activity, or the presence of a READ_SMS-capable app?
+  context: When rules and simple statistics are insufficient, model the device's normal traffic shape.
+    Train a per-device LSTM-autoencoder on bytes sent, packet count, connection duration, destination
+    port, protocol (conn.log), destination TLD (dns.log), and JA3/JA3S (ssl.log), alerting when reconstruction
+    error exceeds a dynamic threshold. In parallel, run an Isolation Forest over per-device vectors (bytes
+    to rare ASNs, distinct external destinations/hour, off-hours ratio, READ_SMS-app present). Every alert
+    must surface its top-3 contributing features (SHAP/LIME) so an analyst can triage why the model fired
+    and tie it back to SMS collection rather than benign app updates or backups.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Mobile Device Management (MDM) logs
+  - 'NAI: Corporate Wi-Fi network egress points, VPN concentrators, and the Mobile Device Management (MDM)
+    platform.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [orig_bytes, pkts, duration, dst_port, proto,\n  dns.tld, ssl.ja3, ssl.ja3s]\n\
+      ae = LSTM_Autoencoder.per_device(features)\nalert where ae.reconstruction_error > dynamic_threshold\n\
+      iso = IsolationForest([bytes_to_rare_asn, distinct_dsts_per_hr,\n  off_hours_ratio, read_sms_app_present])\n\
+      alert where iso.score outlier -> explain top3 (SHAP)"
+- question: On a Windows host, does a known mobile-sync process (PhoneExperienceHost.exe, iTunesHelper.exe)
+    spawn a network or encoding utility (powershell.exe, certutil.exe, bitsadmin.exe, curl.exe), especially
+    with arguments suggesting encoding or transfer?
+  context: A workstation that syncs a phone is a natural staging point for data collected from that phone.
+    Search process-creation events (Windows Event ID 4688) for a parent matching mobile-sync tooling whose
+    child is a LOLBin used for encoding or network transfer — particularly with arguments like -encode,
+    -f, transfer, or embedded URIs/IPs. Legitimate sync software rarely launches certutil or bitsadmin
+    to move data off-host, so such a parent-child chain is a strong signal that collected mobile data
+    (including SMS exports) is being staged or exfiltrated through the workstation. A positive result
+    warrants immediate host triage of the child process command line and network destination.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Employee workstations with mobile device syncing software installed and the centralized log
+    aggregator/SIEM.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EventID==4688 and ParentImage in (PhoneExperienceHost.exe, iTunesHelper.exe)
+
+      and NewProcessName in (powershell.exe, certutil.exe, bitsadmin.exe, curl.exe)
+
+      and CommandLine matches (-encode|-f |transfer|https?://|\d+\.\d+\.\d+\.\d+)
+
+      -> alert'
+- question: For each mobile-sync parent process, is a child process and command-line argument tuple statistically
+    rare (top 99th percentile / Isolation Forest outlier) compared to a 30-day profile of that parent's
+    normal children?
+  context: Even without matching a fixed LOLBin list, anomalous descendants of sync tooling are suspicious.
+    Profile each mobile-sync parent's child processes and command-line arguments over 30 days, compute
+    a rarity score per parent-child-argument tuple, and alert on the top 99th percentile. Use a modified
+    Z-score (MAD, |score|>3.5) so automation-skewed counts do not inflate the baseline, and run an Isolation
+    Forest over the tuple frequency vectors for multivariate rarity. This catches novel staging tooling
+    that a signature would miss, while the rarity framing keeps the false-positive rate manageable on
+    busy endpoints.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Employee workstations with mobile device syncing software installed and the centralized log
+    aggregator/SIEM.'
+  range: Last 90 days (30-day rolling profile)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'profile = freq(parent, child, arg) for parent in SYNC_TOOLS over 30d
+
+      mz = 0.6745*(cnt - median)/MAD per tuple
+
+      alert where rarity(tuple) >= p99 or abs(mz) > 3.5
+
+      iso = IsolationForest(tuple_frequency_vectors)
+
+      alert where iso.outlier'
+- question: Does a supervised classifier label a sync-originated process/command-line chain as 'potential
+    data staging' rather than 'benign sync', based on parent/child names, command-line length and entropy,
+    embedded IPs or encoded strings, and PowerShell script-block n-grams?
+  context: 'Convert host telemetry into a learned verdict. Train a Gradient Boosting / XGBoost model over
+    TF-IDF n-grams of the process/command-line sequence using Windows Event ID 4688/4104 features: parent/child
+    names, command-line length and entropy, presence of IPs or encoded strings, and PowerShell script-block
+    n-grams. Classify each sync-originated chain as ''benign sync'' vs ''potential data staging'' with
+    a risk score, surfacing the top-3 contributing features for analyst review. This complements rules
+    and rarity scoring by generalizing from labeled examples of staging behavior, and the feature attributions
+    let an analyst confirm whether the chain truly handles collected mobile data.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Employee workstations with mobile device syncing software installed and the centralized log
+    aggregator/SIEM.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "X = features(EventID 4688/4104):\n  parent, child, cmd_len, cmd_entropy, has_ip, has_b64,\n\
+      \  powershell_scriptblock_ngrams(TF-IDF)\nmodel = XGBoost.fit(labeled benign_sync vs data_staging)\n\
+      score = model.predict_proba(chain)\nalert where score >= risk_threshold -> explain top3"
+- question: Does any Android app on the corporate fleet declare or hold READ_SMS/RECEIVE_SMS/SEND_SMS
+    while NOT being the device's registered default SMS handler?
+  context: 'The default SMS handler is the only standard role that legitimately needs the dangerous SMS
+    permissions, so any other app declaring or being granted READ_SMS/RECEIVE_SMS/SEND_SMS is immediately
+    suspect. From the Android manifest and the MDM permission-grant feed, alert on such apps and enrich
+    the alert by extracting the app''s restricted/suspicious API calls and embedded URLs (DREBIN-style
+    features). This is the core on-device tripwire for SMS collection: a flashlight or game holding READ_SMS
+    has no benign reason to do so. A positive result should drive app removal, permission revocation,
+    and deeper vetting.'
+  answer_sources:
+  - Mobile Device Management (MDM) logs
+  - Application Vetting (static/dynamic analysis)
+  - Android application manifest
+  - MDM Application Permission events
+  - 'NAI: The MDM/EMM application-inventory and permission-grant feed, and the application-vetting pipeline
+    that analyzes APKs before/while deployed to the corporate fleet.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for app in MDM.app_inventory:\n  perms = manifest(app) ∪ MDM.granted_permissions(app)\n  if\
+      \ perms ∩ {READ_SMS, RECEIVE_SMS, SEND_SMS}\n     and app.package != device.default_sms_handler:\n\
+      \    enrich = {restricted_api_calls(app), embedded_urls(app)}\n    -> alert(device, app, perms,\
+      \ enrich)"
+- question: Does static or dynamic taint analysis of an app reveal a data-flow path that carries data
+    from an SMS source (SmsManager / content://sms) to a network sink?
+  context: A proven source-to-sink data flow is a high-fidelity verdict that does not depend on the declared
+    permission set. In the vetting pipeline, run static taint analysis (FlowDroid) using SUSI source/sink
+    lists to flag any code path carrying data from an SMS source (SmsManager or a content://sms query)
+    to a network sink, and corroborate at runtime with dynamic taint tracking (TaintDroid) that observes
+    the SMS database flowing to a network destination. Because the verdict is the actual flow of SMS content
+    to the network, it is robust against obfuscation and permission tricks; a confirmed flow is strong
+    grounds to classify the app as an SMS stealer.
+  answer_sources:
+  - Mobile Device Management (MDM) logs
+  - Application Vetting (static/dynamic analysis)
+  - Android application manifest
+  - MDM Application Permission events
+  - 'NAI: The MDM/EMM application-inventory and permission-grant feed, and the application-vetting pipeline
+    that analyzes APKs before/while deployed to the corporate fleet.'
+  range: Last 90 days (per app-vetting submission)
+  queries:
+  - technology: App-vetting/pseudocode
+    query: "static = FlowDroid(apk, sources=SUSI.sms_sources,\n  sinks=SUSI.network_sinks)\nif static.path(SmsManager|content://sms\
+      \ -> network):\n  -> alert(app, path)\ndynamic = TaintDroid(run app)\nif dynamic.taint(sms_db ->\
+      \ network_dest):\n  -> confirm high_confidence(app)"
+- question: Is an app that lacks READ_SMS obtaining SMS-derived data indirectly — through IPC or shared/external
+    storage written by a sibling app that does hold the permission?
+  context: 'Adversaries can sidestep permission checks: an app without READ_SMS can still obtain SMS content
+    via covert channels — reading shared/external-storage files or Intents populated by a permissioned
+    sibling app. Add vetting rules for this Reardon-style failure mode: flag apps that read shared-storage
+    files or receive Intents carrying SMS content that originated from a permissioned app. This matters
+    because permission-based controls alone will miss collusion or side-channel access; detecting the
+    indirect path closes a gap that sophisticated actors exploit to keep the collecting app''s permission
+    profile innocuous.'
+  answer_sources:
+  - Mobile Device Management (MDM) logs
+  - Application Vetting (static/dynamic analysis)
+  - Android application manifest
+  - MDM Application Permission events
+  - 'NAI: The MDM/EMM application-inventory and permission-grant feed, and the application-vetting pipeline
+    that analyzes APKs before/while deployed to the corporate fleet.'
+  range: Last 90 days (per app-vetting submission)
+  queries:
+  - technology: App-vetting/pseudocode
+    query: "for app where READ_SMS not in app.permissions:\n  if app reads shared_storage_file written_by(sms_permissioned_app)\n\
+      \     or app receives Intent carrying sms_content:\n    -> alert(app, covert_channel=source_app)"
+- question: Does an app's content://sms query rate or rows-returned exceed its own historical baseline
+    (modified Z-score >3.5), bulk-read the entire inbox in one session, or show a spike in SecurityException/permission-denied
+    SMS calls?
+  context: 'Where on-device telemetry exists, profile each app''s content://sms query rate and rows returned,
+    and alert when reads exceed a modified Z-score of 3.5 (MAD) over the app''s own history or when an
+    app bulk-reads the entire inbox in a single session. Also profile failure state: a spike in SecurityException/permission-denied
+    SMS calls indicates an app probing for access it lacks. Compare each device against fleet peers running
+    the same app set to separate genuinely anomalous behavior from an app-wide update. Sudden bulk reads
+    or persistent access probing are classic SMS-stealer behaviors worth escalating.'
+  answer_sources:
+  - Mobile Device Management (MDM) logs
+  - Application Vetting (static/dynamic analysis)
+  - Android application manifest
+  - MDM Application Permission events
+  - 'NAI: The MDM/EMM application-inventory and permission-grant feed, and the application-vetting pipeline
+    that analyzes APKs before/while deployed to the corporate fleet.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for app: reads = content://sms query_rate, rows_returned
+
+      mz = 0.6745*(reads - median(app.history))/MAD
+
+      alert where abs(mz) > 3.5 or rows_returned >= inbox_size
+
+      fails = count(SecurityException|permission_denied sms calls)
+
+      alert where fails spikes vs baseline; compare device vs fleet_peers'
+- question: Do behavioral ML models flag an app as exhibiting read-then-exfiltrate SMS-stealer patterns
+    — anomalous API/intent/permission profiles, Markov-chain call sequences, or Isolation Forest outlier
+    on READ_SMS+INTERNET co-occurrence and content://sms-to-exfil features?
+  context: Capture the full read-then-exfiltrate behavior with models rather than single signals. Abstract
+    call-graph API sequences into package/family Markov chains (MaMaDroid), combine permission (including
+    SMS), API, and intent features in a DNN (Naway and Li), and ensemble n-gram models over API-call sequences
+    (Wang et al.). Run an Isolation Forest over per-app vectors (READ_SMS+INTERNET co-occurrence, content://sms
+    calls, distinct exfil destinations) and surface the top-3 contributing features per alert. These models
+    generalize across malware families and obfuscation, catching novel SMS stealers whose individual features
+    look benign but whose behavioral sequence reveals collection followed by exfiltration.
+  answer_sources:
+  - Mobile Device Management (MDM) logs
+  - Application Vetting (static/dynamic analysis)
+  - Android application manifest
+  - MDM Application Permission events
+  - 'NAI: The MDM/EMM application-inventory and permission-grant feed, and the application-vetting pipeline
+    that analyzes APKs before/while deployed to the corporate fleet.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "markov = MaMaDroid(callgraph -> family Markov chains)\ndnn = DNN(permissions+API+intents)\
+      \  // Naway & Li\nngram = Ensemble(API_sequence n-grams)  // Wang et al.\niso = IsolationForest([read_sms_and_internet,\
+      \ content_sms_calls,\n  distinct_exfil_dsts])\nalert where any model flags app -> explain top3 features"
