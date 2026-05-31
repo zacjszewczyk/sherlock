@@ -1,0 +1,303 @@
+name: 'AT1023.001: Query RDS'
+id: 1991621a-b327-4d02-b251-cbec660da089
+description: Investigate whether an adversary is conducting cloud service discovery against Amazon RDS
+  by issuing control-plane Describe*/List* queries to enumerate database instances, clusters, snapshots,
+  log files, and security-group configuration. This playbook helps an analyst determine if a principal
+  is mapping managed relational databases and their exposure or recovery paths to select high-value targets
+  for follow-on access, manipulation, data exfiltration, or destruction. It correlates first-party CloudTrail
+  control-plane events (eventSource rds.amazonaws.com) with the volume, frequency, and ordering of read
+  calls per principal; profiles targeting of publicly accessible, backed-up, or sensitively tagged databases;
+  and surfaces permission-probing failure signatures (clustered AccessDenied/UnauthorizedOperation) and
+  novelty signals (first-seen principal/API/region). Methods span symbolic-logic detections, statistical
+  baselining, and machine-learning models to give the SOC granular, defensible coverage of RDS reconnaissance.
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any single principal issue a focused burst of distinct RDS read/describe API calls (for
+    example eight or more DescribeDBInstances, DescribeDBClusters, DescribeDBSnapshots, DescribeDBClusterSnapshots,
+    DescribeDBLogFiles, or DescribeDBSecurityGroups) within a five-minute window, especially shortly after
+    assuming a role, on first-ever account access, or alongside parallel IAM/EC2/S3 discovery?
+  context: In the Discovery tactic, an adversary maps the RDS estate before deciding how to act. A tight
+    cluster of distinct RDS read actions from one identity is a hallmark of deliberate enumeration rather
+    than routine application activity, which typically repeats a small, stable set of calls. Look on CloudTrail
+    events with eventSource=rds.amazonaws.com for one principal (userIdentity.arn / accessKeyId) issuing
+    at least eight distinct RDS read actions in five minutes, and raise confidence when preceded within
+    an hour by sts:AssumeRole, first-ever account access, or simultaneous discovery across other services.
+    Match known recon-tool user agents (Pacu, ScoutSuite, scripted boto3 patterns). Tune the 8-call/5-minute
+    floor to the environment but never remove it. A positive result indicates targeted reconnaissance
+    of managed databases; a negative result favors benign automation or admin browsing.
+  answer_sources: &id001
+  - CloudTrail
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - 'NAI: Amazon RDS control-plane telemetry in production accounts, regions containing sensitive databases,
+    and identities capable of calling describe and list APIs against RDS resources'
+  range: Last 90 days (alert on a 5-minute sliding window; pivot 1 hour before/after)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com"
+
+      | where eventName in ("DescribeDBInstances","DescribeDBClusters","DescribeDBSnapshots","DescribeDBClusterSnapshots","DescribeDBLogFiles","DescribeDBSecurityGroups")
+
+      | bin _time span=5m | stats dc(eventName) as distinct_rds_reads values(eventName) as reads min(_time)
+      as first by userIdentity.arn, userIdentity.accessKeyId, sourceIPAddress, userAgent, _time
+
+      | where distinct_rds_reads >= 8
+
+      | join type=left userIdentity.arn [ search source=cloudtrail eventName="AssumeRole" earliest=-1h
+      ]
+
+      | eval recon_tool=if(match(userAgent,"(?i)pacu|scoutsuite|boto3"),1,0)
+
+      | alert'
+- question: Is the current RDS read activity for a principal a statistical outlier versus its own 30-90
+    day history and its peer-role baseline, across read-call count, distinct-resource count, region fan-out,
+    and snapshot-inspection frequency?
+  context: Reconnaissance during Discovery often manifests as a sudden expansion in how many RDS resources
+    and regions an identity touches relative to its norm. Build 30-90 day per-principal and peer-role
+    baselines for RDS read-call count, distinct-resource count, region fan-out, and snapshot-inspection
+    frequency. Alert when a session exceeds the peer-role 95th percentile or a robust modified Z-score
+    |z|>3.5 (using median absolute deviation, which resists distortion by high-volume automation accounts)
+    on any metric. Apply STL/seasonal-hybrid-ESD decomposition or Prophet forecasting to remove business-hour
+    and batch seasonality so out-of-band bursts surface as residuals. Alert text must name the metric,
+    the principal's baseline, and the observed value. A positive result means the identity is behaving
+    unlike itself and its peers; a negative result indicates volumes consistent with expected operations.
+  answer_sources: *id001
+  range: Last 90 days (baseline 30-90 days; evaluate per session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-90d
+
+      | stats count as read_calls dc(resourceId) as distinct_resources dc(awsRegion) as region_fanout
+      count(eval(match(eventName,"Snapshot"))) as snapshot_reads by userIdentity.arn, session_id
+
+      | eventstats median(read_calls) as med p95(read_calls) as peer_p95 by role
+
+      | eval mad=`median_abs_dev(read_calls)`, mz=0.6745*(read_calls-med)/mad
+
+      | where abs(mz) > 3.5 OR read_calls > peer_p95
+
+      | `stl_decompose_remove_seasonality`
+
+      | eval detail="metric=read_calls baseline=".med." observed=".read_calls | alert'
+- question: Does a per-principal sequence model flag the ordering of RDS discovery actions as improbable,
+    or does an Isolation Forest score the session's feature vector (distinct RDS APIs, resource count,
+    region fan-out, snapshot-read ratio, AccessDenied rate) as anomalous?
+  context: Sophisticated actors interleave benign calls to evade simple thresholds, so model the order
+    and shape of activity rather than raw counts. Train a sequence model (LSTM next-key as in DeepLog,
+    or a GPT-style log model) on ordered per-principal CloudTrail action sequences and flag RDS-discovery
+    orderings whose next-event probability falls outside the top-g predictions; harden against padding/interleaving
+    with critical-behavior-unit modeling. Independently score per-session feature vectors (distinct RDS
+    APIs, resource count, region fan-out, snapshot-read ratio, AccessDenied rate) with Isolation Forest
+    and surface the top-3 contributing features (SHAP) in the alert. A positive result highlights a session
+    whose RDS behavior is structurally unusual and warrants triage; explainable features tie the score
+    back to concrete evidence for analysts.
+  answer_sources: *id001
+  range: Last 90 days (train on 30-90 days of sequences; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Per-principal CloudTrail action sequences -> sequence model + Isolation Forest
+
+      model deeplog_next_key(sequence=ordered_eventName by userIdentity.arn)
+
+      | eval seq_anomaly=(observed_next not in top_g_predictions)
+
+      | featurize session: [distinct_rds_apis, resource_count, region_fanout, snapshot_read_ratio, access_denied_rate]
+
+      | score isolation_forest -> if_score, shap_top3
+
+      | where seq_anomaly==1 OR if_score > threshold
+
+      | emit userIdentity.arn, if_score, shap_top3'
+- question: After enumerating RDS, did the same caller profile public exposure (PubliclyAccessible), snapshot
+    availability, VPC/security-group placement, engine version, or tag metadata for the same databases
+    and then escalate by accessing Secrets Manager/SSM parameters, modifying security groups, or issuing
+    snapshot actions (CopyDBSnapshot, ModifyDBSnapshotAttribute, CreateDBSnapshot)?
+  context: Discovery is most dangerous when it transitions into targeting and action. This question chains
+    RDS enumeration to follow-on reads/actions that profile exposure and recovery paths for the same resource
+    set, then watches for escalation into credential access, network changes, or snapshot exfiltration
+    primitives. Alert when RDS describe activity is followed by profiling of PubliclyAccessible status,
+    snapshot availability, security-group placement, engine version, or tags for the same database set,
+    and escalate if the caller later reads Secrets Manager/SSM, modifies security groups, or performs
+    snapshot share/copy/create against those resources. Chain across services using portable Sigma/cloud
+    rules. A positive result strongly suggests deliberate selection of high-value databases for exploitation;
+    a negative result indicates discovery without observed targeting follow-through.
+  answer_sources: &id002
+  - CloudTrail
+  - AWS Config
+  - 'NAI: RDS instances and clusters with public accessibility, backup retention, or sensitive business
+    tags, along with configuration history that reveals how those databases are exposed and protected'
+  range: Last 90 days (correlate enumeration and follow-on within a 24-hour window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (eventSource="rds.amazonaws.com" OR eventSource IN ("secretsmanager.amazonaws.com","ssm.amazonaws.com","ec2.amazonaws.com"))
+
+      | transaction userIdentity.arn maxspan=24h
+
+      | eval enumerated=match(eventName,"Describe(DBInstances|DBClusters|DBSnapshots)")
+
+      | eval profiled=searchmatch("PubliclyAccessible OR DescribeDBSecurityGroups OR ListTagsForResource")
+
+      | eval escalated=match(eventName,"GetSecretValue|GetParameter|AuthorizeSecurityGroupIngress|ModifySecurityGroup|CopyDBSnapshot|ModifyDBSnapshotAttribute|CreateDBSnapshot")
+
+      | where enumerated AND profiled AND escalated | alert'
+- question: Within a session, is the proportion of queried RDS resources that are production-tagged, public,
+    internet-reachable via attached security groups, or recently snapshotted unusually high compared to
+    the caller's normal distribution and the peer-role 95th percentile?
+  context: Adversaries doing Discovery concentrate on the databases that matter, so the ratio of high-value/exposed
+    resources in a session is itself a signal. Per session, compute the proportion of queried RDS resources
+    that are production-tagged, public, internet-reachable via attached security groups, or recently snapshotted,
+    and compare against the caller's normal distribution using modified Z-score |z|>3.5. Flag sessions
+    with an unusually high concentration on high-value or externally exposed databases relative to the
+    peer-role 95th percentile. Report the exposed-resource ratio and the specific high-value resources
+    in the alert so analysts can immediately assess blast radius. A positive result shows the caller is
+    disproportionately interested in sensitive/exposed databases; a negative result reflects browsing
+    distributed across ordinary resources.
+  answer_sources: *id002
+  range: Last 90 days (baseline 30-90 days; evaluate per session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-90d
+
+      | lookup rds_inventory resourceId OUTPUT is_public, is_prod_tagged, sg_internet_reachable, recently_snapshotted
+
+      | stats count as total sum(eval(is_public OR is_prod_tagged OR sg_internet_reachable OR recently_snapshotted))
+      as high_value by userIdentity.arn, session_id
+
+      | eval exposed_ratio=high_value/total
+
+      | eventstats median(exposed_ratio) as med p95(exposed_ratio) as peer_p95 by role
+
+      | eval mz=0.6745*(exposed_ratio-med)/`mad(exposed_ratio)`
+
+      | where abs(mz) > 3.5 OR exposed_ratio > peer_p95
+
+      | table userIdentity.arn exposed_ratio high_value_resources | alert'
+- question: Do graph-based models flag the discovery session as improbable targeting, for example early-session
+    pivots into broad RDS enumeration, contextually-malicious-but-statistically-benign access, or improbable
+    new user-to-RDS-resource edges?
+  context: Cross-service pivoting and improbable access patterns are best captured with graph models that
+    understand identity, service, and resource relationships. Score discovery sessions with an evolving
+    user-service-activity graph (CS-GAD) to flag early-session pivots into broad RDS enumeration, heterogeneous
+    IAM graph models to catch contextually-malicious-but-statistically-benign targeting, and link prediction
+    to score improbable new user->RDS-resource edges (CyberGraph). Features include resource criticality,
+    public exposure, snapshot presence, query ordering, and correlation with subsequent privilege/collection
+    activity; surface the top-3 contributing features per alert. In the Discovery tactic, a high graph
+    anomaly score indicates an identity reaching into databases it has no historical or contextual reason
+    to touch, which is a strong precursor to collection or impact.
+  answer_sources: *id002
+  range: Last 90 days (build graph over 30-90 days; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Graph-based targeting models over user-service-resource graph
+
+      build_graph(nodes=[user, service, rds_resource], edges=access, window=90d)
+
+      | score cs_gad(session) -> pivot_score
+
+      | score iam_hetero_graph(session) -> context_score
+
+      | score link_prediction(new_edge=user->rds_resource) -> improbable_edge
+
+      | features [resource_criticality, public_exposure, snapshot_presence, query_ordering, followon_priv_collection]
+
+      | where pivot_score>thr OR context_score>thr OR improbable_edge>thr
+
+      | emit userIdentity.arn, shap_top3'
+- question: 'Did a single identity generate a burst of CloudTrail AccessDenied or UnauthorizedOperation
+    errors on rds: actions (for example five or more denials in ten minutes), particularly interleaved
+    with successful Describe* calls or following a recent role assumption?'
+  context: 'Actors using stolen or low-privilege credentials frequently probe permissions blindly, producing
+    clustered authorization failures that are a strong failure-mode indicator of credential/permission
+    enumeration during Discovery. Alert when one identity generates a burst of CloudTrail errorCode=AccessDenied
+    or UnauthorizedOperation on rds: actions (default >=5 denials in 10 minutes). Escalate when denied
+    RDS probes are interleaved with successful Describe* calls (indicating the actor is finding what it
+    can access) or follow recent role assumption. A positive result suggests an identity testing the boundaries
+    of its RDS permissions; a negative result indicates normal, well-scoped access without repeated denials.'
+  answer_sources: &id003
+  - CloudTrail
+  - CloudTrail Lake
+  - 'NAI: RDS control-plane telemetry including CloudTrail errorCode and userAgent fields across production
+    accounts and regions, and per-principal historical API/region baselines used to establish first-seen
+    behavior'
+  range: Last 90 days (alert on a 10-minute sliding window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" (errorCode="AccessDenied" OR errorCode="*UnauthorizedOperation*")
+
+      | bin _time span=10m
+
+      | stats count as denials values(eventName) as denied_actions by userIdentity.arn, _time
+
+      | where denials >= 5
+
+      | join type=left userIdentity.arn [ search source=cloudtrail eventSource="rds.amazonaws.com" errorCode="success"
+      earliest=-10m ]
+
+      | eval escalate=if(isnotnull(successful_describe) OR recent_assume_role,1,0) | alert'
+- question: Is this the first time a given principal has invoked a specific RDS Describe* API or operated
+    from a particular region, and is the principal's AccessDenied-to-success ratio a statistical outlier
+    versus its own baseline?
+  context: 'Novelty is a powerful, low-noise discovery signal: an actor with new or misused credentials
+    often calls RDS APIs or operates from regions the identity has never touched, and probes generate
+    an elevated failure rate. Maintain a per-principal lookback baseline (Athena/inputlookup) of previously
+    invoked RDS APIs and source regions, and alert on first-seen (principal, RDS Describe* API) or first-use-from-region
+    pairs. Separately track each principal''s AccessDenied-to-success ratio and alert when it exceeds
+    its modified Z-score baseline (|z|>3.5), profiling failure rate as a distinct signal. A positive result
+    flags behavior the identity has never exhibited, or an abnormal concentration of failures; a negative
+    result confirms activity consistent with established patterns.'
+  answer_sources: *id003
+  range: Last 90 days (lookback baseline up to 90 days; evaluate per event/session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-90d
+
+      | inputlookup append=t principal_rds_baseline.csv
+
+      | eval first_seen_api=if(NOT [principal,eventName] in baseline_apis,1,0)
+
+      | eval first_seen_region=if(NOT [principal,awsRegion] in baseline_regions,1,0)
+
+      | stats count as total count(eval(errorCode="AccessDenied")) as denied by userIdentity.arn, session_id
+
+      | eval ad_ratio=denied/total
+
+      | eval mz=0.6745*(ad_ratio-`median(ad_ratio)`)/`mad(ad_ratio)`
+
+      | where first_seen_api=1 OR first_seen_region=1 OR abs(mz)>3.5 | alert'
+- question: Do unsupervised rare-API and unusual-geo/source-IP models flag the RDS activity, and does
+    scoring the originating CLI/SDK invocation (for example 'aws rds describe-*') reveal rare command
+    syntax or anomalous host-side process provenance?
+  context: Rare-event and command-line modeling catch reconnaissance that evades thresholds and baselines.
+    Run unsupervised rare-API and unusual-geo/source-IP jobs over CloudTrail with influencer fields surfacing
+    the top contributing features for explainable triage. Score the originating CLI/SDK invocation (e.g.,
+    aws rds describe-*) with a command-line language model to flag rare syntax, and correlate with host-side
+    provenance where AWS CLI/SDK RDS calls terminate anomalous process chains (e.g., MAGIC). Emit the
+    top-3 features (principal, rare action, source geo) in the alert. In the Discovery tactic, a high
+    score points to RDS enumeration originating from an unusual identity, location, or command pattern,
+    which warrants correlation with endpoint provenance to confirm a compromised host or tooling.
+  answer_sources: *id003
+  range: Last 90 days (train ML jobs on 30-90 days; score continuously)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Unsupervised rare-API + unusual-geo/IP + CLI language model
+
+      ml rare_event(field=eventName, influencers=[userIdentity.arn, sourceIPAddress, awsRegion]) -> rare_score
+
+      ml unusual_geo(field=sourceIPAddress) -> geo_score
+
+      score cli_lm("aws rds describe-*") -> rare_syntax_score
+
+      correlate host_provenance(MAGIC) where aws_cli_call terminates anomalous process_chain
+
+      | where rare_score>thr OR geo_score>thr OR rare_syntax_score>thr
+
+      | emit top3=[principal, rare_action, source_geo]'
