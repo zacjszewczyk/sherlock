@@ -1,0 +1,761 @@
+name: 'T1205.002: Traffic Signaling: Socket Filters'
+id: 157bd407-1cb4-4258-9216-b2c65d02dfde
+description: 'Investigate adversary use of socket filters (e.g., libpcap/BPF on Unix-like hosts, WinPcap/Npcap
+  on Windows) to implant a passive, traffic-triggered backdoor for persistence and command and control.
+  Implants such as BPFDoor open no listening port and are invisible to netstat: a process attaches a BPF
+  program to a raw/packet socket, lies dormant, and only acts when a crafted ''magic packet'' that matches
+  the filter arrives — at which point it spawns a reverse/bind shell or beacons back to the trigger source.
+  This playbook helps an analyst hunt the full kill chain across endpoint and network telemetry: (1) the
+  deterministic host floor of raw-socket creation plus filter attach (auditd/eBPF socket()+setsockopt
+  SO_ATTACH_FILTER/SO_ATTACH_BPF, bpf(BPF_PROG_LOAD), /dev/bpf* opens, Windows WFP 5152/5156 filter adds,
+  Sysmon module/driver loads of wpcap/packet/npf); (2) durable host artifacts such as execution from tmpfs
+  (/dev/shm, /tmp, /run), deleted/anonymous binaries, and daemon-name masquerade; (3) the inbound trigger
+  itself in Zeek conn.log (single small one-way packet, rare/high port, exotic protocol, low TTL, fragmentation
+  anomalies, C2-reputation source); and (4) post-activation effects — shell spawns, first outbound connections
+  back to the trigger origin, DGA/NXDOMAIN bursts, anti-forensic log clearing, and periodic beaconing.
+  It supplies symbolic-logic, statistical, and machine-learning methods so a SOC analyst can detect both
+  the dormant implant and its moment of activation across Stealth, Command and Control, and Persistence
+  tactics.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0011
+  tactic_name: Command and Control
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which non-allowlisted processes on Linux/Unix hosts created a raw or packet socket (AF_PACKET/AF_INET,
+    SOCK_RAW) and then attached a BPF program via setsockopt(SO_ATTACH_FILTER/SO_ATTACH_BPF) or bpf(BPF_PROG_LOAD)?
+  context: This is the deterministic floor for socket-filter implants such as BPFDoor, which open no listening
+    port and are therefore invisible to netstat — supporting Persistence and Command and Control while
+    staying Stealthy. Using eBPF (Tracee/Falco) or auditd, look for the syscall chain socket(AF_PACKET|AF_INET,
+    SOCK_RAW) followed by setsockopt with SO_ATTACH_FILTER/SO_ATTACH_BPF or a bpf(BPF_PROG_LOAD), where
+    the executable is NOT on a sniffer allowlist (tcpdump, wireshark/dumpcap, tshark, dhclient, zeek,
+    nmap). A positive match means a non-sniffer program is silently arming itself to watch raw traffic
+    — the exact behavior BPFDoor exhibits. Surface PID, exe path, cap_net_raw, parent process, and user
+    so the analyst can immediately triage provenance; a benign result is typically an allowlisted capture
+    tool or DHCP client.
+  answer_sources:
+  - auditd:SYSCALL
+  - linux:osquery
+  - WinEventLog:Sysmon
+  - 'NAI: Linux servers/workstations with auditd or eBPF agent (Sysmon for Linux / Tracee / Falco), osquery
+    fleet, internet-facing hosts running libpcap'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (auditd:SYSCALL, eBPF, WinEventLog:Sysmon)\n  | where syscall=socket AND (domain=AF_PACKET\
+      \ OR domain=AF_INET) AND type=SOCK_RAW\n  | join same pid/exe where syscall=setsockopt AND optname\
+      \ IN (SO_ATTACH_FILTER, SO_ATTACH_BPF)\n     OR syscall=bpf AND cmd=BPF_PROG_LOAD\n  | where exe\
+      \ NOT IN allowlist(tcpdump,dumpcap,tshark,wireshark,dhclient,zeek,nmap)\n  | emit pid, exe, parent,\
+      \ uid, cap_net_raw, cmdline -> alert"
+- question: Across the fleet, which executables that hold an AF_PACKET/SOCK_RAW socket are statistically
+    rare — below 0.1% environment-wide frequency or never previously seen on that host?
+  context: Legitimate raw-socket use is dominated by a tiny set of capture tools, so a per-host and environment-wide
+    frequency table of raw-socket-capable executables makes implants stand out. Alert when a process holding
+    a raw/packet socket falls below the 0.1% environment frequency, or when it is a never-before-seen
+    executable on that host — treating both the low count (Frequency) and the never-before-seen condition
+    (State) as distinct signals. This rarity baseline catches Stealthy persistence implants that masquerade
+    as ordinary binaries but have no benign history of touching raw sockets. A positive is a rare/new
+    binary with raw-socket capability; benign noise is usually a newly deployed but legitimate monitoring
+    agent, which the analyst confirms against change records.
+  answer_sources:
+  - auditd:SYSCALL
+  - linux:osquery
+  - WinEventLog:Sysmon
+  - 'NAI: Linux servers/workstations with auditd or eBPF agent (Sysmon for Linux / Tracee / Falco), osquery
+    fleet, internet-facing hosts running libpcap'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (auditd:SYSCALL, linux:osquery) where has_raw_socket=true\n  | stats count\
+      \ by exe, host\n  | eventstats sum(count) as total, dc(host) as hosts\n  | eval env_freq = count/total\n\
+      \  | where env_freq < 0.001 OR first_seen_on_host within range\n  | emit exe, host, count, env_freq,\
+      \ first_seen -> alert"
+- question: Do raw-socket process events score as outliers when evaluated by an Isolation Forest over
+    syscall-context features (exe path depth, uid, cap_net_raw, parent name, hour, filter length)?
+  context: Where simple allowlists and frequency tables miss novel tooling, an unsupervised Isolation
+    Forest trained on benign raw-socket process events learns the normal envelope and flags low-score
+    anomalies — e.g., a deleted-binary path, a non-root parent, an atypical hour, or an unusually long
+    filter program. This supports Stealth and Persistence detection by catching implants whose individual
+    attributes look plausible but whose combination is abnormal. Per explainable-NIDS guidance, the alert
+    should emit the top-3 contributing features so the analyst understands why the event scored anomalous.
+    A low anomaly score with suspicious top features warrants host triage; high scores (normal) reflect
+    routine capture activity.
+  answer_sources:
+  - auditd:SYSCALL
+  - linux:osquery
+  - WinEventLog:Sysmon
+  - 'NAI: Linux servers/workstations with auditd or eBPF agent (Sysmon for Linux / Tracee / Falco), osquery
+    fleet, internet-facing hosts running libpcap'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = IsolationForest(features=[exe_path_depth, uid, cap_net_raw, parent_name, hour,\
+      \ filter_len])\n  | score raw_socket_events\n  | where anomaly_score < threshold\n  | emit event,\
+      \ top3_features(shap) -> alert"
+- question: Which processes that hold a raw/packet socket are executing from memory-backed or temporary
+    paths (/dev/shm, /tmp, /var/run), from a deleted/anonymous binary, or under a name that masquerades
+    a system daemon?
+  context: BPFDoor-class implants copy themselves to /dev/shm and run from a deleted binary with a spoofed
+    daemon-like name to achieve Stealthy Persistence. Alert when a process holding AF_PACKET/SOCK_RAW
+    has an executable path under /dev/shm, /tmp, or /var/run, OR whose /proc/<pid>/exe readlink ends with
+    ' (deleted)', OR whose comm masquerades a known daemon while running from a non-package path. This
+    combines raw-socket ownership (capability) with disreputable provenance (artifact). A positive is
+    a strong implant indicator; benign hits are rare and usually involve short-lived scripts or installers
+    running from /tmp, which the analyst can dismiss after confirming they lack a raw socket.
+  answer_sources:
+  - auditd:SYSCALL
+  - WinEventLog:Sysmon
+  - linux:osquery
+  - 'NAI: Linux hosts with eBPF/auditd, osquery process+open-sockets tables, EDR with deleted-executable
+    detection'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (auditd:SYSCALL, linux:osquery) where has_raw_socket=true\n  | where exe_path\
+      \ MATCHES \"^(/dev/shm|/tmp|/var/run|/run)/\"\n     OR exe_readlink ENDSWITH \" (deleted)\"\n  \
+      \   OR (comm IN system_daemon_names AND exe_path NOT IN package_db)\n  | emit pid, comm, exe_path,\
+      \ deleted_flag, uid -> alert"
+- question: Is the per-host-role rate of executions originating from tmpfs/shared-memory paths abnormally
+    elevated (above mean + 3σ), and does any tmpfs execution co-occur with raw-socket ownership?
+  context: In a healthy fleet, executions from tmpfs/shared-memory are near-zero for most host roles,
+    so tracking the per-role rate and alerting beyond mean + 3σ exposes anomalous bursts of memory-resident
+    execution typical of fileless or Stealthy implants. Most importantly, a tmpfs execution that co-occurs
+    with raw-socket ownership is essentially never benign and should alert on its own. This statistical
+    baseline complements the deterministic rule by catching implants that vary their exact path. A positive
+    indicates either a spike of tmpfs execution or the highly specific tmpfs+raw-socket combination; benign
+    spikes correlate with deployment/maintenance windows.
+  answer_sources:
+  - auditd:SYSCALL
+  - WinEventLog:Sysmon
+  - linux:osquery
+  - 'NAI: Linux hosts with eBPF/auditd, osquery process+open-sockets tables, EDR with deleted-executable
+    detection'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=process_exec | eval tmpfs = exe_path MATCHES \"^(/dev/shm|/tmp|/run)/\"\n  |\
+      \ bin _time span=1d | stats count(eval(tmpfs)) as tmpfs_execs by host_role, _time\n  | eventstats\
+      \ mean(tmpfs_execs) as m, stdev(tmpfs_execs) as s by host_role\n  | where tmpfs_execs > m + 3*s\
+      \ OR (tmpfs AND has_raw_socket)\n  | emit host, host_role, tmpfs_execs -> alert"
+- question: Which raw-socket processes fail to fit any benign cluster when their process-provenance features
+    (path class, deleted-flag, comm-vs-path mismatch, uid, capabilities) are clustered with DBSCAN/Isolation
+    Forest?
+  context: Clustering process-provenance features lets benign raw-socket processes form dense groups while
+    implants land as noise points or low-density outliers — useful for Stealthy Persistence hunting where
+    the attacker mimics legitimate binaries. Apply DBSCAN (or Isolation Forest) over features such as
+    path class (package vs tmpfs vs deleted), deleted-flag, comm-vs-path mismatch, uid, and capability
+    set, and surface the top-3 distinguishing features for each isolated point. A process that does not
+    belong to any benign cluster — especially one combining a deleted backing inode with a daemon-spoofed
+    comm — is a prime implant candidate; tightly clustered points are routine and need no triage.
+  answer_sources:
+  - auditd:SYSCALL
+  - WinEventLog:Sysmon
+  - linux:osquery
+  - 'NAI: Linux hosts with eBPF/auditd, osquery process+open-sockets tables, EDR with deleted-executable
+    detection'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = features(path_class, deleted_flag, comm_path_mismatch, uid, caps) for raw_socket_procs\n\
+      \  | DBSCAN(eps, min_samples) -> labels\n  | where label == -1  // noise / no benign cluster\n \
+      \ | emit proc, top3_distinguishing_features -> alert"
+- question: Are there inbound Zeek conn.log records matching a 'magic packet' trigger profile — a single
+    packet (orig_pkts==1), small payload (orig_ip_bytes < 100), one-way state (S0/REJ/OTH), and either
+    a non-standard port (>1024) or a C2-reputation source IP?
+  context: 'The activation packet for a socket-filter backdoor is low-volume and one-way: the implant
+    consumes it via BPF without the OS stack ever completing a handshake, so it appears as a single unanswered
+    small packet. Fire a SIEM rule on conn.log inbound records with orig_pkts==1 and orig_ip_bytes < 100,
+    conn_state in (S0,REJ,OTH), and either a non-standard destination port or a source IP on a C2 intel
+    list — noting that triggers may also piggyback on already-open ports such as HTTP. This is the primary
+    Command and Control trigger signature. A positive is a candidate trigger to correlate with on-host
+    activation; benign matches include scanners and backscatter, which the analyst filters by reputation
+    and target.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors at internet egress/ingress points, Virtual network taps in cloud environments
+    (e.g., VPC Traffic Mirroring), Core network switch SPAN ports'
+  range: Last 90 days; when a candidate is found, pivot to a +/- 15 s host-centered window for on-host
+    activation
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log where local_resp=true\n  | where orig_pkts==1 AND orig_ip_bytes<100 AND conn_state\
+      \ IN (\"S0\",\"REJ\",\"OTH\")\n  | where id.resp_p>1024 OR id.orig_h IN c2_intel_set\n  | emit ts,\
+      \ id.orig_h, id.resp_h, id.resp_p, proto, conn_state -> notice"
+- question: Per host, which inbound connections fall in the bottom 1% of destination-port frequency or
+    more than 3σ below the host's mean packet/byte counts, and which hosts show a spike in S0/REJ/OTH
+    (failed/one-way) ratios?
+  context: Baselining each host's inbound flow attributes (dport, proto, TCP flags, packet/byte counts)
+    turns the rarity and one-way nature of a trigger into a statistical signal even without intel. Alert
+    when a connection uses a bottom-1% port for that host OR is >3σ below the host mean for packets/bytes,
+    and separately profile the S0/REJ/OTH ratio per host so a spike of unanswered single packets is itself
+    flagged. This catches Command and Control triggers that avoid known-bad IPs. A positive is an anomalously
+    rare/small/one-way inbound flow; benign deviations include occasional misconfigured clients, distinguished
+    by repetition and source legitimacy.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors at internet egress/ingress points, Virtual network taps in cloud environments
+    (e.g., VPC Traffic Mirroring), Core network switch SPAN ports'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log inbound | stats count by resp_h, resp_p ; compute port_freq per host\n  | eventstats\
+      \ mean(orig_pkts) as mp, stdev(orig_pkts) as sp,\n               mean(orig_ip_bytes) as mb, stdev(orig_ip_bytes)\
+      \ as sb by resp_h\n  | where port_freq_pct < 0.01 OR orig_pkts < mp-3*sp OR orig_ip_bytes < mb-3*sb\n\
+      \  | timechart ratio(conn_state in S0,REJ,OTH) by resp_h -> flag spikes"
+- question: Do the bytes of small inbound payloads deviate sharply from the per-port/per-length service
+    norm when scored with a PAYL-style 1-gram byte-frequency model (Mahalanobis distance)?
+  context: Crafted trigger bytes rarely look like the legitimate service that normally uses a port. Build
+    PAYL-style per-port, per-length byte-frequency (1-gram) models from benign traffic and score each
+    small inbound payload by Mahalanobis distance from the expected distribution; a high distance means
+    the payload's byte composition is anomalous for that service — exactly what a hand-crafted magic packet
+    looks like, even when piggybacked on an open port. This is a content-aware Command and Control trigger
+    detector. A positive is a payload whose byte histogram diverges from the service norm; benign high-distance
+    results often stem from encrypted or compressed legitimate traffic, which the analyst rules out by
+    service context.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors at internet egress/ingress points, Virtual network taps in cloud environments
+    (e.g., VPC Traffic Mirroring), Core network switch SPAN ports'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  for each inbound payload with len L on port P:\n    model = PAYL[P][L]  // benign 1-gram\
+      \ byte freq + covariance\n    d = mahalanobis(bytefreq(payload), model.mean, model.cov)\n    if\
+      \ d > threshold[P][L]: emit ts, src, dst, P, L, d -> alert"
+- question: Which inbound conn.log flows receive low anomaly scores from an Isolation Forest (or high
+    reconstruction error from a Kitsune autoencoder) trained on benign flow features?
+  context: An unsupervised model over benign conn.log flows (port, proto, duration, byte/pkt counts, flags)
+    learns normal network behavior and flags candidate triggers as low-score (Isolation Forest) or high-reconstruction-error
+    (Kitsune online autoencoder) outliers, catching novel Command and Control trigger patterns that escape
+    fixed thresholds. Surface the top-3 contributing features for each flagged flow to speed triage. A
+    positive is an inbound flow that is anomalous across multiple dimensions at once; benign anomalies
+    (new legitimate services, backups) are confirmed by recurrence and endpoint identity. Kitsune's streaming
+    mode suits line-rate scoring at sensors.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - 'NAI: Network sensors at internet egress/ingress points, Virtual network taps in cloud environments
+    (e.g., VPC Traffic Mirroring), Core network switch SPAN ports'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = IsolationForest|KitsuneAE(features=[port,proto,duration,orig_bytes,resp_bytes,orig_pkts,flags])\n\
+      \  | score inbound conn.log flows\n  | where anomaly_score < thr OR recon_error > thr\n  | emit\
+      \ flow, top3_features -> alert"
+- question: On Windows, which process-creation (4688 / Sysmon EID 1) or module-load (Sysmon EID 7) events
+    reference packet-capture/raw-socket primitives (pcap, libpcap, winpcap, npcap, setsockopt, SO_ATTACH_FILTER,
+    wpcap.dll, packet.dll, npf.sys), especially from user-writable paths?
+  context: Windows socket-filter implants are the analogue of libpcap-based ones, relying on WinPcap/Npcap.
+    Alert when 4688/Sysmon EID 1 command lines contain pcap/libpcap/winpcap/npcap/setsockopt/SO_ATTACH_FILTER,
+    OR Sysmon EID 7 shows wpcap.dll/packet.dll/npf.sys loaded by a process not on a network/security-tool
+    allowlist — particularly when the image runs from C:\Users\, C:\ProgramData\, or C:\Temp\. This supports
+    Persistence and Stealth detection on Windows endpoints. A positive is non-allowlisted capture tooling,
+    often the implant or its loader; benign hits are legitimate sniffers (Wireshark, Nmap) which the analyst
+    confirms by path and signer.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - 'NAI: Endpoint security logs from all workstations and servers, Centralized Windows Event Log collection
+    system, Live memory analysis on suspicious hosts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventID=4688 OR Sysmon EID=1) AND CommandLine MATCHES /(pcap|libpcap|winpcap|npcap|setsockopt|SO_ATTACH_FILTER)/i\n\
+      \  OR (Sysmon EID=7 AND ImageLoaded IN (wpcap.dll, packet.dll, npf.sys) AND Image NOT IN allowlist)\n\
+      \  | where Image MATCHES /^C:\\\\(Users|ProgramData|Temp)\\\\/i\n  | emit Image, CommandLine, ParentImage,\
+      \ User, Signed -> alert"
+- question: Which Windows process launches exceed the 99th percentile of command-line length or Shannon
+    entropy for that NewProcessName, indicating obfuscated or encoded launch strings?
+  context: Implants frequently launch with encoded/obfuscated command lines to evade string matching.
+    Baseline per-NewProcessName command-line length and Shannon entropy and flag launches above the 99th
+    percentile for that executable, which exposes packed or base64-encoded arguments even when the keyword
+    list misses them — a Stealth-defeating statistical complement to the keyword rule. A positive is an
+    unusually long/high-entropy command line for a given binary; benign cases include legitimate tools
+    that pass encoded blobs (some installers, management agents), which the analyst validates by parent
+    and signer.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - 'NAI: Endpoint security logs from all workstations and servers, Centralized Windows Event Log collection
+    system, Live memory analysis on suspicious hosts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  EventID=4688 | eval cl_len=len(CommandLine), cl_ent=shannon_entropy(CommandLine)\n \
+      \ | eventstats perc99(cl_len) as p99_len, perc99(cl_ent) as p99_ent by NewProcessName\n  | where\
+      \ cl_len > p99_len OR cl_ent > p99_ent\n  | emit NewProcessName, CommandLine, cl_len, cl_ent, ParentProcessName\
+      \ -> alert"
+- question: Which Windows process-creation events are isolated as rare raw-socket tooling when DBSCAN/Isolation
+    Forest is applied to features such as parent name, path class, command-line length/entropy, and signer?
+  context: Clustering process-creation features groups routine launches together and isolates rare raw-socket/capture
+    tooling as outliers, catching novel or renamed implants on Windows endpoints (Persistence/Stealth).
+    Use parent name, path class (system vs user-writable), command-line length and entropy, and code-signing
+    status as features; emit the top-3 features driving each outlier score. A positive is a process whose
+    feature combination is unlike normal launches — e.g., an unsigned binary from C:\Temp with a high-entropy
+    command line spawned by an unusual parent; dense-cluster launches are routine and need no action.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - 'NAI: Endpoint security logs from all workstations and servers, Centralized Windows Event Log collection
+    system, Live memory analysis on suspicious hosts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = features(parent_name, path_class, cl_len, cl_entropy, signer) for 4688/EID1 events\n\
+      \  | IsolationForest|DBSCAN -> outliers\n  | emit process, top3_features -> alert"
+- question: On any host, did a single small inbound packet get followed within ~15 seconds by a previously
+    dormant process spawning a shell (cmd/powershell/bash/sh) or opening its first outbound connection
+    — ideally back to the trigger source IP?
+  context: This temporal correlation is the core activation signature of a socket-filter backdoor and
+    ties the Command and Control trigger to on-host effect. Maintain state on suspected trigger packets
+    (single small inbound packet) and alert if, within 15 s on the same host, a dormant process spawns
+    a shell or makes its first outbound connection — strongest when that connection returns to the trigger
+    source IP, matching the BPFDoor activation chain. This correlation is far more specific than either
+    signal alone. A positive is the trigger→activation chain on one host within the window; benign coincidences
+    are rare and easily dismissed when the outbound destination differs from the inbound source.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM capable of correlating endpoint and network logs, Data lake with host and network
+    telemetry, Endpoint Detection and Response (EDR) platform logs'
+  range: Last 90 days; correlate within a 15 s host-centered window around each candidate trigger packet
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  trig = inbound flows where orig_pkts==1 AND orig_ip_bytes<100 (state-stored by host)\n\
+      \  | join host, _time +0..15s with\n     (4688/EID1 where Image IN (cmd,powershell,bash,sh) AND\
+      \ parent_dormant)\n     OR (Sysmon EID3/conn.log first outbound from host)\n  | where outbound.dest\
+      \ == trig.src  // strongest case\n  | emit host, trig.src, child_proc, outbound.dest -> alert"
+- question: After a rare inbound packet, does a host's process-creation or outbound-connection count exceed
+    mean + 3σ within the activation window?
+  context: Activation often produces a measurable burst of child processes and outbound connections where
+    the host was previously quiet. Track per-host process-creation rate and outbound-connection State,
+    and alert when a rare inbound packet is followed by a spawn/outbound count exceeding mean + 3σ within
+    the window — capturing both the Volume and Frequency of triggered execution. This statistical view
+    catches Command and Control activations even when the exact child process or destination varies. A
+    positive is an anomalous post-trigger spike on an otherwise idle host; benign spikes correlate with
+    scheduled jobs or user logons, which the analyst excludes by baseline timing.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM capable of correlating endpoint and network logs, Data lake with host and network
+    telemetry, Endpoint Detection and Response (EDR) platform logs'
+  range: Last 90 days; evaluate the spike within the post-trigger correlation window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline per host: mean/stdev of proc_creates and outbound_conns per minute\n  | on\
+      \ trigger_packet(host,t0): window=[t0, t0+15s]\n  | if count(proc_creates in window) > mean+3*std\
+      \ OR count(outbound in window) > mean+3*std\n  | emit host, t0, spike_counts -> alert"
+- question: Do ordered event sequences (inbound packet → process-create → outbound) score as low-probability
+    activations under an HMM/LSTM trained on normal host sequences?
+  context: Modeling the temporal order of events with an HMM or LSTM captures the implant's distinctive
+    activation sequence — a rare inbound packet immediately followed by a shell spawn and an outbound
+    connection — which is improbable under normal host behavior. Train on benign ordered sequences and
+    flag low-probability transitions, reporting the contributing sequence steps. This sequence-aware ML
+    targets Command and Control activations that individual rules miss. A positive is an ordered chain
+    with very low likelihood; benign low-probability sequences are usually novel-but-legitimate workflows,
+    distinguishable by the absence of a preceding rare inbound trigger.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM capable of correlating endpoint and network logs, Data lake with host and network
+    telemetry, Endpoint Detection and Response (EDR) platform logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  seq_model = HMM|LSTM trained on ordered host event tokens\n  | score sequences [inbound_pkt\
+      \ -> proc_create -> outbound]\n  | where seq_logprob < threshold\n  | emit host, sequence_steps,\
+      \ logprob -> alert"
+- question: Is there inbound traffic using an IP protocol other than TCP/UDP/ICMP toward internal hosts,
+    or Zeek weird.log notices of 'ip_fragmentation_anomaly' or 'possible_split_routing'?
+  context: Because the BPF program — not the OS stack — matches a trigger, socket-filter backdoors can
+    be activated by arbitrary IP protocols that evade stateless firewalls. Fire on conn.log records whose
+    proto is not TCP/UDP/ICMP targeting internal hosts, and monitor weird.log for ip_fragmentation_anomaly
+    or possible_split_routing, since protocol and fragmentation anomalies are viable Command and Control
+    triggers. A positive is exotic inbound protocol traffic or fragmentation weirdness aimed at an internal
+    host; benign cases include legitimate tunneling/clustering protocols (GRE, ESP) which the analyst
+    whitelists per environment.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - 'NAI: Network sensors at the internet border, Sensors monitoring traffic between internal network
+    segments, Cloud provider network logs (e.g., AWS VPC Flow Logs, Azure Network Watcher)'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log where local_resp=true AND proto NOT IN (\"tcp\",\"udp\",\"icmp\")\n  | union\
+      \ (weird.log where name IN (\"ip_fragmentation_anomaly\",\"possible_split_routing\"))\n  | emit\
+      \ ts, id.orig_h, id.resp_h, proto, name -> alert"
+- question: Which inbound packets carry a TTL below the 5th percentile for their origin ASN/country baseline,
+    indicating crafted evasive traffic?
+  context: Crafted trigger packets often have anomalous TTLs because they are hand-built rather than generated
+    by a normal stack and route. Baseline TTL distributions per ASN/country and alert on inbound packets
+    whose TTL falls below the 5th percentile for similar origins, which flags spoofed or manipulated packets
+    used to slip Command and Control triggers past filtering. A positive is an inbound packet with an
+    unusually low TTL for its origin; benign low-TTL traffic can arise from legitimate long network paths
+    or proxies, which the analyst validates against route expectations.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - 'NAI: Network sensors at the internet border, Sensors monitoring traffic between internal network
+    segments, Cloud provider network logs (e.g., AWS VPC Flow Logs, Azure Network Watcher)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  inbound packets | lookup asn,country by src_ip\n  | eventstats perc5(ttl) as p5_ttl\
+      \ by asn\n  | where ttl < p5_ttl\n  | emit ts, src_ip, asn, country, ttl, p5_ttl -> alert"
+- question: Which inbound packets are flagged as boundary/outlier by a one-class SVM / Isolation Forest
+    / Kitsune autoencoder trained on normal inbound traffic (protocol, TTL, packet size, fragmentation
+    flags)?
+  context: A one-class model of normal inbound traffic learns the legitimate envelope of protocol, TTL,
+    packet size, and fragmentation flags, then flags boundary or outlier packets as candidate evasive
+    Command and Control triggers — catching crafted packets that no single threshold would. List the top-3
+    deviating features per flagged packet for triage. A positive is a packet that sits outside the learned
+    normal region across several features at once; benign outliers (new legitimate protocols, MTU edge
+    cases) are confirmed by recurrence and source legitimacy.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - 'NAI: Network sensors at the internet border, Sensors monitoring traffic between internal network
+    segments, Cloud provider network logs (e.g., AWS VPC Flow Logs, Azure Network Watcher)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = OneClassSVM|IsolationForest|KitsuneAE(features=[proto, ttl, pkt_size, frag_flags])\n\
+      \  | score inbound packets\n  | where outlier\n  | emit packet, top3_deviating_features -> alert"
+- question: On Windows, can a permitted-connection (5156) be joined via FilterId to a filter-add (5152)
+    whose creating process (5152 ProcessId → 4688) is unsigned or runs from a temporary path — or on macOS/BSD,
+    did a non-allowlisted process open(/dev/bpf*) and issue BIOCSETF?
+  context: 'Attaching a socket filter leaves platform-specific traces: on Windows, WFP records a filter
+    add (5152) and subsequent permitted connections (5156), while on macOS/BSD the analogue is open(/dev/bpf*)
+    plus BIOCSETF. Join 5156↔5152 via FilterId, map the 5152 ProcessId to its 4688 creation, and alert
+    when the creator is unsigned or runs from atypical paths (C:\Temp\, C:\Windows\Tasks\); on macOS/BSD
+    alert on /dev/bpf* opens with BIOCSETF by non-allowlisted processes. This is the filter-installation
+    evidence for Persistence/Stealth. A positive is an anomalous process installing a packet filter; benign
+    installers are signed security/network products which the analyst allowlists.'
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 5152
+  - Windows Event ID 4688
+  - OpenBSM:AuditTrail
+  - 'NAI: Key servers with Windows Firewall enabled, User endpoints with local firewalls, Centralized
+    Windows Event Log repository, macOS hosts with OpenBSM auditing'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  E5152 = WFP filter-add ; E5156 = WFP permit ; join on FilterId\n  | lookup 4688 by E5152.ProcessId\
+      \ -> creator\n  | where creator.Signed=false OR creator.Image MATCHES /^C:\\\\(Temp|Windows\\\\\
+      Tasks)\\\\/i\n  | union (OpenBSM where event=open(/dev/bpf*) followed_by ioctl=BIOCSETF AND proc\
+      \ NOT IN allowlist)\n  | emit creator.Image, FilterId, host -> alert"
+- question: Which parent-child relationships for WFP/BPF filter creation occur below 0.1% frequency across
+    the environment?
+  context: Filter creation is performed by a small, stable set of programs, so baselining parent-child
+    relationships for WFP/BPF filter creation and flagging pairs below 0.1% environment-wide frequency
+    spotlights unusual filter installers attempting Stealthy Persistence. A positive is a rare process
+    lineage installing a packet filter — e.g., an Office app or script spawning a filter-creating child;
+    benign rare pairs arise from infrequent legitimate tooling, which the analyst confirms against software
+    inventory.
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 5152
+  - Windows Event ID 4688
+  - OpenBSM:AuditTrail
+  - 'NAI: Key servers with Windows Firewall enabled, User endpoints with local firewalls, Centralized
+    Windows Event Log repository, macOS hosts with OpenBSM auditing'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  filter_create_events (WFP 5152 / BPF attach)\n  | stats count by parent_image, child_image\n\
+      \  | eventstats sum(count) as total | eval freq=count/total\n  | where freq < 0.001\n  | emit parent_image,\
+      \ child_image, count, freq -> alert"
+- question: Within a process graph (nodes=processes, edges=filter creation), which processes install filters
+    outside their normal community per Louvain community detection / graph anomaly scoring?
+  context: Representing filter-creation relationships as a graph and applying Louvain community detection
+    (or graph anomaly scoring) reveals processes that install filters outside their normal community structure
+    — a behavioral outlier even when frequency alone looks plausible. This supports Persistence/Stealth
+    hunting by exposing implants whose filter-installation relationships do not match peer processes.
+    Report the top-3 graph features (e.g., cross-community edge, atypical degree). A positive is a process
+    bridging into a community it normally never touches to install a filter; benign cross-community edges
+    are typically administrative tools, validated by role.
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 5152
+  - Windows Event ID 4688
+  - OpenBSM:AuditTrail
+  - 'NAI: Key servers with Windows Firewall enabled, User endpoints with local firewalls, Centralized
+    Windows Event Log repository, macOS hosts with OpenBSM auditing'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = graph(nodes=processes, edges=filter_create)\n  | communities = Louvain(G)\n  | score\
+      \ nodes for cross-community filter edges / anomalous degree\n  | emit process, top3_graph_features\
+      \ -> alert"
+- question: Did a Security log clear (Windows 1102), audit-policy change/disable (Windows 4719), or Linux
+    auditd/service stop occur within five minutes of a rare, low-volume inbound packet (orig_ip_bytes
+    < 100, one-way) from an unusual source IP?
+  context: An implant that activates and then immediately performs anti-forensics ties the Command and
+    Control trigger to a destructive Defense-Evasion effect. Alert when 1102/4719 (or auditd disable)
+    occurs within five minutes of a conn.log record with orig_ip_bytes < 100 and a one-way history from
+    a rare source IP, binding the log clearing to the trigger packet. This correlation is highly specific
+    because routine maintenance rarely follows a rare inbound packet. A positive is anti-forensics shortly
+    after a candidate trigger; benign log clears occur during sanctioned maintenance, distinguishable
+    by change tickets and the absence of a preceding trigger.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 1102
+  - Windows Event ID 4719
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM with correlated data from Domain Controllers, endpoints, and network sensors,
+    Security log archives'
+  range: Last 90 days; correlate within a 5-minute host-centered window after each candidate trigger
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  trig = conn.log inbound where orig_ip_bytes<100 AND conn_state IN (S0,REJ,OTH) AND src\
+      \ rare\n  | join host, _time t0..t0+5m with\n     (EventID IN (1102,4719)) OR (auditd: audit_disable\
+      \ OR service_stop=auditd)\n  | emit host, trig.src, security_event, delta_t -> alert"
+- question: Does a host's rate of critical security events exceed mean + 3σ after it receives an inbound
+    packet from a previously unseen source IP?
+  context: Rather than matching specific anti-forensic events, baseline each host's rate of critical security
+    events and alert when that rate exceeds mean + 3σ following receipt of an inbound packet from a previously
+    unseen source IP. This statistical approach catches a post-trigger burst of security-relevant activity
+    (clears, policy changes, service stops) tied to a novel source — a Defense-Evasion/Command and Control
+    signal. A positive is an abnormal post-packet spike of security events on a host; benign spikes accompany
+    patching or audited admin work, excluded by known-source and change context.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 1102
+  - Windows Event ID 4719
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM with correlated data from Domain Controllers, endpoints, and network sensors,
+    Security log archives'
+  range: Last 90 days; evaluate the rate spike in the window following the inbound packet
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline per host: mean/stdev critical_security_event_rate\n  | on inbound from new_src(host,t0):\
+      \ window=[t0,t0+5m]\n  | if count(critical_sec_events in window) > mean+3*std\n  | emit host, t0,\
+      \ new_src, spike_count -> alert"
+- question: Does a Bayesian network estimate a high posterior P(LogCleared | RareInboundPacket), justifying
+    a prioritized alert?
+  context: A Bayesian network encodes the causal/probabilistic link between a rare inbound packet and
+    a subsequent log-clearing/anti-forensic event, allowing the analyst to compute P(LogCleared | RareInboundPacket)
+    and raise a prioritized alert when the posterior exceeds a high-confidence threshold. Surface the
+    contributing evidence nodes so the analyst sees what drove the score. This probabilistic fusion strengthens
+    Command and Control / Defense-Evasion correlation under uncertainty. A high posterior indicates strong
+    evidence the clearing followed a trigger; low posteriors reflect coincidental or maintenance-driven
+    clears.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 1102
+  - Windows Event ID 4719
+  - auditd:SYSCALL
+  - 'NAI: Centralized SIEM with correlated data from Domain Controllers, endpoints, and network sensors,
+    Security log archives'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  BN nodes: RareInboundPacket, LogCleared, AuditDisabled, NewSrc, TimeDelta\n  | compute\
+      \ posterior P(LogCleared | RareInboundPacket, evidence)\n  | where posterior > high_conf_threshold\n\
+      \  | emit host, posterior, contributing_nodes -> alert"
+- question: Did a single-packet inbound connection (orig_pkts==1, orig_ip_bytes < 64) from a known-C2
+    source IP target a non-standard high-numbered port (>1024) — the 'knock' profile for a dormant C2
+    channel?
+  context: 'The knock that wakes a dormant socket-filter C2 channel is minimal: one packet, tiny payload,
+    high port, from a known-bad origin. Correlate conn.log with a ''Known C2 IPs'' set and alert when
+    a single-packet inbound connection uses a high-numbered port (>1024) with orig_pkts == 1 and orig_ip_bytes
+    < 64. This is a precise Command and Control trigger detector when reliable intel is available. A positive
+    is an intel-backed knock to a high port; benign matches are essentially none when the intel is curated,
+    though stale intel can cause false hits, which the analyst validates against feed freshness.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network sensors at internet perimeter, Threat Intelligence Platform integrated with SIEM, DNS
+    server logs'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log where local_resp=true AND id.orig_h IN known_c2_ips\n  | where orig_pkts==1\
+      \ AND orig_ip_bytes<64 AND id.resp_p>1024\n  | emit ts, id.orig_h, id.resp_h, id.resp_p, proto ->\
+      \ alert"
+- question: Among single-packet inbound events, which destination ports are in the bottom 1% of usage
+    frequency from low-reputation ASNs, and which sources show high unanswered (S0/REJ) ratios?
+  context: Even without exact C2 IPs, the destination ports used for knocks are rare and the connections
+    go unanswered. Compute usage frequency for every destination port in single-packet inbound events
+    and alert on bottom-1% ports originating from low-reputation ASNs, while separately tracking the unanswered
+    (S0/REJ) ratio per source as a distinct failure-state signal. This statistical view surfaces Command
+    and Control knocks to obscure ports. A positive is a rare-port single-packet event from a sketchy
+    ASN, or a source dominated by unanswered packets; benign rare-port traffic usually comes from reputable
+    ASNs and is filtered accordingly.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network sensors at internet perimeter, Threat Intelligence Platform integrated with SIEM, DNS
+    server logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log where orig_pkts==1 | lookup asn_reputation by id.orig_h\n  | stats count by\
+      \ id.resp_p | eventstats sum(count) as tot | eval pf=count/tot\n  | where pf < 0.01 AND asn_reputation=low\n\
+      \  | stats ratio(conn_state in S0,REJ) as fail_ratio by id.orig_h -> flag high\n  | emit src, dport,\
+      \ pf, fail_ratio -> alert"
+- question: Which inbound flows does a gradient-boosting classifier score above 0.95 as a trigger, given
+    features like IP reputation, port rarity, packet/byte counts, and flags?
+  context: A supervised gradient-boosting classifier trained on labeled traffic learns the combined signature
+    of a knock — IP reputation, port rarity, minimal packet/byte counts, and one-way flags — and scores
+    inbound flows accordingly. Alert on scores > 0.95 and output SHAP/top-3 feature attributions so analysts
+    can triage the Command and Control trigger decision. A positive is a high-confidence model classification
+    with interpretable drivers; benign high scores can come from scanners resembling knocks, which the
+    analyst confirms via the attributed features and source behavior.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network sensors at internet perimeter, Threat Intelligence Platform integrated with SIEM, DNS
+    server logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  clf = GradientBoosting(features=[ip_reputation, port_rarity, orig_pkts, orig_ip_bytes,\
+      \ flags])\n  | score inbound conn.log flows\n  | where score > 0.95\n  | emit flow, score, shap_top3\
+      \ -> alert"
+- question: Within 60 seconds of a suspected trigger packet, did the destination host issue DNS queries
+    (Zeek dns.log) matching DGA characteristics (high entropy, long, high digit ratio) or a TI blocklist?
+  context: After activation, a socket-filter implant often resolves its C2 via DGA or blocklisted domains.
+    Correlate suspected trigger packets with same-host dns.log queries and alert if a DNS request within
+    60 s matches a DGA regex or TI blocklist — high Shannon entropy (>3.5), excessive length (>25 chars),
+    or a high number-to-letter ratio. This binds Command and Control resolution to the trigger. A positive
+    is DGA/blocklisted resolution shortly after a candidate trigger on the same host; benign DGA-looking
+    lookups (CDNs, telemetry) are distinguished by reputation and the absence of a preceding trigger.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network sensors monitoring DNS traffic (port 53), Centralized SIEM correlating DNS logs with
+    endpoint process logs, DNS resolver logs'
+  range: Last 90 days; correlate within a 60 s host-centered window after each candidate trigger
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  trig = candidate trigger packets (host,t0)\n  | join host, _time t0..t0+60s with dns.log\
+      \ queries\n  | where query MATCHES dga_regex OR query IN ti_blocklist\n     OR shannon_entropy(query)>3.5\
+      \ OR len(query)>25 OR digit_ratio(query)>0.3\n  | emit host, trig.src, query, entropy -> alert"
+- question: Which DNS queries exceed the 99th entropy percentile, and which hosts show NXDOMAIN bursts
+    beyond mean + 3σ — especially following a suspected trigger?
+  context: DGA channels manifest both as high-entropy domain strings and as bursts of failed (NXDOMAIN)
+    resolutions as the implant cycles candidate domains. Baseline legitimate-domain Shannon entropy and
+    per-host NXDOMAIN rate, then flag queries above the 99th entropy percentile and NXDOMAIN bursts exceeding
+    mean + 3σ — treating failed resolutions as a distinct DGA signal — with priority when they follow
+    a suspected trigger. This statistical view catches Command and Control resolution that evades exact
+    regex. A positive is an entropy/NXDOMAIN spike, strongest post-trigger; benign NXDOMAIN bursts arise
+    from typos or misconfigured clients, excluded by recurrence patterns.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network sensors monitoring DNS traffic (port 53), Centralized SIEM correlating DNS logs with
+    endpoint process logs, DNS resolver logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  dns.log | eval ent=shannon_entropy(query)\n  | eventstats perc99(ent) as p99\n  | where\
+      \ ent > p99\n  | timechart count(eval(rcode==NXDOMAIN)) as nx by host\n  | eventstats mean(nx) as\
+      \ m, stdev(nx) as s by host | where nx > m+3*s -> alert"
+- question: Which domains are flagged as high-perplexity by an Isolation Forest over lexical features
+    and/or an RNN/LSTM character model?
+  context: Stateless lexical features (n-gram frequencies, length, character distribution) feed an Isolation
+    Forest for line-rate scoring without DPI, while an RNN/LSTM character model flags high-perplexity
+    (unpredictable) domain strings characteristic of DGAs. Combine both and emit the top-3 lexical features
+    per flagged domain. This ML view catches Command and Control DGA resolution that fixed thresholds
+    miss. A positive is a domain that is both statistically rare and linguistically improbable; benign
+    hits include random-looking but legitimate CDN/hashed hostnames, which the analyst confirms by reputation
+    and resolution success.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network sensors monitoring DNS traffic (port 53), Centralized SIEM correlating DNS logs with
+    endpoint process logs, DNS resolver logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  if_model = IsolationForest(lexical_features(domain))\n  rnn = CharLSTM perplexity(domain)\n\
+      \  | where if_anomaly OR rnn_perplexity > thr\n  | emit domain, top3_lexical_features -> alert"
+- question: Within ~10 seconds of an inbound connection to a host on a high-numbered port with no known
+    listening service, was a shell (cmd/powershell/sh/bash) created with reverse-shell syntax (e.g., 'powershell
+    -nop -w hidden -enc', 'bash -i >& /dev/tcp/')?
+  context: BPFDoor and similar implants return bind/reverse shells upon receiving their trigger. Alert
+    when conn.log reports an inbound connection on a non-standard port (no known service) and within 10
+    s a 4688/auditd event logs a shell launched with reverse-shell syntax such as '-nop -w hidden -enc'
+    or 'bash -i >& /dev/tcp/'. This directly evidences Command and Control execution following the trigger.
+    A positive is the trigger→reverse-shell chain on one host; benign reverse-shell-like command lines
+    are rare and usually tied to sanctioned admin tooling, distinguishable by user, parent, and the absence
+    of a preceding inbound trigger.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Endpoint EDR/sysmon logs from all hosts, Network sensors at key choke points, Centralized SIEM
+    for correlation'
+  range: Last 90 days; correlate within a 10 s host-centered window after each candidate inbound connection
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  inb = conn.log inbound on high port with no_known_service(host,resp_p)\n  | join host,\
+      \ _time t0..t0+10s with\n     (4688/EID1 OR auditd:execve) where Image IN (cmd,powershell,sh,bash)\n\
+      \     AND CommandLine MATCHES /(-nop -w hidden -enc|bash -i >& \\/dev\\/tcp\\/|sh -i)/i\n  | emit\
+      \ host, inb.src, child_proc, CommandLine -> alert"
+- question: After a suspected trigger, do a host's outbound flows show beacon regularity — low coefficient-of-variation
+    in timing/size or FFT periodicity (RITA-style) — and do SF vs S0/REJ ratios distinguish successful
+    from failed beacons?
+  context: Once activated, an implant typically establishes a periodic Command and Control beacon. After
+    a trigger, evaluate the host's outbound flows for beacon regularity using the coefficient of variation
+    of inter-arrival timing and size, plus FFT periodicity (RITA-style); a low-jitter periodic channel
+    confirms activation, while connection-state ratios (SF vs S0/REJ) distinguish successful beacons from
+    failed attempts. This statistical confirmation elevates confidence that a passive backdoor is now
+    live. A positive is a regular, low-jitter outbound channel emerging post-trigger; benign periodic
+    traffic (NTP, update checks, telemetry) is excluded by destination reputation and known schedules.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Endpoint EDR/sysmon logs from all hosts, Network sensors at key choke points, Centralized SIEM
+    for correlation'
+  range: Last 90 days; analyze outbound flows in the hours following a suspected trigger
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  for host post-trigger: group outbound by dest\n  | compute cv(inter_arrival), cv(bytes),\
+      \ fft_peak(timing)\n  | where cv < cv_thr OR fft_peak_significant\n  | stats ratio(conn_state==SF)\
+      \ vs ratio(S0,REJ) by dest\n  | emit host, dest, cv, periodicity, sf_ratio -> alert"
+- question: Do process-execution graphs reveal anomalous subgraphs/chains (e.g., service → shell → network)
+    that appear only after a suspected trigger?
+  context: Building process-execution graphs and applying subgraph/graph anomaly detection surfaces execution
+    chains — such as service → shell → network connection — that materialize only after a suspected trigger,
+    which is the structural fingerprint of a socket-filter backdoor activating. Report the top-3 anomalous
+    edges/features per detection. This graph-based ML view ties Command and Control execution to its provenance
+    even when individual processes look benign. A positive is a post-trigger chain absent from normal
+    host behavior; benign new chains are usually explained by software updates or admin actions, confirmed
+    by signer and schedule.
+  answer_sources:
+  - Windows Event ID 4688
+  - WinEventLog:Sysmon
+  - Zeek conn.log
+  - auditd:SYSCALL
+  - 'NAI: Endpoint EDR/sysmon logs from all hosts, Network sensors at key choke points, Centralized SIEM
+    for correlation'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = process_execution_graph(host)\n  | detect anomalous subgraphs (service->shell->network)\
+      \ appearing post-trigger\n  | emit host, anomalous_chain, top3_edges -> alert"
