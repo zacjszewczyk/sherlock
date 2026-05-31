@@ -1,0 +1,230 @@
+name: 'D3-ET: Encrypted Tunnels'
+id: bb5756d4-afd9-4956-b63c-92f5b9a112ca
+description: 'This playbook helps an analyst hunt for and investigate encrypted tunnels — encrypted encapsulation
+  of routable network traffic used by adversaries (and unsanctioned insiders) to bypass network controls,
+  exfiltrate sensitive data, and maintain covert command-and-control. It guides investigation of network
+  sessions exhibiting encrypted-tunneling characteristics: deterministic tunnel protocol/port tuples and
+  TLS/SSH handshake signatures, persistent high-volume or byte-asymmetric encrypted channels, periodic
+  beacon/keep-alive cadence, payload entropy on plaintext-expected protocols (DNS/ICMP/HTTP), domain-fronting
+  and SNI/Host mismatch, and tunnel-setup failure spikes that are inconsistent with sanctioned enterprise
+  encrypted services. It layers deterministic signature rules, statistical baselining/periodicity analysis,
+  and machine-learning flow classification, anomaly detection, and clustering so detection survives TLS
+  1.3 with encrypted SNI/certificates. The goal is to isolate active encrypted tunnels at network egress
+  points, internal choke points, and critical servers/endpoints, and to distinguish malicious or unauthorized
+  tunnels from legitimate encrypted traffic.'
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there network sessions to external endpoints that match known encrypted-tunnel protocol,
+    port, and message-size signatures (SSH TCP/22, IPsec IKE UDP/500 and 4500 plus ESP/IP proto 50, OpenVPN
+    UDP/1194, WireGuard UDP/51820 with its fixed 148/92/64-byte handshake messages) and are NOT on the
+    approved-tunnel allowlist?
+  context: 'This is the deterministic detection floor for the Isolate tactic: the most direct way to find
+    an active encrypted tunnel is to match well-known tunnel protocol/port tuples and fixed handshake
+    message sizes. WireGuard in particular emits distinctive 148/92/64-byte handshake messages with a
+    leading message-type byte, making it identifiable even though it is encrypted. The analyst looks for
+    any session carrying these signatures to an external endpoint that is not a sanctioned VPN/tunnel
+    concentrator on the allowlist. A positive result is a candidate unauthorized tunnel to isolate and
+    investigate; a negative result does not clear the host, because adversaries run tunnels on non-standard
+    ports — escalate to the statistical and ML layers. Tune by maintaining the allowlist, never by deleting
+    the port/proto matches.'
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Zeek dns.log
+  - Firewall connection logs
+  - 'NAI: Network egress points, internal network choke points (e.g., core switches), and critical servers/endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  // Deterministic tunnel signature match at egress\n  filter conn.log where (proto==tcp AND\
+      \ id.resp_p==22)\n    OR (proto==udp AND id.resp_p IN (500,4500)) OR (proto==esp /*IP proto 50*/)\n\
+      \    OR (proto==udp AND id.resp_p==1194)\n    OR (proto==udp AND id.resp_p==51820 AND orig_pkt_len\
+      \ IN (148,92,64))\n  where id.resp_h is EXTERNAL\n  and dst NOT IN approved_tunnel_allowlist\n \
+      \ -> alert \"Unauthorized encrypted tunnel signature\""
+- question: Do any TLS or SSH handshakes to external hosts match a known tunnel/implant client fingerprint
+    (JA3/JA3S, JA4/JA4S/JA4SSH), present an absent or self-signed certificate, or carry a rare client
+    fingerprint not seen elsewhere in the enterprise?
+  context: Tunnel and implant client stacks have characteristic TLS/SSH handshakes that can be fingerprinted
+    independently of destination IP or SNI, so this survives infrastructure rotation. Prefer JA4/JA4S/JA4SSH
+    over JA3 because JA3 destabilizes under browser TLS extension randomization, producing false negatives.
+    The analyst maintains deny/allow lists of fingerprints in Zeek ssl.log/ssh.log and alerts when a known-tunnel
+    fingerprint, an absent/self-signed certificate, or a rare client fingerprint contacts an external
+    host. Within the Isolate tactic this lets you attribute a suspicious encrypted flow to a specific
+    client stack and isolate the endpoint. A rare or known-bad fingerprint with a self-signed cert is
+    high fidelity; a common browser fingerprint is likely benign but should still be checked against flow-based
+    methods.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  // Fingerprint-based tunnel/implant detection\n  join ssl.log, ssh.log on uid where id.resp_h\
+      \ is EXTERNAL\n  let fp = coalesce(ja4, ja4s, ja4ssh, ja3, ja3s)\n  if fp IN tunnel_fingerprint_denylist\n\
+      \     OR cert is NULL OR cert.self_signed==true\n     OR count_enterprise_seen(fp) <= rare_threshold\n\
+      \  -> alert \"Tunnel client-stack fingerprint to external host\""
+- question: Are there HTTPS connections where the outer TLS SNI does not match the inner HTTP Host header,
+    or where a rare inner host is hidden behind a common CDN front, indicating a domain-fronted tunnel?
+  context: Domain fronting hides the true destination of an encrypted tunnel by presenting an innocuous,
+    common SNI/front domain in the TLS handshake while the inner HTTP Host header routes the traffic to
+    a different, often rare, backend. The analyst compares the outer SNI against the inner Host header
+    on the same connection and flags mismatches, and additionally surfaces rare inner hosts behind shared
+    CDN fronts. For the Isolate tactic this exposes C2/exfil channels that masquerade as legitimate CDN
+    traffic. Where TLS 1.3 encrypts the SNI and the inner Host cannot be observed, fall back to certificate/destination
+    rarity and the flow-based statistical and ML methods. A mismatch is a strong tunnel indicator worth
+    isolating; matching SNI/Host is normal.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  // Domain-fronting / SNI vs Host mismatch\n  join ssl.log s, http.log h on s.uid==h.uid\n\
+      \  if s.server_name != h.host\n     OR (is_common_cdn(s.server_name) AND count_seen(h.host) <= rare_threshold)\n\
+      \  -> alert \"Domain-fronted tunnel: SNI/Host mismatch\"\n  // TLS1.3 ESNI: fall back to cert/destination\
+      \ rarity + flow methods"
+- question: Which encrypted sessions fall in the extreme upper percentiles for duration and total bytes,
+    and which show strongly asymmetric inbound:outbound byte ratios (e.g., greater than 10:1 outbound)
+    on long-lived flows that look like exfiltration or tunneling rather than balanced web browsing?
+  context: Encrypted tunnels used for exfiltration tend to be long-lived and high-volume, and they often
+    push far more data outbound than they receive, unlike balanced interactive web browsing. The analyst
+    baselines per-role session duration and byte-volume distributions across encrypted traffic, then flags
+    sessions in extreme upper percentiles (e.g., top 5% for both duration and total bytes) and computes
+    the inbound:outbound byte ratio to surface strongly asymmetric outbound flows. Percentile cutoffs
+    should be derived from at least 30 days of conn.log per egress point so they are dataset-specific.
+    In the Isolate context, a long-lived, high-volume, outbound-skewed encrypted flow is a prime candidate
+    tunnel to isolate; short balanced sessions are normal traffic.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  // Long / high-volume / asymmetric encrypted sessions\n  baseline = percentiles(conn.log[last\
+      \ 30d] per role) of duration, orig+resp bytes\n  for session in encrypted_conns:\n    if session.duration\
+      \ >= p95.duration AND total_bytes >= p95.bytes:\n       ratio = orig_bytes / max(resp_bytes,1)\n\
+      \       if ratio > 10 -> alert \"Long asymmetric outbound encrypted tunnel\""
+- question: Do any source-destination pairs show regular beacon/keep-alive cadence — low coefficient of
+    variation in inter-arrival times, low MAD, skewed Bowley distribution, a strong dominant FFT frequency,
+    or recurring connection counts — that indicates automated tunnel/C2 timing rather than human-driven
+    traffic?
+  context: Encrypted tunnels and C2 implants frequently maintain periodic keep-alives or beacons. The
+    analyst computes inter-arrival regularity statistics (coefficient of variation, median absolute deviation,
+    Bowley skewness) and FFT periodicity per source-destination pair to surface this cadence, using multi-stage
+    filtering and whitelist suppression (BAYWATCH/RITA approaches) to remain robust to deliberate jitter.
+    Flows with low CV, a strong dominant FFT frequency, and recurring connection counts are elevated.
+    For the Isolate tactic, identifying a beaconing pair points directly to the endpoint and external
+    host to isolate. Highly regular machine-cadenced timing is suspicious; bursty, irregular human-driven
+    traffic is normal — though sophisticated actors add jitter, so combine with the CT-HMM ML method.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  // Beacon periodicity / jitter analysis per src-dst pair\n  for pair in group(conn.log by\
+      \ id.orig_h,id.resp_h):\n    iat = diff(sorted(ts))\n    cv = stddev(iat)/mean(iat); mad=MAD(iat);\
+      \ skew=bowley(iat)\n    f,power = FFT_dominant(iat)\n    if (cv < 0.1 OR power > thresh) AND conn_count\
+      \ >= recurring_min\n       AND pair NOT IN whitelist\n    -> alert \"Beacon/keep-alive cadence (tunnel/C2)\""
+- question: On plaintext-expected protocols (DNS, ICMP, HTTP), do query volume, sub-domain length/entropy,
+    compressed-size estimates of per-channel information content, or Shannon entropy (greater than 7.0)
+    exceed protocol norms in a way that indicates an encrypted tunnel riding a cleartext channel?
+  context: Adversaries tunnel encrypted payloads inside protocols that are expected to be cleartext —
+    DNS, ICMP, and HTTP — to evade controls. The analyst bounds the surreptitious throughput of each channel
+    by measuring information content via lossless compression (low analyst overhead) and applies Shannon-entropy
+    thresholds (>7.0) to detect encrypted blobs carried on these ports, alerting when query volume, sub-domain
+    length/entropy, or compressed-size estimates exceed protocol norms. For DNS tunneling specifically,
+    long high-entropy sub-domains and abnormal query volume to a single domain are tell-tale. Within Isolate,
+    this catches covert channels that the protocol/port signature rules miss. High entropy on a normally
+    low-entropy channel strongly suggests a tunnel; ordinary text-like, low-entropy DNS/HTTP is benign.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  // Covert throughput / entropy on cleartext-expected protocols\n  for q in dns.log:\n  \
+      \  if entropy(subdomain) > 7.0 OR len(subdomain) > norm\n       OR query_volume_per_domain > p99\
+      \ -> alert \"DNS tunnel suspicion\"\n  for c in icmp/http payloads:\n    if shannon_entropy(payload)\
+      \ > 7.0\n       OR compressed_size_estimate(channel) > protocol_norm\n    -> alert \"Encrypted blob\
+      \ on cleartext channel\""
+- question: Is there a spike in tunnel-setup failure signals — blocked outbound connections (firewall
+    denies), TLS/SSH handshake failures, repeated connection retries, or DNS NXDOMAIN bursts — to a candidate
+    external endpoint, especially immediately preceding a successful long-lived encrypted session?
+  context: 'Tunnel establishment often produces a burst of failures before success: the client retries
+    blocked egress paths, fails handshakes against the wrong port/service, or resolves rotating/dead domains
+    (NXDOMAIN) until one works. The analyst tracks these failure-mode signals as distinct indicators,
+    baselines normal failure rates per egress point, and alerts on deviation. The highest-fidelity pattern
+    is a spike of failed connection attempts to a single external host that is immediately followed by
+    a successful long-lived encrypted session — that sequence is a classic tunnel-establishment fingerprint.
+    For the Isolate tactic, catching this at setup time lets you isolate the endpoint before bulk exfiltration.
+    A failure spike followed by a persistent encrypted flow is strong; isolated failures alone are noise.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  // Tunnel-setup failure-rate profiling\n  per (src,dst_ext) over sliding_window:\n    fails\
+      \ = fw_denies + tls_ssh_handshake_fail + retries + dns_nxdomain\n    if fails > baseline_failrate(egress)*k\n\
+      \       AND exists successful long_lived_encrypted_session(src,dst) AFTER spike\n    -> alert \"\
+      Tunnel-establishment pattern (failure burst -> persistent flow)\""
+- question: Does a supervised flow classifier (trained on time-related flow features such as forward/backward
+    inter-arrival times, active/idle durations, flow bytes/sec, and duration) label any encrypted flow
+    as VPN/tunneled rather than ordinary encrypted traffic — and what are the top-3 features driving that
+    score?
+  context: Because payload inspection is defeated by encryption (and increasingly by TLS 1.3 with encrypted
+    SNI/certificates), a supervised classifier (C4.5/KNN or gradient boosting) trained on payload-agnostic,
+    time-related flow features can separate VPN/tunneled flows from ordinary encrypted traffic. Train
+    and validate on the labeled ISCXVPN2016 corpus. The analyst reviews flows the model scores as tunneled,
+    and the alert must surface the top-3 contributing features (e.g., idle-time ratio, bytes/sec, flow
+    duration) alongside the score so triage is explainable. For the Isolate tactic this provides coverage
+    that survives infrastructure and protocol changes. A high tunnel score with sensible top features
+    warrants isolation and deeper review; a low score with benign features supports clearing the flow.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "  // Supervised VPN/tunnel flow classifier\n  features = [fwd_iat, bwd_iat, active_dur, idle_dur,\
+      \ flow_bytes_per_s, duration]\n  model = gbm_or_c45_knn(trained_on=ISCXVPN2016)  // payload-agnostic\n\
+      \  score = model.predict_proba(flow)\n  if score >= tunnel_threshold:\n    top3 = explain_top_features(model,\
+      \ flow)\n    -> alert \"Flow classified VPN/tunnel\", score, top3"
+- question: Do self-supervised/contrastive representation models over unlabeled flow metadata, or Continuous-Time
+    Hidden Markov Models of beacon timing/state, flag novel encrypted-traffic anomalies or jittered callbacks
+    that defeat fixed-interval beacon rules — and what top-3 features drive each anomaly score?
+  context: Sophisticated actors build custom tunnels with no labeled training samples and add timing jitter
+    to defeat fixed-interval beacon detection. To catch these, the analyst applies self-supervised/contrastive
+    representation learning (ET-SSL) on unlabeled flow metadata to flag encrypted-traffic anomalies without
+    labeled tunnel examples, and models jittered beacon timing/state with Continuous-Time Hidden Markov
+    Models (CT-HMM) to surface callbacks that evade the periodicity rules. These run in parallel with
+    the deterministic and statistical layers, and each anomaly report surfaces the top-3 driving features
+    for triage. For the Isolate tactic this is the safety net for previously unseen tunnels. A strong
+    anomaly with coherent driving features merits investigation and possible isolation; corroborate against
+    the other layers before acting, as unsupervised models can be noisy.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "  // Novel-tunnel anomaly detection (self-supervised + CT-HMM)\n  emb = ET_SSL_encoder(unlabeled_flow_metadata)\
+      \   // contrastive\n  a1 = anomaly_score(emb)\n  a2 = CTHMM_beacon_state_model.score(inter_arrival_times)\
+      \  // jitter-robust\n  if a1 > thr OR a2 > thr:\n    top3 = explain_top_features(flow)\n    -> alert\
+      \ \"Novel/jittered encrypted tunnel anomaly\", a1, a2, top3"
+- question: When encrypted flows are clustered (e.g., DBSCAN) on features such as duration, total/asymmetry
+    byte counts, port, protocol, JA3/JA4 fingerprint, and inter-arrival regularity, do any clusters group
+    recurring patterns consistent with encrypted tunnels and separate them from clustered benign encrypted
+    services?
+  context: Unsupervised clustering groups encrypted flows that behave alike, letting recurring tunnel
+    patterns emerge as distinct clusters separate from clusters of benign encrypted services. The analyst
+    applies DBSCAN (or similar) over flow features — duration, total and asymmetry byte counts, port,
+    protocol, JA3/JA4 fingerprint, and inter-arrival regularity — and surfaces cluster membership plus
+    the distinguishing feature values in alerts so analysts can confirm tunnel behavior. For the Isolate
+    tactic, a tight cluster of long, asymmetric, regularly-timed flows sharing an unusual fingerprint
+    is a strong candidate set of tunnels to isolate together. Membership in a benign, well-understood
+    cluster (e.g., a known SaaS service) supports clearing the flows; membership in an anomalous cluster
+    warrants investigation.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "  // Unsupervised clustering of encrypted flows\n  X = features[duration, total_bytes, byte_asymmetry,\
+      \ port, proto, ja3_ja4, iat_cv]\n  clusters = DBSCAN(eps, min_samples).fit(X)\n  for c in clusters:\n\
+      \    if cluster_profile(c) ~ tunnel(long, asymmetric, regular, rare_fp)\n       AND c NOT IN known_benign_service_clusters\n\
+      \    -> alert \"Encrypted-tunnel behavior cluster\", members, distinguishing_features"
