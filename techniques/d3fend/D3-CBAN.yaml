@@ -1,0 +1,241 @@
+name: 'D3-CBAN: Certificate-based Authentication'
+id: 1058150f-4a74-4d79-a8dc-a45339acfefd
+description: 'This playbook helps an analyst investigate whether certificate-based authentication (D3-CBAN)
+  is consistently enforced across critical systems and whether its implementation harbors misconfigurations
+  or exploitable weaknesses. It guides verification that authentication telemetry confirms certificate
+  mechanisms are actually enforced on designated systems, and surfaces password/fallback logons on certificate-only
+  assets, weak certificate-to-account mappings, certificate validation failures, and the use of revoked
+  or expired certificates. The core principle is that certificate presence is not certificate trust: the
+  verification result and failure codes are the true signals. Using Windows authentication and AD CS events
+  alongside Zeek TLS/x509 telemetry, the playbook combines deterministic symbolic-logic checks (PKINIT
+  certificate-info presence, OCSP/CRL revocation, weak-mapping KDC events, RFC 5280 path validation, AD
+  CS issuance abuse), statistical baselining of authentication and certificate-attribute distributions,
+  and machine-learning anomaly detection to identify hosts and sessions whose enforcement posture is an
+  outlier or whose fallback logons are anomalous.'
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: On systems designated as certificate-only (AAL2/AAL3), are there any successful interactive
+    or network logons (Windows Event ID 4624) whose corresponding Kerberos TGT request (Event ID 4768)
+    lacks populated Certificate Information fields (issuer, serial number, thumbprint)?
+  context: PKINIT certificate logons always populate the Certificate Information fields of the 4768 TGT
+    request per RFC 4556, so a successful 4624 on a certificate-only asset that maps to a 4768 with empty
+    certificate fields indicates a password/fallback logon - a control gap on an asset that NIST SP 800-63B
+    requires to use certificate authentication. A positive result means the certificate policy was bypassed;
+    correlate with prior 4625 certificate-validation failures to detect deliberate fallback abuse. A negative
+    result confirms the host honored its certificate-only policy. This directly supports the Harden goal
+    of confirming enforcement.
+  answer_sources: &id001
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4768
+  - Windows Kerberos-Key-Distribution-Center Event ID 39/40/41
+  - Windows Event ID 4886/4887 (AD CS)
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - 'NAI: Authentication Servers (Domain Controllers, RADIUS, AD CS), Critical Application Servers, VPN
+    Concentrators, mTLS-protected services, Endpoints of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=windows (EventID=4624 OR EventID=4768)\n  | transaction Account_Name, TargetLogonId\
+      \ maxspan=10s\n  | where EventID=4624 AND host IN (cert_only_assets)\n      AND (isnull(CertIssuerName)\
+      \ OR isnull(CertSerialNumber) OR isnull(CertThumbprint))\n  | join type=left Account_Name [search\
+      \ EventID=4625 CertValidation=fail earlier=24h]\n  | table _time, host, Account_Name, LogonType,\
+      \ CertThumbprint"
+- question: Did any TLS session or logon succeed while the presented certificate was reported revoked
+    by OCSP/CRL, or where the revocation status was 'unknown' or the revocation check was skipped (fail-open)?
+  context: 'Revocation must be enforced deterministically (OCSP RFC 6960): a session that completes against
+    a ''revoked'' certificate - or worse, when status is ''unknown'' or the check was bypassed fail-open
+    - means a compromised or retired credential is still being trusted. Parse Zeek ssl.log validation_status
+    together with x509.log not_valid_after and serial to flag revoked, expired, or untrusted-chain certificates
+    on protected services. A positive result is a high-severity trust failure, especially when tied to
+    privileged accounts or management interfaces, and should be escalated. This validates that the Harden
+    control rejects bad certificates rather than merely observing them.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "ssl.log JOIN x509.log ON cert_chain_fuid\n  WHERE established == true\n    AND ( validation_status\
+      \ == \"revoked\"\n          OR validation_status == \"unknown\"\n          OR validation_status\
+      \ == \"\" /* check skipped / fail-open */\n          OR x509.not_valid_after < ts )\n  RETURN ts,\
+      \ id.orig_h, id.resp_h, server_name, validation_status, x509.serial"
+- question: On domain controllers, are certificates authenticating via weak/implicit mappings (UPN, email,
+    or Subject) rather than strong mappings (SID security extension or IssuerSerialNumber), as shown by
+    KDC weak-mapping warnings or denial events (Event ID 39/41, SID mismatch)?
+  context: Per Microsoft KB5014754, weak or implicit certificate-to-account mappings enable certificate
+    forgery and impersonation. Under Compatibility/Audit mode the KDC emits warning events when a certificate
+    authenticates via a weak mapping; under Full Enforcement it denies with Event ID 39/41 or SID-mismatch
+    errors. A positive result identifies accounts still relying on insecure mappings that an attacker
+    could abuse to impersonate principals via a forged or repurposed certificate. Remediation is to establish
+    strong mappings before enabling Full Enforcement. This is central to hardening certificate authentication
+    on Active Directory.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=windows source=\"Kerberos-Key-Distribution-Center\"\n  (EventID=39 OR EventID=41 OR\
+      \ EventID=40 OR MappingType=\"weak\" OR Mapping IN (\"UPN\",\"email\",\"Subject\"))\n  | stats count\
+      \ by host, EventID, Account_Name, CertSubject, MappingType\n  | sort - count"
+- question: Do any certificates used to authenticate to protected services fail RFC 5280 path validation
+    - chaining to an untrusted anchor, violating the validity window, breaching basicConstraints, using
+    a weak key length, or lacking the clientAuth/smartcardLogon EKU - yet still establish a session?
+  context: This re-implements RFC 5280 path validation against observed certificates from Zeek x509.log.
+    A certificate that authenticates without the clientAuth or smartcardLogon EKU, chains to an untrusted
+    root, falls outside its validity window, violates basicConstraints, or uses a weak key, but whose
+    session still establishes, is a fail-open bypass (Georgiev et al.). A positive result means the relying
+    service is not enforcing certificate semantics and accepts invalid credentials. This verifies that
+    the Harden control performs genuine validation rather than accepting any presented certificate.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "x509.log AS c JOIN ssl.log AS s ON s.cert_chain_fuid CONTAINS c.fuid\n  WHERE s.established\
+      \ == true AND s.id.resp_h IN (protected_services)\n    AND ( s.validation_status != \"ok\"\n   \
+      \       OR c.key_length < 2048\n          OR not (\"clientAuth\" in c.ext_key_usage OR \"smartcardLogon\"\
+      \ in c.ext_key_usage)\n          OR c.basic_constraints_ca == true /* leaf marked CA */ )\n  RETURN\
+      \ ts, s.id.orig_h, s.id.resp_h, c.subject, c.key_length, c.ext_key_usage"
+- question: Are AD CS certificate request/issue events (Event ID 4886/4887) producing certificates with
+    clientAuth or Any-Purpose EKU that carry a requester-supplied SAN, are enrolled over the HTTP endpoint,
+    or come from misconfigured templates (ESC1/ESC2/ESC6/ESC8)?
+  context: Such certificates can be used with PKINIT to authenticate as another principal (Certified Pre-Owned,
+    Schroeder & Christensen). Correlating 4886 (request) and 4887 (issue) events for authentication-capable
+    EKUs combined with requester-specified SAN, HTTP-endpoint enrollment (NTLM relay / ESC8), or vulnerable
+    templates surfaces certificate-based privilege escalation paths. A positive result indicates an issued
+    certificate that could impersonate an arbitrary user and demands immediate revocation plus template
+    remediation; audit templates with PSPKIAudit. This hardens the issuance side of certificate-based
+    authentication.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=windows source=\"AD CS\" (EventID=4886 OR EventID=4887)\n  | where (\"clientAuth\" in\
+      \ EKU OR \"Any Purpose\" in EKU OR EKU==\"\")\n      AND (SAN_supplied_by_requester==true OR enrollment_endpoint==\"\
+      HTTP\"\n           OR template IN (vulnerable_templates))\n  | table _time, Requester, template,\
+      \ SAN, EKU, enrollment_endpoint"
+- question: Per NAI and service tier, has the non-certificate authentication ratio (4624 logons lacking
+    4768 Certificate Information versus total logons) exceeded an environment-derived percentile or risen
+    sharply week over week?
+  context: This statistical method computes the proportion of logons that did NOT use a certificate and
+    alerts when it breaches a baseline learned from the environment's own logon-type/method distributions
+    (LANL auth dataset). A rising non-certificate ratio on assets meant to be certificate-only signals
+    erosion of enforcement - new fallback paths, exempted accounts, or misconfiguration. A positive (excursion)
+    result tells the analyst where certificate enforcement is slipping; a stable ratio confirms posture.
+    This supports the Harden objective of measuring enforcement coverage over time.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=windows EventID=4624\n  | eval cert_used=if(isnotnull(linked_4768.CertThumbprint),1,0)\n\
+      \  | bin _time span=1w\n  | stats sum(eval(cert_used==0)) as noncert count as total by NAI, service_tier,\
+      \ _time\n  | eval ratio=noncert/total\n  | eventstats p95(ratio) as p95 by NAI, service_tier\n \
+      \ | where ratio>p95 OR ratio> 1.5*prev_week_ratio"
+- question: Does the volume of TLS validation errors per network segment and service (from ssl.log validation_status)
+    exceed modeled confidence bounds, and which specific failure codes - digest, chain, or revocation
+    - are driving the excursion?
+  context: Modeling expected TLS validation-error volume and triggering on excursions reveals CA misconfiguration,
+    certificate-expiration waves, or active interception. Crucially, digest/chain/revocation failure codes
+    should be tracked as distinct signals rather than aggregated noise - improperly signed certificates
+    fail verification at high rates (Certified Malware, Kim et al.; Georgiev et al.). A positive result
+    narrows whether the spike is operational (an expiry wave) or adversarial (interception/forged signing).
+    This gives the Harden effort an early-warning trend on certificate trust health.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "ssl.log\n  | bin ts span=1h\n  | stats count by segment, server_name, validation_status, ts\n\
+      \  | model expected = movingavg/holtwinters(count) by segment, server_name, validation_status\n\
+      \  | where count > expected + 3*stdev\n  | annotate failure_class = classify(validation_status:\
+      \ digest|chain|revocation)"
+- question: For each protected service, do the certificate-attribute distributions (validity length, issuer,
+    key size, self-signed fraction) from x509.log deviate from their empirical reference distributions
+    - for example a spike in self-signed or abnormally short-validity certificates?
+  context: Baselining per-service certificate attributes and scoring deviations against empirical reference
+    distributions (Durumeric et al.) lets a spike in self-signed certificates or unusually short validity
+    periods on a protected service be quantitatively scored rather than guessed. Such shifts can indicate
+    rogue certificates, an interception appliance, or sloppy issuance undermining the certificate trust
+    model. A high deviation score flags a service whose certificate hygiene has changed and warrants inspection.
+    This supports hardening by detecting drift in the certificates actually presented.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=x509.log\n  | stats avg(validity_days) p50(key_length)\n      sum(eval(self_signed==1))\
+      \ as ss count by service\n  | eval ss_frac=ss/count\n  | lookup baseline_dist service OUTPUT ref_validity\
+      \ ref_keylen ref_ss_frac sd_*\n  | eval z_ss=(ss_frac-ref_ss_frac)/sd_ss_frac, z_val=(validity_days-ref_validity)/sd_validity\n\
+      \  | where abs(z_ss)>3 OR abs(z_val)>3"
+- question: Is the daily count of KDC weak/no-strong-mapping warning events per domain controller trending
+    upward or maintaining a non-zero floor as a measure of certificate-mapping control debt?
+  context: 'Trending the per-DC count of KDC weak-mapping warning events provides a control-debt metric
+    (Microsoft KB5014754): a rising trend or a persistent non-zero floor means accounts are still authenticating
+    via weak certificate mappings and would break - or be exploitable - once Full Enforcement is enabled.
+    A positive result (non-zero/rising) tells the analyst remediation of strong mappings is incomplete;
+    driving the count to zero indicates readiness for enforcement. This is a direct Harden readiness indicator.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=windows source=\"Kerberos-Key-Distribution-Center\" (weak_mapping_warning OR EventID\
+      \ IN (39,40,41))\n  | bin _time span=1d\n  | stats count as warns by host, _time\n  | trendline\
+      \ sma7(warns) as trend\n  | where warns>0 OR trend increasing"
+- question: Which hosts are outliers in overall certificate-enforcement posture when scored by an unsupervised
+    model over features such as non-certificate auth ratio, validation-failure counts, certificate-age
+    statistics, weak-mapping KDC-event counts, and privileged-access volume?
+  context: An unsupervised per-host model (Extended Isolation Forest, Hariri et al.) trained on tabular
+    enforcement features identifies hosts whose certificate posture is an outlier relative to peers, catching
+    combinations of weaknesses that no single deterministic rule would. Run it in parallel with the deterministic
+    floor (the symbolic-logic checks above) so it augments rather than replaces them, and emit the top-3
+    contributing features via Shapley attribution for triage. A high anomaly score directs the analyst
+    to the worst-enforced hosts. This supports the Harden objective of prioritizing remediation.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = per_host[noncert_ratio, validation_failures,\n                      cert_age_mean,\
+      \ cert_age_stdev, weak_mapping_events,\n                      privileged_access_volume]\n  model\
+      \ = ExtendedIsolationForest().fit(features)\n  scores = model.anomaly_score(features)\n  alert hosts\
+      \ where scores > threshold\n  attach top3 = SHAP(model, host_features)"
+- question: For mTLS/TLS-protected services where payload is opaque, are there sessions whose handshake
+    and certificate-presentation metadata are out-of-distribution from the peer's normal profile - for
+    example an mTLS endpoint negotiating without a client certificate or presenting an anomalous one?
+  context: Self-supervised anomaly detection over handshake/certificate-presentation metadata (ET-SSL)
+    flags sessions that deviate from a peer's learned normal profile when content cannot be inspected.
+    An mTLS endpoint suddenly negotiating without a client certificate, or presenting a certificate unlike
+    its history, is a strong sign of misconfiguration or impersonation. This complements the deterministic
+    validation rules by catching subtle metadata shifts. A positive result identifies sessions worth correlating
+    with the validation and revocation checks above, hardening trust on encrypted services.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "meta = ssl_handshake_features[ja3, ja3s, client_cert_present,\n                          \
+      \      cipher, ext_order, cert_issuer, cert_keylen]\n  model = SelfSupervisedAnomalyDetector().fit(meta\
+      \ per peer)\n  alert sessions where ood_score(meta) > threshold\n      OR (peer.expects_client_cert\
+      \ AND client_cert_present==false)"
+- question: On an account that normally authenticates with a certificate, has a first-time non-certificate
+    or fallback logon occurred, as flagged by a sequence or authentication-graph model of enterprise logon
+    behavior?
+  context: An auth-sequence/graph model trained on enterprise authentication logs (validated against the
+    LANL User-Computer Authentication Dataset) detects when an account that customarily uses a certificate
+    suddenly performs a non-certificate or fallback logon for the first time - a behavioral signal of
+    credential abuse or enforcement bypass that a static rule may miss. Surface the top contributing features
+    in the alert for fast triage. A positive result highlights an anomalous fallback worth investigating
+    against the deterministic bypass and revocation checks. This strengthens the Harden goal by catching
+    behavioral deviations from certificate-based norms.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "seq = per_account ordered_auth_events[time, method, src, dst, logon_type]\n  model = AuthSequenceModel().fit(seq)\
+      \  /* baseline normal per account */\n  alert when account.usual_method==\"certificate\"\n     \
+      \ AND new_event.method != \"certificate\"\n      AND first_occurrence(account, fallback)\n  attach\
+      \ top_features = SHAP(model, new_event)"
