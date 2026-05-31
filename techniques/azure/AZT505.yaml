@@ -1,0 +1,224 @@
+name: 'AZT505: Scheduled Jobs'
+id: 0e89a3e6-2c36-4cd0-a690-3c74ea322f0b
+description: This playbook helps an analyst investigate whether an adversary established persistence in
+  Azure by scheduling a runbook or related automation job so privileged code executes at a defined interval
+  without further interaction. It focuses on Automation Accounts where a schedule asset is created or
+  linked to a runbook so the account regularly executes code that can restore access, modify credentials,
+  reassign roles, alter policy/network controls, or reapply malicious configuration after cleanup attempts
+  or password resets. Because the privilege of the recurring job derives from the runbook's RunAs/managed-identity
+  context, the playbook couples deterministic schedule- and runbook-write detection rules with cadence/volume
+  baselining and behavioral modeling of the downstream privileged actions. It guides examination of Azure
+  Activity operations (schedule create/link, runbook draft write and publish, job write), AzureDiagnostics
+  JobLogs/JobStreams, and identity sign-in telemetry to separate benign business automation from attacker-chosen
+  persistence.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Was an Automation schedule asset (Microsoft.Automation/automationAccounts/schedules/write)
+    created or updated with a Succeeded status and linked to a runbook that performs sensitive administrative
+    actions (writing credentials, role assignments, policy objects, or network controls) on a recurring
+    basis?
+  context: 'This question targets the core of AZT505 persistence under the Persistence tactic: an adversary
+    creates or links a schedule so a runbook executes privileged code at a fixed cadence. Deterministically
+    flag successful schedule create/update operations and correlate them with runbooks that perform sensitive
+    operations using the legitimate recurrence semantics (one-time/hourly/daily/weekly/monthly). Escalate
+    when a newly scheduled runbook writes credentials, role assignments, policy objects, or network controls
+    soon after schedule creation. Record Caller, CallerIpAddress, and the principal type (interactive
+    user vs ServicePrincipal/ManagedIdentity). A positive result is a recently scheduled runbook whose
+    downstream actions re-establish access or modify security posture; a negative result is a schedule
+    tied to benign, well-known operational automation.'
+  answer_sources: &id001
+  - AzureActivity
+  - AzureDiagnostics
+  - AADManagedIdentitySignInLogs
+  - AADServicePrincipalSignInLogs
+  - AuditLogs
+  - 'NAI: Automation Accounts; schedule asset create/link operations (Microsoft.Automation/automationAccounts/schedules/write)
+    and runbook draft write/publish in the Azure Activity log; job-execution operations (.../jobs/write);
+    AzureDiagnostics JobLogs/JobStreams (RunbookName_s, ResultType, JobId_g); and scheduled runbook executions
+    that touch identity, authorization, network, or secret-management resources'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "AzureActivity\n| where OperationNameValue =~ 'Microsoft.Automation/automationAccounts/schedules/write'\n\
+      | where ActivityStatusValue == 'Success'\n| project ScheduleTime=TimeGenerated, Caller, CallerIpAddress,\
+      \ _ResourceId, PrincipalType=identityType\n| join kind=inner (\n    AzureActivity | where OperationNameValue\
+      \ has 'Microsoft.Authorization/roleAssignments/write'\n       or OperationNameValue has 'secrets/write'\
+      \ or OperationNameValue has 'networkSecurityGroups/write'\n    ) on $left._ResourceId == $right._ResourceId\n\
+      | where DownstreamTime between (ScheduleTime .. ScheduleTime + 24h)\n| extend severity = iff(PrincipalType\
+      \ in ('ServicePrincipal','ManagedIdentity'), 'high', 'medium')"
+- question: Did a new schedule write operation get followed by repeated job creation (.../jobs/write)
+    on a runbook that previously had no cadence or had been dormant, reconstructing a schedule -> recurring-job
+    execution chain?
+  context: Under Persistence, attackers turn a previously dormant or unscheduled runbook into a recurring
+    job. Reconstruct the schedule->recurring-job chain by linking Microsoft.Automation/automationAccounts/Schedules/write
+    to subsequent repeated .../jobs/write events, and corroborate with AzureDiagnostics JobLogs/JobStreams
+    (RunbookName_s, ResultType, JobId_g). Treat the first scheduled recurrences plus privileged downstream
+    actions within the same JobId as concrete persistence evidence. A positive result is a runbook newly
+    placed on a cadence and executing repeatedly with privileged effect; a negative result is expected
+    periodic automation already present in the baseline.
+  answer_sources: *id001
+  range: Last 90 days; pivot +/- 7 days around the schedule write to capture the first recurrences
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "let sched = AzureActivity\n  | where OperationNameValue =~ 'Microsoft.Automation/automationAccounts/Schedules/write'\
+      \ and ActivityStatusValue=='Success';\nlet jobs = AzureActivity | where OperationNameValue has '/jobs/write';\n\
+      sched | join kind=inner jobs on _ResourceId\n| summarize jobCount=count(), firstJob=min(JobTime),\
+      \ lastJob=max(JobTime) by RunbookName=_ResourceId, ScheduleTime\n| where jobCount >= 2\n| join kind=leftouter\
+      \ (\n    AzureDiagnostics | where Category in ('JobLogs','JobStreams')\n    | project JobId_g, RunbookName_s,\
+      \ ResultType\n  ) on $left.RunbookName == $right.RunbookName_s\n| where toscalar(prior_cadence(RunbookName))\
+      \ == 0   // runbook was dormant / had no cadence before"
+  - technology: Zeek/pseudocode
+    query: "# Corroborate from job telemetry: link JobId across recurrences\nAzureDiagnostics where Category\
+      \ in {JobLogs, JobStreams}\n  group by RunbookName_s, JobId_g\n  emit recurrence_count, distinct\
+      \ ResultType set, downstream_privileged_action flag"
+- question: Do detection-as-code rules on Azure Activity operation names show schedule create/link, runbook
+    draft write (.../runbooks/write), or runbook publish (.../runbooks/publish/action) by an unusual principal,
+    IP/geo, or service identity (excluding built-in AzureAutomationTutorial* runbooks)?
+  context: This deterministic floor catches the write operations that establish scheduled persistence.
+    Apply rules to Azure Activity operation names for schedule create/link, runbook draft write, and runbook
+    publish, excluding built-in AzureAutomationTutorial* runbooks to reduce noise. Raise severity when
+    the schedule/runbook is created by a principal with no prior Automation history, from an unusual IP/geo,
+    or by a ServicePrincipal/ManagedIdentity that does not normally administer Automation. A positive
+    result is a sensitive write by an out-of-pattern identity; a negative is a known administrator performing
+    expected publishing within normal operations.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "AzureActivity\n| where OperationNameValue in~ (\n    'Microsoft.Automation/automationAccounts/schedules/write',\n\
+      \    'Microsoft.Automation/automationAccounts/runbooks/write',\n    'Microsoft.Automation/automationAccounts/runbooks/publish/action')\n\
+      | where _ResourceId !has 'AzureAutomationTutorial'\n| where ActivityStatusValue == 'Success'\n|\
+      \ extend isNewActor = Caller !in (known_automation_admins)\n| extend isOddGeo = CallerIpAddress\
+      \ !in (known_admin_ips)\n| where isNewActor or isOddGeo or identityType in ('ServicePrincipal','ManagedIdentity')\n\
+      | project TimeGenerated, OperationNameValue, Caller, CallerIpAddress, identityType, _ResourceId"
+- question: Does the recurrence interval, jobs/hour volume, distinct target-resource count, or creation
+    time of a runbook schedule deviate from the Automation Account's historical baseline (exceeding the
+    95th percentile or a modified Z-score |Mi| > 3.5)?
+  context: Statistical baselining separates benign periodicity from attacker-chosen cadence. Baseline
+    runbook scheduling frequency, recurrence interval, creator identity, and downstream privilege scope
+    for each Automation Account. Model the recurrence interval of legitimate scheduled jobs with autocorrelation/inter-arrival
+    regularity, and set robust thresholds using the median/MAD modified Z-score (flag |Mi| > 3.5). Flag
+    schedules whose Volume (jobs/hour, distinct target resources), Frequency (recurrence interval), creation
+    time, or target runbook behavior exceeds the account's historical 95th percentile or deviates from
+    normal operations. A positive result is a statistically anomalous cadence or volume; a negative result
+    falls within established periodic norms.
+  answer_sources: *id001
+  range: Last 90 days (use trailing 90-day window as baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'AzureActivity
+
+      | where OperationNameValue has ''Automation'' and OperationNameValue has ''/jobs/write''
+
+      | summarize jobsPerHour=count(), distinctTargets=dcount(targetResource) by AutomationAccount=_ResourceId,
+      bin(TimeGenerated,1h)
+
+      | summarize med=percentile(jobsPerHour,50), mad=stdev(jobsPerHour), p95=percentile(jobsPerHour,95)
+      by AutomationAccount
+
+      | extend modZ = 0.6745 * (jobsPerHour - med) / mad
+
+      | where abs(modZ) > 3.5 or jobsPerHour > p95'
+- question: Is this the first time a given principal has created an Automation schedule or published a
+    runbook, and does observed job/runbook-write volume exceed what a seasonal time-series forecast predicts?
+  context: Per-principal first-seen baselining catches identities branching into Automation administration
+    for the first time, a common persistence setup step. Flag an identity that has never created Automation
+    schedules or published runbooks, and forecast expected job/runbook-write volume with seasonal time-series
+    models, alerting on large residuals. Complement with Sentinel built-in volume and rare-operation anomalies.
+    A positive result is a never-before-seen author combined with anomalous write volume; a negative result
+    is an established author within forecast bounds.
+  answer_sources: *id001
+  range: Last 90 days (baseline) with forecast over the most recent 7-14 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "let hist = AzureActivity\n  | where OperationNameValue in~ ('.../schedules/write','.../runbooks/publish/action')\n\
+      \  | summarize firstSeen=min(TimeGenerated) by Caller;\nAzureActivity\n| where OperationNameValue\
+      \ in~ ('.../schedules/write','.../runbooks/publish/action')\n| join kind=inner hist on Caller\n\
+      | where TimeGenerated == firstSeen   // first-ever such op for this principal\n| union (\n    AzureActivity\
+      \ | make-series writes=count() default=0 on TimeGenerated step 1d by _ResourceId\n    | extend (anom,score,baseline)=series_decompose_anomalies(writes)\n\
+      \    | mv-expand anom to typeof(double) | where anom != 0)"
+- question: Does a newly scheduled runbook show an anomalous Failed/Suspended job ratio, repeated failed-then-retried
+    executions, or off-hours Started events compared to the account's trailing baseline?
+  context: Job state itself is a persistence signal. Profile job State using AzureDiagnostics ResultType
+    (Started/Completed/Failed/Suspended). Alert when a newly scheduled runbook shows an anomalous Failed/Suspended
+    ratio, repeated failed-then-retried jobs, or off-hours Started events versus the account's trailing
+    95th-percentile baseline. Sustained failures of a recurring scheduled job (for example, expired credentials
+    being retried) should be treated as a persistence indicator rather than benign noise. A positive result
+    is a recurring job with abnormal failure/retry or timing patterns; a negative result is stable, on-schedule
+    successful execution.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "AzureDiagnostics\n| where Category in ('JobLogs','JobStreams')\n| summarize total=count(),\n\
+      \    failed=countif(ResultType in ('Failed','Suspended')),\n    offHours=countif(ResultType=='Started'\
+      \ and hourofday(TimeGenerated) !between (7 .. 19))\n  by RunbookName_s, bin(TimeGenerated,1d)\n\
+      | extend failRatio = todouble(failed)/total\n| where failRatio > 0.3 or offHours > 0\n| where RunbookName_s\
+      \ in (newly_scheduled_runbooks)"
+- question: Does UEBA per-entity or peer-group baselining over AzureActivity/AuditLogs score the schedule
+    creation, runbook linkage, and execution cycle as outside the operator's or service principal's normal
+    behavior, with anomaly enrichment (unusual administrative activity, impossible travel)?
+  context: Machine learning surfaces recurring jobs that resemble persistence rather than business automation.
+    Use Sentinel UEBA per-entity and peer-group baselining over AzureActivity/AuditLogs to score schedule/runbook
+    operations performed outside an operator's or service principal's normal behavior, and enrich with
+    Defender for Cloud Apps anomaly policies (unusual administrative activity, impossible travel). Prioritize
+    schedules that repeatedly trigger high-risk actions or reintroduce the same configuration drift after
+    prior remediation. Every model output must list its top-3 contributing features (for example, first-seen
+    schedule author, anomalous recurrence interval, new privileged downstream action) in the alert text.
+    Run ML in parallel with, never replacing, the deterministic rules. A positive result is a high behavioral
+    anomaly score on automation operations; a negative result aligns with peer/entity norms.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'BehaviorAnalytics
+
+      | where ActivityType has ''Automation'' or SourceRecordId in (automation_ops)
+
+      | where InvestigationPriority >= 7   // UEBA anomaly score threshold
+
+      | extend top3 = ActivityInsights  // surface top-3 contributing features
+
+      | join kind=leftouter (CloudAppEvents | where AnomalyPolicy in (''UnusualAdminActivity'',''ImpossibleTravel''))
+      on AccountObjectId
+
+      | project TimeGenerated, UserName, ActivityType, InvestigationPriority, top3'
+- question: When the principal -> Automation-account -> schedule -> runbook -> job -> identity chain is
+    modeled as a heterogeneous dynamic graph, do rare/anomalous subgraphs or privileged-access paths (with
+    cadence/volume shifts) score as scheduled persistence?
+  context: Graph and path modeling reveals persistence structures that single-event rules miss. Model
+    the principal->Automation-account->schedule->runbook->job->identity chain as a heterogeneous dynamic
+    graph and score rare/anomalous subgraphs that behave like scheduled persistence. Correlate the scheduled
+    runbook's RunAs/managed-identity downstream actions into causal privileged-access paths scored for
+    rarity with low alert volume, and apply time-series ML on per-account job telemetry to detect cadence/volume
+    shifts indicating a newly introduced schedule. Surface the top-3 contributing features per alert and
+    keep these models parallel to the deterministic floor. A positive result is a rare subgraph/path linking
+    a new schedule to privileged identity actions; a negative result is a well-trodden, expected automation
+    path.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Build heterogeneous graph from telemetry
+
+      nodes = {principal, automationAccount, schedule, runbook, job, identity}
+
+      edges = AzureActivity + AzureDiagnostics(JobLogs/JobStreams) linking writes->jobs->downstream identity
+      ops
+
+      score = rare_subgraph_score(graph)  # GNN / path rarity
+
+      paths = causal_privileged_access_paths(runbook.runAsIdentity -> sensitive_ops)
+
+      alert if score > tau and cadence_shift(per_account_job_series) detected
+
+      emit top3_contributing_features per alert'
