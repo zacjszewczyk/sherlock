@@ -1,0 +1,373 @@
+name: 'D3-ST: Session Termination'
+id: 2978c97e-4c36-4734-af2b-238cf7e15684
+description: >-
+  This playbook helps an analyst verify that a session-termination / eviction action actually succeeded
+  across every layer where an adversary's access can persist: local host sessions, live network connections,
+  cloud identity tokens, and Active Directory/Kerberos tickets. It validates that a Windows logoff (Event
+  4634/4647) and a forced TCP reset (Zeek RSTO/RSTR) followed the eviction trigger, that no successful
+  logon or new traffic resumed for the evicted account/host, and that cloud refresh tokens were invalidated
+  and Continuous Access Evaluation (CAE) rejected pre-existing access tokens. It also confirms Kerberos
+  ticket invalidation - including the twice-reset krbtgt requirement that defeats forged Golden Tickets
+  - and layers statistical and machine-learning methods to profile residual activity, measure time-to-evict
+  against SLAs, track eviction success on control charts, forecast capability health, and detect behavioral
+  re-emergence of a supposedly evicted entity. Use it to prove an eviction was complete and to catch the
+  failure modes that leave a sophisticated attacker with surviving access.
+type: technique
+related:
+- tactic_id: D3-E
+  tactic_name: Evict
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: After an eviction action is triggered for an account or device, can we confirm a matching
+    Windows logoff (Event 4634/4647) on the session Logon ID and a forced TCP reset (Zeek RSTO/RSTR) from
+    the user's last known IP within 60 seconds?
+  context: This is the primary symbolic-logic validation that an eviction took effect on the host and
+    network layers, supporting the Evict mission. Take the eviction timestamp, then join Windows Event
+    4634/4647 (account logged off) to the originating 4624 logon via the shared Logon ID for the target
+    SID, and independently confirm the user's active TCP connections were aborted (Zeek conn_state RSTO/RSTR,
+    the wire-level forced reset). A match within ~60 seconds proves the session was killed; a missing,
+    late, or absent logoff/reset means the termination did not land and the analyst should treat the account/host
+    as still active and escalate containment.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; pivot to a +/- 1 hour window around each eviction trigger
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for trigger in eviction_events:\n  logoff = search(EventID in [4634,4647] and TargetUserSid==trigger.sid\n\
+      \                  and LogonId==trigger.logon_id\n                  and time between trigger.t and\
+      \ trigger.t+60s)\n  reset = search(zeek.conn where id_orig_h==trigger.last_ip\n                \
+      \ and conn_state in ['RSTO','RSTR']\n                 and ts between trigger.t and trigger.t+60s)\n\
+      \  if not logoff or not reset: alert('eviction not confirmed', trigger)"
+- question: For every connection targeted by a network eviction (firewall/IPS reset or tcpkill), does
+    Zeek conn.log show a reset state (RSTO/RSTR/RSTOS0) with zero subsequent originator/responder bytes,
+    rather than a still-established flow?
+  context: 'A network eviction is only successful if the connection is actually torn down at the wire
+    level. This symbolic check inspects Zeek conn.log for each targeted flow: a reset state (RSTO/RSTR/RSTOS0)
+    with no further orig_bytes/resp_bytes confirms the abort, while a flow still in an established state
+    (conn_state S1/SF with an ongoing data history such as ''Dd'' after the trigger) is a failed termination
+    meaning the adversary''s channel survived. This directly serves the Evict mission by distinguishing
+    a real connection kill from a firewall rule that was added but never severed the live session.'
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; focus on flows active at the eviction time
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for flow in targeted_flows:\n  c = zeek.conn[flow.uid]\n  if c.conn_state in ['RSTO','RSTR','RSTOS0']\
+      \ and c.orig_bytes_after_trigger==0 and c.resp_bytes_after_trigger==0:\n    pass  # confirmed terminated\n\
+      \  elif c.conn_state in ['S1','SF'] or c.history contains ongoing data flags after trigger:\n  \
+      \  alert('network termination failed - flow still established', flow)"
+- question: Does the evicted account show any successful logon (Event 4624) or new network traffic (Zeek
+    conn.log) within 10 minutes after the eviction trigger - the definitive sign the adversary still has
+    access?
+  context: 'This is the explicit incident-response validation step from NIST SP 800-61r2''s containment/eradication
+    phase. After triggering eviction, watch a short window (10 minutes) for any successful interactive
+    or network logon (4624) or any new connection in Zeek conn.log attributable to the evicted entity.
+    A positive result is a hard failure: the account or host is still operable and the eviction must be
+    repeated or escalated. A clean window is the minimum bar for declaring containment, central to the
+    Evict mission.'
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; alert on a 10-minute window after each trigger
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for trigger in eviction_events:\n  post = search((EventID==4624 and TargetUserSid==trigger.sid)\
+      \ or\n                (zeek.conn and id_orig_h==trigger.last_ip)\n                where time between\
+      \ trigger.t and trigger.t+10m)\n  if post: alert('FAILED EVICTION - post-trigger access', trigger,\
+      \ post)"
+- question: How much residual activity (post-trigger logons/min via 4624, failed logons via 4625, and
+    residual bytes from Zeek) does the evicted entity generate, and is any of it above a near-zero noise
+    floor?
+  context: Residual activity is treated as a distinct failure-mode signal rather than ordinary behavior.
+    For each evicted entity, count post-trigger successful logons per minute (4624), failed logons (4625),
+    and residual network bytes (Zeek orig_bytes + resp_bytes). Any non-zero value above a near-zero noise
+    floor is an anomaly worth investigating. Baselining normal versus residual network behavior - long-lived
+    connections, beaconing regularity - on first-party Zeek logs catches a host quietly resuming activity.
+    This statistical lens supports the Evict mission by quantifying how completely access was removed.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; baseline pre-eviction, measure post-eviction
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "stats count(4624) as logons_min, count(4625) as fails,\n      sum(zeek.orig_bytes+zeek.resp_bytes)\
+      \ as residual_bytes\n  by evicted_entity, bin(1m) where t>trigger.t\nnoise_floor = baseline_p99(quiet_period)\n\
+      if logons_min>noise_floor or residual_bytes>noise_floor or fails>noise_floor:\n  flag('residual\
+      \ activity after eviction', evicted_entity)"
+- question: What is the time delta between each eviction trigger and its corresponding termination log,
+    and do any cases exceed the hard SLA (e.g., >5 minutes) or the rolling 95th percentile of the time-to-evict
+    distribution?
+  context: Time-to-evict is a performance metric for the defensive capability itself. For every eviction
+    event, compute the delta between the trigger and the corresponding termination log (the Volume/Frequency/State
+    of each phase). Flag individual cases breaching a hard SLA (e.g., 5 minutes) and any case above the
+    rolling 95th percentile of the distribution for process review. Slow evictions widen the window an
+    adversary retains access, so under the Evict mission a creeping latency is itself a security regression
+    even when terminations eventually succeed.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "deltas = [termination_log.t - trigger.t for each eviction]\np95 = percentile(deltas, 95)\n\
+      for d in deltas:\n  if d > 5m: alert('SLA breach time-to-evict', d)\n  elif d > p95: flag('tail\
+      \ latency for review', d)"
+- question: Is the daily ratio of successful terminations to total attempts staying in control on an EWMA
+    chart, or is a CUSUM/Bayesian change-point detecting a persistent degradation in eviction capability?
+  context: Small, persistent erosion of eviction capability can hide below any single threshold. Track
+    the daily success/attempt ratio on an EWMA control chart (lambda 0.1-0.3, ~3-sigma limits) so slow
+    degradation signals out-of-control before a hard breach, and run CUSUM or Bayesian change-point detection
+    to localize when the regime shifted. For the Evict mission this gives early warning that something
+    - a broken automation, a new bypass, a misconfiguration - is quietly reducing how reliably the org
+    can remove adversary access.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ratio_t = successful_terminations_day / total_attempts_day
+
+      ewma_t = lambda*ratio_t + (1-lambda)*ewma_{t-1}   # lambda 0.1-0.3
+
+      if ewma_t < LCL(3sigma): alert(''eviction success out-of-control'')
+
+      changepoint = cusum_or_bayes(ratio_series)
+
+      if changepoint: report(''regime shift at'', changepoint)'
+- question: Does an ETS/ARIMA forecast of session-termination volume and success rate predict the observed
+    success rate falling below its lower prediction interval, indicating impending loss of defensive control?
+  context: This forward-looking machine-learning method fits an ETS or ARIMA model to the time series
+    of termination volume and success rate, then alerts when observed success drops below the lower prediction
+    interval for upcoming windows - an early indicator that eviction capability is failing before it fully
+    breaks. The alert should surface the top-3 contributing terms (trend, recent residuals, seasonal component)
+    so an analyst can act, not just see a number. Under the Evict mission this protects the org's ability
+    to remove attackers by treating that ability as a monitored, forecastable service.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; forecast horizon 1-7 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "model = fit_ETS_or_ARIMA(success_rate_series)\nfc = model.forecast(horizon)\nif observed_success_rate\
+      \ < fc.lower_PI:\n  alert('forecasted loss of eviction control',\n        contributors=top3(trend,\
+      \ residuals, seasonal))"
+- question: Do unsupervised models over post-eviction telemetry (an LSTM over identity/logon log-key sequences
+    and an online autoencoder ensemble over per-flow stats) flag a disabled SID reappearing or an evicted
+    device's traffic returning to baseline?
+  context: Behavioral re-emergence is the subtle failure where an evicted entity comes back to life. A
+    DeepLog-style LSTM over identity/logon log-key sequences flags a disabled SID reappearing or out-of-distribution
+    session events, with per-event diagnosis. A Kitsune-style online autoencoder ensemble over per-flow
+    statistics scores an evicted device's traffic returning to (or deviating from) its baseline without
+    needing labels. Both must emit the top-3 contributing features - the offending log key, the high-reconstruction-error
+    feature - never a bare anomaly score. This directly serves the Evict mission by catching adversary
+    resurfacing that rule-based checks miss.
+  answer_sources:
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, critical servers, VPN/RDP gateways, and network egress points.'
+  range: Last 90 days; score continuously after eviction
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "# DeepLog LSTM over logon log-key sequence\nif lstm.predict_next(seq) excludes observed_key\
+      \ and entity in evicted_set:\n  alert('disabled SID re-emerged', key=offending_log_key)\n# Kitsune\
+      \ autoencoder ensemble over per-flow features\nscore = autoencoder.reconstruction_error(flow_features)\n\
+      if score > threshold and device in evicted_set:\n  alert('evicted device traffic returned', features=top3_error(flow_features))"
+- question: After a revokeSignInSessions or account-disable action in Entra ID, can we confirm the audit
+    event, verify subsequent refresh-token requests fail, and confirm CAE-enabled resources reject pre-existing
+    tokens within minutes?
+  context: Cloud identity eviction is only real when refresh tokens are invalidated and CAE forces re-evaluation
+    of existing access tokens. This symbolic check confirms the Entra ID audit event for revokeSignInSessions
+    and/or account disable, then verifies the account's later refresh-token requests fail and that CAE-enabled
+    resources (Exchange, SharePoint, Teams, Graph) reject pre-existing tokens within minutes. Absence
+    of these confirmations means the revocation did not propagate and the identity is still usable - a
+    critical Evict-mission gap, because stateless access tokens otherwise stay valid until expiry.
+  answer_sources:
+  - Entra ID Sign-in logs
+  - Entra ID Audit logs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Cloud identity provider (Entra ID), token issuance endpoints, and CAE-enabled resource providers
+    (Exchange, SharePoint, Teams, Graph).'
+  range: Last 90 days; verify within minutes of each revocation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "rev = search(EntraAudit where activity in ['revokeSignInSessions','Disable account']\n   \
+      \          and target==identity)\nif not rev: alert('no revocation audit event', identity)\nrefresh_fail\
+      \ = search(SignInLogs where identity and tokenType=='refresh' and result=='failure' after rev.t)\n\
+      cae_reject = search(SignInLogs where identity and CAE in event and result=='rejected' after rev.t)\n\
+      if not refresh_fail or not cae_reject: alert('revocation did not propagate', identity)"
+- question: Is there any successful sign-in or Graph/resource access using a token issued before the revocation
+    timestamp where no CAE rejection occurred - or any refresh-token rotation replay (the same rotated
+    token presented twice)?
+  context: This catches the documented failure mode where self-encoded access tokens remain valid until
+    expiry (default ~60-90 minutes) even after a revocation. Alert on any successful sign-in or Graph/resource
+    access whose token issuance timestamp precedes the revocation and where CAE did not reject it - the
+    adversary is riding a still-valid token. Separately, a refresh-token rotation replay (the same rotated
+    token presented twice) is a strong theft indicator and should force whole-grant revocation. Both findings
+    are Evict-mission failures requiring immediate token-level remediation.
+  answer_sources:
+  - Entra ID Sign-in logs
+  - Entra ID Audit logs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Cloud identity provider (Entra ID), token issuance endpoints, and CAE-enabled resource providers
+    (Exchange, SharePoint, Teams, Graph).'
+  range: Last 90 days; window = revocation time to access-token TTL (~90 min)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for access in graph_and_signin_success after revocation.t:\n  if access.token_issued_at <\
+      \ revocation.t and not access.cae_rejected:\n    alert('residual token use after revocation', access)\n\
+      # rotation replay\nif rotated_refresh_token seen >1 time:\n  alert('refresh-token replay - revoke\
+      \ whole grant', token)"
+- question: What is the delta between each revocation action and the last successful token use per identity,
+    and does any value exceed the access-token TTL (residual-token use), with the revocation success ratio
+    holding on an EWMA chart?
+  context: This statistical method measures how long tokens keep working after revocation. Compute, per
+    identity, the time from the revocation action to the last successful token use; any value exceeding
+    the access-token TTL signals residual-token use that outlived where CAE should have cut it off. Charting
+    the success ratio of revocations on an EWMA control chart catches gradual capability degradation.
+    For the Evict mission this quantifies cloud eviction latency and flags when the org's ability to cut
+    cloud access is slipping.
+  answer_sources:
+  - Entra ID Sign-in logs
+  - Entra ID Audit logs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Cloud identity provider (Entra ID), token issuance endpoints, and CAE-enabled resource providers
+    (Exchange, SharePoint, Teams, Graph).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'delta = last_successful_token_use[id] - revocation_time[id]
+
+      if delta > access_token_TTL: flag(''residual token use'', id, delta)
+
+      ratio = successful_revocations_day / attempts_day
+
+      ewma = lambda*ratio + (1-lambda)*ewma_prev
+
+      if ewma < LCL: alert(''cloud revocation capability degrading'')'
+- question: Does UEBA peer/self baselining score renewed or anomalous activity (sign-ins, resource access)
+    by a supposedly evicted identity as anomalous, with the top-3 contributing factors surfaced?
+  context: Even after revocation, a returning identity may use legitimate-looking but anomalous patterns.
+    Apply UEBA peer and self baselines (e.g., Microsoft Sentinel entity behavior analytics) to score renewed
+    sign-ins and resource access by an identity that should be evicted, and surface the top-3 contributing
+    factors - unusual time, location, or request volume - rather than a bare score. A high anomaly score
+    on a supposedly dead identity indicates the eviction failed or the adversary re-authenticated through
+    another path, directly supporting the Evict mission's goal of confirming durable removal.
+  answer_sources:
+  - Entra ID Sign-in logs
+  - Entra ID Audit logs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Cloud identity provider (Entra ID), token issuance endpoints, and CAE-enabled resource providers
+    (Exchange, SharePoint, Teams, Graph).'
+  range: Last 90 days; score continuously post-revocation
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "for activity in post_revocation_activity[identity]:\n  score = ueba_baseline(identity, peers).anomaly(activity)\n\
+      \  if score > threshold:\n    alert('anomalous activity by evicted identity',\n          factors=top3(unusual_time,\
+      \ location, request_volume))"
+- question: After an account disable (4725) or password reset (4724), is there any new TGT request (4768),
+    service-ticket request (4769), or Type-3 network logon (4624) for that account, indicating a still-valid
+    ticket is in use?
+  context: 'Because a Ticket-Granting Ticket stays valid until expiry, a single password reset or disable
+    does not immediately evict an attacker who already holds tickets. This symbolic check ties the remediation
+    event (4724 reset or 4725 disable) to subsequent Kerberos activity: any new TGT request (4768), service-ticket
+    request (4769), or Type-3 network logon (4624) for that account afterward means a still-valid ticket
+    is being used and the eviction is incomplete until ticket expiry. Surfacing this is essential to the
+    Evict mission so responders know to wait out or force ticket invalidation.'
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - Windows Event ID 4724
+  - Windows Event ID 4725
+  - Zeek kerberos.log
+  - 'NAI: Domain Controllers and Kerberos-authenticating critical servers.'
+  range: Last 90 days; window from remediation to ticket lifetime (~10 h)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "rem = search(EventID in [4724,4725] and TargetUser==account)\npost = search((EventID in [4768,4769]\
+      \ and TargetUser==account) or\n              (EventID==4624 and LogonType==3 and TargetUser==account)\n\
+      \              where t > rem.t)\nif post: alert('still-valid Kerberos ticket after eviction', account,\
+      \ post)"
+- question: Was the krbtgt account password reset twice (not once) during eviction, and is there continued
+    ticket activity after only a single krbtgt reset - the condition under which forged Golden Tickets
+    remain valid?
+  context: 'Forged Golden Tickets survive a single krbtgt password reset because Kerberos accepts tickets
+    signed with either the current or previous krbtgt key; only a second reset invalidates them. This
+    check verifies two krbtgt resets occurred during eviction and alerts if only one is observed while
+    ticket activity continues - the documented condition under which Golden Tickets stay valid. For the
+    Evict mission this is a high-stakes verification: failing to double-reset krbtgt leaves a domain-compromise-level
+    adversary fully authenticated despite apparent remediation.'
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - Windows Event ID 4724
+  - Windows Event ID 4725
+  - Zeek kerberos.log
+  - 'NAI: Domain Controllers and Kerberos-authenticating critical servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "krbtgt_resets = count(EventID==4724 and TargetUser=='krbtgt' in eviction_window)\nif krbtgt_resets\
+      \ < 2 and any(EventID in [4768,4769] after first_reset):\n  alert('Golden Ticket may survive - krbtgt\
+      \ reset only once', krbtgt_resets)"
+- question: How many post-eviction ticket requests (4768/4769) and Kerberos sessions (Zeek kerberos.log)
+    does the evicted account generate before expected ticket expiry, and is the cross-account trend rising
+    on an EWMA chart?
+  context: This statistical method treats residual Kerberos activity as a failure-mode metric. Count post-eviction
+    TGT/service-ticket requests (4768/4769) and Kerberos sessions from Zeek kerberos.log for the evicted
+    account; any value above zero before expected ticket expiry is an anomaly. A rising trend across many
+    accounts on an EWMA control chart indicates systemic eviction failure - for example a remediation
+    process that consistently leaves tickets live. Under the Evict mission this both validates individual
+    evictions and surfaces a broken process affecting the whole environment.
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - Windows Event ID 4724
+  - Windows Event ID 4725
+  - Zeek kerberos.log
+  - 'NAI: Domain Controllers and Kerberos-authenticating critical servers.'
+  range: Last 90 days; per-account until ticket expiry
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "residual = count(EventID in [4768,4769] where TargetUser==account and t>eviction.t)\n    \
+      \    + count(zeek.kerberos where client==account and ts>eviction.t)\nif residual > 0 and now < eviction.t\
+      \ + ticket_lifetime:\n  flag('residual ticket use', account, residual)\newma_across_accounts = ewma(daily_residual_rate)\n\
+      if ewma_across_accounts rising > LCL_breach: alert('systemic Kerberos eviction failure')"
