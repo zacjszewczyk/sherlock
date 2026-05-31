@@ -1,0 +1,369 @@
+name: 'T1016.001: Internet Connection Discovery'
+id: f573d7f5-628d-450d-8d06-3c1e98678d91
+description: 'Investigate possible Internet Connection Discovery (T1016.001), in which an adversary checks
+  a compromised host for outbound Internet reachability before attempting to reach command-and-control
+  infrastructure. This playbook helps an analyst hunt for connectivity checks across endpoint, network,
+  and DNS telemetry: native utilities such as ping, tracert, curl, wget, nslookup, Test-NetConnection,
+  scutil, networksetup, and vmkping executing with anomalous parentage; outbound connections or DNS queries
+  that match threat-intelligence feeds; bursts of multi-protocol egress (ICMP, DNS, HTTP, raw TCP) from
+  a single host; outbound traffic from restricted assets (Domain Controllers, PCI/OT segments) or service
+  accounts; and high-entropy, low-volume, high-failure DNS fan-out to many unique domains. For each behavior
+  it pairs a deterministic symbolic-logic rule with statistical baselining and machine-learning anomaly
+  detection so the analyst can distinguish benign administration and software-update traffic from adversary
+  reconnaissance that precedes C2.'
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any host make an outbound connection or DNS query whose destination IP or queried domain
+    matches a subscribed threat-intelligence blocklist, and what process and connection state accompanied
+    it?
+  context: 'Connectivity checks against attacker-controlled infrastructure frequently precede C2, so a
+    match between observed egress and a threat-intel feed is a high-severity Discovery signal. Join Zeek
+    dns.log and conn.log (and Windows Event ID 4688 plus Sysmon Event ID 3 for endpoint context) against
+    your blocklist of known-bad IPs and domains. Always capture process context (Image, ParentImage, CommandLine)
+    so a benign browser is distinguishable from a LOLBin or script. Critically, record the connection
+    STATE separately: established sessions confirm reachability, while repeated blocked/reset connections
+    or NXDOMAIN responses to a known-bad host are themselves a discovery/probing signal. A positive result
+    means the host is actively reaching, or attempting to reach, malicious infrastructure and should be
+    triaged for compromise; a negative result across the window lowers (but does not eliminate) suspicion
+    for this indicator.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days; pivot to a tight per-host window around any match to correlate process and connection
+    state.
+  queries:
+  - technology: Zeek/pseudocode
+    query: dns = dns.log; conn = conn.log; matches = (dns where query in threat_intel.domains) OR (conn
+      where id.resp_h in threat_intel.ips); enrich matches with proc=Win4688[host,ts] (Image,ParentImage);
+      tag state = conn.conn_state (established vs S0/REJ/RSTO) and dns.rcode (NOERROR vs NXDOMAIN/SERVFAIL);
+      alert severity=high; group repeated blocked attempts to same known-bad host as probing.
+  - technology: SIEM/Rule pseudocode
+    query: index=egress (dest_ip IN threat_intel_ips OR query IN threat_intel_domains) | join host,_time
+      process_creation (EventCode=4688 OR Sysmon EID3) | eval signal=if(action IN(blocked,reset) OR rcode!=NOERROR,"probing","contact")
+      | table _time host user Image ParentImage dest signal | alert.
+- question: For each suspicious or feed-matched external destination, how rare is it across the enterprise,
+    and is it being contacted with the small byte volumes characteristic of a connectivity check?
+  context: A destination contacted by very few hosts, seen for the first time, and exchanging only tiny
+    amounts of data is a hallmark of a discovery probe rather than normal business traffic. Over a rolling
+    30-day window compute each destination's prevalence (distinct hosts and total connections) and first-seen
+    date, then escalate destinations rarer than the 99th percentile of all external destinations that
+    also carry per-connection byte volumes under ~1 KB. Derive the percentile cutoff and byte threshold
+    from your own egress baseline rather than fixed values, following EXPOSURE-style prevalence, first-seen,
+    and dynamism scoring. A positive result (rare + low-volume + recently first-seen) strongly suggests
+    a probe to a redirector or C2 staging host; common, high-volume destinations are deprioritized as
+    benign.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days for hunting, with prevalence and first-seen computed over a rolling 30-day baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = conn.log[last 30d]; per dest: distinct_hosts=dc(src), total_conns=count, first_seen=min(ts),
+      avg_bytes=avg(bytes_out+bytes_in); p99_rarity = percentile(distinct_hosts,1);  // rarest 1% alert
+      where distinct_hosts <= p99_rarity AND avg_bytes < 1024 AND first_seen within 7d | sort distinct_hosts
+      asc | table dest distinct_hosts total_conns first_seen avg_bytes.'
+- question: Does a supervised connection classifier score any outbound session as malicious, and which
+    features (destination rarity, byte ratio, parent process) drove that score?
+  context: To catch connectivity checks that evade single-signal rules, score connection metadata with
+    a gradient-boosted classifier (Random Forest / XGBoost). Features include src/dst IP, port, protocol,
+    JA3/JA3S hash, bytes-in/out, duration, connection STATE, initiating process and parent (from Event
+    ID 4688), threat-intel match flag, and enterprise prevalence. A score above 0.9 can trigger automated
+    containment, but the alert MUST list the top-3 contributing features via feature-importance so an
+    analyst can validate the verdict (e.g., 'destination prevalence', 'byte ratio', 'parent process').
+    Run this model in parallel with the deterministic threat-feed rule and never replace that rule with
+    the model. A high score plus interpretable, security-relevant features is high-confidence; a high
+    score driven by spurious features indicates the model needs retraining.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days for scoring; retrain on a rolling 30-60 day labeled baseline.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = conn_features[src,dst,port,proto,ja3,ja3s,bytes_in,bytes_out,duration,conn_state,proc,parent,ti_match,prevalence];
+      score = xgboost_model.predict_proba(X); if score > 0.9: alert + auto_contain; alert.top_features
+      = explain_importance(model,X)[:3]; // keep deterministic threat_feed_rule running independently.'
+- question: Did a known network-connectivity utility (ping, tracert, curl, wget, nslookup, PathPing, Test-NetConnection,
+    scutil, networksetup, vmkping) execute against a public IP or domain with a parent process that is
+    not an interactive shell or approved admin tool?
+  context: 'Adversaries routinely run native connectivity utilities to confirm Internet egress during
+    automated discovery. Alert on Windows Event ID 4688 / Sysmon Event ID 1 where NewProcessName is one
+    of ping.exe, tracert.exe, curl.exe, wget.exe, nslookup.exe, PathPing.exe (Linux auditd: ping/traceroute/curl/wget;
+    macOS: ping/scutil/networksetup; ESXi: ping/vmkping/curl) and the command line targets a public IP/domain,
+    or where PowerShell script-block logs (Event ID 4104) contain Test-NetConnection, Resolve-DnsName,
+    or Invoke-WebRequest. Suppress events whose ParentImage is a legitimate interactive shell (explorer.exe,
+    cmd.exe) or an allow-listed administrative tool. Correlate the process to its outbound connection
+    via Sysmon Event ID 3. An execution spawned by a service host, script interpreter, or unusual parent
+    strongly suggests automated reconnaissance rather than an administrator''s manual check.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Endpoint devices (Workstations, Laptops), Servers (especially those with restricted internet
+    access like Domain Controllers)'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: proc = (EventCode=4688 OR Sysmon EID1) where NewProcessName IN (ping.exe,tracert.exe,curl.exe,wget.exe,nslookup.exe,PathPing.exe)
+      AND CommandLine matches public_ip_or_domain; OR ps = (EventCode=4104) where ScriptBlock matches
+      (Test-NetConnection|Resolve-DnsName|Invoke-WebRequest); exclude ParentImage IN (explorer.exe,cmd.exe,allowlisted_admin_tools);
+      join Sysmon EID3 on process_guid for outbound dest; alert.
+  - technology: auditd/pseudocode
+    query: type=EXECVE where exe IN (/bin/ping,/usr/bin/traceroute,/usr/bin/curl,/usr/bin/wget) AND argv
+      contains public_ip_or_domain AND ppid_exe NOT IN (interactive_shells,allowlist); alert.
+- question: Has any host or user exceeded its normal execution frequency of connectivity utilities, run
+    one for the first time, or shown a spike in failed connectivity attempts (timeouts, non-200, connection-refused)?
+  context: Beyond a single execution, the rate and success pattern of connectivity tools reveals probing.
+    Build a 30-day rolling baseline of each utility's execution FREQUENCY (count/hour) per host and per
+    user. Alert when the one-hour count exceeds the host's 95th percentile, when a user or parent process
+    runs the utility for the first time, or when the failure STATE rate spikes (ping timeouts, curl non-200
+    or connection-refused) which indicates active egress probing against many destinations. Compute all
+    thresholds from your own telemetry. A first-time-on-host execution combined with a burst of failures
+    is a strong reconnaissance indicator; steady, expected usage by known admin accounts is benign and
+    suppressed.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Endpoint devices (Workstations, Laptops), Servers (especially those with restricted internet
+    access like Domain Controllers)'
+  range: Last 90 days for hunting; baselines computed over a rolling 30-day window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: base = util_exec[last 30d] by host,user,utility -> hourly_count; p95 = percentile(hourly_count,95)
+      per host,utility; alert where current_hour_count > p95 OR (host,utility) not seen before for this
+      user/parent OR fail_rate(timeouts+conn_refused+non200) > baseline_fail_rate*3 | table host user
+      utility count fail_rate first_seen.
+- question: Does a command-line anomaly model flag rare or obfuscated arguments on a connectivity utility,
+    and does a time-series forecast show an execution-frequency spike correlated with service or scheduled-task
+    changes?
+  context: Sophisticated actors obfuscate command lines or hide connectivity checks inside automation.
+    Score command-line text with a fleet-trained contextual-embedding model (BERT-style) and an interpretable
+    GBDT on character/keyword/entropy features to flag rare arguments and obfuscation. In parallel run
+    a time-series model (ARIMA/STL) on per-host utility execution frequency; a forecast-exceeding spike
+    that is temporally correlated with service creation (Event ID 7045) or scheduled-task changes (Event
+    ID 4698) is high-confidence, because it ties discovery to a persistence or execution mechanism. Surface
+    the top-3 features (anomalous token, parent process, entropy) in every alert. A model hit on obfuscated
+    arguments with a correlated frequency spike warrants immediate investigation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Endpoint devices (Workstations, Laptops), Servers (especially those with restricted internet
+    access like Domain Controllers)'
+  range: Last 90 days for scoring and forecasting; embeddings/GBDT retrained on rolling fleet telemetry.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'emb_score = bert_cmdline_model(CommandLine); gbdt_score = gbdt_obfuscation(char/keyword/entropy_feats);
+      anomaly = max(emb_score,gbdt_score) > thr; ts = arima_or_stl(host_utility_freq); spike = observed
+      > forecast_upper; corr = exists(Event7045 OR Event4698 within +-30m of spike); if anomaly OR (spike
+      AND corr): alert.top_features = [anomalous_token,parent,entropy].'
+- question: Did a single host initiate outbound connections across three or more distinct protocols (ICMP,
+    DNS/UDP, HTTP/TCP, raw TCP) to external destinations within a short (2-5 minute) window, and was the
+    initiating process something other than a browser or update agent?
+  context: 'Adversaries often test multiple egress paths at once to find one that works, producing a rapid
+    burst of connections across several protocols from one source. Trigger when a single source generates
+    Zeek conn.log events across three or more distinct protocols (icmp, udp/dns, tcp/http) to external
+    destinations within a 2-minute window. Enrich with endpoint process data (Event ID 4688 plus Sysmon
+    Event ID 3) to exclude web browsers and known software-update agents. Track the success/fail STATE
+    per attempt: a burst that is mostly failed connections across protocols indicates egress mapping rather
+    than legitimate use. A positive result from a non-browser process is a strong Discovery signal; legitimate
+    multi-protocol bursts (e.g., a browser loading a page plus telemetry) are filtered out by process
+    context.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, Endpoint devices, DNS Resolvers'
+  range: Last 90 days; evaluate on sliding 2-5 minute windows per source host.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'window=2m per src; protos = distinct(proto/service) to external dst; if count(protos) >= 3
+      (e.g., icmp,dns,http): enrich proc via Win4688+SysmonEID3 join on host,ts; exclude proc IN (browsers,update_agents);
+      fail_ratio = failed_conns/total; alert (flag high fail_ratio as egress mapping).'
+- question: Does a host show an unusually high protocol-diversity, volume, or frequency score, and is
+    any destination being contacted at regular (beaconing) intervals?
+  context: 'Statistical profiling separates a one-off multi-protocol burst from sustained reconnaissance
+    and beaconing. Per host, compute a protocol-diversity score (unique protocols per 5 minutes) plus
+    connection VOLUME (bytes) and FREQUENCY (conns/min), and alert above the host''s 99th percentile.
+    Then layer cadence analysis: if the same destination is contacted at regular inter-arrival intervals,
+    score it for beaconing (BAYWATCH/RITA-style). Calibrate against benign periodic-traffic baselines
+    (software updates, telemetry, NTP) to suppress noise. A host that is simultaneously high in protocol
+    diversity and shows tight, low-jitter beaconing to a rare destination is high-priority; regular cadence
+    to known update/telemetry endpoints is expected and suppressed.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, Endpoint devices, DNS Resolvers'
+  range: Last 90 days; protocol-diversity on 5-minute windows, beaconing cadence over multi-hour to multi-day
+    spans.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host,5min: div=dc(proto), vol=sum(bytes), freq=count/min; alert where div>p99(div) OR
+      freq>p99(freq); beacon: per (host,dst) compute inter_arrival deltas; score = low_variance(deltas)
+      AND consistent_size; suppress dst IN benign_periodic_baseline; alert beacon_score high.'
+- question: Do unsupervised models flag any temporally dense, single-host connection cluster with high
+    protocol diversity and a high failed-connection ratio?
+  context: Clustering and anomaly detection surface multi-protocol probing patterns that no static rule
+    anticipated. Cluster 5-minute connection windows using features such as source host, protocol set,
+    destination port, byte ratio, and success/fail rate with DBSCAN, or score them with an Isolation Forest
+    / One-Class SVM. Flag temporally dense single-host clusters that combine high protocol diversity with
+    a high failed-connection ratio. Use LIME or feature-importance to print the top-3 drivers (protocol
+    count, failed-conn ratio, byte volume) in the alert so analysts can validate. Keep the deterministic
+    three-protocol rule running in parallel. An anomalous dense cluster driven by protocol diversity and
+    connection failures is a strong egress-mapping indicator.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Network Egress Points, Endpoint devices, DNS Resolvers'
+  range: Last 90 days; cluster on 5-minute connection windows.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: W = window_features(5min)[src,proto_set,dst_port,byte_ratio,fail_rate]; labels = DBSCAN(W)
+      OR score = IsolationForest/OneClassSVM(W); flag dense single-host clusters with high proto_diversity
+      AND high fail_rate; alert.top_features = LIME(W)[:3]; keep 3-protocol deterministic rule in parallel.
+- question: Did any outbound connection originate from a strictly controlled asset (Domain Controller,
+    PCI/OT segment) or run under a service-account context (Logon Type 5) to a destination that is not
+    on the pre-approved allow list?
+  context: 'Hosts like Domain Controllers and assets in PCI-DSS or OT segments, and processes running
+    as service accounts, should rarely if ever reach the Internet, so any unapproved egress from them
+    is high-signal. Maintain asset lists of ''Restricted Internet Access'' hosts and known service-account
+    names. Alert on any Zeek conn.log / Sysmon Event ID 3 outbound connection where the source is a restricted
+    host, or the user is a service account (correlated via Windows Event ID 4624 Logon Type 5), and the
+    destination is not on an explicit allow-list. Treat firewall-BLOCKED egress from these hosts as a
+    first-class signal rather than noise: repeated blocked attempts indicate connectivity probing. A single
+    unapproved (even blocked) outbound attempt from a DC or service account warrants immediate investigation
+    for compromise.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - 'NAI: Critical Server Subnets (e.g., Domain Controllers, Database Servers), Network Egress Points,
+    Authentication Logs'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: conn = (conn.log OR SysmonEID3) outbound; restricted = src_host IN asset_list(DC,PCI,OT) OR
+      user IN service_accounts(via Event4624 LogonType=5); alert where restricted AND dest NOT IN allow_list;
+      include action=blocked as first-class signal; group repeated blocked -> probing.
+- question: Is an outbound connection from a critical server initiated by a process outside that server
+    role's normal set, or has the host's blocked-egress or failed service-account logon rate exceeded
+    baseline?
+  context: Each server role has a characteristic set of processes that legitimately initiate outbound
+    connections; deviations expose misuse. Profile, per server role, the set and frequency of processes
+    that normally make outbound connections over 30 days. Alert when a connection is initiated by a process
+    outside the role's 95th-percentile-common set (for example, a database server spawning powershell.exe
+    to the Internet), or when the host's blocked-egress rate or failed service-account (Logon Type 5)
+    logon rate exceeds baseline. This frequency-and-lineage profiling reflects LOLBin-abuse detection
+    guidance. A DB/DC/critical server suddenly using an interpreter or unusual binary to reach the Internet
+    is a strong indicator of post-compromise discovery; expected role-specific processes are suppressed.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - 'NAI: Critical Server Subnets (e.g., Domain Controllers, Database Servers), Network Egress Points,
+    Authentication Logs'
+  range: Last 90 days for hunting; role baselines derived from 30 days of telemetry.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: role_base = egress_initiators[last 30d] by server_role -> proc_set with p95 freq; alert where
+      conn.initiating_proc NOT IN role_base.common_set(p95) OR blocked_egress_rate(host) > baseline OR
+      failed_logon_type5_rate(host) > baseline | table host role proc dest rate.
+- question: Does a per-server one-class anomaly model classify any new outbound connection from a critical
+    asset as anomalous, and which features explain it?
+  context: For the most sensitive assets, model normal egress tightly so any deviation stands out. Train
+    a One-Class SVM / Isolation Forest on each critical server's normal outbound traffic using features
+    such as destination IP/port, protocol, bytes, duration, success/fail state, and initiating process;
+    these models are robust under poisoning and support LIME explainability. Any new connection classified
+    anomalous is alerted with its top-3 contributing features (initiating process, destination rarity,
+    byte volume). Keep the deterministic allow-list rule running in parallel. Because the normal egress
+    profile of a critical server is narrow, an anomaly here is high-confidence evidence of unexpected,
+    potentially adversarial Internet connectivity from a protected asset.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - 'NAI: Critical Server Subnets (e.g., Domain Controllers, Database Servers), Network Egress Points,
+    Authentication Logs'
+  range: Last 90 days for scoring; per-server models trained on a rolling 30-day normal baseline.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'for each critical_server: model = OneClassSVM/IsolationForest(normal_egress[dst,port,proto,bytes,duration,state,proc]);
+      for new_conn: if model.predict(new_conn)==anomaly: alert.top_features = LIME(new_conn)[:3] (proc,dst_rarity,bytes);
+      run allow_list deterministic rule in parallel.'
+- question: Is any host resolving more than ~50 unique, uncategorized, previously-unseen second-level
+    domains in 24 hours with minimal per-domain byte volume and a high rate of NXDOMAIN/SERVFAIL responses?
+  context: 'Connectivity and C2 discovery against redirectors produces a distinctive pattern: low-byte,
+    high-diversity DNS fan-out with many failed resolutions. Flag hosts resolving more than ~50 unique,
+    uncategorized, previously-unseen second-level domains in 24h where per-domain connection VOLUME is
+    minimal (<1 KB in Zeek conn.log) and many resolutions return NXDOMAIN/SERVFAIL. Exclude known CDN
+    and cloud provider domains, which legitimately generate high domain diversity. A host matching this
+    low-byte, high-diversity, high-failure profile after CDN filtering is strongly indicative of automated
+    connectivity discovery or DGA-driven C2 lookup; ordinary browsing typically resolves fewer unique
+    uncategorized SLDs with successful, higher-volume follow-on connections.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network Egress Points, DNS Resolvers'
+  range: Last 90 days; evaluated over rolling 24-hour per-host windows.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'per host,24h: uniq_slds = dc(sld(query) where category=uncategorized AND first_seen<24h);
+      nxrate = count(rcode IN (NXDOMAIN,SERVFAIL))/count(query); vol = avg(conn.bytes for resolved dst);
+      exclude sld IN (cdn,cloud_providers); alert where uniq_slds > 50 AND vol < 1024 AND nxrate high.'
+- question: Which hosts rank highest by Shannon entropy of their unique second-level domains and KL-divergence
+    from natural-language character distributions, indicating algorithmically generated domain names?
+  context: Algorithmically generated domains (DGAs) used for connectivity/C2 lookup have character distributions
+    that diverge from human-readable names. Daily, compute the Shannon entropy of each host's set of unique
+    SLDs and the KL-divergence of the domain character distributions versus natural-language baselines
+    to isolate algorithmically generated names. Combine this with destination rarity/first-seen scoring
+    (EXPOSURE-style) and explicitly profile the NXDOMAIN STATE rate. Review the top 1% of hosts by entropy
+    after filtering high-diversity CDNs. A host whose domain set has high entropy, high KL-divergence
+    from natural language, and an elevated NXDOMAIN rate is a strong DGA/connectivity-discovery candidate;
+    hosts dominated by readable, well-categorized domains are deprioritized.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network Egress Points, DNS Resolvers'
+  range: Last 90 days; entropy and KL-divergence computed daily per host.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host,day: H = shannon_entropy(unique_slds); KL = kl_divergence(char_dist(slds), english_char_baseline);
+      nxrate = nxdomain_count/query_count; rarity = exposure_first_seen_score(dst); filter cdn/cloud;
+      rank by H desc; review top 1% where KL high AND nxrate elevated.'
+- question: Does a forecasting model show a host's daily unique-destination count exceeding its prediction
+    interval, or does an anomaly model flag a stealthy low-throughput DNS channel?
+  context: To catch both sudden fan-out and slow, stealthy channels, pair forecasting with anomaly detection.
+    Forecast per-host daily unique-destination counts (Prophet/STL); an observation above the prediction
+    interval flags an anomalous diversity increase. Complement this with an Isolation Forest on behavioral
+    DNS features (query rate, entropy, NXDOMAIN ratio, mean response size) to catch stealthy low-byte
+    channels that never spike but persistently deviate. Alerts must list the top-3 features (unique-domain
+    count, NXDOMAIN ratio, mean query entropy). Retain the deterministic >50-domain hunting rule in parallel.
+    A forecast breach or a behavioral anomaly with security-relevant top features indicates connectivity
+    discovery or low-throughput DNS exfiltration/C2 worth investigating.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network Egress Points, DNS Resolvers'
+  range: Last 90 days; forecasting on daily counts with multi-week training history.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'fc = prophet_or_stl(host_daily_unique_dst); breach = observed > fc.upper_interval; iso = IsolationForest(dns_features[query_rate,entropy,nxdomain_ratio,mean_resp_size]);
+      anomaly = iso.score < thr; if breach OR anomaly: alert.top_features=[unique_domains,nxdomain_ratio,mean_entropy];
+      keep >50-domain deterministic rule in parallel.'
