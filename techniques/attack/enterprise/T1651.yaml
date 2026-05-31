@@ -1,0 +1,377 @@
+name: 'T1651: Cloud Administration Command'
+id: a1bb4888-8b0f-4a5a-b0ec-8f055d6e01f7
+description: Investigate potential abuse of cloud administration and management services (e.g., AWS Systems
+  Manager Run Command/StartSession, Azure RunCommand, GCP OS Config/os-patch-runs) to execute commands
+  inside virtual machines. An adversary with administrative access to a cloud control plane, or one leveraging
+  a compromised service provider or delegated-administrator account via a trusted relationship, can drive
+  arbitrary code into guest operating systems through installed VM agents (amazon-ssm-agent/ssm-agent,
+  WindowsAzureGuestAgent.exe/waagent, google_guest_agent). This playbook helps an analyst pivot across
+  the cloud control plane (CloudTrail, azure:activity, IAM logs) and the in-guest host telemetry (Windows
+  4688, Sysmon 1/3, Zeek, VPC/NSG flow logs) to confirm whether a control-plane command actually materialized
+  inside a VM, whether the spawned process is anomalous or interactive, whether it initiated suspicious
+  egress or beaconing, and whether the originating API call itself deviates from established identity,
+  source-IP, and temporal baselines. It combines deterministic symbolic-logic detections, statistical
+  scoring (volume, entropy, frequency, failure bursts, beacon cadence), and explainable machine-learning
+  anomaly detection to surface and triage suspected cloud administration command abuse.
+type: technique
+related:
+- tactic_id: TA0002
+  tactic_name: Execution
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Was a cloud administration command (AWS ssm:SendCommand/StartSession, Azure Microsoft.Compute/virtualMachines/runCommand/action,
+    or GCP os-patch-runs/execute) issued on the control plane, and can it be correlated within a 5-minute
+    window to the corresponding VM agent process spawning a child process on the targeted host?
+  context: This is the core proof that a cloud-management API call actually executed code inside a guest
+    OS. On the Execution tactic, adversaries with cloud admin access abuse these services to run scripts
+    in VMs without ever logging into the host directly. Look for control-plane events (CloudTrail eventName
+    SendCommand/StartSession with eventSource ssm.amazonaws.com, including success or null status; Azure
+    runCommand action) and require a temporal join to the on-host agent (amazon-ssm-agent/ssm-agent, WindowsAzureGuestAgent.exe/waagent,
+    google_guest_agent) spawning a child via Windows 4688 / Sysmon 1. Encode a legitimate-use baseline
+    (approved SSM documents, maintenance-window targets, output directed to S3/CloudWatch) and alert on
+    deviations; layer in deterministic threat-intel matches on command arguments or encoded payloads.
+    A positive correlation strongly indicates the API call materialized as guest execution; a control-plane
+    event with no matching host child process may indicate a failed/blocked command or missing host telemetry.
+  answer_sources:
+  - AWS:CloudTrail (ssm:SendCommand, ssm:StartSession)
+  - azure:activity (Microsoft.Compute/virtualMachines/runCommand/action)
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances, Cloud provider management plane (API logs)'
+  range: Last 90 days; pivot to a 5-minute correlation window around each control-plane event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "control = cloudtrail where eventSource=\"ssm.amazonaws.com\" AND eventName in (\"SendCommand\"\
+      ,\"StartSession\") OR azure.activity where operationName=\"Microsoft.Compute/virtualMachines/runCommand/action\"\
+      \nhost = events where (EventID=4688 OR sysmon=1) AND ParentImage in (\"amazon-ssm-agent\",\"ssm-agent\"\
+      ,\"WindowsAzureGuestAgent.exe\",\"waagent\",\"google_guest_agent\")\nJOIN control TO host ON instance_id\
+      \ WITHIN 5m\nWHERE NOT (control.document IN approved_docs AND control.target IN maintenance_targets)\n\
+      \  OR control.command MATCHES ti_indicators OR control.command MATCHES /(-enc|base64|FromBase64String)/\n\
+      ALERT"
+  - technology: Sigma/pseudocode
+    query: "logsource: aws cloudtrail\ndetection:\n  sel:\n    eventSource: ssm.amazonaws.com\n    eventName:\
+      \ [SendCommand, StartSession]\n  condition: sel\n# base rule: sigmahq aws_cloudtrail_ssm_malicious_usage"
+- question: Do any cloud administration commands have abnormally large size (byte/length), high Shannon
+    entropy, unusual fan-out (number of target instances per SendCommand), or elevated frequency (commands/min)
+    relative to the per-IAM-role baseline?
+  context: 'Statistical profiling exposes abuse that evades signature rules. For the Execution tactic,
+    operators frequently push long, encoded, or obfuscated payloads, blast a command across many instances
+    at once, or fire commands in rapid succession — all of which deviate from the steady, narrow pattern
+    of legitimate automation tied to a given IAM role. Score command length/byte count and Shannon entropy
+    and flag anything above the 95th percentile; profile fan-out (targets per SendCommand) and frequency
+    (commands/min per principal) against the role baseline. Explicitly treat State: track agent exit codes
+    and CloudTrail errorCode (AccessDenied) bursts as a distinct failed-execution signal that can precede
+    a successful compromise. Derive thresholds from at least 30 days of your own CloudTrail/host history.
+    High entropy plus high fan-out from a role that normally targets one host is a strong abuse indicator.'
+  answer_sources:
+  - AWS:CloudTrail (ssm:SendCommand, ssm:StartSession)
+  - azure:activity (Microsoft.Compute/virtualMachines/runCommand/action)
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances, Cloud provider management plane (API logs)'
+  range: Last 90 days; minimum 30-day lookback to derive per-role baselines
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from cloudtrail where eventName in ("SendCommand","StartSession")
+
+      compute len=length(command), ent=shannon_entropy(command), fanout=count(target_instances), freq=count()
+      by principal per 1m
+
+      baseline p95_len, p95_ent, p95_fanout by iam_role over last 30d
+
+      WHERE len>p95_len OR ent>p95_ent OR fanout>p95_fanout OR freq>role_freq_p95
+
+      ALERT'
+  - technology: SIEM/Stats pseudocode
+    query: 'from cloudtrail where errorCode="AccessDenied"
+
+      bucket 5m by principal; count denies
+
+      WHERE denies >= burst_threshold THEN flag failed-execution-burst'
+- question: Does an explainable machine-learning classifier flag a cloud administration command as anomalous
+    based on combined control-plane and host features, and which top contributing features (e.g., source-IP
+    rarity, command entropy, first-time target) drove the score?
+  context: 'An ML layer catches multivariate anomalies that single-feature thresholds miss. For the Execution
+    tactic, train an Isolation Forest / Random Forest on control-plane plus host features: source-IP rarity,
+    principal history, command length, special-character ratio, entropy, target-instance count, and success/fail
+    status, complemented by rare-function population analysis over CloudTrail. Crucially, surface the
+    top-3 contributing features via SHAP in the alert text so an analyst can validate the model''s reasoning
+    rather than chase a black-box score. A high anomaly score driven by ''first-time target + high command
+    entropy + rare source IP'' is highly actionable; a score driven only by benign novelty (a new but
+    authorized maintenance host) can be dispositioned and fed back for tuning.'
+  answer_sources:
+  - AWS:CloudTrail (ssm:SendCommand, ssm:StartSession)
+  - azure:activity (Microsoft.Compute/virtualMachines/runCommand/action)
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances, Cloud provider management plane (API logs)'
+  range: Last 90 days; train on >=30-day history, score in near-real-time
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [src_ip_rarity, principal_hist, cmd_len, special_char_ratio, entropy, target_count,
+      success_fail]
+
+      model = IsolationForest(contamination=auto).fit(history_30d)
+
+      score = model.decision_function(event); shap_top3 = shap(model, event)[:3]
+
+      WHERE score < anomaly_threshold THEN alert(event, contributing=shap_top3)'
+- question: Did a cloud VM agent (amazon-ssm-agent, waagent, google_guest_agent) spawn a deny-listed interactive
+    utility or LOLBin (interactive cmd.exe, powershell -enc, /bin/bash -i, nc, curl|sh, certutil) outside
+    an approved interactive Session Manager window?
+  context: Legitimate cloud automation runs discrete, non-interactive scripts; an agent spawning an interactive
+    shell or known living-off-the-land binary is a hallmark of hands-on-keyboard abuse under the Execution
+    tactic. Alert when the agent process is the parent of deny-listed interactive tools or LOLBins, with
+    special attention to encoded PowerShell, interactive bash, netcat, and download-and-execute patterns
+    (curl|sh, certutil). Baseline the approved automation set and permitted interactive Session Manager
+    windows so that sanctioned admin sessions are excluded. Preserve concrete process-name and argument
+    rules and tune rather than delete them. A match outside an approved window indicates an operator is
+    using the cloud agent as an execution channel into the guest.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from (EventID=4688 OR sysmon=1)
+
+      where ParentImage in ("amazon-ssm-agent","waagent","google_guest_agent")
+
+      and (Image in denylist_interactive OR CommandLine MATCHES /(-enc|bash -i|\bnc\b|curl.+\|\s*sh|certutil)/)
+
+      and NOT within(approved_session_manager_window)
+
+      ALERT'
+- question: Is a process spawned by a cloud VM agent statistically rare — never before seen on the host
+    or in the bottom 5th percentile of frequency across the environment — and does its spawn frequency,
+    process-tree depth, or non-zero exit-code rate deviate from the host baseline?
+  context: Rarity scoring catches novel tooling without an explicit deny-list. For the Execution tactic,
+    flag agent child processes that are new to the host or sit in the bottom 5th percentile of environment-wide
+    frequency, and profile spawn frequency (children/min) and process-tree depth against the host baseline
+    derived from enterprise process history. Also profile the non-zero exit-code (failure) rate of agent
+    children as a distinct signal — bursts of failed executions can indicate trial-and-error abuse. A
+    first-seen binary spawned by waagent on a host that normally only runs a handful of automation scripts
+    warrants investigation; routine but infrequent patch tooling can be baselined out.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances'
+  range: Last 90 days; derive percentiles from >=30-day enterprise process history
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from (EventID=4688 OR sysmon=1) where ParentImage in agent_set
+
+      compute child_freq, tree_depth, fail_rate=avg(exit_code!=0) by host over 30d
+
+      WHERE Image NOT IN host_seen_images OR pct_rank(child_freq) < 0.05 OR tree_depth > host_p95 OR fail_rate
+      > host_p95
+
+      ALERT'
+- question: Does the in-guest agent event sequence (agent invocation -> script execution -> child process)
+    depart from the learned automation baseline according to a sequence-anomaly model, and which contributing
+    log events explain the deviation?
+  context: Sequence modeling detects abuse that individual events look benign in isolation. For the Execution
+    tactic, model the expected agent guest event sequence with an LSTM next-event predictor (DeepLog-style)
+    and an attention-RNN that exposes the contributing log fields. Alert on execution paths that diverge
+    from the learned automation baseline — for example, an agent invocation followed by an unexpected
+    interactive process rather than the usual script-then-exit pattern — and report the top contributing
+    events for analyst validation. A deviation flagged with clear supporting events (unexpected child
+    after agent invocation) is actionable; explainability lets the analyst confirm whether the new sequence
+    is malicious or a legitimate but novel automation flow.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Cloud virtual machine instances'
+  range: Last 90 days; train on historical agent event sequences
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = order_by(time, agent_guest_events_per_host)
+
+      model = DeepLog_LSTM.fit(normal_sequences)  # next-event prediction
+
+      for step in seq: if observed not in model.topk_predicted(step): anomaly += 1; contributors = attention_rnn.explain(step)
+
+      WHERE anomaly > 0 THEN alert(host, contributing_events=contributors)'
+- question: Did a process spawned by a cloud VM agent initiate a network connection to a threat-intel-listed
+    C2 endpoint or to a non-corporate egress destination, and was any agent-child egress connection blocked
+    or denied?
+  context: 'Following execution, agent-spawned processes that call out to attacker infrastructure reveal
+    command-and-control or staging consistent with the Execution-to-follow-on flow. Correlate agent-spawned
+    child processes (Windows 4688 / Sysmon 1) with their network connections (Sysmon 3 / Zeek conn.log
+    / VPC flow logs) and alert on connections to TI-listed C2 endpoints or to non-corporate egress destinations.
+    Provenance-link the agent -> process -> network edges so the chain is explicit. Keep failure profiling:
+    blocked or denied egress from agent children is itself a distinct signal of attempted C2. A confirmed
+    agent->process->TI-endpoint edge is high-fidelity; denied egress may indicate a contained but active
+    intrusion attempt.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Cloud VPC/NSG flow logs
+  - 'NAI: Virtual network gateways and firewalls, Cloud-native network flow logs (VPC), Endpoint network
+    sensors'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'proc = (EventID=4688 OR sysmon=1) where ParentImage in agent_set
+
+      net = (sysmon=3 OR zeek.conn OR vpc_flow)
+
+      JOIN proc TO net ON pid/host
+
+      WHERE net.dest IN ti_c2 OR net.dest NOT IN corporate_cidr
+
+      OR net.action in ("blocked","denied")
+
+      ALERT provenance(agent->proc->net)'
+  - technology: Zeek/pseudocode
+    query: 'conn.log: filter orig_h in cloud_vm_subnets AND resp_h not in corporate_cidr
+
+      join with process provenance where parent in agent_set -> flag external egress'
+- question: Do network connections from agent-spawned processes exhibit beaconing — highly regular inter-arrival
+    timing (low interval coefficient of variation, FFT periodicity) or oversized/skewed flow volume (bytes
+    out/in, out:in ratio) — relative to the process-host baseline?
+  context: Beacon detection finds C2 channels that hide in allowed destinations. For the Execution tactic's
+    downstream activity, score connection inter-arrival regularity (interval coefficient of variation
+    and FFT periodicity) and per-flow volume (bytes out/in and the out:in ratio) against the process-host
+    baseline, flagging highly periodic or oversized flows. Add jitter-robust state modeling (CT-HMM) so
+    beacons with randomized intervals are still caught. A process launched by a VM agent that maintains
+    a steady, low-jitter callback or pushes large outbound volumes is a strong C2/exfil indicator; bursty,
+    irregular human-driven traffic generally is not.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Cloud VPC/NSG flow logs
+  - 'NAI: Virtual network gateways and firewalls, Cloud-native network flow logs (VPC), Endpoint network
+    sensors'
+  range: Last 90 days; correlate over multi-day windows to expose slow beacons
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from net where parent_proc in agent_children
+
+      group by (src,dst) compute intervals=diff(ts); cv=std(intervals)/mean(intervals); periodicity=fft_peak(intervals);
+      vol_out=sum(bytes_out); ratio=bytes_out/bytes_in
+
+      WHERE cv < cv_low_thresh OR periodicity > peak_thresh OR vol_out > host_p95 OR ratio > ratio_thresh
+
+      ALERT'
+- question: Does a time-series forecast of agent-child connection volume, frequency, and inter-arrival
+    distribution deviate from the model's prediction, and which cadence/volume features explain the deviation?
+  context: Forecasting models detect emerging C2 even with high-jitter beacons. For the Execution tactic,
+    forecast agent-child connection volume/frequency and inter-arrival distribution with LSTM/transformer
+    time-series models that are robust to jitter, and alert on deviations from the predicted envelope,
+    surfacing the cadence/volume features driving the alert. This catches a slow, randomized callback
+    that periodicity tests miss, and the explainability lets the analyst see whether the deviation is
+    a genuine new communication pattern or expected operational change. A sustained deviation in cadence
+    from a freshly agent-spawned process is actionable.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Cloud VPC/NSG flow logs
+  - 'NAI: Virtual network gateways and firewalls, Cloud-native network flow logs (VPC), Endpoint network
+    sensors'
+  range: Last 90 days; rolling forecast windows
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = resample(agent_child_conns, interval=1h) -> [volume, freq, mean_interarrival]
+
+      model = LSTM_forecaster.fit(history)
+
+      pred = model.predict(next); resid = actual - pred
+
+      WHERE abs(resid) > forecast_band THEN alert(features=top_resid_dims)'
+- question: Were any execution APIs (ssm:SendCommand/StartSession, Azure runCommand) invoked from IPs
+    outside corporate CIDR ranges or from TOR/anonymizing nodes, and did a burst of AccessDenied errors
+    precede a successful call from the same principal?
+  context: The originating API call can betray abuse before any host execution. For the Execution tactic,
+    alert when command-execution APIs originate from IPs outside corporate CIDR ranges or from TOR/anonymizing
+    exit nodes, and on AccessDenied bursts immediately preceding a successful call — a classic permission-probing-then-success
+    pattern. Deploy CloudWatch metric filters/alarms on these event names. A successful SendCommand from
+    an anonymizing IP, especially right after repeated denies, indicates a likely compromised or misused
+    credential driving cloud-administration execution; calls from known corporate ranges during normal
+    admin activity are benign.
+  answer_sources:
+  - AWS:CloudTrail
+  - azure:activity
+  - Identity and Access Management (IAM) logs
+  - 'NAI: Identity and Access Management (IAM) service logs, Cloud provider management plane (API logs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from (cloudtrail eventName in (SendCommand,StartSession) OR azure runCommand)
+
+      WHERE sourceIPAddress NOT IN corporate_cidr OR sourceIPAddress IN tor_exit_nodes
+
+      ALERT
+
+      SUBPATTERN: principal with errorCode=AccessDenied count>=N within 10m THEN successful call -> ALERT
+      escalate'
+  - technology: CloudWatch/pseudocode
+    query: 'metric_filter: {$.eventName=SendCommand||$.eventName=StartSession}
+
+      alarm when count>0 from non_corporate_source'
+- question: Is a cloud administration API call a first-time action for the IAM principal, or does it create
+    a new source-IP -> principal -> instance edge, and is the principal's AccessDenied call rate elevated
+    relative to its baseline?
+  context: Identity-centric baselining catches credential abuse and lateral discovery. For the Execution
+    tactic, score each IAM-principal call against its own baseline (command set, target instances, geography,
+    source IP) and flag first-time API actions per principal using lookback baselining; score new source-IP
+    -> principal -> instance edges via Bayesian new-edge detection. Profile the failed (AccessDenied)
+    call rate per principal as a distinct discovery/abuse signal. A principal that has never issued SendCommand
+    suddenly targeting new instances from a new IP is a strong indicator of compromise; an established
+    admin repeating known actions is not.
+  answer_sources:
+  - AWS:CloudTrail
+  - azure:activity
+  - Identity and Access Management (IAM) logs
+  - 'NAI: Identity and Access Management (IAM) service logs, Cloud provider management plane (API logs)'
+  range: Last 90 days; >=30-day lookback for principal baselines
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline per principal: {cmd_set, targets, geo, src_ips} over 30d
+
+      for event: first_seen = event.action NOT IN principal.cmd_set
+
+      new_edge = bayes_new_edge(src_ip, principal, instance)
+
+      deny_rate = count(AccessDenied)/count(*) by principal
+
+      WHERE first_seen OR new_edge.prob_high OR deny_rate > principal_baseline
+
+      ALERT'
+- question: Does an explainable anomaly model flag a cloud administration API call as anomalous across
+    multi-dimensional features (geo, time, IAM principal, target-instance count, source-IP rarity, success/fail),
+    and which top contributing features and peer-group deviations explain it?
+  context: A multivariate ML layer at the control plane catches subtle identity/behavioral anomalies.
+    For the Execution tactic, train an Isolation Forest on API features (geography, time-of-day, IAM principal,
+    target-instance count, source-IP rarity, success/fail), augment with rare-function population analysis
+    over CloudTrail and UEBA peer-group anomaly detection, and surface the top-3 contributing features
+    in the alert. This catches a call that is individually plausible but collectively unusual — for example,
+    a normal command at an abnormal hour from a rare IP by a principal whose peers never perform it. Explainability
+    and peer context let the analyst confirm whether the principal's behavior truly diverges from its
+    role group.
+  answer_sources:
+  - AWS:CloudTrail
+  - azure:activity
+  - Identity and Access Management (IAM) logs
+  - 'NAI: Identity and Access Management (IAM) service logs, Cloud provider management plane (API logs)'
+  range: Last 90 days; train on >=30-day history
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [geo, hour, principal, target_count, src_ip_rarity, success_fail]
+
+      model = IsolationForest().fit(history_30d)
+
+      score = model.decision_function(event); shap3 = shap(model,event)[:3]
+
+      peer = ueba_peer_group_deviation(principal, action)
+
+      WHERE score<thresh OR peer.anomalous THEN alert(contributing=shap3, peer=peer)'
