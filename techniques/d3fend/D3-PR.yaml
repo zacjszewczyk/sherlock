@@ -1,0 +1,349 @@
+name: 'D3-PR: Password Rotation'
+id: de4f5752-7087-4263-929d-0feef96a94a0
+description: Investigate the effectiveness of the organization's password rotation policy in mitigating
+  credential-compromise risk. This playbook helps an analyst (1) enumerate accounts whose password age
+  exceeds policy and flag rotation-bypass flags and stale privileged/service/krbtgt secrets; (2) measure
+  password-age risk distribution, compliance trends, and forecast non-compliance hotspots; (3) evaluate
+  the quality of new and rotated secrets by rejecting weak/breached passwords at set-time, detecting predictable
+  old-to-new transforms, quantifying population credential strength, measuring cross-site reuse, and scoring
+  guessability with ML models; and (4) drive risk-based rotation from compromise signals such as breached-credential
+  matches, reset volume/burst frequency, and failed/blocked-reset rates. Together these questions surface
+  where rotation adds little value (calendar churn) versus where it is essential (compromise-driven resets),
+  so the SOC can prioritize remediation by privilege tier.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which accounts have a password age that exceeds the configured rotation policy window, broken
+    down by privilege tier?
+  context: Under the Harden tactic, stale passwords expand the window in which a compromised credential
+    remains usable. Query the directory attribute pwdLastSet and password-change events to list every
+    account whose password age exceeds the policy window (e.g., human accounts older than 365 days per
+    NIST SP 800-63B, or the locally configured maxPwdAge), and produce remediation lists grouped by privilege
+    tier. Treat pure calendar rotation as low-value; prioritize compromise-driven resets. A positive result
+    is a concrete remediation list of over-age accounts ranked by privilege; an empty result means the
+    population is within policy.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR account IN directory:\n  age_days = now - account.pwdLastSet\n  threshold = maxPwdAge\
+      \ OR (365 if account.type=='human')\n  IF age_days > threshold: emit(account, age_days, privilege_tier)\n\
+      ORDER BY privilege_tier, age_days DESC"
+- question: Which accounts have rotation-bypass flags set or hold stale privileged/service/krbtgt secrets
+    that exceed safe rotation cadence?
+  context: Rotation bypass undermines the Harden policy entirely. Deterministically flag accounts with
+    DONT_EXPIRE_PASSWORD or PASSWD_NOTREQD set in userAccountControl, service/managed accounts whose secret
+    age exceeds 90 days, and krbtgt whose last rotation exceeds 180 days or that has not received the
+    required two resets spaced beyond maximum ticket lifetime (needed to invalidate forged Golden Tickets).
+    Tune ages to local policy but do not remove the hard thresholds. A hit on krbtgt or a privileged service
+    account is high priority because it directly enables persistence.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR account IN directory:\n  IF account.uac HAS (DONT_EXPIRE_PASSWORD OR PASSWD_NOTREQD):\
+      \ emit(account, 'rotation_bypass')\n  IF account.is_service AND secret_age(account) > 90d: emit(account,\
+      \ 'stale_service_secret')\n  IF account.name=='krbtgt' AND (rotation_age > 180d OR reset_count <\
+      \ 2): emit(account, 'stale_krbtgt')"
+- question: Do any password reset events originate outside the authorized admin/PAM workflow, including
+    a single operator resetting many accounts in a short window?
+  context: Suspicious reset pathways can indicate account takeover or insider abuse, defeating the intent
+    of the Harden control. Correlate Windows Event ID 4723 (self-change), 4724 (admin reset), and 4738
+    (account changed) against the authorized admin/PAM workflow allowlist, flagging resets whose Subject
+    operator, source host, or hour falls outside the approved set, and any single operator resetting more
+    than 5 distinct accounts in 10 minutes. Count success and failure states separately. A positive result
+    is an out-of-band or burst reset that warrants immediate triage.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR e IN events WHERE id IN (4723,4724,4738):\n  IF e.operator NOT IN PAM_allowlist OR e.src_host\
+      \ NOT IN approved OR e.hour NOT IN approved_hours:\n    emit(e, 'out_of_band_reset')\nWINDOW 10m\
+      \ PER operator: IF distinct(target_account) > 5: emit(operator, 'burst_reset', status)"
+- question: What is the distribution (median, 90th/95th/99th percentile, and tail) of password age by
+    account type and business unit, and where does it breach policy?
+  context: A statistical view of password age tells the Harden program where risk concentrates rather
+    than treating every stale account equally. Compute median and 90th/95th/99th percentiles and the tail
+    of password age by account type and business unit, alerting where a group's 95th percentile exceeds
+    policy. Weight tiers using attacker successor-prediction baselines (~41% offline, ~17% online within
+    five guesses) and the interval-vs-guess-rate benefit model so you focus on stale tiers that genuinely
+    raise compromise risk. A breached percentile in a privileged BU is the strongest signal to act.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'STATS p50=median(age), p90, p95, p99, max(age) BY account_type, business_unit
+
+      WHERE p95 > policy_window
+
+      RANK BY privilege_weight * tail_mass'
+- question: Is the weekly password-rotation compliance trend degrading or stagnating in high-risk tiers?
+  context: Compliance erosion is a leading indicator that the Harden control is failing operationally.
+    Build weekly compliance trend lines (count and ratio of non-rotated accounts) and apply change-point
+    detection (CUSUM/PELT/Bayesian online CPD) to flag statistically significant drops or stagnation in
+    high-risk tiers. Alert on any decrease beyond the historical 2-sigma band. A detected change point
+    in a privileged tier means the rotation program is regressing and needs management attention.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SERIES weekly_noncompliance_ratio BY tier
+
+      cp = changepoint_detect(series, method=''CUSUM|PELT|BOCPD'')
+
+      IF cp.direction==''worse'' OR delta > 2*sigma_hist: alert(tier, cp)'
+- question: Where will rotation non-compliance most likely persist, and which account features drive that
+    prediction?
+  context: Forecasting lets the Harden program intervene before stale credentials accumulate. Forecast
+    where rotation non-compliance will persist using historical compliance rates, ownership, account criticality,
+    and exception history; emit alerts that surface the top-3 contributing features (e.g., orphaned-owner,
+    prior-exception, privileged-tier) alongside the score so analysts can act. A high-confidence hotspot
+    prediction on privileged or orphaned accounts should drive proactive cleanup.
+  answer_sources:
+  - Active Directory Logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Windows Event ID 4738
+  - Directory attribute pwdLastSet
+  - 'NAI: Domain Controllers'
+  range: Last 365 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [hist_compliance, owner_status, criticality, exception_history]
+
+      score = forecast_model.predict(account, features)
+
+      IF score > threshold: alert(account, score, top3_features(score))'
+- question: Are new or rotated passwords being screened against breach corpora, dictionaries, and minimum-length
+    rules at set-time, and are rejections being logged?
+  context: Rotation only hardens the environment if the new secret is strong. Enforce a deterministic
+    accept/reject gate that screens every new or rotated password against breach-corpus and dictionary
+    blacklists and minimum length (>=8, allow >=64) per NIST SP 800-63B and Azure AD Password Protection
+    banned lists. Rejected attempts must be logged as a distinct failure-mode signal. A high reject rate
+    confirms the filter is catching weak choices; an absence of reject logs may mean the gate is not deployed
+    or not enforced.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ON password_set(account, candidate):\n  IF candidate IN breach_corpus OR candidate IN dictionary\
+      \ OR len(candidate) < 8:\n    reject; log(account, 'weak_set_rejected', reason)\n  ELSE accept"
+- question: Do rotated passwords show predictable old-to-new transforms such as digit increments, single-character
+    substitutions, or appended characters?
+  context: Predictable transforms defeat the purpose of rotation because an attacker who knows the old
+    password can guess the new one. When successive hashes/strengths are comparable, compute the transform/edit-distance
+    between the prior and new password and flag changes that are simple digit increments, single-character
+    substitutions, or appended characters, since such transforms dominate forced changes and remain trivially
+    guessable. A flagged transform indicates the rotation provided little real security benefit and the
+    user should be coached or the policy strengthened.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ON password_change(account, old, new) WHERE comparable(old,new):\n  d = edit_distance(old,\
+      \ new)\n  IF d <= 2 OR is_increment(old,new) OR is_append(old,new):\n    emit(account, 'predictable_transform',\
+      \ d)"
+- question: What is the population credential strength measured with partial-guessing metrics, and which
+    accounts fall below safe guessing resistance?
+  context: Aggregate strength tells the Harden program how resistant the credential base is to guessing
+    attacks. Estimate population credential strength with sample-robust partial-guessing metrics (alpha-guesswork,
+    lambda-success rate) rather than Shannon entropy, ranking accounts whose effective guessing resistance
+    falls below ~20 bits for priority rotation. Accounts below the threshold are the highest-value targets
+    for forced rotation and stronger policy.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'guess_resistance = partial_guessing_metric(hash_population, metric=''alpha_guesswork|lambda_success'')
+
+      FOR account: IF effective_bits(account) < 20: rank_for_rotation(account)'
+- question: What is the rate and edit-distance distribution of reused or weakly-transformed passwords
+    across the account base and against known external leaks?
+  context: Cross-site reuse means a leak elsewhere can compromise enterprise accounts, scoping how wide
+    a rotation response must be. Measure the rate and edit-distance distribution of reused/weakly-transformed
+    passwords across the account base and against known external leaks, using the 43-51% reuse and ~30%-within-100-guesses
+    cross-site crackability baselines to scope enterprise-wide rotation when a related secret leaks. A
+    high reuse rate means a single external breach can cascade into your environment.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR account: nearest = min_edit_distance(account.hash, leak_corpus + internal_corpus)
+
+      reuse_rate = count(nearest <= k) / total
+
+      HIST(edit_distance) ; alert IF reuse_rate > baseline'
+- question: How guessable are new and rotated passwords according to a neural (RNN/LSTM) character-level
+    guessability model?
+  context: A neural guessability model catches weak secrets that rule-based filters miss, supporting the
+    Harden goal of strong credentials. Score new and rotated passwords with an RNN/LSTM character-level
+    guessability model to reject weak secrets and rank accounts by cracking risk. The alert must surface
+    the estimated guess number and the top-3 weak substrings driving it so analysts and users understand
+    why a password is weak. A low guess number means the password would fall quickly to an offline attack.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'guess_num = neural_guessability_model.score(candidate)  # RNN/LSTM char-level
+
+      IF guess_num < reject_threshold: reject
+
+      alert(account, guess_num, top3_weak_substrings(candidate))'
+- question: What interpretable weak-password patterns (dictionary word, keyboard sequence, date, l33t,
+    repeat) are present in set/reset and batch evaluations?
+  context: Interpretable strength feedback improves user behavior and supports targeted Harden remediation.
+    Run the zxcvbn pattern estimator to provide interpretable strength scores at set/reset and in batch,
+    surfacing the top-3 contributing weak patterns (dictionary word, keyboard sequence, date, l33t, repeat)
+    in the alert rather than only a score. Identifying the specific weak pattern lets you coach users
+    and refine banned-pattern lists.
+  answer_sources:
+  - Active Directory password filter
+  - Identity Provider password set/reset events
+  - Offline password-hash exports
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'result = zxcvbn(candidate)
+
+      IF result.score < 3: emit(account, result.score, top3_patterns(result.sequence))'
+- question: Have any accounts matched a breached-credential corpus, and were those matches treated as
+    deterministic compromise events forcing rotation and session invalidation?
+  context: Compromise-driven rotation is the highest-value use of the Harden control. Treat a privacy-preserving
+    breach-corpus match (k-anonymity + private set intersection) as a deterministic compromise event that
+    forces rotation and disables affected sessions, consistent with rotate-on-compromise guidance and
+    the evidence that ~1.5% of sign-ins used breached credentials. A breach match that did NOT trigger
+    rotation/session-kill is a critical gap; a match that did indicates the control is working.
+  answer_sources:
+  - Breach-alert / credential-exposure logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Identity Provider sign-in logs
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR account: IF psi_match(account.credential, breach_corpus, k_anonymity=True):\n  IF NOT\
+      \ rotation_forced(account) OR NOT sessions_revoked(account):\n    alert(account, 'breached_unremediated')"
+- question: Are per-operator and enterprise-wide password reset volumes showing sudden surges or abnormal
+    bursts beyond baseline?
+  context: Mass reset activity can signal an attacker-driven compromise response or panic, both relevant
+    to the Harden tactic. Baseline per-operator and enterprise-wide reset volume (count/min) and apply
+    change-point detection to flag sudden reset surges (e.g., mass attacker-driven or panic resets) and
+    abnormal bursts beyond the historical 3-sigma rate. A detected surge warrants correlating with incident
+    timelines to determine whether it is legitimate response or abuse.
+  answer_sources:
+  - Breach-alert / credential-exposure logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Identity Provider sign-in logs
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SERIES reset_count_per_min BY operator, enterprise
+
+      cp = changepoint_detect(series)
+
+      IF rate > mean + 3*sigma OR cp: alert(scope, ''reset_surge'')'
+- question: How do failed and blocked reset rates (rejected weak/breached sets, failed self-service resets,
+    rate-limited/locked attempts) compare to baseline?
+  context: Failure-mode signals reveal both attacks and control health for the Harden program. Track the
+    failure-mode signals distinctly - rejected weak/breached set attempts, failed self-service resets,
+    and rate-limited/locked reset attempts - alerting when the failed-to-successful reset ratio exceeds
+    its baseline, since rate-limiting failed attempts is a core control. A spike in rate-limited attempts
+    may indicate brute-force or credential-stuffing against the reset flow.
+  answer_sources:
+  - Breach-alert / credential-exposure logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Identity Provider sign-in logs
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'STATS rejected_set, failed_selfservice, ratelimited BY window
+
+      ratio = failed / successful_resets
+
+      IF ratio > baseline_ratio: alert(window, breakdown)'
+- question: Which accounts remain exposed-but-unreset after a breach match, and are there anomalous reset
+    bursts when combining breach state with reset telemetry?
+  context: Distinguishing exposed-but-unreset from exposed-and-reset states is essential to closing compromise
+    gaps under the Harden tactic. Combine breach-match state with reset telemetry to detect accounts that
+    remain exposed-but-unreset versus reset (distinct states) and anomalous reset bursts, using forecasting/change-point
+    models and the exposed-vs-reset distinction. Surface the top-3 contributing features (breach-source,
+    days-since-exposure, privilege) in the alert. Exposed-but-unreset privileged accounts are the most
+    urgent to remediate.
+  answer_sources:
+  - Breach-alert / credential-exposure logs
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - Identity Provider sign-in logs
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'state = join(breach_match, reset_events) PER account
+
+      IF state==''exposed'' AND NOT reset: alert(account, ''exposed_unreset'', top3_features)
+
+      burst = changepoint_detect(reset_series); IF burst: alert(scope, burst)'
