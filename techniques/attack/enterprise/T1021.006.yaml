@@ -1,0 +1,461 @@
+name: 'T1021.006: Windows Remote Management'
+id: 837aa125-7d70-48bd-bdb9-08fc0d7ccb49
+description: Hunt for adversaries abusing Windows Remote Management (WinRM, TCP 5985/5986) to move laterally
+  and execute commands on remote Windows hosts. WinRM lets an actor with valid credentials run executables,
+  modify the registry, and interact with WMI on a target, and is commonly driven through PowerShell, the
+  winrm command, or tools such as Evil-WinRM. This playbook helps an analyst investigate WinRM remote
+  sessions deterministically (listener connections and 4624 network logons followed by WsmPrvSE.exe),
+  match WinRM source hosts against threat-intelligence and internal-compromise watchlists, profile rare
+  source-destination-user logon triplets and authentication-failure states, classify anomalous WinRM graph
+  edges, inspect WsmPrvSE.exe child processes and PowerShell script blocks for download cradles, encoded
+  commands, and obfuscation, score command entropy and volume, detect prohibited pathways and off-hours
+  volume spikes, and correlate post-authentication process/script execution under the same Logon ID to
+  surface hands-on-keyboard lateral movement, scanning, and credential-access activity.
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did an inbound connection to the WinRM listener on TCP 5985 (HTTP) or 5986 (HTTPS), or a network
+    logon (Security 4624, LogonType 3) immediately followed by WsmPrvSE.exe spawning on the destination,
+    occur on any host?
+  context: 'This is the deterministic floor for WinRM lateral movement: per Microsoft''s documented WinRM
+    ports and host process, any connection terminating on the WinRM listener, or a LogonType 3 network
+    logon followed by the WinRM plug-in host WsmPrvSE.exe, is a confirmed remote WinRM session. Establishing
+    this ground truth lets the analyst enumerate every WinRM session in the environment and is the baseline
+    that all statistical and ML layers build on. A positive result confirms a remote session occurred
+    (it does not by itself prove malice); a negative result means no WinRM remote activity reached that
+    host. Never remove this floor — it guarantees coverage even when behavioural models miss. In the Lateral
+    Movement context this is the anchor event for confirming an adversary using legitimate WinRM tooling
+    to enter a remote system.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days, pivoting on each WinRM session for correlation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      winrm_net = FILTER conn.log BY dest_port IN [5985,5986] AND service="winrm-listener"
+      winrm_logon = FILTER Event4624 BY logon_type=3
+        JOIN Event4688 ON host,logon_id WHERE child_image="WsmPrvSE.exe" WITHIN 60s
+      CONFIRM_WINRM = winrm_net OR winrm_logon
+  - technology: Zeek/pseudocode
+    query: |-
+      event connection_established(c):
+        if c$id$resp_p in {5985/tcp, 5986/tcp}:
+      log_winrm_session(c)
+- question: Does any WinRM source IP (from 5985/5986 flows or WinRM/Operational Event ID 6) match a threat-intelligence
+    or internal-compromise watchlist?
+  context: Continuously compare WinRM source IPs against threat-intelligence feeds and internal containment/compromise
+    watchlists. A match means a host already attributed to adversary activity is now driving WinRM sessions
+    — a strong indication of hands-on-keyboard lateral movement. On a hit, enrich with the corresponding
+    4624 logon context, WinRM operational events, and WsmPrvSE.exe process lineage to confirm a real remote
+    session rather than a stray packet. A positive result should escalate immediately; a clean result
+    lowers but does not eliminate suspicion, since internal pivots may originate from not-yet-flagged
+    hosts. This directly supports the Lateral Movement question of whether a known-bad actor is using
+    WinRM to reach further into the network.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days; re-evaluate as watchlists update.
+  queries:
+  - technology: SIEM/threat-intel pseudocode
+    query: |-
+      winrm_src = FILTER (conn.log dest_port IN [5985,5986]) OR (WinRM_Op EventID=6) PROJECT src_ip
+      hit = ENRICH winrm_src WITH ti_watchlist, internal_compromise_list
+      ALERT WHERE hit=true ENRICH_WITH Event4624(logon_context), WsmPrvSE_lineage
+- question: Did a user initiate a WinRM session from a source host that is statistically rare (bottom
+    5th percentile of historical frequency) for that user and destination?
+  context: Over a 30-day window, profile for each account the set of source hosts from which they normally
+    initiate WinRM connections, and compute the frequency of each source-destination-user triplet. A new
+    WinRM session whose source host sits in the bottom 5th percentile of historical frequency for that
+    user/destination indicates an unusual origin point — a classic structurally-anomalous login signal.
+    Derive the percentile cutoff from your own 30-day distribution so it reflects local norms. A positive
+    result flags an account potentially being driven from an attacker-controlled foothold; a negative
+    result means the origin is consistent with that user's history. This sharpens the Lateral Movement
+    hunt by catching credential reuse from abnormal pivot points.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days, with a rolling 30-day baseline per user/destination.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = COUNT winrm_sessions BY user,src_host,dest OVER last_30d
+      pctile = PERCENTILE_RANK(baseline.freq) PER user,dest
+      ALERT new_session WHERE pctile(user,src_host,dest) <= 5
+- question: Is a single source host or account producing an abnormal WinRM authentication-failure pattern
+    — more than 10 failed WinRM auths in 5 minutes, or a failure-then-success transition?
+  context: 'Track per source host and per account the count and ratio of failed WinRM authentications
+    (Security 4625 with LogonType 3 against the WinRM service, WinRM/Operational error events, and firewall-denied
+    5985/5986 attempts) versus successes. Alert when a source exceeds 10 failed WinRM auths in 5 minutes
+    (password spray/guess) OR shows a failure-then-success transition (guessing that finally worked).
+    This is a distinct credential-access signal that frequently precedes lateral movement: it captures
+    the moment an adversary brute-forces or sprays before pivoting. A clean failure profile suggests normal
+    administration; a spike or failure-to-success sequence warrants immediate review of the subsequent
+    session. Tying failures to the eventual successful WinRM logon links credential access to the Lateral
+    Movement objective.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days; evaluate failures in 5-minute sliding windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      fails = FILTER Event4625 logon_type=3 (target=WinRM) OR WinRM_Op error OR fw_denied(5985,5986)
+      ALERT src WHERE COUNT(fails) > 10 WITHIN 5min
+      ALERT WHERE seq(fail...,then Event4624 success) SAME src,account
+- question: Does a new WinRM session form a highly improbable first-time edge in the host-to-host WinRM
+    graph (e.g., finance -> developer-workstation)?
+  context: Construct a directed graph where hosts are nodes and WinRM sessions are edges, then train an
+    unsupervised graph anomaly model (GraphSAGE / node2vec link prediction) on 30+ days of normal topology
+    and score new edges in real time. Highly improbable first-time edges — for example a finance host
+    suddenly opening a WinRM session to a developer workstation — are strong lateral-movement indicators
+    because attackers traverse paths that legitimate operations never use. The alert must surface the
+    top-3 contributing features (edge novelty score, source-node out-degree change, destination sensitivity
+    tier) so the analyst can judge it quickly. A high-scoring novel edge is a priority lead; expected
+    edges within normal topology are deprioritized. This captures the structural footprint of an adversary
+    moving through the network.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days, with 30+ days of topology for model training.
+  queries:
+  - technology: ML/graph pseudocode
+    query: |-
+      G = BUILD_DIGRAPH(nodes=hosts, edges=winrm_sessions, window=30d)
+      model = TRAIN node2vec_link_prediction(G)
+      score = model.score(new_edge)
+      ALERT WHERE score > threshold REPORT top3_features(novelty, out_degree_delta, dest_tier)
+- question: Did a TI-matched or graph-anomalous WinRM source account also show abnormal logon context
+    (new source host, unusual logon hour, or unexpected privilege assignment via 4672) within the same
+    30-minute window?
+  context: Escalate TI-matched or graph-anomalous WinRM connections when the same source account simultaneously
+    exhibits abnormal logon context — a new source host, an unusual logon hour, or unexpected privilege
+    assignment (Security 4672) — within a 30-minute window. Co-occurrence of an attributed/anomalous WinRM
+    session with identity anomalies builds a causal escalation path, sharply raising confidence that the
+    activity is malicious rather than coincidental. The analyst is looking for the convergence of multiple
+    weak signals into one strong one. A match across both dimensions is a high-fidelity lateral-movement-plus-privilege-escalation
+    lead; an isolated signal stays at lower priority. This implements the Hopper-style causal chaining
+    of suspicious logins for the Lateral Movement mission.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - Zeek notice.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4688
+  - 'NAI: Core network switches, network traffic sensors at VLAN boundaries, authentication logs on member
+    servers and domain controllers, threat intelligence platforms.'
+  range: Last 90 days; correlate signals within 30-minute windows.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      flagged = winrm WHERE ti_match=true OR graph_anomaly=true
+      identity_anom = (new_src_host) OR (unusual_logon_hour) OR (Event4672 unexpected_priv)
+      ALERT WHERE flagged JOIN identity_anom ON account WITHIN 30min
+- question: Did WsmPrvSE.exe spawn a child process or script containing malicious indicators — download
+    cradles (IEX, Net.WebClient, Invoke-WebRequest), encoded commands (-enc/-EncodedCommand), credential-dumping/discovery
+    tools, unsigned binaries, or execution from user-writable paths?
+  context: Isolate process and script activity whose parent is WsmPrvSE.exe — the documented WinRM plug-in
+    host — and flag malicious command-line and script indicators. WinRM sessions legitimately run admin
+    commands, but download cradles, encoded commands, credential-dumping tools, unsigned binaries, and
+    execution from user-writable directories strongly suggest the session is being abused for remote execution.
+    The analyst is examining what an authenticated WinRM session actually did on the target. A hit indicates
+    likely tooling deployment or fileless execution; a clean child-process tree suggests benign administration.
+    Validate detection coverage with Evil-WinRM / Invoke-Command atomic tests. In the Lateral Movement
+    context, this confirms whether the remote session was used to further the intrusion rather than to
+    administer the host.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - 'NAI: Process creation and command-line logs on all Windows endpoints and servers, particularly Domain
+    Controllers and administrative bastion hosts. PowerShell script block logging archives.'
+  range: Last 90 days, pivoting on each WsmPrvSE.exe parent process.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      winrm_children = FILTER (Event4688 OR Sysmon1) BY parent_image="WsmPrvSE.exe"
+      ALERT WHERE cmdline MATCHES /(IEX|Net\.WebClient|Invoke-WebRequest|-enc|-EncodedCommand|mimikatz)/i
+        OR image_unsigned=true OR image_path IN user_writable_paths
+- question: Do any command lines or PowerShell script blocks (Event ID 4104) spawned by WsmPrvSE.exe exceed
+    the 95th percentile of Shannon entropy or raw byte length for the environment?
+  context: For all command lines and PowerShell script blocks (Event ID 4104) under WsmPrvSE.exe, compute
+    both Shannon entropy and raw byte length (volume), baseline both metrics environment-wide, and flag
+    any command exceeding the 95th percentile of entropy or length. High entropy points to obfuscation/encoding
+    while high length points to a large embedded payload — both are hallmarks of attacker-delivered PowerShell.
+    Derive the thresholds from your own corpus so legitimate but verbose admin scripts don't dominate.
+    A command that trips either threshold is a strong obfuscation/payload lead worth decoding; normal
+    short, low-entropy commands are deprioritized. This statistical layer catches WinRM remote-execution
+    abuse that signature rules miss.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - 'NAI: Process creation and command-line logs on all Windows endpoints and servers, particularly Domain
+    Controllers and administrative bastion hosts. PowerShell script block logging archives.'
+  range: Last 90 days, with environment-wide entropy/length baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      cmds = FILTER (Event4104 OR Event4688) BY parent_image="WsmPrvSE.exe"
+      cmds.entropy = SHANNON(cmds.text); cmds.len = BYTELEN(cmds.text)
+      e95 = PERCENTILE(all_cmds.entropy,95); l95 = PERCENTILE(all_cmds.len,95)
+      ALERT WHERE entropy > e95 OR len > l95
+- question: Does a WinRM session show a high error-to-success ratio (e.g., >30% failed invocations) across
+    script-block errors, non-zero process exits, and AMSI/Defender blocks?
+  context: 'Count per WinRM session the number of script blocks raising errors/exceptions, processes exiting
+    with non-zero codes, and AMSI/Defender blocks, then compute the ratio against successful invocations.
+    A high failure ratio (e.g., greater than 30%) signals trial-and-error tooling or partially-blocked
+    attacker activity — clean administration rarely fails repeatedly. This is a distinct triage signal:
+    it separates fumbling or defense-evading intruders from competent legitimate operators. A high-error
+    session deserves deeper review of what the actor was attempting; a low-error session is more consistent
+    with routine use. This execution-failure profiling complements content inspection in the Lateral Movement
+    hunt by spotting attackers fighting against the host''s defenses.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - 'NAI: Process creation and command-line logs on all Windows endpoints and servers, particularly Domain
+    Controllers and administrative bastion hosts. PowerShell script block logging archives.'
+  range: Last 90 days, aggregated per WinRM session.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      per_session = GROUP BY logon_id WHERE parent="WsmPrvSE.exe"
+      fails = COUNT(script_errors + nonzero_exit + amsi_block)
+      ratio = fails / COUNT(total_invocations)
+      ALERT WHERE ratio > 0.30
+- question: Does a machine-learning classifier flag WinRM-spawned PowerShell script blocks or command
+    lines as malicious?
+  context: Classify WinRM-spawned content (4104 script blocks and 4688/Sysmon 1 command lines under WsmPrvSE.exe)
+    with a character-level CNN/RNN trained on labeled benign/malicious PowerShell, layered with an AST-based
+    model for robustness against obfuscation. This catches malicious intent that evades keyword rules
+    and entropy thresholds by learning the deeper structure of attacker scripts. The alert must surface
+    the top-3 contributing features/tokens (decoded payload n-gram, AST node anomaly, entropy) rather
+    than only a score, so the analyst can validate the verdict. A high-confidence malicious classification
+    is a priority lead; a benign classification supports — but does not prove — legitimate use. This ML
+    layer hardens detection of WinRM remote-execution abuse during Lateral Movement.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - 'NAI: Process creation and command-line logs on all Windows endpoints and servers, particularly Domain
+    Controllers and administrative bastion hosts. PowerShell script block logging archives.'
+  range: Last 90 days; retrain periodically on labeled corpora.
+  queries:
+  - technology: ML/NLP pseudocode
+    query: |-
+      content = FILTER (Event4104 OR Event4688 OR Sysmon1) BY parent="WsmPrvSE.exe"
+      score = ensemble(charCNN_RNN(content), AST_model(content))
+      ALERT WHERE score > threshold REPORT top3_tokens_features
+- question: Did WinRM traffic (TCP 5985/5986) traverse a prohibited pathway, such as workstation-to-workstation
+    or a non-admin subnet to a tier-0 host?
+  context: Enforce WinRM pathway policy on 5985/5986 flows and alert on forbidden source/destination pairs
+    — workstation-to-workstation sessions and non-admin subnets reaching tier-0 assets — leveraging WinRM's
+    fixed ports. Legitimate WinRM administration follows defined management paths (admin VLAN to servers);
+    attacker lateral movement routinely violates them. The analyst is checking whether a WinRM session
+    crossed a boundary that policy forbids. A violation is a high-value lateral-movement indicator, especially
+    when repeated from the same source (campaign-level fan-out); compliant paths are expected. Correlating
+    repeated violations from one source aggregates noise into a clear intrusion narrative for the Lateral
+    Movement mission.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4624
+  - 'NAI: Network flow data collectors (e.g., Zeek sensors) at network segment boundaries, especially
+    between user, server, and administrative VLANs. Core switch and router flow export data.'
+  range: Last 90 days; correlate repeated violations per source.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      winrm = FILTER conn.log BY dest_port IN [5985,5986]
+      ALERT WHERE (src_zone=workstation AND dest_zone=workstation)
+        OR (src_zone NOT IN admin_subnets AND dest_tier=0)
+      AGGREGATE violations BY src_ip FOR campaign_view
+- question: Did hourly WinRM connection counts exceed the historical mean + 3 standard deviations for
+    that hour-of-day and day-of-week?
+  context: From Zeek conn.log, baseline hourly WinRM (5985/5986) connection counts over 30 days, computing
+    mean and standard deviation per hour-of-day and day-of-week, and alert when an observed hour exceeds
+    mean + 3 standard deviations for that window. Sudden spikes in WinRM volume indicate scanning, brute-force
+    fan-out, or mass remote execution that departs from the environment's normal rhythm. Recompute the
+    baseline monthly so seasonal drift doesn't erode accuracy. A spike is a strong scanning/lateral-movement-at-scale
+    signal; volumes within the expected band are normal operations. This time-aware statistical layer
+    catches bursty adversary behaviour the deterministic rules alone would not prioritize.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4624
+  - 'NAI: Network flow data collectors (e.g., Zeek sensors) at network segment boundaries, especially
+    between user, server, and administrative VLANs. Core switch and router flow export data.'
+  range: Last 90 days; rebuild the hourly baseline monthly.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      counts = COUNT conn.log(dest_port IN [5985,5986]) BY hour_of_day,day_of_week
+      mu,sigma = MEAN_STD(counts OVER last_30d) PER hour,dow
+      ALERT WHERE observed_count > mu + 3*sigma
+- question: Is a source host generating a surge of denied/reset/half-open WinRM connections fanning out
+    across many destinations (above the 99th-percentile destination count)?
+  context: Track the rate of denied/reset WinRM connection attempts (firewall-blocked 5985/5986, TCP resets,
+    half-open flows in conn.log) per source. A surge of failed connections fanning out across many destinations
+    is a distinct scanning/spray signal even when no session ever succeeds — the attacker is probing for
+    reachable WinRM listeners. Alert when a source's blocked-attempt fan-out exceeds the 99th-percentile
+    destination count. This captures reconnaissance and lateral-movement preparation that successful-session
+    detections would miss entirely. A wide blocked fan-out is a high-priority scanning lead; isolated
+    failed attempts are routine. It gives the analyst early warning before an adversary finds a foothold
+    for WinRM-based Lateral Movement.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4624
+  - 'NAI: Network flow data collectors (e.g., Zeek sensors) at network segment boundaries, especially
+    between user, server, and administrative VLANs. Core switch and router flow export data.'
+  range: Last 90 days; evaluate fan-out per source over rolling windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      failed = FILTER conn.log BY dest_port IN [5985,5986] AND state IN [REJ,RSTO,S0]
+      fanout = COUNT_DISTINCT(dest_ip) BY src_ip
+      p99 = PERCENTILE(all_src.fanout,99)
+      ALERT WHERE fanout > p99
+- question: Did observed WinRM volume between major network segments exceed the forecast confidence interval,
+    or did a temporally novel segment edge score anomalous?
+  context: Run a time-series forecaster (Prophet/LSTM) on WinRM volume between major segments (e.g., Admin
+    VLAN -> Server VLAN) to learn daily/weekly rhythm, and a temporal graph link-prediction model to score
+    never-before-seen segment edges. Alert when observed volume breaches the predicted confidence interval
+    or when a temporally novel edge scores anomalous, including the top-3 features (predicted-vs-observed
+    delta, edge novelty, off-hours flag) in the alert. This combines volumetric forecasting with structural
+    novelty to catch both surges and brand-new pathways at the segment level. A breach of forecast or
+    a novel anomalous edge is a strong large-scale lateral-movement indicator; volumes and edges that
+    match the learned rhythm are expected. This ML layer models the network's macro-behaviour to expose
+    unauthorized remote administration at scale.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows WinRM/Operational Event ID 6
+  - Windows Event ID 4624
+  - 'NAI: Network flow data collectors (e.g., Zeek sensors) at network segment boundaries, especially
+    between user, server, and administrative VLANs. Core switch and router flow export data.'
+  range: Last 90 days; forecast on daily/weekly rhythm per segment pair.
+  queries:
+  - technology: ML/forecast pseudocode
+    query: |-
+      vol = TIMESERIES winrm_volume BY segment_pair
+      fc = PROPHET_or_LSTM.fit(vol).predict_interval()
+      edge_score = temporal_link_pred(segment_graph)
+      ALERT WHERE observed > fc.upper OR edge_score > threshold REPORT top3(delta,novelty,off_hours)
+- question: Did a WinRM-attributed network logon (4624, LogonType 3) lead to child processes or scripts
+    sharing the same Logon ID under WsmPrvSE.exe that run high-risk utilities, credential-access commands,
+    or rapid discovery chains?
+  context: Correlate WinRM-attributed 4624 (LogonType 3) sessions with child process/script activity sharing
+    the same Logon ID under WsmPrvSE.exe, alerting on high-risk utilities, credential-access commands,
+    and rapid discovery chains rarely seen in legitimate remote administration. Joining the logon to its
+    downstream activity by Logon ID stitches authentication to action, letting the analyst see exactly
+    what a remote operator did post-login. Discovery bursts (whoami, net, nltest), credential-access tools,
+    and risky utilities under a freshly-authenticated WinRM session strongly indicate hands-on-keyboard
+    lateral movement. A risky post-auth chain is a priority lead; routine maintenance commands are not.
+    This directly answers whether an authenticated WinRM session was weaponized for further intrusion.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows WinRM/Operational Event ID 6
+  - 'NAI: Authentication, privilege assignment, and process creation logs on all critical servers (Domain
+    Controllers, Certificate Authorities, database servers) and privileged administrative workstations.'
+  range: Last 90 days, correlating by Logon ID within each session.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      winrm_logon = FILTER Event4624 BY logon_type=3 (winrm-attributed)
+      acts = FILTER (Event4688 OR Event4104) BY parent="WsmPrvSE.exe"
+      JOIN ON logon_id
+      ALERT WHERE acts MATCHES high_risk_utils OR cred_access_cmds OR discovery_chain
+- question: Does a WinRM session contain a rare command sequence (2-3-command n-gram with historical frequency
+    below 1%), or an excess of discovery/error commands above the 99th percentile for that user?
+  context: For each user-host pair, model typical WinRM session command sequences as 2-3-command n-grams
+    from Event ID 4688/4104 and flag sessions containing a sequence whose historical frequency is below
+    1%. Additionally count discovery commands per session (whoami, net user, ipconfig, nltest) and the
+    count of failed/error-returning commands, alerting if either exceeds the 99th percentile for that
+    user. Rare command sequences and discovery/error bursts reveal an operator behaving unlike the legitimate
+    owner of the credentials — the signature of an intruder exploring an unfamiliar host. A flagged session
+    is a strong post-authentication lateral-movement lead; sequences matching the user's normal pattern
+    are deprioritized. This sequence-aware statistical layer catches subtle behavioural deviation within
+    otherwise valid WinRM sessions.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows WinRM/Operational Event ID 6
+  - 'NAI: Authentication, privilege assignment, and process creation logs on all critical servers (Domain
+    Controllers, Certificate Authorities, database servers) and privileged administrative workstations.'
+  range: Last 90 days, with per-user/host n-gram baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      seqs = NGRAM(commands,2..3) PER user,host FROM (Event4688,Event4104)
+      ALERT session WHERE ANY ngram.freq < 0.01
+      disc = COUNT(whoami,net user,ipconfig,nltest); errs = COUNT(error_returning_cmds)
+      ALERT WHERE disc > p99(user) OR errs > p99(user)
+- question: Does a WinRM session (per Logon ID) cluster as a DBSCAN noise point that fits no normal behavioural
+    cluster?
+  context: Per Logon ID (from 4624), build a feature vector — session duration, total process count, average
+    command entropy, byte-volume of transferred output, error/failure count, and counts of command categories
+    (discovery, execution, defense evasion) — and cluster with DBSCAN, flagging noise points that fit
+    no normal cluster. Outlier sessions that resemble no established behavioural group are prime candidates
+    for malicious lateral movement because attacker sessions differ holistically from routine administration.
+    The alert must surface the top-3 features driving the outlier classification so the analyst can interpret
+    why it stands out. A noise-point session warrants full investigation; sessions falling within dense
+    normal clusters are expected. This unsupervised multi-feature layer captures anomalous WinRM behaviour
+    that single-metric rules miss in the post-authentication Lateral Movement phase.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows WinRM/Operational Event ID 6
+  - 'NAI: Authentication, privilege assignment, and process creation logs on all critical servers (Domain
+    Controllers, Certificate Authorities, database servers) and privileged administrative workstations.'
+  range: Last 90 days; cluster sessions per Logon ID.
+  queries:
+  - technology: ML/cluster pseudocode
+    query: |-
+      feats = PER logon_id [duration, proc_count, avg_entropy, out_bytes, error_count, cat_counts(discovery,execution,evasion)]
+      labels = DBSCAN(feats, eps, min_samples)
+      ALERT WHERE label == NOISE REPORT top3_outlier_features
