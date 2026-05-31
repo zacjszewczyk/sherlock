@@ -1,0 +1,432 @@
+name: 'T1544: Ingress Tool Transfer'
+id: cbae00dd-0922-4a00-b813-e99768ebd4c5
+description: 'This playbook helps an analyst investigate potential Ingress Tool Transfer (T1544) against
+  corporate-managed mobile devices (Android and iOS), where an adversary transfers tools, payloads, or
+  other files from an external system onto a compromised device to facilitate follow-on actions. It guides
+  the investigation across three complementary evidence angles: (1) identifying inbound file transfers
+  whose file attributes (MIME type, filename, entropy), source reputation (domain age, threat intelligence),
+  and network/TLS characteristics (self-signed or invalid certificates, anomalous JA3/JA4 client fingerprints)
+  collectively indicate an unauthorized tool; (2) detecting network sessions whose inbound data-transfer
+  volume is a statistical outlier versus the device''s own history and its peer group, to non-allowlisted
+  destinations; and (3) correlating, on-device, a managed application''s retrieval of content from a non-baselined
+  external source with the immediate local creation of a new artifact (executable, archive, DEX/JAR, native
+  .so, dylib-like resource, overlay asset, or opaque payload) and any subsequent dynamic loading or execution
+  while the app is backgrounded or the device is locked. Together these detections combine deterministic
+  symbolic-logic floor rules, statistical baselining, and machine-learning anomaly models to produce defensible,
+  granular alerts for a SOC analyst.'
+type: technique
+related:
+- tactic_id: TA0037
+  tactic_name: Command And Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any inbound file transfers to managed mobile device IP ranges sourced from IPs, hostnames,
+    or domains that match threat-intelligence indicators for droppers, malware-staging infrastructure,
+    or known command-and-control servers?
+  context: 'Under the Command and Control tactic, adversaries pull tooling onto a compromised mobile device
+    over the C2 channel or an alternate protocol such as FTP/HTTP. Matching the source of an inbound transfer
+    against curated threat intelligence is the highest-confidence, lowest-effort detection: a hit on a
+    known dropper or C2 indicator strongly implies the transferred file is a malicious tool. Extract source
+    IP/host, MIME type, and transfer size from Zeek files.log/http.log and correlate the serving certificate
+    from x509.log. Reuse SigmaHQ download-and-execute and non-browser-HTTPS rule templates translated
+    to Zeek/proxy. A positive match warrants immediate triage of the device; a negative result does not
+    clear the transfer because intelligence coverage is incomplete and should be combined with the other
+    checks below.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  files.log OR http.log\n  | where direction == inbound AND dst_ip in MANAGED_MOBILE_RANGES\n\
+      \  | lookup tx_hosts (id.orig_h, host, http.host) against THREAT_INTEL_INDICATORS(category in [dropper,\
+      \ c2, malware_staging])\n  | join x509.log on cert_serial to enrich subject/issuer\n  | where match\
+      \ == true\n  | output device, source, mime_type, total_bytes, ti_category -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source = proxy OR zeek_files\n  | where transfer_direction = inbound AND client in managed_mobile\n\
+      \  | join threat_intel on (src_ip, src_domain)\n  | where ti_match\n  | emit alert(\"Inbound transfer\
+      \ from known-malicious infrastructure\", device, mime, bytes)"
+- question: Do the TLS/HTTP client fingerprints (JA3/JA3S, JA4/JA4H) of any transfer-associated session
+    from a managed mobile device match a known-bad C2 fingerprint, or fall outside the approved per-device/per-app
+    fingerprint set?
+  context: Within Command and Control, downloader and C2 client stacks frequently differ from legitimate
+    browsers and approved app SDKs in their TLS ClientHello composition and HTTP header ordering. Computing
+    JA3/JA3S for each transfer-associated TLS session lets the analyst flag fingerprints that appear on
+    known-bad C2 lists or that are absent from the baseline approved set for that device/app. Version-resilient
+    JA4/JA4H is preferred because it survives ClientHello extension randomization and exposes apps whose
+    HTTP header order or User-Agent does not match a legitimate browser/SDK. A fingerprint match to a
+    malicious tool, or an unrecognized fingerprint paired with an inbound payload, indicates non-sanctioned
+    tooling performing the retrieval. Benign-but-rare apps can cause false positives, so corroborate with
+    reputation and certificate checks.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  ssl.log JOIN files.log/http.log on uid\n  | where dst in MANAGED_MOBILE_RANGES AND inbound_transfer\n\
+      \  | compute ja3, ja3s, ja4, ja4h\n  | where ja3 in KNOWN_BAD_C2_JA3\n         OR ja3 NOT in APPROVED_SET[device][app]\n\
+      \         OR ja4h_header_order != legit_browser_or_sdk_profile\n  | output device, app, ja3, ja4h,\
+      \ dst -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  tls_sessions(managed_mobile)\n  | enrich ja3, ja4\n  | where ja3 in bad_c2_list OR ja3\
+      \ not in per_device_app_allow\n  | emit alert(\"Anomalous downloader TLS fingerprint\", device,\
+      \ app, ja3, ja4)"
+- question: Does any inbound file transfer to a non-baselined host carry a risky MIME type (application/octet-stream,
+    application/vnd.android.package-archive, application/zip, application/java-archive) while the serving
+    certificate is self-signed, has a non-OK validation status, or a validity window under 30 days?
+  context: This is a deterministic certificate-hygiene and MIME floor rule for the Command and Control
+    tactic that must operate independently of any ML score. Adversaries staging tools onto mobile devices
+    often serve installable or opaque payloads (APK, JAR, ZIP, raw octet streams) from hastily provisioned
+    infrastructure using self-signed or short-lived certificates with validation problems. Joining the
+    risky-MIME condition from files.log/http.log with the certificate attributes from x509.log yields
+    a high-signal, explainable alert. A match means a suspicious payload type is being delivered over
+    a low-trust TLS channel to a host not in the baseline; treat it as a strong candidate for tool transfer.
+    Sanctioned internal app-distribution channels should be allowlisted to control false positives.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  files.log JOIN http.log JOIN x509.log on uid/cert\n  | where dst_host NOT in BASELINE_HOSTS\
+      \ AND inbound\n  | where mime_type in [application/octet-stream, application/vnd.android.package-archive,\
+      \ application/zip, application/java-archive]\n  | where cert.self_signed == true OR cert.validation_status\
+      \ != \"ok\" OR cert.validity_days < 30\n  | output device, dst_host, mime_type, cert.validation_status,\
+      \ cert.validity_days -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  inbound_transfers(managed_mobile)\n  | where mime in RISKY_MIME and dst not in baseline_hosts\n\
+      \  | join cert_facts\n  | where cert.self_signed or cert.status != ok or cert.validity_days < 30\n\
+      \  | emit alert(\"Risky payload over low-trust certificate\")"
+- question: When inbound file transfers are scored on a composite of filename/payload entropy, source
+    domain age, MIME risk, and certificate trust, which transfers exceed the per-environment risk threshold?
+  context: This statistical method ranks transfers rather than relying on a single binary rule, supporting
+    the Command and Control tactic by surfacing tool-transfer candidates that no individual floor rule
+    catches. The analyst computes a composite risk score from filename/payload entropy above the 95th
+    percentile of the device baseline (packed/encrypted tools have high entropy), source domain age under
+    90 days from WHOIS (fresh infrastructure), risky MIME types, and self-signed/invalid certificates.
+    Rather than fixed constants, feature weights and the cut point are derived empirically via correlation-based
+    ranking (crRelevance and Normalized Mean Residue Similarity, per CorrNetDroid) because most flow features
+    overlap between benign and malicious traffic. Transfers above the environment-tuned threshold are
+    prioritized for analyst review; the contributing factors should be shown so the analyst understands
+    why a transfer scored high.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  for each inbound_transfer(managed_mobile):\n    e   = entropy(filename, payload_sample)\n\
+      \    age = whois_domain_age_days(src_domain)\n    mr  = mime_risk(mime_type)\n    cr  = cert_risk(self_signed,\
+      \ validation_status, validity_days)\n    weights = corr_rank_weights(crRelevance, NMRS)   # learned\
+      \ per environment\n    score = w1*pct_rank(e) + w2*(age<90) + w3*mr + w4*cr\n  | where score > ENV_THRESHOLD\n\
+      \  | output device, src, score, contributing_features -> ALERT"
+- question: Do any transfer-associated network sessions from managed mobile devices receive high anomaly
+    scores from an Isolation Forest trained on baseline connection, TLS, and DNS features, and what are
+    the top contributing features?
+  context: This unsupervised machine-learning approach detects downloader sessions under Command and Control
+    that evade signature and reputation checks. An Isolation Forest is trained on baseline conn/ssl/dns
+    features (JA3/JA3S, TLS version, cipher, duration, resp_bytes, byte ratios, DNS query type) and transfer-associated
+    sessions are scored; high anomaly scores flag sessions that deviate from normal device behavior. TLS-handshake
+    plus flow-metadata features separate downloader sessions from browsers without requiring decryption.
+    The analyst should surface the top-3 contributing features (e.g., JA3 rarity, inbound byte volume,
+    certificate validity) in the alert via SHAP attributions so the result is interpretable, and the model
+    must be retrained on temporally consistent splits to resist concept drift (TESSERACT). A high score
+    with intuitive drivers (rare fingerprint, large inbound volume) is a strong tool-transfer lead.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = IsolationForest.train(baseline_sessions[ja3, ja3s, tls_version, cipher, duration,\
+      \ resp_bytes, byte_ratio, dns_qtype])\n  | score transfer_associated_sessions(managed_mobile)\n\
+      \  | where anomaly_score > HIGH\n  | annotate top3 = SHAP(top_features)\n  | retrain on temporally_consistent_splits\
+      \  # drift control\n  | output device, session, anomaly_score, top3 -> ALERT"
+- question: Are there inbound transfers from managed mobile devices where response bytes exceed a static
+    large-download threshold (e.g., 100MB) to a destination IP/domain that is not on the approved high-volume
+    allowlist?
+  context: For Command and Control, large inbound transfers to unsanctioned destinations are a primary
+    indicator of tool or payload staging. The analyst maintains an allowlist of approved high-volume services
+    (app stores, OS update servers, sanctioned cloud storage) and alerts when resp_bytes exceeds a static
+    threshold while the destination is not allowlisted. To reduce false positives, corroborate with a
+    non-browser JA3/JA4 fingerprint on the same flow, since legitimate bulk downloads typically use recognizable
+    browser/SDK stacks. SigmaHQ download-pattern templates can be translated to the egress sensor. A large
+    download to an unknown host with a non-browser client stack is a strong tool-transfer candidate; allowlisted
+    bulk traffic and recognized app updates are expected and filtered.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - MDM application inventory logs
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log JOIN ssl.log on uid\n  | where orig in MANAGED_MOBILE_RANGES AND resp_bytes\
+      \ > 100MB\n  | where dst_ip NOT in ALLOWLIST AND dst_domain NOT in ALLOWLIST\n  | where ja3/ja4\
+      \ NOT in BROWSER_OR_SDK_PROFILES\n  | output device, dst, resp_bytes, ja3 -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  egress(managed_mobile)\n  | where resp_bytes > 100MB and dst not in allowlist\n  | enrich\
+      \ ja3, ja4\n  | where client_stack != browser\n  | emit alert(\"Large download to non-allowlisted\
+      \ destination\")"
+- question: Which managed mobile devices show inbound data-transfer volumes that are statistical outliers
+    (|Z| > 3) versus their own 30-day baseline and their peer group, to destinations that are not approved
+    high-volume services?
+  context: This statistical method anchors detection in deviation from normal behavior rather than fixed
+    thresholds, supporting Command and Control by catching covert staging sized below absolute limits
+    but abnormal for the device. The analyst builds 30-day baselines of daily and per-flow inbound volume
+    per device and per peer group and alerts on Z-scores exceeding |3|. Correlation-based feature selection
+    (CorrNetDroid) confirms which volume/shape features (resp_bytes, flow duration, packet counts, byte
+    ratio) best separate malicious download sessions in the environment, since most flow features overlap
+    between benign and malware traffic. A device suddenly transferring far more inbound data than itself
+    and its peers, to a non-approved destination, is a strong anomaly; expected variance (e.g., a sanctioned
+    large app update) should be excluded via the allowlist.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - MDM application inventory logs
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline = rolling30d(inbound_volume per device, per peer_group)  # daily and per-flow\n\
+      \  | for current sessions(managed_mobile) where dst NOT in ALLOWLIST:\n      z_dev  = (vol - baseline.device.mean)/baseline.device.std\n\
+      \      z_peer = (vol - baseline.peer.mean)/baseline.peer.std\n  | where abs(z_dev) > 3 OR abs(z_peer)\
+      \ > 3\n  | rank features by corr_selection(resp_bytes, duration, pkts, byte_ratio)\n  | output device,\
+      \ vol, z_dev, z_peer, dst -> ALERT"
+- question: Are there bursts in per-device connection-failure and retrieval-error rates (failed/blocked
+    connections, NXDOMAIN, HTTP 404/403, TLS validation failures) that precede or accompany a successful
+    large inbound transfer?
+  context: Stagers often probe and retry across multiple hosts before a successful pull, so failure modes
+    are treated as distinct signals under Command and Control. The analyst baselines per-device rates
+    of failed or blocked connections, NXDOMAIN responses, HTTP 404/403, and TLS validation failures, then
+    alerts on bursts that precede or accompany a successful large inbound transfer. This retry/probe pattern
+    is characteristic of a downloader cycling through dead or rotating infrastructure. Because volume
+    and timing side-channels can be deliberately masked, combining multiple independent statistics (error
+    bursts plus a subsequent large transfer) raises confidence. A spike of errors immediately followed
+    by a successful big download to an unfamiliar host is a strong indicator; isolated transient errors
+    are normal and should not alert alone.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - MDM application inventory logs
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline = rolling_rate per device of [conn_failed, nxdomain, http_404, http_403, tls_validation_fail]\n\
+      \  | detect burst where rate > baseline.mean + 3*baseline.std (window=15m)\n  | correlate burst\
+      \ with successful_inbound_transfer(resp_bytes large) within 30m\n  | output device, error_burst_profile,\
+      \ following_transfer -> ALERT"
+  - technology: Zeek/pseudocode
+    query: ">-\n  combine conn.log(history/conn_state failures) + dns.log(NXDOMAIN) + http.log(404/403)\
+      \ + ssl.log(validation_status!=ok)\n  | per device sliding-window count\n  | where count >> baseline\
+      \ AND followed_by large inbound conn within 30m\n  | output device, counts, transfer -> ALERT"
+- question: Does the observed hourly inbound download volume for any managed mobile device exceed the
+    99% prediction interval of a SARIMA/Prophet forecast, and what destinations and JA3/JA4 fingerprints
+    drive the anomaly?
+  context: This time-series machine-learning method models each device's normal hourly inbound volume
+    and flags departures that simple thresholds miss, supporting Command and Control by detecting staging
+    that is anomalous for the time of day or recent trend. Using SARIMA or Prophet to forecast hourly
+    inbound volume per device, the analyst alerts when observed volume exceeds the 99% prediction interval,
+    including the top destinations and JA3/JA4 fingerprints for context. Temporally consistent training
+    and AUT-tracked drift monitoring (TESSERACT) keep accuracy from collapsing over time, and the top-3
+    drivers of each anomaly are exposed via SHAP. An hour of inbound volume well above the forecast band,
+    attributable to an unfamiliar destination or non-browser fingerprint, is a strong tool-transfer lead;
+    expected periodic peaks (e.g., scheduled backups) fall within the model's intervals.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - MDM application inventory logs
+  - 'NAI: Network egress points capturing traffic from corporate-managed mobile devices, including VPN
+    concentrators, corporate Wi-Fi access point controllers, and Mobile Device Management (MDM) or Unified
+    Endpoint Management (UEM) platform traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model = SARIMA_or_Prophet.fit(hourly_inbound_volume per device)  # temporally consistent\n\
+      \  | forecast next_hours with 99% prediction_interval\n  | where observed_volume > upper_99_PI\n\
+      \  | annotate top_destinations, ja3/ja4, top3 = SHAP(drivers)\n  | monitor drift via AUT\n  | output\
+      \ device, hour, observed, pi_upper, drivers -> ALERT"
+- question: Did any managed application perform an inbound retrieval from a non-baselined domain/IP and
+    then write a new binary, archive, DEX/JAR, native library, or opaque payload to app-private, cache,
+    temp, or shared storage within a short window (<=60s) while lacking an approved content-download/update/browser/file-sync
+    role in MDM policy?
+  context: 'This first-party correlation of network acquisition with immediate local staging is the strongest
+    on-device evidence of ingress tool transfer and directly supports Command and Control. The analyst
+    joins MobileEDR network-retrieval telemetry with file-creation telemetry: an alert fires when a managed
+    app fetches content from a non-baselined source and writes a new executable, archive, DEX/JAR, native
+    .so, or opaque payload to app-private/cache/temp/shared storage within roughly 60 seconds, and the
+    app''s MDM-declared role does not include content download, update, browser, or file sync. File-write-then-load
+    Sigma templates can be translated to mobile EDR telemetry. A matching app with no legitimate reason
+    to download and stage code is a high-confidence detection; apps with sanctioned download roles are
+    expected and should be excluded.'
+  answer_sources:
+  - MobileEDR file-creation telemetry
+  - MobileEDR OS API execution telemetry
+  - MobileEDR application-state telemetry
+  - MDM/UEM application inventory and permission logs
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: Mobile EDR/UEM agents on corporate-managed Android and iOS devices reporting file-creation,
+    OS-API/dynamic-load, application-state, and permission events, correlated with network egress telemetry
+    from VPN concentrators, corporate Wi-Fi controllers, and MDM/UEM traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: MobileEDR/pseudocode
+    query: ">-\n  net = retrieval_events(managed_app, dst NOT in BASELINE)\n  file = file_creation_events(path\
+      \ in [app_private, cache, temp, shared] AND type in [exe, archive, dex, jar, .so, opaque])\n  |\
+      \ join net, file on (device, app) where file.time - net.time <= 60s\n  | enrich app.mdm_role\n \
+      \ | where mdm_role NOT in [content_download, update, browser, file_sync]\n  | output device, app,\
+      \ dst, file.path, file.type -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  correlate mobileedr_network + mobileedr_file_create within 60s on (device, app)\n  |\
+      \ where dst not in baseline and new_file.type in risky_types\n  | join mdm_inventory on app -> role\n\
+      \  | where role not in approved_download_roles\n  | emit alert(\"App download-then-stage without\
+      \ approved role\")"
+- question: Did any application invoke dynamic-code-loading APIs (Android DexClassLoader/PathClassLoader,
+    System.load/loadLibrary, Runtime.exec; iOS dlopen of a container-local image) on a file that was created
+    within minutes of a network retrieval?
+  context: 'Dynamic loading of freshly downloaded code is the on-device culmination of ingress tool transfer
+    under Command and Control: the adversary not only stages a payload but loads or executes it. The analyst
+    alerts when an app calls dynamic-code-loading APIs on a file created within minutes of a network retrieval.
+    On Android these are DexClassLoader/PathClassLoader, System.load/loadLibrary, and Runtime.exec; on
+    iOS, dlopen of a container-local image. The URL-plus-dynamic-load combination is exactly the static
+    feature set Drebin uses to identify payload-fetching apps. A positive result indicates the staged
+    file is being activated as code, which is rarely legitimate for apps that fetched the file from a
+    non-baselined source; legitimate plugin/update frameworks loading from sanctioned sources should be
+    baselined out to control noise.'
+  answer_sources:
+  - MobileEDR file-creation telemetry
+  - MobileEDR OS API execution telemetry
+  - MobileEDR application-state telemetry
+  - MDM/UEM application inventory and permission logs
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: Mobile EDR/UEM agents on corporate-managed Android and iOS devices reporting file-creation,
+    OS-API/dynamic-load, application-state, and permission events, correlated with network egress telemetry
+    from VPN concentrators, corporate Wi-Fi controllers, and MDM/UEM traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: MobileEDR/pseudocode
+    query: ">-\n  load = osapi_events(api in [DexClassLoader, PathClassLoader, System.load, System.loadLibrary,\
+      \ Runtime.exec, dlopen])\n  fetch = retrieval_events(managed_app)\n  create = file_creation_events()\n\
+      \  | join create with fetch where create.time - fetch.time <= few_minutes\n  | join load on load.target_file\
+      \ == create.path\n  | output device, app, api, file.path, source_dst -> ALERT"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  match dynamic_load(file=F) where F.created_within_minutes_of(network_retrieval)\n  |\
+      \ emit alert(\"Dynamic load of freshly downloaded code\", device, app, api, F)"
+- question: When each managed app's session inbound volume and post-retrieval new-file-creation count
+    are evaluated against its own per-hour baseline, which sessions jointly exceed |3| Z-scores?
+  context: This statistical method scores the retrieval-to-staging behavior of each app against its own
+    normal activity, supporting Command and Control by catching apps that suddenly both download more
+    and write more new files than usual. The analyst baselines each managed app's normal rate of inbound
+    bytes and new-file creations per hour, then alerts when a session's inbound volume and post-retrieval
+    file-creation count jointly exceed |3| Z-scores. Correlation-based feature selection (CorrNetDroid)
+    weights the few most discriminative flow/host features so the score is driven by signal rather than
+    noise. Requiring both dimensions to be anomalous together reduces false positives from a benign large
+    download with no staging or routine file churn with no download. A joint outlier is a strong indicator
+    that an app is acquiring and staging tooling.
+  answer_sources:
+  - MobileEDR file-creation telemetry
+  - MobileEDR OS API execution telemetry
+  - MobileEDR application-state telemetry
+  - MDM/UEM application inventory and permission logs
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: Mobile EDR/UEM agents on corporate-managed Android and iOS devices reporting file-creation,
+    OS-API/dynamic-load, application-state, and permission events, correlated with network egress telemetry
+    from VPN concentrators, corporate Wi-Fi controllers, and MDM/UEM traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline = per_app per_hour stats(inbound_bytes, new_file_count)\n  | for each session(managed_app):\n\
+      \      z_vol  = (inbound_bytes - baseline.bytes.mean)/baseline.bytes.std\n      z_file = (new_file_count\
+      \ - baseline.files.mean)/baseline.files.std\n  | where abs(z_vol) > 3 AND abs(z_file) > 3\n  | weight\
+      \ features via corr_selection\n  | output device, app, z_vol, z_file -> ALERT"
+- question: Does any managed app's API/behavior sequence (network API -> file I/O -> dynamic load/exec)
+    deviate from its benign baseline when modeled as Markov-chain transitions, and which transitions drive
+    the deviation?
+  context: This machine-learning method models the full download-then-load behavior chain rather than
+    individual events, supporting Command and Control by detecting the characteristic sequence of an ingress-tool-transfer
+    payload coming to life. Following MaMaDroid, the analyst models the app's API/behavior sequence (network
+    API -> file I/O -> dynamic load/exec) using Markov-chain transition features over package/family abstractions
+    and classifies deviations from benign baselines. Temporally consistent training and drift monitoring
+    (TESSERACT) keep the model accurate over time, and the top-3 contributing transitions/features per
+    alert are surfaced via SHAP. An app whose transition profile shifts toward network->file-write->dynamic-load,
+    unlike its benign baseline, is a strong tool-transfer lead; the interpretable transitions help the
+    analyst confirm whether the behavior chain is genuinely malicious or an explainable app update flow.
+  answer_sources:
+  - MobileEDR file-creation telemetry
+  - MobileEDR OS API execution telemetry
+  - MobileEDR application-state telemetry
+  - MDM/UEM application inventory and permission logs
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: Mobile EDR/UEM agents on corporate-managed Android and iOS devices reporting file-creation,
+    OS-API/dynamic-load, application-state, and permission events, correlated with network egress telemetry
+    from VPN concentrators, corporate Wi-Fi controllers, and MDM/UEM traffic logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = markov_transitions(app_api_sequence over package/family abstractions)\n \
+      \           # states: network_api -> file_io -> dynamic_load/exec\n  model = classifier.train(benign_baseline_transitions)\
+      \  # temporally consistent\n  | score managed_app_sessions\n  | where deviation > THRESHOLD\n  |\
+      \ annotate top3 = SHAP(transitions)\n  | monitor drift\n  | output device, app, deviation, top3_transitions\
+      \ -> ALERT"
