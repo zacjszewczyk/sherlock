@@ -1,0 +1,352 @@
+name: 'D3-DPLM: Direct Physical Link Mapping'
+id: 894695fb-d667-4301-8646-eb0de1754790
+description: Investigate and validate the physical/logical link topology of critical server segments using
+  Direct Physical Link Mapping. This playbook helps an analyst reconstruct host-to-host adjacency from
+  correlated network and endpoint telemetry (Zeek conn/dhcp logs, Windows WFP Events 5156/5157, Sysmon
+  Event 3, and the CMDB), then test that observed topology against approved segmentation policy. It guides
+  the analyst from a deterministic policy floor (segment adjacency allow-lists, first-seen paths, zone-bridging
+  hosts, and failed-connection probing ratios) through statistical methods (traffic ranking, change-point
+  detection, Bayesian edge surprise, and spectral graph inference) to machine-learning methods (Louvain
+  community detection, graph embeddings, temporal link prediction, and online autoencoder flow scoring).
+  The goal is defensible inference of stable adjacencies, segment boundaries, and newly appearing direct
+  links so an analyst can detect unauthorized bridging, rogue cabling, switch misconfiguration, and topology
+  drift into crown-jewel segments, and queue plausible-but-unrecorded links for physical inspection.
+type: technique
+related:
+- tactic_id: D3-M
+  tactic_name: Model
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Across Zeek conn.log, Windows WFP permitted-connection events (Event ID 5156), and Sysmon
+    Event ID 3, what is the complete edge list of observed direct host-to-host communications into and
+    within our critical server segments, with each edge resolved to named assets and annotated with first-seen,
+    last-seen, total connections, total bytes, and the dominant process?
+  context: 'This is the foundational modeling step for Direct Physical Link Mapping: it reconstructs the
+    de-facto physical/logical link topology from observed traffic rather than relying on manual cabling
+    diagrams. For each unique (source, destination) pair, resolve raw IPs to assets using Zeek dhcp.log
+    lease data and the CMDB so analysts reason about hosts (e.g., Domain Controllers, database servers)
+    instead of ephemeral addresses. Annotating each edge with volume (bytes), frequency (connection counts),
+    and dominant process makes later changes explainable and gives the analyst a baseline adjacency map
+    to compare against approved segmentation. A complete, asset-resolved edge list is the substrate every
+    downstream policy, statistical, and ML check depends on; gaps here (unresolved IPs, missing sensors)
+    blind the rest of the playbook.'
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - Sysmon Event ID 3
+  - Enterprise asset inventory / CMDB
+  - 'NAI: Core network switches and critical servers (e.g., Domain Controllers, database servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index IN (zeek_conn, win_5156, sysmon_3)
+
+      | eval src_asset=lookup_cmdb(src_ip, _time), dst_asset=lookup_cmdb(dst_ip, _time)
+
+      | stats min(_time) AS first_seen, max(_time) AS last_seen, count AS total_conns, sum(bytes) AS total_bytes,
+      mode(process) AS dominant_process BY src_asset, dst_asset
+
+      | outputlookup observed_edge_list'
+- question: Do any of the inferred host-to-host edges violate the approved zone-to-zone adjacency / conduit
+    allow-lists for our critical servers, or introduce a previously unknown direct path into a crown-jewel
+    segment?
+  context: This is the deterministic detection floor for unauthorized topology. Every inferred edge is
+    checked against approved segmentation policy derived from Purdue zoning (NIST SP 800-82r3) and per-resource
+    micro-segmentation policy (NIST SP 800-207). A hard, explainable rule fires whenever an edge crosses
+    a zone boundary that policy forbids or establishes a brand-new direct path into a crown-jewel segment
+    (e.g., a workstation talking straight to a database server). Because it is rule-based, this check
+    is high-confidence and low-noise; it should run in parallel with the statistical and ML scoring so
+    a clear policy violation is never masked by anomaly thresholds. A positive result is an immediate
+    investigative lead into possible lateral movement, rogue cabling, or switch misconfiguration; a clean
+    result raises confidence that observed adjacency conforms to the intended segmentation model.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'inputlookup observed_edge_list
+
+      | eval src_zone=zone_of(src_asset), dst_zone=zone_of(dst_asset)
+
+      | lookup approved_adjacency src_zone dst_zone OUTPUT allowed
+
+      | where isnull(allowed) OR allowed="false" OR (dst_zone IN crown_jewel_zones AND NOT in_allowlist(src_zone,dst_zone))
+
+      | alert "Segmentation violation: unapproved direct path"'
+- question: Has any edge into a protected segment appeared for the first time with no prior 30-day history,
+    or is any single host showing confirmed connections in two policy-distinct zones within the same window
+    (indicating multi-homing or rogue bridging)?
+  context: First-seen direct paths and zone-bridging hosts are strong indicators of topology drift or
+    deliberate boundary violation. Condition (a) flags edges into a protected segment that have no precedent
+    in the trailing 30 days, catching newly established links such as a freshly provisioned (or rogue)
+    connection to a Domain Controller. Condition (b) catches a single host with confirmed connections
+    in two policy-distinct zones in the same window, the hallmark of multi-homing or a bridge that defeats
+    micro-segmentation (NIST SP 800-207). The alert names the offending host, both zones, and the bridging
+    process so an analyst can quickly determine whether this is sanctioned dual-homing, a misconfiguration,
+    or an attacker pivoting between segments. A negative result across the window supports the assumption
+    that segment boundaries remain intact.
+  answer_sources: *id001
+  range: Last 90 days (with a trailing 30-day history baseline per edge)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'inputlookup observed_edge_list
+
+      | eval dst_zone=zone_of(dst_asset)
+
+      | join type=left src_asset dst_asset [ inputlookup edge_history_30d ]
+
+      | where (dst_zone IN protected_zones AND isnull(prior_seen))
+
+      | append [ inputlookup observed_edge_list | eval z=zone_of(dst_asset) | stats dc(z) AS zones values(z)
+      AS zone_list values(dominant_process) AS procs BY src_asset | where zones>=2 ]
+
+      | alert "First-seen path or zone-bridging host"'
+- question: For each edge toward our critical segments, what is the ratio of failed, half-open, and rejected
+    connection attempts (Zeek S0/REJ/RSTO/RSTOS0 and Windows blocked-connection Event ID 5157) versus
+    established (SF) connections, and is any source generating a surge of blocked/failed attempts toward
+    a crown-jewel host?
+  context: Even when no successful edge forms, a surge of failed or blocked connection attempts toward
+    critical segments is a distinct scanning/probing signal that reveals reconnaissance against the physical/logical
+    topology. By combining Zeek conn_state values with Windows Event ID 5157 (blocked connections), the
+    analyst computes per-edge ratios of unsuccessful (S0, REJ, RSTO, RSTOS0) to established (SF) connections.
+    A default trigger of more than 20 failed attempts per minute from one source to a crown-jewel host
+    (tuned to environment baseline) surfaces host or port sweeps that precede lateral movement. High failed-to-established
+    ratios point to probing or misconfiguration; consistently established connections indicate legitimate,
+    stable links worth modeling as real topology edges.
+  answer_sources: *id001
+  range: Last 90 days (evaluate per-minute rates for surge detection)
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'index IN (zeek_conn, win_5157)
+
+      | eval failed=if(conn_state IN ("S0","REJ","RSTO","RSTOS0") OR action="blocked",1,0), est=if(conn_state="SF",1,0)
+
+      | bin _time span=1m
+
+      | stats sum(failed) AS fails sum(est) AS estab BY src_asset, dst_asset, _time
+
+      | eval fail_ratio=fails/(estab+1)
+
+      | where dst_asset IN crown_jewels AND fails>20
+
+      | alert "Probing/scan surge toward critical segment"'
+- question: Over a rolling 30-day window, which edges carry the most traffic by total connection count,
+    total transferred bytes, and 95th-percentile daily frequency, and which top-percentile edges should
+    be classified as backbone or critical dependencies?
+  context: Ranking links by traffic distribution lets the analyst prioritize which parts of the inferred
+    topology matter most and which deserve the heaviest scrutiny in downstream graph analytics. Aggregating
+    each edge over a rolling 30-day window and computing total connections, total bytes, and the 95th-percentile
+    daily frequency identifies backbone links and critical dependencies (e.g., app-server-to-database
+    paths). These high-value edges become the weighting input for community detection and anomaly scoring,
+    and they tell the analyst where an unexpected change would have the greatest blast radius. A sudden
+    appearance of a new edge in the top percentile, or the disappearance of an established backbone link,
+    is itself an investigative signal.
+  answer_sources: *id001
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'inputlookup observed_edge_list earliest=-30d
+
+      | stats sum(total_conns) AS conns sum(total_bytes) AS bytes perc95(daily_freq) AS p95_freq BY src_asset,
+      dst_asset
+
+      | eventstats perc99(bytes) AS bytes_top BY _none
+
+      | eval tier=if(bytes>=bytes_top,"backbone","normal")
+
+      | sort - bytes'
+- question: Applying change-point detection (CUSUM / PELT / Bayesian online) to per-edge presence rates
+    and the day-to-day Jaccard similarity of the communication graph, are there abrupt structural shifts
+    in the topology, and specifically does graph Jaccard similarity drop below its baseline mean minus
+    three sigma?
+  context: Topology should evolve gradually; abrupt structural shifts often mean infrastructure change
+    or unauthorized bridging. This method computes each edge's daily presence rate and the day-to-day
+    Jaccard similarity of the whole graph, then applies CUSUM, PELT, or Bayesian online change-point detection
+    (Aminikhanghahi and Cook) to the similarity and per-edge count/byte time series. An alert fires when
+    Jaccard similarity drops below baseline mean minus 3 sigma, and the alert names which edges entered
+    or left the graph so the analyst can immediately see what changed. A detected change point that coincides
+    with a maintenance window is benign; one that does not aligns with possible rogue cabling, switch
+    reconfiguration, or an attacker reshaping reachable paths.
+  answer_sources: *id001
+  range: Last 90 days (daily time series for change-point analysis)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'inputlookup daily_graph_snapshots
+
+      | streamstats current=f window=1 values(edge_set) AS prev_set
+
+      | eval jaccard=jaccard_sim(edge_set, prev_set), entered=set_diff(edge_set,prev_set), left=set_diff(prev_set,edge_set)
+
+      | changepoint method=PELT field=jaccard
+
+      | eventstats mean(jaccard) AS mu stdev(jaccard) AS sd
+
+      | where jaccard < mu-3*sd OR changepoint_flag=1
+
+      | alert "Topology change-point: edges entered=entered left=left"'
+- question: Using a two-stage Bayesian dynamic-graph surprise model fitted to per-edge counting-process
+    baselines, which edges are newly active or have a locally surprising connection/byte rate, and is
+    their joint structural significance high enough to rule out isolated noise?
+  context: This Bayesian approach (Heard et al.) models each edge as a counting process with its own learned
+    baseline, then flags edges that are newly active or whose connection/byte rate is locally surprising
+    relative to that baseline. A second stage assesses whether surprising edges cluster into a structurally
+    significant pattern, which suppresses isolated, one-off noise that would otherwise generate false
+    positives. Reporting the posterior surprise score and the prior expected rate in the alert gives the
+    analyst a quantified, defensible measure of how anomalous a link is and what was expected instead.
+    High joint surprise concentrated around a crown-jewel host is a strong lead for unauthorized direct
+    paths; scattered low-score surprises are typically benign churn.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'inputlookup observed_edge_list
+
+      | fit_bayes_counting_process baseline=edge_history rate_field=total_conns
+
+      | eval surprise=posterior_surprise(total_conns, prior_rate), new_edge=isnull(prior_rate)
+
+      | where surprise>threshold OR new_edge
+
+      | stats sum(surprise) AS joint_surprise values(*) BY component
+
+      | where joint_surprise>struct_threshold
+
+      | alert "Bayesian edge surprise score=surprise prior=prior_rate"'
+- question: Where direct adjacency cannot be observed from traffic alone, what latent link/graph structure
+    does spectral-template graph inference recover from node-level traffic signals, and which inferred-but-unrecorded
+    direct paths should be queued for physical inspection?
+  context: 'Some physical links never surface cleanly in traffic logs, yet Direct Physical Link Mapping
+    ultimately depends on physical ground truth. Spectral-template graph inference (Segarra et al.) estimates
+    the underlying graph shift operator from node-level traffic observations, recovering plausible link
+    structure even where direct adjacency is unobservable. Comparing the inferred graph against the observed
+    edge list surfaces plausible-but-unrecorded direct paths, which is precisely the candidate list a
+    network engineer should physically inspect to validate cabling and switch connectivity. This bridges
+    passive analytics and the manual observation that the technique requires: the model points the human
+    at the specific segments most likely to hide undocumented links.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'inputlookup node_traffic_signals
+
+      | infer_graph method=spectral_template OUTPUT inferred_adjacency
+
+      | join [ inputlookup observed_edge_list ]
+
+      | eval unrecorded=if(inferred_adjacency>0 AND isnull(total_conns),1,0)
+
+      | where unrecorded=1
+
+      | table src_asset dst_asset inferred_weight
+
+      | alert "Inferred unrecorded direct path - queue for physical inspection"'
+- question: When the weighted communication graph is partitioned with Louvain modularity-optimization
+    community detection, what host communities emerge as likely physical or logical segments, and which
+    hosts changed community assignment week-over-week?
+  context: 'Community detection infers the de-facto segmentation of the network from communication patterns,
+    which can be compared against the intended segmentation model. Building a weighted undirected graph
+    from normalized edge frequencies and running Louvain modularity optimization (Blondel et al.) groups
+    tightly coupled hosts into communities that typically map to physical or logical segments. Publishing
+    this community map gives the analyst an empirical view of how hosts actually cluster. Crucially, hosts
+    whose community assignment changes week-over-week are flagged for review: a Domain Controller or database
+    server migrating between communities can signal re-cabling, a new trust relationship, or an attacker
+    establishing footholds that shift a host''s communication neighborhood.'
+  answer_sources: *id001
+  range: Last 90 days (compare week-over-week community membership)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'inputlookup observed_edge_list
+
+      | eval w=normalize(total_conns)
+
+      | graph_cluster algorithm=louvain weight=w OUTPUT community
+
+      | join host [ inputlookup community_last_week ]
+
+      | where community != prev_community
+
+      | alert "Host changed community membership (possible segment drift)"'
+- question: Using graph embeddings (node2vec random walks or a variational graph autoencoder) learned
+    over historical topology, which newly observed edges score as anomalous by embedding distance or adjacency-reconstruction
+    error, and what are the top contributing features?
+  context: Graph-embedding anomaly detection learns the historical shape of the topology and scores new
+    edges by how poorly they fit it. node2vec biased random walks (Grover and Leskovec) or a variational
+    graph autoencoder (Kipf and Welling) encode normal adjacency; newly observed edges are scored by embedding
+    distance or reconstruction error, following the enterprise auth-graph link-prediction approach validated
+    by Bowman et al. (>85% TPR at 0.0004% FPR on LANL). Surfacing the top-3 contributing features (e.g.,
+    a novel neighbor, large embedding distance, unusual byte volume) makes each alert explainable. High-anomaly
+    links are elevated for validation of rogue cabling, switch misconfiguration, or unauthorized transit;
+    low scores indicate the edge is consistent with learned topology.
+  answer_sources: *id001
+  range: Last 90 days (model trained on trailing history, scored on current window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'train: embed_graph method=node2vec|vgae source=edge_history_baseline OUTPUT model
+
+      score: inputlookup observed_edge_list
+
+      | apply model
+
+      | eval anomaly=embedding_distance(src,dst), top_feats=feature_attribution(3)
+
+      | where anomaly>p99(anomaly)
+
+      | alert "Anomalous link anomaly=anomaly features=top_feats"'
+- question: Modeling the host-communication graph as a discrete temporal graph and forecasting expected
+    edges per window with a GNN+RNN temporal link-prediction framework, which observed edges have a low
+    predicted probability, indicating newly appearing direct paths or gradual topology drift?
+  context: Temporal link prediction forecasts what the topology should look like next, so deviations stand
+    out. Treating the host-communication graph as a discrete temporal graph and applying Euler's GNN+RNN
+    framework (King and Huang) yields a predicted probability for each possible edge in the upcoming window.
+    When an observed edge has a low predicted probability, it is likely either a newly appearing direct
+    path or evidence of gradual topology drift across critical segments. This catches slow, deliberate
+    changes that point-in-time anomaly detection might miss. An analyst reviews low-probability observed
+    edges to determine whether a new sanctioned link was added or whether an undocumented/unauthorized
+    path has emerged into a protected segment.
+  answer_sources: *id001
+  range: Last 90 days (per-window temporal forecasting)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'train: temporal_link_predict framework=euler input=temporal_graph_windows OUTPUT model
+
+      score: inputlookup observed_edge_list_current_window
+
+      | apply model OUTPUT pred_prob
+
+      | where pred_prob < 0.05
+
+      | table src_asset dst_asset pred_prob
+
+      | alert "Low-probability observed edge - newly appearing path / topology drift"'
+- question: Scoring incremental damped-window flow statistics per edge with an unsupervised autoencoder
+    ensemble, which links produce reconstruction error above the 99th percentile, and what per-feature
+    attribution explains the spike (e.g., unexpected bridging traffic)?
+  context: 'Online per-edge flow anomaly detection catches behavioral changes on a link without any labeled
+    data. Incremental damped-window statistics (byte/packet rates, jitter, inter-arrival times) are computed
+    per edge and scored by an unsupervised autoencoder ensemble (Kitsune). Thresholding reconstruction
+    error at the 99th percentile with per-feature attribution (Akcay et al.) produces explainable, feature-ranked
+    alerts: a spike on a link, such as unexpected bridging traffic between segments that should be isolated,
+    is surfaced with the specific flow features that drove the score. Because it operates incrementally
+    and unsupervised, it adapts to evolving baselines and flags emergent anomalies on critical-segment
+    links in near real time, complementing the structural graph methods with flow-level sensitivity.'
+  answer_sources: *id001
+  range: Last 90 days (incremental/streaming scoring with damped window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'stream flow_records
+
+      | per_edge_stats damped_window=true fields=(byte_rate,pkt_rate,jitter,iat)
+
+      | apply kitsune_autoencoder_ensemble OUTPUT recon_error
+
+      | eval feat_attr=per_feature_attribution()
+
+      | where recon_error > p99(recon_error)
+
+      | alert "Flow anomaly on edge recon_error=recon_error drivers=feat_attr"'
