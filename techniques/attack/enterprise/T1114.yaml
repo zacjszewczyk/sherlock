@@ -1,0 +1,405 @@
+name: 'T1114: Email Collection'
+id: 1edccc73-4a7d-449f-b74f-2c95bbd66c75
+description: 'Investigate whether an adversary is collecting sensitive information from user email. This
+  playbook helps an analyst hunt for and triage Email Collection activity across mail servers and clients
+  on Windows, macOS, Linux, and cloud Office Suite (M365/Exchange Online) environments. It covers: creation
+  or modification of auto-forwarding inbox rules that redirect mail to external domains; execution of
+  mailbox search/export tooling (Search-Mailbox, New-MailboxExportRequest, EWS) on hosts not designated
+  for mail administration; staging and exfiltration of local email archive files (.pst/.ost/.zip) by non-mail-client
+  processes; statistically rare authentications to corporate email services (OWA/MAPI/Azure AD) followed
+  by mass mailbox reads; unauthorized reads of local email data files preceding outbound network connections;
+  and connections to standard mail ports by processes or host-roles that are not approved mail clients.
+  For each behavior the playbook offers symbolic-logic rules, statistical baselines, and machine-learning
+  approaches so an analyst can confirm or rule out email-based collection by sophisticated external actors,
+  commodity malware, or insiders.'
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any inbox rule been created or modified (New-InboxRule, Set-InboxRule, UpdateInboxRules,
+    or Set-Mailbox -ForwardingSmtpAddress) that auto-forwards or redirects mail to an external domain
+    that is not on the organization's remote-domain allowlist?
+  context: In the Collection tactic, adversaries frequently establish silent, persistent email exfiltration
+    by creating client-side or mailbox-level forwarding rules so that copies of sensitive mail flow to
+    an attacker-controlled address without the user's knowledge. This symbolic-logic check alerts on rule-creation/modification
+    events in the M365 Unified Audit Log and corroborates them against Zeek smtp.log headers (X-MS-Exchange-Organization-AutoForwarded:true).
+    Forwards to free-mail providers or newly-registered TLDs should be treated as high severity. A positive
+    result is a rule sending mail off-domain; a negative result is forwarding only to allowlisted internal/partner
+    domains. Confirm mailbox auditing and the remote-domain AutoForwardEnabled state are intact so the
+    signal is not suppressed.
+  answer_sources:
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail Gateway (e.g., Exchange Online, On-prem Exchange), Network Egress Points, Webmail Application
+    Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (m365:unified, exchange:audit)\n  AND operation IN (\"New-InboxRule\",\"Set-InboxRule\"\
+      ,\"UpdateInboxRules\",\"Set-Mailbox\")\n  AND (ForwardTo OR RedirectTo OR ForwardingSmtpAddress)\
+      \ matches external_domain\n  AND external_domain NOT IN remote_domain_allowlist\n  | join (Zeek\
+      \ smtp.log WHERE header \"X-MS-Exchange-Organization-AutoForwarded\"=true)\n  | eval severity =\
+      \ if(target_tld IN free_mail OR domain_age < 30d, \"high\", \"medium\")\n  | table _time, user,\
+      \ operation, external_domain, severity"
+- question: Does the current daily volume of auto-forwarded messages (or forwarded bytes) for any user
+    exceed their own 30-day 95th-percentile baseline, or involve a first-seen external destination?
+  context: Rule-based forwarding may be configured quietly and only become visible through volume. This
+    statistical method builds each user's 30-day distribution of daily auto-forwarded message count and
+    forwarded bytes and alerts when the current value exceeds the 95th percentile or routes to a never-before-seen
+    external destination, ranking candidates with Directed Anomaly Scoring to hold a fixed daily alert
+    budget. Profile the failure state separately - spikes in NDR/bounce events or outbound-spam blocks
+    for the forwarded mail - as a distinct corroborating signal. A positive result indicates an abnormal
+    forwarding spike consistent with bulk email collection.
+  answer_sources:
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail Gateway (e.g., Exchange Online, On-prem Exchange), Network Egress Points, Webmail Application
+    Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=mailflow forwarded=true\n  | stats count AS fwd_cnt, sum(bytes) AS fwd_bytes\
+      \ BY user, date\n  | eventstats p95(fwd_cnt) AS p95c, p95(fwd_bytes) AS p95b BY user\n  | eval first_seen_dest\
+      \ = (dest NOT IN user_known_dest_30d)\n  | where fwd_cnt > p95c OR fwd_bytes > p95b OR first_seen_dest\n\
+      \  | sort - das_score"
+- question: When scored by a classifier over rule-creation features (creation hour, account role, target
+    TLD/age, source ASN/JA3, recipient-set deviation), which forwarding-rule events rank as most likely
+    malicious?
+  context: Some malicious forwarding rules look benign individually; a supervised model can separate them
+    using contextual features. This machine-learning approach scores each rule-creation event over creation
+    hour, account role, target domain TLD and registration age, source ASN and JA3 fingerprint, and how
+    far the recipient set deviates from the sender's historical contacts, emitting the top-3 contributing
+    features in the alert for analyst explainability (e.g., via LIME). Train on labeled benign/malicious
+    rule events and tune the threshold to the per-org alert budget. A high score with off-hours creation
+    to a young TLD by a privileged account is a strong Collection indicator.
+  answer_sources:
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail Gateway (e.g., Exchange Online, On-prem Exchange), Network Egress Points, Webmail Application
+    Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = [creation_hour, account_role, target_tld, domain_age,\n             source_asn,\
+      \ ja3, recipient_set_deviation]\n  model = load(\"inbox_rule_classifier\")\n  score = model.predict_proba(features)\n\
+      \  explain = LIME(model, features).top(3)\n  WHERE score > org_threshold\n  EMIT user, rule_id,\
+      \ score, explain"
+- question: Has a mailbox search or export operation (Search-Mailbox, New-MailboxExportRequest, Get-Mailbox
+    piped to export, or EWS / Microsoft.Exchange.WebServices usage) been executed by a non-admin host/user
+    or outside an approved change window?
+  context: Adversaries collect bulk email by running Exchange mailbox search/export cmdlets or EWS API
+    calls, often from a compromised non-administrative host. This symbolic-logic check alerts on Windows
+    Event ID 4688/4104 (or M365 SearchQueryInitiated) when the command line contains high-risk mailbox
+    export/search verbs executed by hosts or identities that are not designated mail administrators, or
+    outside change windows. Auto-escalate when the same identity also disabled mailbox auditing - a strong
+    sign of deliberate evasion. A positive result is mailbox export tooling running where it should never
+    run; a negative result is the expected admin running it during a sanctioned window.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Exchange Servers, Administrator Workstations, Domain Controllers, User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventCode=4688 OR EventCode=4104 OR operation=\"SearchQueryInitiated\")\n  AND CommandLine\
+      \ matches (\"Search-Mailbox\"|\"New-MailboxExportRequest\"|\"Get-Mailbox*export\"|\"Microsoft.Exchange.WebServices\"\
+      )\n  AND (host NOT IN exchange_admin_hosts OR user NOT IN mail_admins OR NOT in_change_window)\n\
+      \  | eval escalate = exists(same_identity disabled mailbox_audit)\n  | table _time, host, user,\
+      \ CommandLine, escalate"
+- question: Is this the first time a given user has executed a high-risk Exchange/PowerShell export or
+    search cmdlet, and does the export volume (mailbox count or exported bytes) exceed the 99th percentile?
+  context: Rare-event statistics surface abuse that signature rules miss. This method computes per-user
+    IDF/first-seen rarity for PowerShell and Exchange cmdlets and flags first-time execution of high-risk
+    export/search cmdlets. It also scores the full trace (logon -> cmdlet -> export -> outbound) with
+    statistical leverage so a chain of individually-benign events surfaces as an outlier, and tracks export
+    volume (mailbox count, exported bytes) against the 99th percentile. A positive result is a user's
+    first-ever mailbox-export command coupled with an unusually large export, consistent with staged email
+    Collection.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Exchange Servers, Administrator Workstations, Domain Controllers, User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (4688,4104) cmdlet IN high_risk_export_cmdlets\n  | stats min(_time) AS first_use,\
+      \ count BY user, cmdlet\n  | eval is_first_seen = (first_use within window)\n  | join trace=(logon->cmdlet->export->outbound)\
+      \ eval leverage_score\n  | eventstats p99(exported_bytes) AS p99 BY org\n  | where is_first_seen\
+      \ OR exported_bytes > p99 OR leverage_score > t"
+- question: Does an Isolation Forest (or One-Class SVM) model over PowerShell/cmdlet features flag any
+    mailbox-related script execution as anomalous?
+  context: Obfuscated or unusual mailbox-export scripting can be caught by unsupervised anomaly detection
+    on execution features. This machine-learning approach applies an Isolation Forest (with One-Class
+    SVM as a robustness fallback) over features such as script length, token entropy, high-risk cmdlet
+    flags, user, host, and hour, reporting the top-3 contributing features via LIME. Isolation Forest
+    is a low-latency, fleet-deployable baseline. A flagged event combining high token entropy, a high-risk
+    export cmdlet, an unusual user/host, and off-hours timing points to scripted email Collection.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Exchange Servers, Administrator Workstations, Domain Controllers, User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = [script_length, token_entropy, high_risk_cmdlet_flag, user, host, hour]\n\
+      \  model = IsolationForest()  # fallback: OneClassSVM\n  anomaly = model.decision_function(features)\n\
+      \  explain = LIME(model, features).top(3)\n  WHERE anomaly < threshold\n  EMIT host, user, script_id,\
+      \ anomaly, explain"
+- question: Was an email archive file (.pst/.ost/.zip) created outside approved mail directories by a
+    non-mail-client process, then read, then matched by an outbound transfer of similar byte count within
+    ~5 minutes?
+  context: 'A classic email Collection-to-exfiltration chain is: stage mailbox data into an archive in
+    a temp/user directory, then ship it out. This symbolic-logic rule correlates Event ID 4663 showing
+    creation of a .pst/.ost/.zip outside approved mail directories by a non-mail-client process, Event
+    ID 4688 showing the file being read, and Zeek conn.log/files.log showing an outbound transfer whose
+    byte count matches the archive size within roughly five minutes (volume correlation). A positive result
+    is a strong, time-bound exfiltration signal; a negative result is archive creation with no matching
+    egress.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, File Servers, Network Egress Points'
+  range: Last 90 days; pivot to a 5-minute correlation window around file creation/read
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  EventCode=4663 obj_ext IN (.pst,.ost,.zip) path NOT IN approved_mail_dirs proc NOT IN\
+      \ mail_clients\n  | join host (EventCode=4688 read same_file)\n  | join host (Zeek conn.log|files.log\
+      \ outbound WHERE abs(orig_bytes - file_size) < tol\n               AND egress_time - create_time\
+      \ <= 5m)\n  | table _time, host, proc, file, file_size, dest_ip, orig_bytes"
+- question: Do the daily counts/sizes of .pst/.zip creations outside mail directories on a host, or the
+    following outbound byte volume, reach the 99th percentile?
+  context: Volume baselining catches staging activity even when timing correlation is imperfect. This
+    statistical method baselines daily counts and sizes of .pst/.zip creations outside mail directories
+    per host and alerts when counts or the subsequent outbound byte volume hit the 99th percentile. It
+    scores the access->stage->exfil trace with statistical leverage and records the transfer success/fail
+    state. A positive result is an abnormal burst of archive staging and/or egress on a host, indicating
+    bulk email Collection prior to exfiltration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, File Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  EventCode=4663 obj_ext IN (.pst,.zip) path NOT IN approved_mail_dirs\n  | stats count\
+      \ AS stage_cnt, sum(file_size) AS stage_bytes BY host, date\n  | eventstats p99(stage_cnt) p99(stage_bytes)\
+      \ BY host\n  | join host outbound_bytes\n  | where stage_cnt>p99 OR stage_bytes>p99 OR outbound_bytes>p99(outbound)\n\
+      \  | eval state=transfer_result"
+- question: After a .pst/.zip creation event, does forecasted host outbound volume show a large positive
+    residual, or does the process-file-network ordering rank as low-probability?
+  context: Time-series and sequence models add predictive context to staging-then-exfil behavior. This
+    machine-learning approach forecasts host outbound volume (e.g., ARIMA/residual or autoencoder reconstruction)
+    using .pst/.zip creation as an exogenous/contextual input and flags large positive residuals following
+    file events; alternatively it models the process-file-network ordering as a sequence and flags low-probability
+    orderings, surfacing the contributing events. A positive result is an unexpected egress surge after
+    archive creation, or an improbable process->file->network sequence, both consistent with email exfiltration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - 'NAI: User Endpoints, File Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  ts = host_outbound_bytes_series\n  ctx = pst_zip_creation_events\n  resid = ts - forecast(ts,\
+      \ exog=ctx)   # ARIMA or autoencoder reconstruction\n  WHERE resid > k*sigma AND ctx within prior_window\n\
+      \  ALSO seq_prob = seq_model(process,file,network).prob\n  WHERE seq_prob < min_prob\n  EMIT host,\
+      \ resid, seq_prob, contributing_events"
+- question: Did a successful email-service authentication (OWA/MAPI/EWS/Azure AD) originate from a TI-blocked
+    IP or show impossible travel, and was it followed by mass MailItemsAccessed or forwarding-rule creation?
+  context: Valid-account abuse of email - the mailbox-read/export/forward pattern documented in the SolarWinds/SVR
+    (CISA AA20-352A) campaign - is a hallmark of sophisticated email Collection. This symbolic-logic check
+    alerts when successful email authentications originate from threat-intel-blocked IPs or exhibit impossible
+    travel, especially when promptly followed by mass MailItemsAccessed events or forwarding-rule creation.
+    A positive result links an anomalous logon to bulk mailbox access, strongly suggesting credentialed
+    adversary collection; a negative result is expected access from known infrastructure.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Authentication Servers (Active Directory), Cloud Identity Provider (Azure AD), VPN Concentrators,
+    Webmail Application Servers, Mail Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventCode=4624 OR azure:ad SignInEvents) service IN (OWA,MAPI,EWS) result=success\n\
+      \  AND (src_ip IN ti_blocklist OR impossible_travel(user, src_ip))\n  | join user (m365 operation\
+      \ IN (\"MailItemsAccessed\",\"New-InboxRule\") within 1h)\n  | stats count AS mail_ops BY user,\
+      \ src_ip\n  | where mail_ops > burst_threshold"
+- question: How structurally rare is each email login's (user, source-ASN, host-role, country, user-agent,
+    JA3, hour) combination against the user's 90-day baseline, and which exceed the 98th percentile?
+  context: Structurally anomalous logins reveal account takeover preceding email Collection. This statistical
+    method scores each login by the structural rarity of (user, source-ASN, host-role, country, user-agent,
+    JA3, hour) against the user's 90-day baseline and alerts above the 98th percentile. It also explicitly
+    profiles failed-logon and blocked-connection rates per account as a distinct precursor signal and
+    ranks candidates with Directed Anomaly Scoring to bound alert volume. A positive result is a login
+    that is structurally unlike the user's history (e.g., rare ASN + new JA3 + off-hours), warranting
+    mailbox-access review.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Authentication Servers (Active Directory), Cloud Identity Provider (Azure AD), VPN Concentrators,
+    Webmail Application Servers, Mail Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (4624, Zeek ssl.log/http.log, azure:ad) service=email success\n  | eval tuple=(user,src_asn,host_role,country,user_agent,ja3,hour)\n\
+      \  | `rarity tuple vs user_baseline_90d` -> rarity_score\n  | eventstats p98(rarity_score) AS p98\
+      \ BY user\n  | join user (failed_logon_rate, blocked_conn_rate)\n  | where rarity_score > p98 |\
+      \ sort - das_score"
+- question: Does an unsupervised model (One-Class SVM or autoencoder) over per-user login vectors flag
+    any email authentication as a deviation from the user's normal pattern?
+  context: Unsupervised models learn each user's normal login envelope and flag novel access used for
+    email Collection. This machine-learning approach trains a One-Class SVM (robust under poisoning) or
+    autoencoder on per-user login vectors (country, ASN, user-agent, JA3, login hour) and flags deviations,
+    emitting the top-3 contributing features (e.g., rare ASN + new JA3 + off-hours) via LIME. A flagged
+    login that departs sharply from the user's baseline - particularly preceding mailbox access - indicates
+    likely account compromise enabling email collection.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Authentication Servers (Active Directory), Cloud Identity Provider (Azure AD), VPN Concentrators,
+    Webmail Application Servers, Mail Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = per_user_login_vectors[country, asn, user_agent, ja3, login_hour]\n  model = OneClassSVM()\
+      \  # or autoencoder reconstruction error\n  score = model.predict(X)\n  explain = LIME(model, X).top(3)\n\
+      \  WHERE score == anomaly\n  EMIT user, login_id, score, explain"
+- question: Did a process outside the approved mail-client allowlist (e.g., powershell.exe, rundll32.exe)
+    read a local .pst/.ost file, followed within five minutes by an outbound connection from the same
+    host to an unknown IP?
+  context: Reading local email data files with a non-mail-client process is a direct email Collection
+    technique, and a quick outbound connection afterward signals exfiltration. This symbolic-logic rule
+    alerts when Event ID 4663 shows a read on .pst/.ost by a process outside the Outlook/Thunderbird/approved
+    mail-client allowlist and Zeek conn.log shows an outbound connection from the same host within five
+    minutes to an unknown IP. A positive result is unauthorized mailbox-file access tied to egress; a
+    negative result is normal mail-client access only.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Network Egress Points, DNS Servers'
+  range: Last 90 days; pivot to a 5-minute window after the file read
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  EventCode=4663 access=read obj_ext IN (.pst,.ost) proc NOT IN mail_client_allowlist\n\
+      \  | join host (Zeek conn.log outbound dest_ip NOT IN known_ips\n               AND conn_time -\
+      \ read_time <= 5m)\n  | table _time, host, proc, file, dest_ip"
+- question: Is this the first time a given process has read .pst/.ost on a host, and does the subsequent
+    outbound byte volume exceed the host's 99th percentile?
+  context: First-seen process behavior plus volume catches novel mailbox-file access used for collection.
+    This statistical method baselines the set of processes that read .pst/.ost per host and alerts on
+    first-time access, combined with a check that the following outbound byte volume exceeds the host's
+    99th percentile, while recording whether the connection succeeded or was blocked (state). A positive
+    result is a never-before-seen process reading a mailbox file followed by a large egress, consistent
+    with email theft.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  EventCode=4663 access=read obj_ext IN (.pst,.ost)\n  | stats min(_time) AS first BY\
+      \ host, proc\n  | eval is_first = (first within window)\n  | join host (outbound_bytes after read)\n\
+      \  | eventstats p99(outbound_bytes) BY host\n  | where is_first AND outbound_bytes > p99\n  | eval\
+      \ state = conn_result"
+- question: Does a sequence model (HMM or seq-to-seq) flag a low-probability process-file-network ordering
+    such as powershell reading user.pst before an external connection?
+  context: Sequence modeling detects improbable orderings of process, file, and network events that signature
+    rules cannot express. This machine-learning approach models process-file-network events as a sequence
+    with an HMM/seq-to-seq model and flags low-probability orderings such as powershell reading user.pst
+    before an external connection, reporting the improbable transition that triggered the alert. A positive
+    result is an unlikely access-then-exfil sequence indicating scripted email collection; a negative
+    result is a high-probability, expected ordering.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Endpoints, Network Egress Points, DNS Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  seq = order(process_create, file_read(.pst/.ost), outbound_conn) BY host\n  model =\
+      \ HMM()  # or seq2seq\n  p = model.sequence_prob(seq)\n  WHERE p < min_prob\n  EMIT host, seq, p,\
+      \ improbable_transition"
+- question: Are there connections to standard mail ports (25, 143, 465, 587, 993, 995) initiated by processes
+    or host-roles that are not on the approved mail-client or admin-tool allowlist (e.g., a web server
+    reaching an internal mail server on 993)?
+  context: Adversaries collecting email may talk directly to mail servers from unexpected hosts (compromised
+    web servers, user endpoints) using IMAP/POP/SMTP. This symbolic-logic check uses Windows Event ID
+    5156 or Zeek conn.log to alert on connections to mail ports initiated by processes or host-roles not
+    on the approved mail-client/admin-tool allowlist. A positive result - such as a web server reaching
+    an internal mail server on 993 - indicates unauthorized mailbox access; a negative result is normal
+    mail-client traffic from sanctioned hosts.
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Mail Gateway, User Endpoints, Application Servers, Internal Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (EventCode=5156 OR Zeek conn.log) dest_port IN (25,143,465,587,993,995)\n  AND (proc\
+      \ NOT IN mail_client_allowlist OR host_role NOT IN (mail,admin))\n  | table _time, host, host_role,\
+      \ proc, dest_ip, dest_port"
+- question: Has a new (process_name, destination_port, dest_role) tuple appeared using a mail port where
+    the process is not a known mail client, or do connection-failure/blocked rates to mail ports spike
+    above the 99th percentile?
+  context: Baselining process-to-port-to-role tuples surfaces novel mail-server access and probing. This
+    statistical method baselines (process_name, destination_port, dest_role) tuples per host and flags
+    new tuples using mail ports where the process is not a known mail client; it also profiles connection-failure/blocked
+    rates to the mail port as a distinct probing signal and alerts on volume/frequency above the 99th
+    percentile. A positive result is a new non-mail-client-to-mail-port tuple or a burst of failed mail-port
+    connections, both consistent with reconnaissance or collection.
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Mail Gateway, User Endpoints, Application Servers, Internal Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn dest_port IN (25,143,465,587,993,995)\n  | eval tuple=(process_name, dest_port,\
+      \ dest_role)\n  | stats min(_time) AS first, count, sum(failed) AS fails BY host, tuple\n  | eval\
+      \ is_new = (first within window AND process NOT IN mail_clients)\n  | eventstats p99(count) p99(fails)\
+      \ BY host\n  | where is_new OR count>p99 OR fails>p99"
+- question: Does an unsupervised graph model over host-role and user communication structure flag rare
+    edges (e.g., web server -> mail server on 993) as anomalous?
+  context: Graph-based detection captures abnormal communication structure that tuple baselines may miss.
+    This machine-learning approach trains an unsupervised graph neural network / graph embedding on host-role
+    and user communication structure and flags rare edges (e.g., web server -> mail server on 993) as
+    anomalies, surfacing the contributing edge features for triage; it can be complemented with log-entity
+    graph embeddings over mailbox-operation sequences. A positive result is a structurally rare connection
+    edge to a mail server from a host that has no business reason to reach it, indicating possible email
+    collection.
+  answer_sources:
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Mail Gateway, User Endpoints, Application Servers, Internal Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = graph(nodes=hosts/users with roles, edges=connections to mail_ports)\n  emb = unsupervised_GNN(G)\
+      \  # or graph embedding\n  rare_edges = edges WHERE edge_anomaly(emb) > threshold\n  EMIT src_host(role),\
+      \ dst_host(role), dest_port, edge_features"
