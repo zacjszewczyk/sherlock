@@ -1,0 +1,223 @@
+name: 'D3-DUC: Decoy User Credential'
+id: 7e4d1975-19a0-44a3-8f1b-4ceb0d168105
+description: Investigate authentication and follow-on activity involving designated decoy (bait) user
+  credentials. Decoy credentials have no legitimate business use, so any access or attempted use is a
+  high-fidelity tripwire for an adversary who has harvested credentials and is attempting to authenticate,
+  spray, or move laterally. This playbook guides an analyst from the deterministic decoy-use alert through
+  validation of unauthorized context (host role, logon type, source, timing, explicit-credential fan-out),
+  statistical profiling of failed decoy authentications and the rarity of source/timing attributes, measurement
+  of post-authentication behavior divergence (volume, frequency, connection state), change-point detection
+  of regime shifts after credential activation, and graph/sequence machine-learning scoring of unprecedented
+  connections and adversary objectives. The goal is to confirm unauthorized use of bait credentials rather
+  than legitimate administration or accidental contact (typos, password-manager autofill, sanctioned testing),
+  and to prioritize response.
+type: technique
+related:
+- tactic_id: D3-DO
+  tactic_name: Decoy Object
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any successful (Windows Event ID 4624) or failed (Windows Event ID 4625) logon occur where
+    the TargetUserName matches an account on the maintained decoy-user list, indicating that bait credentials
+    were touched?
+  context: 'Decoy user credentials are planted (decoy GPP cpassword, decoy local-admin accounts, fake
+    credentials in registry/config/AD) specifically so that no legitimate workflow ever touches them.
+    Any authentication event referencing a decoy identity is therefore a near-zero-false-positive tripwire
+    by construction. In the Decoy Object tactic this is the primary signal: an adversary who has harvested
+    credentials cannot distinguish bait from real, so they will attempt to use them. Maintain the decoy
+    list as data (so the rule never needs editing), keep this deterministic rule permanently enabled,
+    and treat any match as critical. A positive result means a decoy account was used and warrants immediate
+    investigation; a negative result means no decoy contact in the window. Confirm decoys are realistically
+    placed so legitimate automation never collides with them.'
+  answer_sources: &id001
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Credential Stores, High-Value Target Systems (e.g., file servers, databases)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "decoy_accounts = lookup('decoy_user_list')\nWHERE EventID IN (4624, 4625)\n  AND lower(TargetUserName)\
+      \ IN decoy_accounts\nEMIT alert(severity='CRITICAL', reason='Decoy credential used',\n         \
+      \ account=TargetUserName, result=if(EventID==4624,'SUCCESS','FAILURE'),\n          src=IpAddress,\
+      \ host=Computer, logon_type=LogonType)"
+- question: When a decoy credential fired, did the event originate from an unapproved system, an unexpected
+    remote logon type (Type 3 network or Type 10 RDP), a maintenance-blackout window, or did explicit-credential
+    use (Event ID 4648) of the decoy identity fan out to multiple destination hosts consistent with lateral
+    movement?
+  context: A bare decoy hit is high-fidelity, but enriching it with context confirms unauthorized use
+    and characterizes adversary intent for the Decoy Object tactic. Correlate each decoy event with the
+    host's role, the logon type, and the expected source. Escalate when use originates from systems not
+    approved to ever touch decoys, when remote logon types (3/10) appear where only interactive logons
+    are expected, or when activity falls in a maintenance-blackout period. Explicit-credential events
+    (4648) where one source uses the decoy identity against multiple destinations strongly suggest credential-driven
+    lateral movement. Apply lateral-movement invariants such as credential switching mid-path and movement
+    to rarely-accessed hosts as additional deterministic predicates. A positive result is a decoy login
+    from an unauthorized context or fanning out to many hosts; a negative result is an isolated, single-host
+    event.
+  answer_sources: *id001
+  range: Last 90 days; pivot +/- 24h around each decoy event for correlation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "decoy_accounts = lookup('decoy_user_list')\napproved_src = lookup('decoy_approved_sources')\n\
+      WHERE EventID IN (4624, 4648)\n  AND lower(TargetUserName) IN decoy_accounts\n  AND ( IpAddress\
+      \ NOT IN approved_src\n        OR LogonType IN (3, 10)\n        OR in_maintenance_blackout(EventTime)\
+      \ == false )\n// explicit-credential fan-out\n| stats dc(TargetServerName) AS dest_hosts BY SubjectUserName,\
+      \ IpAddress\n  WHERE EventID == 4648\nWHERE dest_hosts >= 2\nEMIT alert(severity='CRITICAL', reason='Decoy\
+      \ use in unauthorized context / lateral fan-out')"
+- question: Are failed decoy logons (Event ID 4625) clustering into a spraying or brute-force pattern,
+    with failed-attempt counts or distinct source-host/IP counts against decoy identities exceeding environment-derived
+    thresholds?
+  context: Failed authentications against decoy accounts are themselves a high-value signal of credential
+    spraying or brute force, independent of any successful use, and are central to detecting an adversary
+    probing within the Decoy Object tactic. Count failed decoy logons per 5/15/60-minute window, the number
+    of distinct source hosts/IPs targeting decoy identities, and the failed:successful ratio. Alert when
+    failed-attempt counts or distinct-source counts exceed thresholds derived from your environment baseline.
+    Start with >=5 failures or >=2 distinct sources per hour and tune toward your 99th-percentile baseline
+    to control noise. A positive result is a burst of decoy failures from one or many sources (spraying);
+    a negative result is sparse, isolated failures consistent with a typo.
+  answer_sources: *id001
+  range: Last 90 days; sliding 5/15/60-minute windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'decoy_accounts = lookup(''decoy_user_list'')
+
+      WHERE EventID == 4625 AND lower(TargetUserName) IN decoy_accounts
+
+      | bin time span=60m
+
+      | stats count AS failures, dc(IpAddress) AS distinct_sources BY time
+
+      WHERE failures >= 5 OR distinct_sources >= 2   // tune to 99th percentile baseline
+
+      EMIT alert(severity=''HIGH'', reason=''Decoy credential spraying/brute-force'', failures, distinct_sources)'
+- question: For each decoy event, how rare are its source IP, ISP/ASN, geolocation, and login hour relative
+    to the historical access pattern of the target host, and which attribute drove the rarity score into
+    the extreme tail?
+  context: Even a single decoy event can be enriched by scoring how anomalous its origin and timing are
+    against historical norms, helping prioritize the most suspicious activity in the Decoy Object tactic.
+    For each event compute rarity percentiles (or robust MAD z-scores) for source IP, ISP/ASN, geolocation,
+    and login hour relative to the target host's history. Prioritize events in the rarest tail (for example
+    below the 5th percentile or |MAD-z| > 3.5) and surface which attribute was responsible so the analyst
+    knows whether it was a never-before-seen ASN, an unusual country, or an off-hours login. A positive
+    result is an event from a rare/novel source or unusual hour; a negative result is an event consistent
+    with the host's normal access.
+  answer_sources: *id001
+  range: Last 90 days; baseline window 90+ days per host
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "decoy_accounts = lookup('decoy_user_list')\nWHERE EventID IN (4624, 4625) AND lower(TargetUserName)\
+      \ IN decoy_accounts\n| enrich asn, geo FROM IpAddress\n| foreach attr IN (IpAddress, asn, country,\
+      \ hour(EventTime)):\n    pctl[attr] = rarity_percentile(attr, baseline=host_history[Computer])\n\
+      \    madz[attr] = mad_zscore(attr, baseline=host_history[Computer])\nWHERE min(pctl.*) < 0.05 OR\
+      \ max(abs(madz.*)) > 3.5\nEMIT alert(severity='HIGH', driver=argmax_rarity(attr), scores=pctl)"
+- question: In the 15- and 60-minute windows after a decoy credential was used, did the triggering host's
+    volume (bytes sent/received and byte-ratio), frequency (process launches per minute, connections per
+    minute), or connection state (success vs failed/blocked) diverge from its baseline beyond robust z-score
+    or PCA-residual/MAD thresholds?
+  context: Once a decoy fires, the adversary's subsequent behavior often diverges sharply from the host's
+    norm; measuring that divergence helps confirm hands-on activity within the Decoy Object tactic. Track
+    post-event windows for Volume (bytes sent/received and byte-ratio from Zeek conn.log), Frequency (process-launch
+    count per minute from Event ID 4688 and connections per minute), and State (counts of successful vs
+    failed/blocked connections) from the triggering host. Alert on deviations above baseline z-score or
+    PCA-residual/MAD thresholds chosen to be robust to the skewed nature of enterprise telemetry. A positive
+    result is a spike in data movement, process churn, or connection failures after decoy use; a negative
+    result is behavior within baseline.
+  answer_sources: *id001
+  range: 'Event-centered: 15- and 60-minute windows after each decoy event; baseline Last 90 days'
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "decoy_events = WHERE EventID IN (4624,4648) AND lower(TargetUserName) IN lookup('decoy_user_list')\n\
+      FOR each decoy_event e ON host h=e.Computer:\n  win = [e.time, e.time+60m]\n  volume = sum(orig_bytes+resp_bytes)\
+      \ FROM zeek_conn WHERE host==h AND time IN win\n  ratio  = sum(orig_bytes)/sum(resp_bytes)\n  freq\
+      \   = count(EventID==4688) FROM win / 60   // procs/min\n  state  = count(conn_state IN ('REJ','S0','RSTR'))\
+      \ FROM zeek_conn IN win\n  z = mad_zscore([volume,ratio,freq,state], baseline=host_profile[h])\n\
+      WHERE max(abs(z)) > 3.5 OR pca_residual([volume,ratio,freq,state]) > thresh\nEMIT alert(severity='HIGH',\
+      \ metrics={volume,ratio,freq,state})"
+- question: Following use of a decoy credential, do per-account or per-host time series (logon rate, byte
+    volume, destination fan-out) show a statistically significant step-change (regime shift) in activity
+    onset detectable by change-point analysis?
+  context: Adversary activity after compromising a credential frequently appears as a sudden, sustained
+    change in behavior rather than a single spike; change-point detection isolates that onset for the
+    Decoy Object tactic. Apply CUSUM, PELT, or Bayesian online change-point detection to per-account and
+    per-host time series such as logon rate, byte volume, and destination fan-out to flag a step-change
+    onset of activity following decoy-credential use. Tune thresholds to be explainable and to balance
+    sensitivity against false alarms. A positive result is a clear change point coinciding with or shortly
+    after decoy use; a negative result is a stationary series with no regime shift.
+  answer_sources: *id001
+  range: Last 90 days; per-account/per-host time series
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each entity IN (decoy_accounts + their_hosts):\n  ts_logon = timeseries(count(EventID\
+      \ IN (4624,4625)), span=1h, by=entity)\n  ts_bytes = timeseries(sum(orig_bytes+resp_bytes), span=1h,\
+      \ by=entity)\n  ts_fanout = timeseries(dc(dest_host), span=1h, by=entity)\n  cp = change_point(ts_*,\
+      \ method='PELT'|'CUSUM'|'BOCPD')\nWHERE cp.detected AND cp.time >= first_decoy_use(entity)\nEMIT\
+      \ alert(severity='MEDIUM-HIGH', changepoint=cp.time, metric=cp.series, magnitude=cp.delta)"
+- question: After decoy use, how unprecedented are the resulting authentication/communication edges when
+    scored by an unsupervised graph model (link-prediction or graph autoencoder), and what are the top
+    contributing edges/features (rare source-destination pair, first-time host, anomalous protocol)?
+  context: Lateral movement following credential compromise creates edges in the authentication and communication
+    graph that have never been seen before; an unsupervised graph neural network can score these for the
+    Decoy Object tactic. Build an authentication/communication graph from auth and connection logs and
+    use a link-prediction or autoencoder GNN to score how unprecedented the connections following decoy
+    use are. Alert on low-likelihood edges and include the top-3 contributing edges/features in the alert
+    text rather than a bare anomaly score so the analyst can act. Train and validate on a representative
+    authentication corpus (e.g. the public LANL dataset). A positive result is a low-likelihood, first-time
+    edge from the decoy-using host; a negative result is edges consistent with the learned graph.
+  answer_sources: *id001
+  range: Last 90 days; graph built over rolling 30-90 day window
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "G = build_graph(nodes=hosts+accounts, edges=auth_events + zeek_conn, window=30d)\nmodel =\
+      \ GraphAutoencoder().fit(G_benign)   // or link-prediction GNN\nFOR each edge e created after decoy_use:\n\
+      \  score = model.edge_likelihood(e)\nWHERE score < low_likelihood_threshold\nEMIT alert(severity='HIGH',\
+      \ edge=e,\n          top_features=model.explain(e)[:3])  // rare pair, first-time host, anomalous\
+      \ proto"
+- question: Does the per-account sequence of auth->process->network events after decoy activation diverge
+    from the top-k next events predicted by a benign-trained sequence model, and do the deviating events
+    suggest reconnaissance, lateral movement, or exfiltration?
+  context: 'The chain of events an adversary performs after using a credential differs from benign activity
+    and can reveal their objective within the Decoy Object tactic. Train a per-account sequence model
+    (such as an LSTM performing next-event prediction) on benign auth->process->network event chains.
+    When the chain after decoy activation diverges from the model''s top-k predicted next events, flag
+    it and report the specific deviating events. The nature of those deviating events helps infer the
+    likely objective: enumeration/recon, lateral movement, or data exfiltration. A positive result is
+    a sequence that violates the learned benign pattern; a negative result is a sequence within the predicted
+    top-k continuations.'
+  answer_sources: *id001
+  range: Last 90 days; per-account event sequences
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seq = ordered_events(account, types=[auth(4624/4648), process(4688), network(zeek_conn)])\n\
+      model = LSTM_next_event().fit(benign_sequences)\nFOR each step s after decoy_activation:\n  if observed_event(s)\
+      \ NOT IN model.topk_predict(history, k):\n     deviations.append(s)\nWHERE len(deviations) > 0\n\
+      EMIT alert(severity='HIGH', deviating_events=deviations,\n          inferred_objective=classify(deviations))\
+      \  // recon|lateral|exfil"
+- question: When the deterministic decoy match, failure-rate signals, source/timing rarity, post-auth
+    volume/frequency/state metrics, and graph/sequence anomaly scores are fused into a calibrated compromise-confidence
+    score, how confident is the model that this is a genuine compromise, and what are the top-3 contributing
+    features?
+  context: Individual signals are stronger together; fusing them into a single calibrated score helps
+    prioritize response across the Decoy Object tactic without losing the high-fidelity tripwire. Combine
+    the deterministic decoy match, failure-rate signals, source/timing rarity, post-auth volume/frequency/state
+    metrics, and graph/sequence anomaly scores into a calibrated compromise-confidence score. The model
+    output MUST surface the top-3 contributing features in the alert text so analysts can validate it,
+    and the deterministic decoy-use alert ALWAYS fires in parallel regardless of the model's score so
+    detection is never gated on the model. A positive result is a high fused confidence with interpretable
+    drivers; a low score still requires the parallel deterministic alert to be triaged.
+  answer_sources: *id001
+  range: Last 90 days; scored per decoy event
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = {\n  decoy_match: 1,                      // deterministic, always set\n  fail_rate:\
+      \ spray_signal_score,\n  rarity: source_timing_rarity,\n  post_auth: vol_freq_state_zscore,\n  graph:\
+      \ gnn_edge_anomaly,\n  sequence: lstm_deviation_score }\nconfidence = calibrated_model.predict_proba(features)\n\
+      EMIT alert(severity=scaled(confidence), confidence=confidence,\n          top_features=calibrated_model.explain(features)[:3])\n\
+      // ALWAYS also emit deterministic decoy-use alert in parallel"
