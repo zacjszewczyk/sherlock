@@ -1,0 +1,440 @@
+name: 'T1555.003: Credentials from Web Browsers'
+id: ee280ecf-8b3d-4a16-a006-c5aa870a655c
+description: Investigate whether an adversary attempted to acquire saved credentials from web browsers
+  (e.g., Chrome/Edge 'Login Data', Firefox 'logins.json'/'key4.db', Safari Keychain-backed stores) on
+  enterprise Windows, Linux, and macOS hosts. This playbook helps an analyst hunt for execution of known
+  credential-theft tooling (LaZagne, WebBrowserPassView, SharpWeb, mimikittenz, BrowserStealer) with correlated
+  C2 connections; command lines and PowerShell script blocks containing browser-credential paths, the
+  canonical 'SELECT ... FROM logins' SQL query, or DPAPI 'CryptUnprotectData' calls; non-browser processes
+  reading or copying browser credential databases (often via LOLBins such as esentutl or sqlite3) into
+  staging directories; and credential reads quickly followed by suspicious outbound network activity indicative
+  of exfiltration. Each question pairs a symbolic-logic, statistical, or machine-learning detection method
+  with concrete data sources, named areas of interest, and pseudocode so a SOC analyst can pursue the
+  lead end to end.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any host execute a process whose image hash or name matches a known browser-credential
+    theft tool (LaZagne, WebBrowserPassView, SharpWeb, BrowserStealer, mimikittenz), and did that same
+    host concurrently connect to known malicious C2 infrastructure?
+  context: Browser credential theft is frequently performed with purpose-built tools. Hash the image in
+    Windows Event ID 4688 / Sysmon EID 1 and join it against threat intelligence for these tools, then
+    correlate the same host's outbound connections (Sysmon EID 3 / Zeek conn.log/dns.log) against C2 intel.
+    A positive hit on either the tool hash/name or the C2 destination is high confidence; the alert should
+    carry the image hash, command line, parent process, and matched destination so triage can confirm
+    whether browser credential stores were actually touched. This directly supports the Credential Access
+    tactic by surfacing the tooling adversaries use to harvest saved browser passwords.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, servers with interactive logins, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (WinEventLog:Security EID=4688, WinEventLog:Sysmon EID=1)
+
+      | eval h=sha256(Image)
+
+      | lookup ti_credtools sha256 AS h OR image_name AS Image
+
+      | join host [ search (Sysmon EID=3 OR zeek:conn OR zeek:dns) | lookup ti_c2 dest_ip OR query ]
+
+      | where ti_credtools.match OR ti_c2.match
+
+      | table host, Image, h, CommandLine, ParentImage, dest_ip, query
+
+      | alert severity=high'
+- question: After a suspicious process launch, did the host contact rare, low-prevalence, or first-seen
+    domains/IPs, including failed connection attempts (NXDOMAIN, firewall-blocked, RST) that suggest beaconing
+    or exfiltration retries?
+  context: Stealers exfiltrate harvested browser credentials to attacker infrastructure that is usually
+    rare across the enterprise. Score the host's Zeek dns.log/conn.log destinations by enterprise prevalence
+    over a 30-day window and flag domains/IPs contacted by fewer than 1% of endpoints, adding weight when
+    the destination is first-seen for that host. Failure states (NXDOMAIN counts, firewall-blocked or
+    RST connections) are distinct signals of C2/exfil retries and should be tracked separately. Surface
+    the top-3 contributors (prevalence %, first-seen flag, time-since-process-launch). A positive result
+    is a low-prevalence/first-seen destination shortly after a suspicious launch; a negative result is
+    contact only with well-established destinations.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, servers with interactive logins, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'let win=30d; baseline = count distinct host per dest over win
+
+      | from zeek:conn, zeek:dns where time > process_launch
+
+      | eval prevalence = host_count(dest)/total_hosts
+
+      | eval first_seen = NOT exists(host,dest, before=process_launch)
+
+      | eval fail = (dns_rcode=NXDOMAIN) OR (conn_state IN (REJ,RSTO,S0)) OR fw_blocked
+
+      | where prevalence < 0.01 OR first_seen OR fail
+
+      | sort by prevalence asc | top3 prevalence, first_seen, time_since_launch'
+- question: Did per-host outbound network volume or connection rate spike above the forecasted/learned
+    baseline shortly after a suspicious process launched, indicating bulk exfiltration of harvested credentials?
+  context: Maintain per-host online flow models over Zeek conn.log volume and frequency and alert when
+    post-process outbound bytes or connection rate exceed the model's reconstruction error or 99th-percentile
+    forecast (autoencoder-ensemble approach a la Kitsune). This catches exfiltration even when the destination
+    is not yet known-bad. Report the top-3 contributing flow features (orig_bytes, connection rate, unique
+    destinations) in the alert. A positive result is an anomalous outbound burst following the launch;
+    benign hosts stay within the learned envelope. Supports Credential Access by detecting the network
+    footprint of credential exfiltration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, servers with interactive logins, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = online_autoencoder_ensemble(per_host, features=[orig_bytes, conn_rate, uniq_dst])
+
+      | score = recon_error(model, current_window)
+
+      | where score > p99_forecast AND time within 30m after process_launch
+
+      | explain top3 features
+
+      | alert'
+- question: Do any process command lines (Event ID 4688) or PowerShell script blocks (Event ID 4104) contain
+    browser-credential patterns such as credential DB paths, the 'SELECT ... FROM logins' query, DPAPI
+    'CryptUnprotectData', or keychain access commands?
+  context: Direct credential extraction leaves telltale strings. Scan Event ID 4688 command lines and
+    Event ID 4104 script blocks for browser credential DB paths (\User Data\Default\Login Data, logins.json,
+    key4.db), the canonical SQL query SELECT ... FROM logins, DPAPI CryptUnprotectData, and LOLBins copying
+    locked DBs (esentutl ... Login Data, sqlite3). On macOS add 'security dump-keychain' and 'find-generic-password'.
+    A match strongly indicates hands-on-keyboard or scripted browser credential access. This supports
+    Credential Access by catching the act of querying or decrypting saved browser passwords. Requires
+    PowerShell v5+ Script Block Logging.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All Windows endpoints and servers where PowerShell v5+ Script Block Logging is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (WinEventLog:Security EID=4688, WinEventLog:PowerShell EID=4104)\n| where CommandLine|ScriptBlockText\
+      \ matches any of [\n  '\\\\User Data\\\\Default\\\\Login Data', 'logins.json', 'key4.db',\n  '(?i)SELECT\
+      \ .*FROM logins', '(?i)CryptUnprotectData',\n  '(?i)esentutl.*Login Data', '(?i)sqlite3',\n  '(?i)security\
+      \ (dump-keychain|find-generic-password)' ]\n| table host, user, ParentImage, CommandLine\n| alert\
+      \ severity=high"
+- question: Are there rare process-to-argument tuples or high-entropy command-line arguments (above the
+    98th percentile) executing on a host/user, especially launched from non-interactive parents?
+  context: Adversaries often obfuscate or encode credential-access commands. Baseline normal admin command
+    lines and script blocks per host/user, then flag rare process->argument tuples and high Shannon-entropy
+    arguments above the 98th percentile, paying special attention to non-interactive parents (e.g., services,
+    scripting hosts). Include a frequency metric (matching commands/min) and emit the top-3 features (entropy,
+    rarity rank, parent process). A positive result is a rare, high-entropy invocation from an unusual
+    parent; routine admin tooling sits in the established baseline. Supports Credential Access by exposing
+    obfuscated browser-credential extraction.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All Windows endpoints and servers where PowerShell v5+ Script Block Logging is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline (process,arg_tuple) freq per host,user over 30d
+
+      | eval entropy = shannon(CommandLine)
+
+      | eval rarity = 1 - pct_rank(tuple_freq)
+
+      | where entropy > p98 AND rarity high AND ParentImage in noninteractive_set
+
+      | eval rate = count_matching/min
+
+      | top3 entropy, rarity, ParentImage'
+- question: Does a sequence/log model classify a PowerShell script block or command sequence as malicious
+    based on credential-access keywords and structural features?
+  context: Train a sequence model (e.g., LSTM as in DeepLog) on labeled benign and malicious script blocks
+    using features such as keyword presence ('Unprotect', 'logins.json', 'SELECT ... FROM logins'), API/token
+    counts, length, and entropy; alert on high malicious probability and surface the top-3 contributing
+    tokens/features. This generalizes beyond fixed regexes to catch novel variants of browser-credential
+    extraction scripts. A positive result is a high malicious-probability script; benign automation scores
+    low. Supports Credential Access by detecting scripted browser password theft.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: All Windows endpoints and servers where PowerShell v5+ Script Block Logging is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [keyword_flags(Unprotect, logins.json, SELECT FROM logins), api_count, token_count,
+      length, entropy]
+
+      | p = lstm_seq_model.predict(script_block_tokens, features)
+
+      | where p > 0.9
+
+      | explain top3 tokens/features
+
+      | alert'
+- question: Did a process that is NOT an allowlisted browser or system binary generate a file-read audit
+    event (Event ID 4663) against a browser credential database (Login Data, logins.json, key4.db, Web
+    Data, Cookies)?
+  context: Only the browser itself should normally read its credential store. Deploy SACLs to generate
+    Event ID 4663 on browser credential stores (*\Login Data, *\logins.json, *\key4.db, *\Web Data, *\Cookies)
+    and alert when the reading Process Name is not an allowlisted browser/system binary. On Linux/macOS
+    use auditd/unifiedlog watches on the equivalent paths. A positive result is a non-browser reader of
+    a credential file, a strong indicator of theft. This supports Credential Access by directly catching
+    unauthorized access to saved browser passwords. Requires SACLs on user profile browser directories.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems on all user workstations and servers. This requires enabling SACLs on user profile
+    directories containing browser data (e.g., ''*\AppData\Local\Google\Chrome\User Data\*'').'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EID=4663
+
+      | where ObjectName matches any [''*\\Login Data'',''*\\logins.json'',''*\\key4.db'',''*\\Web Data'',''*\\Cookies'']
+
+      | where ProcessName NOT IN browser_system_allowlist (chrome.exe,firefox.exe,msedge.exe,System,...)
+
+      | table host, ProcessName, ObjectName, AccessMask, SubjectUserName
+
+      | alert severity=high'
+  - technology: auditd/pseudocode
+    query: 'auditd FILE watch on /home/*/.mozilla/firefox/*/logins.json, /home/*/.config/google-chrome/*/Login
+      Data
+
+      | where exe NOT IN browser_allowlist | alert'
+- question: Which processes reading browser credential files are statistically rare readers (below the
+    5th percentile of prevalence), and do any read an abnormally high number of distinct browser-profile
+    credential files per minute?
+  context: 'Build a 30-day rolling frequency table of (process, parent, access mask) tuples reading credential
+    files via Event 4663 and flag readers below the 5th percentile of prevalence. Add a volume metric:
+    the count of distinct browser-profile credential files a single process reads per minute, since infostealers
+    perform mass-read bursts. Alert above a tuned threshold (e.g., >5 profiles/min). Emit the top-3 contributors
+    (reader rarity, files/min, parent). A positive result is a rare reader or a high-velocity mass read;
+    legitimate browsers read their own single profile. Supports Credential Access by catching infostealer
+    harvesting behavior.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems on all user workstations and servers. This requires enabling SACLs on user profile
+    directories containing browser data (e.g., ''*\AppData\Local\Google\Chrome\User Data\*'').'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline freq(process,parent,access_mask) over 30d on EID=4663 credential reads
+
+      | eval rarity = pct_rank(prevalence)
+
+      | eval files_per_min = dc(ObjectName) by process over 1m window
+
+      | where rarity < 0.05 OR files_per_min > 5
+
+      | top3 rarity, files_per_min, ParentImage'
+- question: Does an unsupervised anomaly model flag a credential-file read (Event 4663 plus parent-process
+    Event 4688 features) as anomalous, e.g., a process touching many unique credential files at an unusual
+    time or user context?
+  context: Score Event 4663 + parent-process (Event 4688) features (process, parent, hour, user context,
+    distinct-files-read) with an unsupervised Isolation Forest, and complement with provenance node-level
+    detection (ThreaTrace) that flags a process touching many unique credential files. Surface the top-3
+    anomaly-contributing features. This catches novel readers and unusual access patterns that signature
+    rules miss. A positive result is a high anomaly score concentrated on credential-file access; routine
+    browser activity scores low. Supports Credential Access by isolating abnormal access to browser credential
+    stores.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File systems on all user workstations and servers. This requires enabling SACLs on user profile
+    directories containing browser data (e.g., ''*\AppData\Local\Google\Chrome\User Data\*'').'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = features(process, parent, hour, user_ctx, distinct_files_read) from EID 4663+4688
+
+      | s = IsolationForest.score(X)
+
+      | augment provenance_node_score(process, unique_cred_files)
+
+      | where s anomalous
+
+      | explain top3 features
+
+      | alert'
+- question: Was a browser credential store file copied into a temporary or staging directory (C:\Windows\Temp,
+    C:\Users\Public, %APPDATA%\Temp), including via LOLBins like 'esentutl /y ... Login Data' or 'Copy-Item
+    ... Login Data'?
+  context: To bypass file locks, adversaries copy the credential DB before reading it. Correlate Event
+    ID 4688 / Sysmon EID 1 process creation with Event ID 11 file-create where the source matches a browser
+    credential path and the destination is a staging directory, including LOLBin variants (esentutl /y
+    ... Login Data, Copy-Item ... Login Data). Alert on a match with source path and destination in the
+    alert text. A positive result is a credential DB copied to a staging location, a strong theft precursor.
+    This supports Credential Access by catching the copy-to-stage step of browser credential harvesting.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Temporary file locations (e.g., C:\Windows\Temp, C:\Users\Public, %APPDATA%\Temp) and user profile
+    directories on all Windows endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (Sysmon EID=1/EID=4688, Sysmon EID=11)\n| where (CommandLine matches '(?i)(esentutl\
+      \ /y|Copy-Item).*Login Data')\n   OR (TargetFilename in staging_dirs AND src ~ browser_cred_path)\n\
+      | eval staging = TargetFilename matches ['C:\\\\Windows\\\\Temp\\\\*','C:\\\\Users\\\\Public\\\\\
+      *','%APPDATA%\\\\Temp\\\\*']\n| where staging\n| table host, ProcessName, src_path, TargetFilename\
+      \ | alert severity=high"
+- question: Are files matching credential-DB names/sizes ('Login Data', .db, .sqlite, .json) being written
+    to staging directories outside the normal 95th-percentile profile, and is there an abnormal volume
+    of such credential-store bytes in a short window?
+  context: Profile staging-directory file creation by extension and size and flag files matching credential-DB
+    names/sizes (Login Data, .db, .sqlite, .json) outside the 95th percentile. Add a volume metric (total
+    bytes of credential-store files written to staging in a 5-minute window) reflecting the copy->stage->exfil
+    pattern. Emit the top-3 contributors (filename match, size match, staging path). A positive result
+    is credential-DB-shaped files appearing in staging at abnormal volume; normal temp usage looks different.
+    Supports Credential Access by detecting staging of harvested browser credential databases.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Temporary file locations (e.g., C:\Windows\Temp, C:\Users\Public, %APPDATA%\Temp) and user profile
+    directories on all Windows endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline staging file (ext,size) distribution per host
+
+      | where TargetFilename in staging_dirs AND (name in [''Login Data''] OR ext in [''.db'',''.sqlite'',''.json''])
+
+      | where size outside p95 OR name_match
+
+      | eval vol = sum(bytes) over 5m window
+
+      | top3 name_match, size_match, staging_path'
+- question: Does a sequence/provenance model recognize the credential-file copy -> creation-in-staging
+    -> subsequent-read event chain as a malicious sequence?
+  context: Model the event chain (credential-file copy -> creation in staging -> subsequent read) with
+    a sequence/log model (DeepLog) or a whole-system provenance temporal GNN (KAIROS); alert on high malicious-sequence
+    probability and use KAIROS-style subgraph reconstruction to surface the offending process/file nodes
+    for triage. This catches the multi-step staging workflow even when individual events look benign.
+    A positive result is a high-probability malicious chain with a reconstructed subgraph; benign file
+    activity does not form this pattern. Supports Credential Access by modeling the end-to-end browser
+    credential staging workflow.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Temporary file locations (e.g., C:\Windows\Temp, C:\Users\Public, %APPDATA%\Temp) and user profile
+    directories on all Windows endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = ordered_events(copy_cred_file -> create_in_staging -> read_copy)
+
+      | p = deeplog_or_kairos_gnn.predict(seq)
+
+      | where p > threshold
+
+      | reconstruct attack_subgraph(process,file nodes)
+
+      | alert'
+- question: Did a non-browser process read a browser credential file (Event ID 4663) and then, within
+    about 5 minutes, the same host/process open an outbound network connection, especially to a C2-matched
+    destination?
+  context: This stateful correlation links the credential read to its likely exfiltration. Trigger a rule
+    when a non-browser process reads a credential file (Event ID 4663) and within 5 minutes the same host/process
+    opens an outbound connection (Sysmon EID 3 / Zeek conn.log); raise high severity if the destination
+    matches C2 intel. Include reader process, destination, and elapsed time in the alert. A positive result
+    is a read tightly followed by egress, strongly suggesting theft and exfil; a read with no egress is
+    lower priority. Supports Credential Access by tying harvesting to its outbound channel.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, firewalls, and host-level event logs on all endpoints where SACL auditing
+    for browser credential files is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'state: A = EID=4663 read of browser_cred_file by process NOT in browser_allowlist
+
+      | B = (Sysmon EID=3 OR zeek:conn) outbound from same host/process within 5m of A
+
+      | where A AND B
+
+      | eval c2 = lookup ti_c2 dest_ip
+
+      | eval sev = if(c2,''high'',''medium'')
+
+      | table host, reader_process, dest, elapsed | alert'
+- question: After a non-browser credential read, did the host contact very-low-prevalence domains (<0.5%
+    of endpoints) or show failure-state spikes (NXDOMAIN, blocked/RST connections, HTTP 4xx) consistent
+    with exfiltration or beacon retries?
+  context: After each non-browser credential read, score the host's dns.log/conn.log destinations by 30-day
+    enterprise prevalence and flag domains contacted by fewer than 0.5% of endpoints, weighting first-seen-for-host.
+    Explicitly profile failure states (NXDOMAIN spikes, blocked/RST connections, HTTP 4xx) as distinct
+    exfil/beacon-retry indicators. Emit the top-3 contributors (prevalence %, failure-rate, time-since-read).
+    A positive result is rare/first-seen egress or a failure-state spike shortly after the read; established
+    destinations are lower risk. Supports Credential Access by detecting the exfil leg after browser credential
+    harvesting.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, firewalls, and host-level event logs on all endpoints where SACL auditing
+    for browser credential files is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'after EID=4663 non-browser read:
+
+      | from zeek:dns,zeek:conn within window after read
+
+      | eval prevalence = host_count(dest)/total_hosts over 30d
+
+      | eval fail = NXDOMAIN OR conn_state in (REJ,RSTO,S0) OR http_status>=400
+
+      | where prevalence < 0.005 OR fail OR first_seen(host,dest)
+
+      | top3 prevalence, fail_rate, time_since_read'
+- question: Within ~10 minutes of a credential read, did per-host outbound volume exceed 3 standard deviations
+    above the 24-hour rolling average or the learned reconstruction-error threshold, corroborated by a
+    provenance attack subgraph?
+  context: Run per-host online anomaly detection over Zeek conn.log orig_bytes and connection rate (Kitsune)
+    and alert when, within 10 minutes of a credential read, outbound volume exceeds 3 standard deviations
+    above the 24-hour rolling average or the model's reconstruction-error threshold; corroborate with
+    provenance attack-subgraph reconstruction (KAIROS) and surface the top-3 contributing flow features.
+    This quantifies the exfiltration burst tied to the credential read. A positive result is an anomalous
+    post-read outbound spike with a supporting subgraph; benign reads are not followed by such bursts.
+    Supports Credential Access by detecting credential exfiltration volume anomalies.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, firewalls, and host-level event logs on all endpoints where SACL auditing
+    for browser credential files is enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'baseline = rolling_24h(orig_bytes, conn_rate) per host
+
+      | within 10m after credential_read:
+
+      |   anom = (volume > mean + 3*std) OR recon_error(kitsune) > thresh
+
+      | where anom
+
+      | corroborate kairos_subgraph(read_process -> egress)
+
+      | explain top3 flow_features | alert'
