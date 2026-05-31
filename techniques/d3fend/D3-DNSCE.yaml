@@ -1,0 +1,322 @@
+name: 'D3-DNSCE: DNS Cache Eviction'
+id: 5c2e5b65-28d0-4e7c-9c88-bd6ae815f167
+description: This playbook helps an analyst verify and measure the effectiveness of DNS Cache Eviction
+  as a disruption against DNS-based command-and-control (C2). It guides the investigation of explicit
+  cache-flush executions (ipconfig /flushdns, Clear-DnsClientCache, rndc flush, systemd-resolve --flush-caches)
+  and the bounded validation window opened immediately afterward to confirm the flush actually cleared
+  cached malicious records rather than being a no-op or quickly re-populated. It covers confirming that
+  poisoned records were replaced by authoritative answers, comparing malicious-domain resolution behavior
+  against a pre-eviction baseline across volume, frequency/beaconing cadence, and resolution state (NOERROR
+  vs NXDOMAIN/SERVFAIL), and detecting hosts that rapidly revert to pre-eviction behavior, indicating
+  only temporary suppression of an active infection that must be prioritized for deeper containment. It
+  blends symbolic-logic detections, statistical baselining, and machine-learning forecasting/anomaly methods
+  to produce defensible, explainable evidence of whether an eviction succeeded or relapsed.
+type: technique
+related:
+- tactic_id: D3-E
+  tactic_name: Evict
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which hosts or internal resolvers executed an explicit DNS cache eviction command (ipconfig
+    /flushdns, Clear-DnsClientCache, rndc flush, or systemd-resolve --flush-caches), and was a bounded
+    validation window opened on each affected host immediately afterward?
+  context: Detecting the flush itself is the anchor event for the entire eviction-effectiveness investigation.
+    Monitor process-creation telemetry (Windows Event ID 4688 and Sysmon Event ID 1) for command lines
+    that perform DNS cache eviction. Each match should immediately open a bounded validation window on
+    the affected host so subsequent resolution behavior can be measured against it. The cache and TTL
+    semantics that a flush resets are defined in RFC 1035. A positive result identifies hosts to track;
+    the absence of any flush event when one was expected may indicate the remediation step never ran or
+    was a no-op, undermining the Evict tactic's goal of disrupting DNS-based C2.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Endpoint devices and internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN ("WinEventID:4688","Sysmon:1")
+
+      | where CommandLine matches /ipconfig\s+\/flushdns|Clear-DnsClientCache|rndc\s+flush|systemd-resolve\s+--flush-caches|resolvectl\s+flush-caches/i
+
+      | emit flush_event(host, user, process, _time)
+
+      | open_validation_window(host, start=_time, duration=60m)'
+- question: After a confirmed cache flush, did the affected host stop successfully resolving known-malicious
+    C2 domains for at least 60 minutes, and did it avoid establishing any follow-on sessions to recently
+    resolved malicious infrastructure?
+  context: A flush is only meaningful if it actually suppresses malicious resolutions. For each host with
+    a flush event, query Zeek dns.log and confirm there are no successful (NOERROR with an A/AAAA answer)
+    resolutions to known-malicious C2 domains from IOC feeds or passive-DNS reputation scoring (per the
+    EXPOSURE passive-DNS approach) for at least 60 minutes. Correlate with Zeek conn.log to ensure no
+    follow-on sessions are established to recently resolved malicious infrastructure. A clean window is
+    positive evidence the eviction worked for the Evict tactic; renewed successful resolutions or new
+    connections indicate the host re-populated its cache and remains compromised.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Endpoint devices and internal DNS resolvers'
+  range: Last 90 days; per-host window of 60 minutes after each flush event
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for host in flush_events:\n  dns = dns.log where id.orig_h==host.ip AND ts BETWEEN flush_ts\
+      \ AND flush_ts+60m\n  bad = dns where query IN ioc_malicious_domains AND rcode_name==\"NOERROR\"\
+      \ AND answers has A/AAAA\n  conns = conn.log where id.orig_h==host.ip AND id.resp_h IN recently_resolved_malicious_ips\n\
+      \  if count(bad)>0 OR count(conns)>0: alert(\"flush failed to suppress IOC\", host)"
+- question: For domains previously associated with cache poisoning, does the post-flush resolved IP match
+    authoritative/reputation-consistent infrastructure, or has the prior forged answer reappeared indicating
+    re-poisoning rather than benign caching?
+  context: Eviction must be verified, not assumed. For domains previously tied to cache poisoning, compare
+    the post-flush resolved IP against authoritative or reputation-consistent infrastructure. If the prior
+    forged answer reappears, treat it as re-poisoning rather than benign caching, consistent with the
+    poisoning model in 'The Hitchhiker's Guide to DNS Cache Poisoning' and CISA's eviction guidance (AR21-134A),
+    which requires eviction be verified and relapse hunted. A match to authoritative infrastructure supports
+    successful Evict; reappearance of the forged record is a high-priority relapse signal warranting containment.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Endpoint devices and internal DNS resolvers'
+  range: Last 90 days; compare pre- vs post-flush answers per poisoned domain
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for d in previously_poisoned_domains:\n  post = latest_answer(dns.log, query=d, ts>flush_ts)\n\
+      \  if post.ip == forged_answer[d]: alert(\"re-poisoning: forged record returned\", d, host)\n  elif\
+      \ post.ip NOT IN authoritative_ips[d]: alert(\"answer inconsistent with authoritative infra\", d)\n\
+      \  else: mark_verified(d)"
+- question: Did the malicious-domain query rate and count of unique suspicious domains drop by a statistically
+    meaningful amount when comparing matched windows before and after each eviction, or did the host fail
+    to achieve a real reduction?
+  context: This quantifies whether a flush produced an actual decline rather than a momentary dip. Compute
+    the malicious-domain query rate per minute and the number of unique suspicious domains in matched
+    windows (default 10 minutes) before and after each eviction event. Derive the per-environment threshold
+    from history (for example require a reduction exceeding the 95th-percentile reduction observed across
+    historical successful evictions) rather than a fixed constant. Flag hosts that fail to achieve a meaningful
+    reduction. A meaningful drop supports the Evict tactic; failure to reduce indicates the eviction did
+    not disrupt C2 and the host should be escalated.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Firewall logs
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; matched 10-minute windows before and after each eviction
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'pre  = stats over [flush_ts-10m, flush_ts) by host: mal_qpm=count(mal_query)/10, uniq_pre=dc(mal_domain)
+
+      post = stats over (flush_ts, flush_ts+10m] by host: mal_qpm, uniq_post=dc(mal_domain)
+
+      reduction = (pre.mal_qpm - post.mal_qpm)/pre.mal_qpm
+
+      thr = p95(historical_successful_eviction_reductions)
+
+      where reduction < thr -> alert("eviction did not meaningfully reduce malicious queries", host)'
+- question: What was the host's pre-eviction beaconing periodicity and per-minute callback rate to the
+    suspected C2 domain, and did that regular cadence signal disappear after the flush or persist?
+  context: Beaconing collapse is direct evidence a flush disrupted C2. Characterize the pre-eviction beaconing
+    periodicity and per-minute callback rate to the suspected C2 domain using FFT-based periodicity extraction
+    (as in BAYWATCH) together with inter-arrival and size coefficient-of-variation, MAD, and Bowley-skewness
+    scoring on Zeek conn.log (as in RITA). Confirm the regular cadence signal disappears after the flush
+    and flag hosts where it persists. Disappearance supports successful Evict; persistence of a clean
+    periodic signal indicates the implant is still beaconing despite the flush.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; pre- vs post-eviction beacon windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'conn = conn.log where id.orig_h==host AND resolved_domain==suspect_c2
+
+      pre_period = fft_dominant_period(intervals(conn, ts<flush_ts))
+
+      pre_score  = beacon_score(cv, mad, bowley_skew over pre intervals)
+
+      post_score = beacon_score(cv, mad, bowley_skew over post intervals)
+
+      if pre_score>=beacon_thr AND post_score>=beacon_thr: alert("beacon cadence persists post-flush",
+      host)'
+- question: Are post-flush periodic resolutions that resumed actually benign periodic traffic (software
+    updates, telemetry, keep-alives) rather than residual C2, so they are not misreported as relapse?
+  context: 'Benign periodic traffic can resume after a flush and mimic residual beaconing. Whitelist and
+    threshold against benign periodic traffic baselines (software updates, telemetry, keep-alives) characterized
+    in ''Modeling and Characterization of Periodic Traffic on a Campus Edge Network'' so that benign periodic
+    resolutions resuming after a flush are not misreported as residual C2. This suppresses false positives
+    in the Evict assessment: confirming a resumed periodic signal matches a known-benign baseline clears
+    the host, whereas an unmatched periodic signal remains a candidate for residual C2.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "post_periodic = periodic_destinations(conn.log, ts>flush_ts) by host\nfor dest in post_periodic:\n\
+      \  if dest.domain IN benign_periodic_baseline OR matches(dest.period, benign_update_telemetry_profile):\n\
+      \    suppress(dest)  # benign, not residual C2\n  else:\n    flag_candidate_residual_c2(dest, host)"
+- question: How do NXDOMAIN and SERVFAIL rates for previously-malicious domains behave after the flush,
+    and does a sustained shift to NXDOMAIN indicate sinkholed/taken-down infrastructure versus renewed
+    successful resolutions indicating live, possibly re-poisoned C2?
+  context: Resolution failure state is a distinct and informative signal. Track NXDOMAIN and SERVFAIL
+    rates for previously-malicious domains separately from successful A/AAAA resolutions, using the negative-caching
+    semantics of RFC 2308. A shift to sustained NXDOMAIN indicates sinkholed or taken-down infrastructure
+    (effective eviction context), whereas renewed successful resolutions indicate live, possibly re-poisoned
+    C2. This refines the Evict judgment beyond simple query counts by interpreting why resolutions are
+    failing or succeeding.
+  answer_sources:
+  - Zeek dns.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'dns = dns.log where query IN previously_malicious_domains AND ts>flush_ts
+
+      by host, domain: nx=count(rcode==NXDOMAIN), sf=count(rcode==SERVFAIL), ok=count(rcode==NOERROR &
+      has A/AAAA)
+
+      if nx/(nx+ok) sustained_high -> tag("sinkholed/taken-down (effective eviction)")
+
+      if ok>0 trending_up -> alert("live or re-poisoned C2 resolving again", host, domain)'
+- question: Across repeated eviction events for a host, are rolling weekly recurrence metrics (time-to-first-malicious-query,
+    residual malicious query volume, NXDOMAIN ratio) degrading outside control limits, indicating partial
+    or short-lived remediation?
+  context: Effectiveness should be trended over time, not judged one flush at a time. Track rolling weekly
+    post-eviction recurrence metrics per host - time-to-first-malicious-query, residual malicious query
+    volume, and NXDOMAIN ratio - and alert when performance degrades outside CUSUM/PELT control limits
+    (per the change-point detection survey), indicating partial or short-lived remediation. Stable or
+    improving metrics support sustained Evict success; degradation beyond control limits signals that
+    flushing is no longer durable for that host and a more aggressive containment is warranted.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - Firewall logs
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; rolling weekly aggregation
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "weekly = rollup(per_eviction_metrics) by host, week:\n  ttfmq=time_to_first_malicious_query,\
+      \ residual_vol=sum(mal_queries_post), nx_ratio=nxdomain/total\nfor m in [ttfmq, residual_vol, nx_ratio]:\n\
+      \  if cusum_or_pelt_changepoint(weekly[m]) breaches control_limit:\n    alert(\"eviction effectiveness\
+      \ degrading\", host, m)"
+- question: Compared to a host-specific forecast of expected beaconing absent intervention, did the post-flush
+    DNS query frequency show a large negative residual (evidence of disruption) or track the counterfactual
+    (evidence the flush did nothing)?
+  context: A counterfactual forecast isolates the flush's true effect. Train a host-specific forecaster
+    (Prophet or ARIMA) on pre-eviction DNS query frequency and periodicity for suspected malicious domains,
+    project the counterfactual expected behavior, and treat large negative post-flush residuals as evidence
+    of successful disruption (per 'Cloud Intrusion Detection Using Time Series Forecasting'). Surface
+    the top-3 contributing features (residual magnitude, periodicity score, malicious-query rate) in the
+    alert text for explainability. Large negative residuals support Evict; residuals near zero mean the
+    host behaved as if no flush occurred.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; train on pre-eviction history, evaluate post-flush
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = Prophet_or_ARIMA(fit = pre_eviction_query_freq[host, malicious_domains])
+
+      forecast = model.predict(post_flush_window)
+
+      residual = actual_post_flush - forecast
+
+      if residual << 0 (large negative): label("disruption confirmed", host)
+
+      else: alert("no disruption vs counterfactual", host)
+
+      report top3_features(residual_magnitude, periodicity_score, malicious_query_rate)'
+- question: Using an Isolation Forest over per-query lexical and rate features, did the host's post-eviction
+    suspicious-domain stream show a sustained drop in anomaly score (disruption) or a rapid return to
+    anomalous scores (relapse)?
+  context: Per-query anomaly scoring gives a stateless, host-specific relapse signal. Apply an Isolation
+    Forest over stateless per-query lexical and rate features (as in 'Real-Time Detection of DNS Exfiltration
+    and Tunneling') to the host's post-eviction suspicious-domain stream. A sustained drop in anomaly
+    score evidences disruption, while a rapid return to anomalous scores flags relapse; the top contributing
+    features must be reported with the score. This supports the Evict assessment with an explainable,
+    continuously updated indicator that does not depend on fixed cadence assumptions.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = per_query_features(dns.log[host, ts>flush_ts]): lexical(entropy,len,ngram), rate(qpm,uniq_domains)
+
+      score = IsolationForest.decision_function(feat)
+
+      if rolling_mean(score) sustained_low: label("disruption", host)
+
+      if score returns_high quickly: alert("relapse", host)
+
+      report top_contributing_features(score)'
+- question: Did sequence models trained on the host's pre-eviction inter-arrival and volume sequence detect
+    the return of a learned beaconing signature - even if jittered - after the flush?
+  context: Sophisticated implants jitter their cadence to evade fixed-period detection. Use sequence models
+    (LSTM or transformer) trained on the host's pre-eviction inter-arrival and volume sequence to recognize
+    the return of a learned, even jittered, beaconing signature after a flush (per 'C2 Beaconing Detection
+    via AI-Based Time-Series Analysis'), reporting the temporal features driving the match. Re-emergence
+    of the learned signature indicates the flush only temporarily suppressed an active infection (failed
+    Evict); continued absence supports durable disruption.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; train on pre-eviction sequence, score post-flush
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq_model = LSTM_or_Transformer(fit = pre_eviction_sequence[host]: inter_arrival, volume)
+
+      match = seq_model.score(post_flush_sequence[host])
+
+      if match >= signature_thr (allowing jitter): alert("learned beacon signature returned", host)
+
+      report temporal_features_driving_match'
+- question: In a continuous-time hidden Markov model of the host's callback behavior, did the 'beaconing'
+    state likelihood collapse after eviction and stay collapsed, or did it rebound indicating relapse?
+  context: A state-space model gives a continuous, explainable confidence signal independent of fixed
+    cadence assumptions. Maintain a Continuous-Time Hidden Markov Model of the host's callback behavior
+    (per NetSpectra Sentinel CT-HMM); the 'beaconing' state likelihood should collapse after a successful
+    eviction and rebound on relapse. A sustained collapse supports the Evict tactic, while a rebound provides
+    early, explainable evidence the host has reverted to C2 callbacks and should be prioritized for containment.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; continuous state tracking around eviction
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ct_hmm = CTHMM.update(host_callback_events stream)
+
+      p_beacon = ct_hmm.state_likelihood("beaconing")
+
+      if p_beacon collapses after flush_ts AND stays_low: label("eviction effective", host)
+
+      if p_beacon rebounds: alert("relapse to beaconing state", host)'
+- question: Did Bayesian online change-point detection over post-eviction host features identify an upward
+    change point signalling reversion to pre-eviction behavior, marking the host for containment?
+  context: Rapid relapse should be caught the moment it begins. Apply Bayesian Online Change Point Detection
+    to post-eviction host features (malicious query rate, unique suspicious domains, periodicity score,
+    NXDOMAIN ratio) per the change-point detection survey to identify an upward change point signalling
+    reversion to pre-eviction behavior. Hosts where such a change point fires should be prioritized for
+    containment because the cache flush only temporarily suppressed an active infection. No change point
+    over the validation horizon supports durable Evict success.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Internal DNS resolvers and network egress'
+  range: Last 90 days; online over post-eviction window
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = stream(post_flush[host]): mal_query_rate, uniq_suspicious_domains, periodicity_score,
+      nxdomain_ratio
+
+      cp = BOCPD.run(features)
+
+      if cp detects upward_changepoint: alert("reversion to pre-eviction behavior", host); prioritize_containment(host)'
