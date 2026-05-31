@@ -1,0 +1,658 @@
+name: 'T1613: Container and Resource Discovery'
+id: 1e88e4ed-5e0e-4cec-8887-d6d42a81a7be
+description: 'This playbook helps an analyst investigate whether an adversary is performing Container
+  and Resource Discovery (MITRE ATT&CK T1613) -- enumerating containers, images, deployments, pods, nodes,
+  secrets, configmaps, and overall cluster state within a containerized environment to orient before lateral
+  movement, privilege escalation, or execution. Such reconnaissance is conducted against the Kubernetes
+  API server, the Docker daemon, the kubelet, container metadata endpoints, and web management UIs (Kubernetes
+  Dashboard, Rancher, OpenShift), or by running container-native CLI tooling (kubectl, docker, crictl,
+  oc) with discovery subcommands (get, describe, ps, images, get nodes, get secrets). The hunt spans containerized
+  platforms plus the endpoint and network telemetry that surrounds them, and pursues the behavior from
+  several complementary angles: container-API connections originating from known-malicious source IPs
+  on threat-intel feeds; discovery-oriented CLI executions launched by non-interactive or unauthorized
+  parents; single sources generating anomalous volumes of API calls or reaching API ports from unauthorized
+  network segments; bursts of HTTP 401/403 forbidden responses indicative of an under-privileged adversary
+  probing the API; scripted scanning of management web UIs by automation User-Agents; a single source
+  enumerating three or more distinct resource types within a short window; and anomalously large responses
+  or out-of-allowlist access to sensitive resources such as secrets, configmaps, and pod logs. Detection
+  methods combine deterministic symbolic-logic rules (threat-intel matching, discovery-CLI and Falco rules,
+  unauthorized-zone port access, multi-resource stateful correlation, sensitive-endpoint allowlists),
+  statistical baselining (new-source rate anomalies, per-IP and per-source count percentiles, forbidden-response
+  bursts, syscall- and entropy-frequency spikes, session URI-ratio anomalies, resource-type Shannon entropy,
+  response-size outliers, and ARIMA/Prophet rate forecasting), and machine learning (API session risk
+  classifiers, discovery clustering with DBSCAN, LSTM autoencoders on UI navigation, ReplicaWatcher peer-divergence
+  analysis, and one-class SVM/Isolation Forest endpoint-access models), applied across Zeek conn/http
+  logs, the Kubernetes API server audit log, Docker daemon logs, Windows Event ID 4688, Linux auditd/execve,
+  and Falco syscall alerts, so the analyst can corroborate suspected container reconnaissance against
+  source reputation, process lineage, network segmentation, API verbs, and resource breadth.'
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: '[Discovery] Threat-intel container API match: Can you determine whether an API call targeting
+    a container platform endpoint (e.g., Kubernetes API, Docker API) originates from a source IP address
+    listed on a current threat intelligence feed of known malicious hosts. -- specifically, using the
+    ''Threat-intel container API match'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that an API call targeting a container platform endpoint (e.g., Kubernetes API, Docker
+    API) originates from a source IP address listed on a current threat intelligence feed of known malicious
+    hosts. This Symbolic Logic approach works as follows: In Zeek conn.log/http.log and the Kubernetes
+    API-server audit log, correlate each container-API connection with current threat intelligence. Alert
+    when `id.orig_h`/`sourceIPs` matches a malicious IP and the destination is a known container API/kubelet
+    port (6443, 443, 2375, 2376, 10250), surfacing the feed entry, API verb, and target resource for triage.
+    Restrict legitimate API access to dedicated management segments per [NIST SP 800-190](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-190.pdf);
+    the canonical discovery destinations (API server, kubelet, instance-metadata) are scoped by the [Threat
+    Matrix for Kubernetes](https://microsoft.github.io/Threat-Matrix-for-Kubernetes/). A positive result
+    -- a rule match, statistical outlier, or model alert -- indicates probable container/resource reconnaissance;
+    pivot to the responsible source IP, account, service account, and process lineage, the targeted API
+    verbs and resource types, the network segment of origin, and any sensitive resources read, to scope
+    the adversary''s knowledge of the environment. A negative result helps reduce suspicion of this particular
+    vector but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server (6443/443), Docker daemon (2375/2376), kubelet (10250), internet gateway,
+    reverse proxies, cloud provider control plane endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "ti = load_threatintel(malicious_ips)\nfor c in conn.log + http.log:\n  if c.id_resp_p in [6443,443,2375,2376,10250]\
+      \ and c.id_orig_h in ti:\n    alert('TI container-API hit', src=c.id_orig_h, dst_port=c.id_resp_p,\
+      \ feed=ti[c.id_orig_h])"
+  - technology: SIEM/Rule pseudocode
+    query: 'from k8s_audit where sourceIPs[*] in threatintel_malicious
+
+      | eval target=objectRef.resource, verb=verb
+
+      | alert severity=high fields(sourceIPs, verb, target, feed_entry)'
+- question: '[Discovery] New-source rate anomaly: Can you determine whether an API call targeting a container
+    platform endpoint (e.g., Kubernetes API, Docker API) originates from a source IP address listed on
+    a current threat intelligence feed of known malicious hosts. -- specifically, using the ''New-source
+    rate anomaly'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that an API call targeting a container platform endpoint (e.g., Kubernetes API, Docker
+    API) originates from a source IP address listed on a current threat intelligence feed of known malicious
+    hosts. This Statistical Method approach works as follows: Compute the hourly count of newly seen source
+    IPs accessing container API ports and maintain a 30-day baseline using the dynamic per-source baselining
+    method of [Lin et al.](https://doi.org/10.1109/CLOUD53861.2021.00063). Fire when the current hour
+    exceeds the 95th percentile of its baseline, signaling possible reconnaissance scanning; derive site-specific
+    percentiles from your own audit-log history. A positive result -- a rule match, statistical outlier,
+    or model alert -- indicates probable container/resource reconnaissance; pivot to the responsible source
+    IP, account, service account, and process lineage, the targeted API verbs and resource types, the
+    network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge of
+    the environment. A negative result helps reduce suspicion of this particular vector but should be
+    corroborated with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server (6443/443), Docker daemon (2375/2376), kubelet (10250), internet gateway,
+    reverse proxies, cloud provider control plane endpoints.'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = pct95(hourly_count_of_new_src_ips_on_container_ports, last_30d)
+
+      cur = count(distinct first_seen_src_ip this_hour where dst_port in [6443,443,2375,2376,10250])
+
+      if cur > baseline: alert(''new-source rate anomaly'', cur, baseline)'
+- question: '[Discovery] API session risk classifier: Can you determine whether an API call targeting
+    a container platform endpoint (e.g., Kubernetes API, Docker API) originates from a source IP address
+    listed on a current threat intelligence feed of known malicious hosts. -- specifically, using the
+    ''API session risk classifier'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that an API call targeting a container platform endpoint (e.g., Kubernetes API, Docker
+    API) originates from a source IP address listed on a current threat intelligence feed of known malicious
+    hosts. This Machine Learning approach works as follows: Score each API connection with a model (e.g.,
+    Random Forest) trained on features such as source-IP reputation, ASN, country, time-of-day, API verb,
+    target resource, and a new-IP indicator; label training data from the [ITU Kubernetes misuse dataset](https://www.itu.int/dms_pub/itu-s/opb/jnl/S-JNL-VOL4.ISSUE2-2023-A26-PDF-E.pdf).
+    Raise alerts when predicted maliciousness crosses a tuned threshold and include the top-3 contributing
+    features (e.g., via SHAP, per the [AI-Driven Container Security survey](https://arxiv.org/pdf/2302.13865))
+    in the alert text. A positive result -- a rule match, statistical outlier, or model alert -- indicates
+    probable container/resource reconnaissance; pivot to the responsible source IP, account, service account,
+    and process lineage, the targeted API verbs and resource types, the network segment of origin, and
+    any sensitive resources read, to scope the adversary''s knowledge of the environment. A negative result
+    helps reduce suspicion of this particular vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server (6443/443), Docker daemon (2375/2376), kubelet (10250), internet gateway,
+    reverse proxies, cloud provider control plane endpoints.'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = [src_reputation, asn, country, hour, api_verb, target_resource, is_new_ip]\nscore\
+      \ = rf_model.predict_proba(features)\nif score > tuned_threshold:\n  alert('risky API session',\
+      \ score, top3=shap(features))"
+- question: '[Discovery] Discovery CLI rule: Can you determine whether the execution of a container-native
+    command-line tool (`kubectl.exe`, `docker.exe`) includes discovery-oriented subcommands (e.g., `get`,
+    `describe`, `ps`, `images`) and is initiated by a non-interactive parent process (e.g., not `explorer.exe`
+    or `cmd.exe`), an unauthorized user, or on a non-administrative host. -- specifically, using the ''Discovery
+    CLI rule'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that the execution of a container-native command-line tool (`kubectl.exe`, `docker.exe`)
+    includes discovery-oriented subcommands (e.g., `get`, `describe`, `ps`, `images`) and is initiated
+    by a non-interactive parent process (e.g., not `explorer.exe` or `cmd.exe`), an unauthorized user,
+    or on a non-administrative host. This Symbolic Logic approach works as follows: Monitor process creation
+    (Windows EID 4688, Linux execve/auditd) for `kubectl`/`docker`/`crictl`/`oc` with discovery subcommands
+    (`get`, `describe`, `ps`, `images`, `get nodes`, `get secrets`) whose parent is not an interactive
+    shell. Pair with [Falco](https://github.com/falcosecurity/rules/blob/main/rules/falco_rules.yaml)
+    rules for in-container discovery — contact to the K8s API server or cloud instance-metadata service
+    from a container and service-account token reads (`/var/run/secrets/kubernetes.io/...`). Raise alerts
+    on matches, excluding allowlisted automation accounts. A positive result -- a rule match, statistical
+    outlier, or model alert -- indicates probable container/resource reconnaissance; pivot to the responsible
+    source IP, account, service account, and process lineage, the targeted API verbs and resource types,
+    the network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge
+    of the environment. A negative result helps reduce suspicion of this particular vector but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd/execve
+  - Falco syscall alerts
+  - 'NAI: Administrative workstations, jump servers, CI/CD runners, container nodes, in-cluster pods.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from proc_create (EID4688 OR auditd_execve)\nwhere image in [kubectl,docker,crictl,oc]\n \
+      \ and cmdline matches /(get|describe|ps|images|get nodes|get secrets)/\n  and parent not in [explorer.exe,cmd.exe,bash,zsh]\n\
+      \  and user not in allowlist_automation\n| alert('discovery CLI', user, host, parent, cmdline)"
+  - technology: Falco/pseudocode
+    query: "rule: in-container discovery\n  condition: container and (outbound to k8s_api or cloud_metadata\n\
+      \    or open_read /var/run/secrets/kubernetes.io/serviceaccount/token)\n  output: container=%container.name\
+      \ user=%user.name proc=%proc.cmdline"
+- question: '[Discovery] Command syscall-frequency spike: Can you determine whether the execution of a
+    container-native command-line tool (`kubectl.exe`, `docker.exe`) includes discovery-oriented subcommands
+    (e.g., `get`, `describe`, `ps`, `images`) and is initiated by a non-interactive parent process (e.g.,
+    not `explorer.exe` or `cmd.exe`), an unauthorized user, or on a non-administrative host. -- specifically,
+    using the ''Command syscall-frequency spike'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that the execution of a container-native command-line tool (`kubectl.exe`, `docker.exe`)
+    includes discovery-oriented subcommands (e.g., `get`, `describe`, `ps`, `images`) and is initiated
+    by a non-interactive parent process (e.g., not `explorer.exe` or `cmd.exe`), an unauthorized user,
+    or on a non-administrative host. This Statistical Method approach works as follows: Per workload,
+    model syscall frequency vectors over sliding windows using [Bag of System Calls](https://arxiv.org/abs/1611.03053);
+    a discovery payload spawning recon tooling shifts the distribution. Alert when the window''s divergence
+    from the learned benign profile exceeds three standard deviations above the historical mean. Also
+    track a 5-minute sliding window of command-line argument entropy per user/host for scripted enumeration.
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd/execve
+  - Falco syscall alerts
+  - 'NAI: Administrative workstations, jump servers, CI/CD runners, container nodes, in-cluster pods.'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per workload: vec = bag_of_syscalls(sliding_window)
+
+      div = divergence(vec, benign_profile)
+
+      if div > mean + 3*std: alert(''syscall-frequency spike'', workload, div)
+
+      also: track 5min entropy(cmdline_args) per user/host for scripted enum'
+- question: '[Discovery] Discovery clustering anomaly: Can you determine whether the execution of a container-native
+    command-line tool (`kubectl.exe`, `docker.exe`) includes discovery-oriented subcommands (e.g., `get`,
+    `describe`, `ps`, `images`) and is initiated by a non-interactive parent process (e.g., not `explorer.exe`
+    or `cmd.exe`), an unauthorized user, or on a non-administrative host. -- specifically, using the ''Discovery
+    clustering anomaly'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that the execution of a container-native command-line tool (`kubectl.exe`, `docker.exe`)
+    includes discovery-oriented subcommands (e.g., `get`, `describe`, `ps`, `images`) and is initiated
+    by a non-interactive parent process (e.g., not `explorer.exe` or `cmd.exe`), an unauthorized user,
+    or on a non-administrative host. This Machine Learning approach works as follows: Cluster process-execution
+    events by parent process, user, host, and tokenized command line (DBSCAN), or score in-container behavior
+    with the explainable classifiers benchmarked in [container syscall-representation IDS](https://www.sciencedirect.com/science/article/pii/S0167404825001270).
+    Flag sessions in small, isolated clusters separate from dense admin behavior, surfacing the top contributing
+    features in the alert. A positive result -- a rule match, statistical outlier, or model alert -- indicates
+    probable container/resource reconnaissance; pivot to the responsible source IP, account, service account,
+    and process lineage, the targeted API verbs and resource types, the network segment of origin, and
+    any sensitive resources read, to scope the adversary''s knowledge of the environment. A negative result
+    helps reduce suspicion of this particular vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd/execve
+  - Falco syscall alerts
+  - 'NAI: Administrative workstations, jump servers, CI/CD runners, container nodes, in-cluster pods.'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "events = features(parent_proc, user, host, tokenize(cmdline))\nclusters = DBSCAN(events)\n\
+      for s in sessions:\n  if cluster_size(s) small and isolated_from(dense_admin_clusters):\n    alert('discovery\
+      \ clustering anomaly', s, top_features)"
+- question: '[Discovery] Unauthorized zone port access: Can you determine whether a single source IP generates
+    a volume of API calls to container endpoints that exceeds a statistical baseline, or originates from
+    a network segment not explicitly authorized for container management. -- specifically, using the ''Unauthorized
+    zone port access'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP generates a volume of API calls to container endpoints that
+    exceeds a statistical baseline, or originates from a network segment not explicitly authorized for
+    container management. This Symbolic Logic approach works as follows: Generate high-severity alerts
+    when Zeek conn.log or the audit log shows a non-admin subnet/account hitting container API endpoints
+    (6443, 10250, 2375/2376) outside the approved management segment defined by [NIST SP 800-190](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-190.pdf).
+    Enforce/audit the boundary with [Kyverno policy-as-code](https://kyverno.io/policies/other/audit-event-on-exec/audit-event-on-exec/)
+    so over-broad reads emit first-party events. A positive result -- a rule match, statistical outlier,
+    or model alert -- indicates probable container/resource reconnaissance; pivot to the responsible source
+    IP, account, service account, and process lineage, the targeted API verbs and resource types, the
+    network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge of
+    the environment. A negative result helps reduce suspicion of this particular vector but should be
+    corroborated with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server, Docker daemon hosts, internal network firewalls and switches, management
+    segment boundary.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for c in conn.log:\n  if c.id_resp_p in [6443,10250,2375,2376]\n     and subnet(c.id_orig_h)\
+      \ not in approved_mgmt_segment:\n    alert(severity=high, 'unauthorized zone port access', c.id_orig_h,\
+      \ c.id_resp_p)"
+  - technology: SIEM/Rule pseudocode
+    query: 'from k8s_audit where sourceIPs[*] not in mgmt_segment and verb in [get,list]
+
+      | alert(''non-admin subnet reading API'', sourceIPs, objectRef.resource)'
+- question: '[Discovery] Per-IP count percentile: Can you determine whether a single source IP generates
+    a volume of API calls to container endpoints that exceeds a statistical baseline, or originates from
+    a network segment not explicitly authorized for container management. -- specifically, using the ''Per-IP
+    count percentile'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP generates a volume of API calls to container endpoints that
+    exceeds a statistical baseline, or originates from a network segment not explicitly authorized for
+    container management. This Statistical Method approach works as follows: Aggregate each source IP''s
+    container-API connection counts over 1-minute windows and compare to its own baseline using the per-source
+    baselining framework of [Lin et al.](https://doi.org/10.1109/CLOUD53861.2021.00063). Alert when any
+    interval exceeds the source''s 99th percentile, indicating brute-force scanning; derive thresholds
+    from cluster-specific history. A positive result -- a rule match, statistical outlier, or model alert
+    -- indicates probable container/resource reconnaissance; pivot to the responsible source IP, account,
+    service account, and process lineage, the targeted API verbs and resource types, the network segment
+    of origin, and any sensitive resources read, to scope the adversary''s knowledge of the environment.
+    A negative result helps reduce suspicion of this particular vector but should be corroborated with
+    the other questions in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land
+    enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server, Docker daemon hosts, internal network firewalls and switches, management
+    segment boundary.'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per src_ip: counts = container_api_conns per 1min window
+
+      baseline = pct99(counts, src_history)
+
+      if any_window > baseline: alert(''per-IP scanning'', src_ip, window_count, baseline)'
+- question: '[Discovery] Forbidden-response burst (failure mode): Can you determine whether a single source
+    IP generates a volume of API calls to container endpoints that exceeds a statistical baseline, or
+    originates from a network segment not explicitly authorized for container management. -- specifically,
+    using the ''Forbidden-response burst (failure mode)'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP generates a volume of API calls to container endpoints that
+    exceeds a statistical baseline, or originates from a network segment not explicitly authorized for
+    container management. This Statistical Method approach works as follows: From the [Kubernetes audit
+    log](https://www.datadoghq.com/blog/key-kubernetes-audit-logs-for-monitoring-cluster-security/), compute
+    per-source the ratio and count of `responseStatus.code` 401/403 to 200. Alert when a source exceeds
+    10 forbidden responses in 5 minutes or its 403:200 ratio exceeds the 99th percentile — the canonical
+    signal of an under-privileged adversary probing the API, per the [Splunk unauthorized-access analytic](https://research.splunk.com/cloud/9b5f1832-e8b9-453f-93df-07a3d6a72a45/).
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server, Docker daemon hosts, internal network firewalls and switches, management
+    segment boundary.'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from k8s_audit per source:\n  forb = count(responseStatus.code in [401,403]) in 5min\n  ratio\
+      \ = count(403)/max(count(200),1)\nif forb > 10 or ratio > pct99(ratio_baseline):\n  alert('forbidden-response\
+      \ burst', source, forb, ratio)"
+- question: '[Discovery] API rate forecasting: Can you determine whether a single source IP generates
+    a volume of API calls to container endpoints that exceeds a statistical baseline, or originates from
+    a network segment not explicitly authorized for container management. -- specifically, using the ''API
+    rate forecasting'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP generates a volume of API calls to container endpoints that
+    exceeds a statistical baseline, or originates from a network segment not explicitly authorized for
+    container management. This Machine Learning approach works as follows: Use ARIMA/Prophet on audit-log/http.log
+    API connection rates trained on 30+ days. Flag deviations outside the forecasted range as global enumeration
+    spikes, reporting the contributing time-window and source. A positive result -- a rule match, statistical
+    outlier, or model alert -- indicates probable container/resource reconnaissance; pivot to the responsible
+    source IP, account, service account, and process lineage, the targeted API verbs and resource types,
+    the network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge
+    of the environment. A negative result helps reduce suspicion of this particular vector but should
+    be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Kubernetes API server audit log
+  - 'NAI: Kubernetes API server, Docker daemon hosts, internal network firewalls and switches, management
+    segment boundary.'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = ARIMA_or_Prophet(api_conn_rate, train=30d)\nfc = model.forecast(now)\nif observed_rate\
+      \ outside fc.interval:\n  alert('enumeration spike', time_window, contributing_source, observed_rate)"
+- question: '[Discovery] Scripted UA detection: Can you determine whether a user session interacting with
+    a container management web UI (e.g., Kubernetes Dashboard) shows behavior consistent with automated
+    scanning, defined by an unusually high request rate or a User-Agent string associated with scripting
+    tools. -- specifically, using the ''Scripted UA detection'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a user session interacting with a container management web UI (e.g., Kubernetes
+    Dashboard) shows behavior consistent with automated scanning, defined by an unusually high request
+    rate or a User-Agent string associated with scripting tools. This Symbolic Logic approach works as
+    follows: Alert on Zeek http.log sessions to container UIs (Dashboard, Rancher, OpenShift) whose `user_agent`
+    matches scripting libraries or enumeration tools and originate from non-approved automation hosts;
+    Dashboard/exposed-interface scraping is an explicit discovery vector in the [Threat Matrix for Kubernetes](https://microsoft.github.io/Threat-Matrix-for-Kubernetes/).
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Web servers hosting container management UIs (Kubernetes Dashboard, Rancher, OpenShift) — an
+    ''exposed sensitive interface'' per the Kubernetes threat matrix.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for h in http.log where host in [k8s_dashboard,rancher,openshift]:\n  if h.user_agent matches\
+      \ /(python-requests|curl|wget|go-http|scanner)/\n     and h.id_orig_h not in approved_automation:\n\
+      \    alert('scripted UA on container UI', h.id_orig_h, h.user_agent, h.host)"
+- question: '[Discovery] Session URI ratio anomaly: Can you determine whether a user session interacting
+    with a container management web UI (e.g., Kubernetes Dashboard) shows behavior consistent with automated
+    scanning, defined by an unusually high request rate or a User-Agent string associated with scripting
+    tools. -- specifically, using the ''Session URI ratio anomaly'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a user session interacting with a container management web UI (e.g., Kubernetes
+    Dashboard) shows behavior consistent with automated scanning, defined by an unusually high request
+    rate or a User-Agent string associated with scripting tools. This Statistical Method approach works
+    as follows: For each session (source IP/User-Agent), compute the unique-URI-to-total-request ratio
+    and request rate, baselining with the deviation-detection approach of [Lin et al.](https://doi.org/10.1109/CLOUD53861.2021.00063).
+    Alert when either exceeds the 98th percentile, flagging likely scanning. A positive result -- a rule
+    match, statistical outlier, or model alert -- indicates probable container/resource reconnaissance;
+    pivot to the responsible source IP, account, service account, and process lineage, the targeted API
+    verbs and resource types, the network segment of origin, and any sensitive resources read, to scope
+    the adversary''s knowledge of the environment. A negative result helps reduce suspicion of this particular
+    vector but should be corroborated with the other questions in this playbook, since a single method
+    can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Web servers hosting container management UIs (Kubernetes Dashboard, Rancher, OpenShift) — an
+    ''exposed sensitive interface'' per the Kubernetes threat matrix.'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per session(src_ip,user_agent):\n  uri_ratio = unique_uris/total_requests\n  rate = total_requests/duration\n\
+      if uri_ratio > pct98 or rate > pct98:\n  alert('session URI ratio anomaly', session, uri_ratio,\
+      \ rate)"
+- question: '[Discovery] UI navigation autoencoder: Can you determine whether a user session interacting
+    with a container management web UI (e.g., Kubernetes Dashboard) shows behavior consistent with automated
+    scanning, defined by an unusually high request rate or a User-Agent string associated with scripting
+    tools. -- specifically, using the ''UI navigation autoencoder'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a user session interacting with a container management web UI (e.g., Kubernetes
+    Dashboard) shows behavior consistent with automated scanning, defined by an unusually high request
+    rate or a User-Agent string associated with scripting tools. This Machine Learning approach works
+    as follows: Train an LSTM autoencoder on historical URI sequences for legitimate user sessions (sequence
+    modeling per the [AI-Driven Container Security survey](https://arxiv.org/pdf/2302.13865)) and flag
+    sessions with high reconstruction error as scripted navigation, surfacing the highest-error URIs in
+    the alert. A positive result -- a rule match, statistical outlier, or model alert -- indicates probable
+    container/resource reconnaissance; pivot to the responsible source IP, account, service account, and
+    process lineage, the targeted API verbs and resource types, the network segment of origin, and any
+    sensitive resources read, to scope the adversary''s knowledge of the environment. A negative result
+    helps reduce suspicion of this particular vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Web servers hosting container management UIs (Kubernetes Dashboard, Rancher, OpenShift) — an
+    ''exposed sensitive interface'' per the Kubernetes threat matrix.'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "ae = LSTM_autoencoder(train=legit_uri_sequences)\nerr = ae.reconstruction_error(session.uri_sequence)\n\
+      if err > threshold:\n  alert('scripted UI navigation', session, top_error_uris)"
+- question: '[Discovery] Multi-resource stateful rule: Can you determine whether a single source IP makes
+    API calls to list or get three or more distinct resource types (e.g., pods, secrets, deployments,
+    nodes) within a 5-minute window, indicating broad reconnaissance. -- specifically, using the ''Multi-resource
+    stateful rule'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP makes API calls to list or get three or more distinct resource
+    types (e.g., pods, secrets, deployments, nodes) within a 5-minute window, indicating broad reconnaissance.
+    This Symbolic Logic approach works as follows: Trigger when a single source IP/user issues `list`/`get`
+    requests for three or more distinct `objectRef.resource` types (e.g., pods, secrets, deployments,
+    nodes) within 5 minutes in the [Kubernetes audit log](https://www.datadoghq.com/blog/key-kubernetes-audit-logs-for-monitoring-cluster-security/);
+    the audit schema fields are defined in the [Kubernetes Auditing docs](https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/).
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - 'NAI: Kubernetes API server, container nodes (for pod-to-API traffic).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from k8s_audit where verb in [list,get]
+
+      | bucket 5min by sourceIPs
+
+      | stats dc(objectRef.resource) as restypes by sourceIPs, bucket
+
+      | where restypes >= 3
+
+      | alert(''broad multi-resource recon'', sourceIPs, restypes)'
+- question: '[Discovery] Resource entropy burst: Can you determine whether a single source IP makes API
+    calls to list or get three or more distinct resource types (e.g., pods, secrets, deployments, nodes)
+    within a 5-minute window, indicating broad reconnaissance. -- specifically, using the ''Resource entropy
+    burst'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP makes API calls to list or get three or more distinct resource
+    types (e.g., pods, secrets, deployments, nodes) within a 5-minute window, indicating broad reconnaissance.
+    This Statistical Method approach works as follows: Within 10-minute windows, compute the Shannon entropy
+    of `objectRef.resource` types per source and alert when it exceeds 3.0 or 3 standard deviations above
+    the per-source baseline (volume + breadth metric); derive thresholds from the [ITU Kubernetes misuse
+    dataset](https://www.itu.int/dms_pub/itu-s/opb/jnl/S-JNL-VOL4.ISSUE2-2023-A26-PDF-E.pdf). A positive
+    result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - 'NAI: Kubernetes API server, container nodes (for pod-to-API traffic).'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per source within 10min window:\n  H = shannon_entropy(objectRef.resource types)\nif H > 3.0\
+      \ or H > per_source_baseline_mean + 3*std:\n  alert('resource entropy burst', source, H)"
+- question: '[Discovery] Replica/peer divergence anomaly: Can you determine whether a single source IP
+    makes API calls to list or get three or more distinct resource types (e.g., pods, secrets, deployments,
+    nodes) within a 5-minute window, indicating broad reconnaissance. -- specifically, using the ''Replica/peer
+    divergence anomaly'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single source IP makes API calls to list or get three or more distinct resource
+    types (e.g., pods, secrets, deployments, nodes) within a 5-minute window, indicating broad reconnaissance.
+    This Machine Learning approach works as follows: For homogeneous pods, compare live kernel-event/API-access
+    distributions across identical replicas with [ReplicaWatcher](https://www.ndss-symposium.org/wp-content/uploads/2024-286-paper.pdf);
+    flag the replica whose enumeration-breadth distribution diverges from its peers without per-app training,
+    reporting the divergent resource types. Alternatively build a bipartite source-to-resource graph and
+    flag weakly connected discovery nodes. A positive result -- a rule match, statistical outlier, or
+    model alert -- indicates probable container/resource reconnaissance; pivot to the responsible source
+    IP, account, service account, and process lineage, the targeted API verbs and resource types, the
+    network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge of
+    the environment. A negative result helps reduce suspicion of this particular vector but should be
+    corroborated with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - 'NAI: Kubernetes API server, container nodes (for pod-to-API traffic).'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "for replica_set in homogeneous_pods:\n  dist = api_access_distribution(each replica)\n  outlier\
+      \ = ReplicaWatcher.diverging(dist)\n  if outlier: alert('replica divergence', outlier.pod, outlier.resource_types)"
+- question: '[Discovery] Sensitive endpoint allowlist: Can you determine whether a single API response
+    for a sensitive resource (e.g., secrets, configmaps, pod logs) has an anomalously large size, or a
+    client accesses these resources using a User-Agent not associated with approved administrative tools.
+    -- specifically, using the ''Sensitive endpoint allowlist'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single API response for a sensitive resource (e.g., secrets, configmaps, pod
+    logs) has an anomalously large size, or a client accesses these resources using a User-Agent not associated
+    with approved administrative tools. This Symbolic Logic approach works as follows: Alert when the
+    audit log or Zeek http.log shows `get`/`list` on secrets, configmaps, or `/logs` from a source/account
+    outside the admin allowlist; enforce least-privilege reads on these resources per [NIST SP 800-190](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-190.pdf)
+    and audit/deny with [Kyverno](https://kyverno.io/policies/other/audit-event-on-exec/audit-event-on-exec/).
+    Falco''s service-account-token read rule provides the in-container corollary ([Falco rules](https://github.com/falcosecurity/rules/blob/main/rules/falco_rules.yaml)).
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Kubernetes API server (endpoints for secrets, configmaps, and pod logs).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from (k8s_audit OR zeek_http) where verb in [get,list]\n  and objectRef.resource in [secrets,configmaps]\
+      \ or uri matches /\\/logs/\n  and source not in admin_allowlist\n| alert('sensitive endpoint access\
+      \ out-of-allowlist', source, objectRef.resource)"
+  - technology: Falco/pseudocode
+    query: "rule: read serviceaccount token in container\n  condition: open_read and fd.name startswith\
+      \ /var/run/secrets/kubernetes.io\n  output: container=%container.name proc=%proc.cmdline"
+- question: '[Discovery] Response size outlier: Can you determine whether a single API response for a
+    sensitive resource (e.g., secrets, configmaps, pod logs) has an anomalously large size, or a client
+    accesses these resources using a User-Agent not associated with approved administrative tools. --
+    specifically, using the ''Response size outlier'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single API response for a sensitive resource (e.g., secrets, configmaps, pod
+    logs) has an anomalously large size, or a client accesses these resources using a User-Agent not associated
+    with approved administrative tools. This Statistical Method approach works as follows: Track per-endpoint
+    `resp_bytes`/response-object-size baselines (Zeek conn.log, audit log) and flag responses exceeding
+    the 99th percentile as bulk secret/configmap/log retrieval (volume metric); the relevant audit fields
+    are documented by [Datadog](https://www.datadoghq.com/blog/key-kubernetes-audit-logs-for-monitoring-cluster-security/).
+    A positive result -- a rule match, statistical outlier, or model alert -- indicates probable container/resource
+    reconnaissance; pivot to the responsible source IP, account, service account, and process lineage,
+    the targeted API verbs and resource types, the network segment of origin, and any sensitive resources
+    read, to scope the adversary''s knowledge of the environment. A negative result helps reduce suspicion
+    of this particular vector but should be corroborated with the other questions in this playbook, since
+    a single method can miss stealthy, low-and-slow, or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Kubernetes API server (endpoints for secrets, configmaps, and pod logs).'
+  range: Last 90 days (baseline); evaluate over the method's stated short windows for the current period
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per endpoint: baseline = pct99(resp_bytes/object_size, history)\nfor r in (zeek_conn OR k8s_audit):\n\
+      \  if r.resp_bytes > baseline[r.endpoint]:\n    alert('bulk secret/log retrieval', r.endpoint, r.resp_bytes,\
+      \ baseline)"
+- question: '[Discovery] Endpoint access anomaly model: Can you determine whether a single API response
+    for a sensitive resource (e.g., secrets, configmaps, pod logs) has an anomalously large size, or a
+    client accesses these resources using a User-Agent not associated with approved administrative tools.
+    -- specifically, using the ''Endpoint access anomaly model'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Discovery tactic (TA0007), an adversary attempts to discover containers
+    and related resources (images, deployments, pods, nodes, secrets, cluster status) to inform their
+    next steps such as lateral movement, privilege escalation, and execution. This evidence focuses on
+    the condition that a single API response for a sensitive resource (e.g., secrets, configmaps, pod
+    logs) has an anomalously large size, or a client accesses these resources using a User-Agent not associated
+    with approved administrative tools. This Machine Learning approach works as follows: Train a one-class
+    SVM/Isolation Forest on features (source, user-agent, time-of-day, resource path, response size) from
+    legitimate access — feature engineering guided by [container syscall/representation IDS benchmarking](https://www.sciencedirect.com/science/article/pii/S0167404825001270)
+    and the [AI-Driven Container Security survey](https://arxiv.org/pdf/2302.13865) — and alert on outliers,
+    surfacing the top-3 contributing features. A positive result -- a rule match, statistical outlier,
+    or model alert -- indicates probable container/resource reconnaissance; pivot to the responsible source
+    IP, account, service account, and process lineage, the targeted API verbs and resource types, the
+    network segment of origin, and any sensitive resources read, to scope the adversary''s knowledge of
+    the environment. A negative result helps reduce suspicion of this particular vector but should be
+    corroborated with the other questions in this playbook, since a single method can miss stealthy, low-and-slow,
+    or living-off-the-land enumeration.'
+  answer_sources:
+  - Kubernetes API server audit log
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Kubernetes API server (endpoints for secrets, configmaps, and pod logs).'
+  range: Last 90 days (training baseline); score current events
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features=[source,user_agent,hour,resource_path,response_size]\nmodel = OneClassSVM_or_IsolationForest(train=legit_access)\n\
+      if model.predict(features) == outlier:\n  alert('sensitive endpoint access anomaly', source, top3_features)"
