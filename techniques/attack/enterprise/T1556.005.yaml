@@ -1,0 +1,2608 @@
+name: 'T1556.005: Modify Authentication Process: Reversible Encryption'
+id: 6fe5301a-8a6d-4cfd-9539-1bbe83e68e24
+description: 'Investigate suspected abuse of Active Directory reversible password encryption (T1556.005),
+  where an adversary enables the AllowReversiblePasswordEncryption / ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED
+  (0x80) property so that passwords created or changed afterward can be recovered in plaintext. This playbook
+  helps an analyst hunt for the enabling action across every scope an adversary might use: per-user changes
+  (Event ID 4738), Fine-Grained Password Policy objects (Events 5136/5137 with msDS-PasswordReversibleEncryptionEnabled),
+  domain-level Group Policy edits (ClearTextPassword=1 in GptTmpl.inf), and PowerShell (Set-ADUser/Set-ADAccountControl
+  -AllowReversiblePasswordEncryption). It then follows the attack chain to its payoff: forced password
+  changes (4723), suspicious logons by staged or dormant accounts (4624/4625, Zeek conn.log), access to
+  the G$MSRADIUSCHAPKEY LSA secret (4656/4663), directory replication / DCSync (4662), and credential-dumping
+  tooling on Domain Controllers (4688/4104/Defender 1116). Detection methods span symbolic-logic rules,
+  statistical baselining (dormancy, off-hours, rate and entropy anomalies), and machine learning (sequence
+  models, classifiers, clustering, peer-group and graph-based provenance matching) so the activity can
+  be caught as Defense Impairment, Persistence, and Credential Access.'
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any Active Directory user account been modified (Windows Event ID 4738) so that the 'Password
+    stored using reversible encryption' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) transitioned
+    from disabled to enabled?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) is observed where the ''User Account Control'' field indicates
+    the ''Password stored using reversible encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED /
+    0x80) was enabled for a user account. On every 4738 (''A user account was changed'') event, compute
+    the bitwise difference of the old versus new ''User Account Control'' value and alert when (old &
+    0x80)==0 and (new & 0x80)==0x80, i.e. the reversible-encryption bit was newly set. This policy is
+    Disabled by default and is only legitimately required for legacy CHAP/IAS/Digest applications, so
+    any enable on an account that is not on a documented allow-list should be treated as actionable. Capture
+    the Subject actor, TargetUserName, and the old/new UAC values from the event to attribute who made
+    the change and which account was staged. A positive result means an account is now storing a recoverable
+    password; a negative result across the range raises confidence that no accounts were weakened.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old_uac=tonumber(OldUACValue,16), new_uac=tonumber(NewUACValue,16)
+
+      | where (old_uac%256<128) AND (new_uac%256>=128) AND ((old_uac & 0x80)=0) AND ((new_uac & 0x80)=0x80)
+
+      | where NOT TargetUserName IN (reversible_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, OldUACValue, NewUACValue, ComputerName'
+- question: For accounts that now have reversible encryption enabled, does any account authenticate (Windows
+    Event ID 4624) after a dormancy period exceeding the environment's 95th-percentile login-inactivity
+    baseline, accompanied by a spike in failed logons or refused network connections?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) is observed where the ''User Account Control'' field indicates
+    the ''Password stored using reversible encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED /
+    0x80) was enabled for a user account. Baseline login activity from 4624 for all flagged accounts and
+    compute the 95th-percentile login dormancy (days since last logon) across active accounts; alert when
+    a flagged account suddenly authenticates after exceeding it. In parallel, profile failed logons (Event
+    4625) and blocked/refused Zeek conn.log connections (conn_state S0/REJ) for the account in the 24-hour
+    window around the change. A burst of failures followed by a success indicates credential probing or
+    replay against a deliberately staged account, which is exactly what you expect when an adversary enables
+    reversible encryption to recover and reuse a credential.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 account IN (reversible_accounts)
+
+      | stats max(_time) as last_logon by TargetUserName
+
+      | eval dormancy_days=(now()-last_logon)/86400
+
+      | eventstats perc95(dormancy_days) as p95
+
+      | where dormancy_days>p95
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline_mean+3*baseline_std]'
+- question: Does the per-user Windows event stream contain a rare, tightly-timed ordering such as [4738
+    enable reversible] -> [4624 logon] within a few minutes that an LSTM log-key sequence model predicts
+    as a low-probability next event?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) is observed where the ''User Account Control'' field indicates
+    the ''Password stored using reversible encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED /
+    0x80) was enabled for a user account. Apply an LSTM log-key sequence model (DeepLog-style) over per-user
+    Windows event streams to flag orderings that fall outside the top-g predicted next events, such as
+    a reversible-encryption enable immediately followed by a logon within five minutes. Cross-score the
+    logon source as a low-probability authentication edge or rare ASN/geo via graph or UEBA models. The
+    alert text must surface the top-3 contributing features (e.g., sequence rarity, new source ASN, dormancy)
+    so the analyst can quickly judge the finding. A flagged sequence suggests an automated takeover where
+    the same actor that weakened the account immediately uses it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=deeplog_logkey input=per_user_event_sequence(window=5m)
+
+      | predict next_event given prior_keys
+
+      | flag where observed_seq=[4738_enable_reversible,4624_logon] AND prob(observed) NOT IN top_g
+
+      | enrich logon_source via graph_edge_score, asn_geo_rarity
+
+      | output top3_features(seq_rarity,new_asn,dormancy)'
+- question: Has a Fine-Grained Password Policy (FGPP) object been created (Event ID 5137) or modified
+    (Event ID 5136) so that the 'msDS-PasswordReversibleEncryptionEnabled' attribute is set to TRUE?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A Fine-Grained Password Policy
+    (FGPP) object is created (Event ID 5137) or modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled''
+    attribute is set to ''TRUE''. Monitor directory service object creation (Event ID 5137) where the
+    Object Class is ''msDS-PasswordSettings'' and modification (Event ID 5136) on existing FGPP objects,
+    alerting whenever ''msDS-PasswordReversibleEncryptionEnabled'' is set to TRUE. FGPPs let an adversary
+    scope reversible encryption to specific users or groups without touching the default domain policy,
+    making them a stealthier vector. Because this setting is needed only for legacy CHAP/IAS/Digest scenarios,
+    any enable off an approved baseline is high-signal. Record the policy name, the actor, and the target
+    users/groups the PSO applies to.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5137 ObjectClass="msDS-PasswordSettings") OR (EventCode=5136
+      ObjectClass="msDS-PasswordSettings")
+
+      | where AttributeLDAPDisplayName="msDS-PasswordReversibleEncryptionEnabled" AND AttributeValue="TRUE"
+
+      | table _time, SubjectUserName, ObjectDN, AttributeValue, ComputerName'
+- question: Does an FGPP modification that enables reversible encryption occur outside an administrator's
+    normal hours, exceed their normal edit frequency, or come from an account with no prior FGPP-management
+    history?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A Fine-Grained Password Policy
+    (FGPP) object is created (Event ID 5137) or modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled''
+    attribute is set to ''TRUE''. Maintain a per-administrator profile of FGPP modification frequency
+    and time-of-day. Alert when the per-day count of FGPP edits enabling reversible encryption exceeds
+    the moving mean + 3 standard deviations, when the edit occurs more than 2 sigma from the admin''s
+    mean modification time, or when the modifying account is a first-seen actor with no FGPP-management
+    history. These deviations distinguish a legitimate, routine policy change from opportunistic abuse
+    of a powerful but rarely-used setting.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 ObjectClass="msDS-PasswordSettings" AttributeValue="TRUE"
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as edits, values(hour) as hrs by SubjectUserName, date_mday
+
+      | append [| inputlookup admin_fgpp_baseline]
+
+      | where edits>mean_edits+3*std_edits OR abs(hour-mean_hour)>2*std_hour OR first_seen_actor=1'
+- question: Does a supervised classifier score an FGPP modification (Event 5136) that sets 'msDS-PasswordReversibleEncryptionEnabled'=TRUE
+    as high-risk based on actor, source workstation, timing, and changed attributes?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A Fine-Grained Password Policy
+    (FGPP) object is created (Event ID 5137) or modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled''
+    attribute is set to ''TRUE''. Score each FGPP modification with a supervised classifier (e.g., Random
+    Forest or Gradient Boosting) using features such as SubjectUserName, source workstation, time-of-day,
+    day-of-week, and the set of changed attributes. A high-risk score for a change enabling reversible
+    encryption indicates a likely malicious modification. The model captures combinations of weak signals
+    (rare actor + off-hours + unusual host) that individual rules miss; emit the top-3 contributing features
+    in the alert so an analyst can validate quickly.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=rf_fgpp_classifier
+
+      features=[SubjectUserName, src_workstation, hour, weekday, changed_attrs]
+
+      | score events where EventCode=5136 AND changed_attrs CONTAINS "msDS-PasswordReversibleEncryptionEnabled=TRUE"
+
+      | where risk_score>=threshold
+
+      | output top3_features'
+- question: For an account with reversible encryption enabled, is a password change (Event ID 4723) followed
+    within five minutes by a successful interactive logon (Event ID 4624, Logon Type 2 or 10) from an
+    external (non-RFC1918) IP address?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A successful authentication event
+    (Windows Event ID 4624) occurs for an account with reversible encryption enabled, immediately following
+    a password change (Windows Event ID 4723) or after a statistically significant period of account inactivity.
+    Create a stateful rule that, for accounts already flagged with reversible encryption, alerts when
+    a password change (4723) is followed within five minutes by a successful interactive logon (4624,
+    Logon Type 2 or 10) from a non-RFC1918 source. The adversary objective once the flag is set is to
+    recover the post-change plaintext, so a reset immediately followed by an external interactive logon
+    is the tell-tale takeover sequence. Capture the source IP, logon type, and timing so the analyst can
+    confirm whether the logon is consistent with legitimate user behavior.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4723 TargetUserName IN (reversible_accounts)
+
+      | join type=inner TargetUserName [search EventCode=4624 LogonType IN (2,10) | where NOT cidrmatch("10.0.0.0/8",IpAddress)
+      AND NOT cidrmatch("172.16.0.0/12",IpAddress) AND NOT cidrmatch("192.168.0.0/16",IpAddress)]
+
+      | where logon_time-pwchange_time<=300
+
+      | table _time, TargetUserName, IpAddress, LogonType'
+- question: Does a reversible-encryption-flagged account authenticate (Event 4624) after an inactivity
+    gap in the 99th percentile of its own time-between-logons baseline, especially preceded by a burst
+    of failed logons?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A successful authentication event
+    (Windows Event ID 4624) occurs for an account with reversible encryption enabled, immediately following
+    a password change (Windows Event ID 4723) or after a statistically significant period of account inactivity.
+    Model per-account time-between-logons from 4624 and alert when a flagged account authenticates after
+    inactivity in the 99th percentile of its baseline. Jointly profile failed logons (4625) and Zeek conn.log
+    S0/REJ rates; a burst of failures preceding the success strengthens the dormant-account-abuse hypothesis.
+    Long-dormant accounts suddenly waking up are a classic sign of an attacker activating a staged credential,
+    and the failure burst distinguishes brute-force/replay from a benign return-to-work logon.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 TargetUserName IN (reversible_accounts)
+
+      | streamstats current=f last(_time) as prev by TargetUserName
+
+      | eval gap=_time-prev
+
+      | eventstats perc99(gap) as p99 by TargetUserName
+
+      | where gap>p99
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline+3*std]'
+- question: Does a sequence model recognize the takeover chain [4738 enable reversible on User A] -> [4724/4723
+    password reset on A] -> [4624 logon by A from a new host] within roughly 30 minutes?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A successful authentication event
+    (Windows Event ID 4624) occurs for an account with reversible encryption enabled, immediately following
+    a password change (Windows Event ID 4723) or after a statistically significant period of account inactivity.
+    Use a sequence model (HMM or LSTM) over per-user event logs to recognize the causal chain of enabling
+    reversible encryption, resetting the password, and then logging on from a new host within about 30
+    minutes. Rank the resulting logon as an anomalous causal login path or low-probability edge using
+    graph models (Hopper/CyberGraph). Output the top-3 features (sequence membership, new host, timing).
+    A matched chain is high-confidence evidence of an end-to-end credential takeover rather than incidental
+    administrative activity.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=lstm_sequence input=per_user_event_logs(window=30m)
+
+      | detect chain [4738_enable_reversible -> 4723|4724_pwreset -> 4624_logon_new_host] same TargetUserName
+
+      | score logon as causal_path_anomaly via graph_edge_model
+
+      | output top3_features(seq_membership,new_host,timing)'
+- question: Has the 'Default Domain Policy' or 'Default Domain Controllers Policy' GPO been modified (Event
+    5136 / domain-policy change Event 4739) to enable 'Store passwords using reversible encryption' (ClearTextPassword
+    = 1 in GptTmpl.inf)?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: The Group Policy Object (GPO) for
+    ''Default Domain Policy'' or ''Default Domain Controllers Policy'' is modified to set ''Store passwords
+    using reversible encryption'' to ''Enabled'', with the change originating from a source host or user
+    account that does not typically perform GPO modifications. Monitor modification events (Event 5136
+    and domain-policy change Event 4739) on the well-known GUIDs for the Default Domain Policy ({31B2F340-016D-11D2-945F-00C04FB984F9})
+    and Default Domain Controllers Policy ({6AC1786C-016F-11D2-945F-00C04FB984F9}). On change, inspect
+    the SYSVOL GptTmpl.inf for ''ClearTextPassword = 1'' and alert if reversible encryption is enabled.
+    Enabling this at the domain level affects all accounts and is only legitimately required for legacy
+    protocols, so it is a high-impact, high-signal event. Capture the actor and source host that performed
+    the GPO edit.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5136 OR EventCode=4739) ObjectDN IN ("*31B2F340-016D-11D2-945F-00C04FB984F9*","*6AC1786C-016F-11D2-945F-00C04FB984F9*")
+
+      | union [| inputlookup sysvol_gpttmpl WHERE setting="ClearTextPassword" value=1]
+
+      | table _time, SubjectUserName, ComputerName, ObjectDN, setting, value'
+  - technology: Zeek/pseudocode
+    query: '# correlate SYSVOL SMB write to GptTmpl.inf with the policy GUID path
+
+      source=zeek_smb_files path="*\\Policies\\{31B2F340*}*GptTmpl.inf" action=write
+
+      | table ts, id.orig_h, id.resp_h, name, path'
+- question: Is a GPO modification enabling reversible encryption performed by a first-seen host or account,
+    or does the daily count/entropy of source hosts modifying GPOs spike beyond the historical baseline?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: The Group Policy Object (GPO) for
+    ''Default Domain Policy'' or ''Default Domain Controllers Policy'' is modified to set ''Store passwords
+    using reversible encryption'' to ''Enabled'', with the change originating from a source host or user
+    account that does not typically perform GPO modifications. Profile the set of hosts and accounts that
+    historically modify GPOs (5136) and alert on a first-seen host or user enabling reversible encryption.
+    Additionally monitor the daily count and Shannon entropy of source hostnames modifying GPOs; a sharp
+    entropy increase or count spike beyond mean + 3 sigma indicates anomalous activity. GPO editing is
+    normally performed by a small, stable set of admins from a few hosts, so novelty and dispersion in
+    that population are strong indicators of compromise.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 (GPO modification)
+
+      | stats count as edits dc(SubjectUserName) as users by ComputerName, date_mday
+
+      | eval entropy=shannon(ComputerName_distribution)
+
+      | where first_seen(ComputerName)=1 OR first_seen(SubjectUserName)=1 OR edits>mean+3*std OR entropy>baseline_entropy+3*std'
+- question: Does an anomaly model score a remote-administration session (by source IP reputation/geo,
+    protocol, and account) as a low-probability edge that is immediately followed by a 5136 enabling reversible
+    encryption?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: The Group Policy Object (GPO) for
+    ''Default Domain Policy'' or ''Default Domain Controllers Policy'' is modified to set ''Store passwords
+    using reversible encryption'' to ''Enabled'', with the change originating from a source host or user
+    account that does not typically perform GPO modifications. Score remote-administration sessions with
+    an anomaly model using source IP reputation/geolocation (Zeek conn.log), protocol (WinRM/RDP), and
+    account. If a session scores anomalous as a low-probability authentication edge and is immediately
+    followed by a 5136 enabling reversible encryption, raise a high-priority alert. Linking a suspicious
+    inbound admin session to a damaging policy change ties the who/where to the what, and the top-3 contributing
+    features (new edge, source geo/ASN, protocol) help the analyst confirm the session was not a sanctioned
+    administrator.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=session_anomaly features=[src_ip_reputation, geo, asn, protocol(WinRM/RDP), account]
+
+      | score remote_admin_sessions
+
+      | join host,time [search EventCode=5136 reversible_enabled=TRUE]
+
+      | where session_anomaly_score>=threshold AND policy_change_followed=1
+
+      | output top3_features(new_edge,geo_asn,protocol)'
+- question: Does any PowerShell script block (Event ID 4104) set the reversible-encryption property, matching
+    patterns like 'Set-ADUser ... -AllowReversiblePasswordEncryption $true' or 'Set-ADAccountControl ...
+    -PasswordReversibleEncryption'?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A PowerShell script block log (Windows
+    Event ID 4104) is observed containing script content that sets the ''AllowReversiblePasswordEncryption''
+    property on an AD user object, especially if the script exhibits signs of obfuscation. Detect PowerShell
+    script blocks (Event 4104) matching the regex /(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true/i
+    and the Set-ADAccountControl -PasswordReversibleEncryption variant. Alert on any match, especially
+    on Domain Controllers, because this scripted enable is the action that makes post-change plaintext
+    recovery possible. Capture the full script block, the executing user, and the host so the analyst
+    can assess intent and scope (single account vs. bulk enable).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104
+
+      | regex ScriptBlockText="(?i)(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true"
+
+      | append [search EventCode=4104 | regex ScriptBlockText="(?i)Set-ADAccountControl.*-PasswordReversibleEncryption"]
+
+      | table _time, UserID, Computer, ScriptBlockText'
+- question: Does a 4104 script block on a Domain Controller that references 'AllowReversiblePasswordEncryption'
+    also exhibit high character entropy or a letter-frequency profile far from normal PowerShell, indicating
+    obfuscation?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A PowerShell script block log (Windows
+    Event ID 4104) is observed containing script content that sets the ''AllowReversiblePasswordEncryption''
+    property on an AD user object, especially if the script exhibits signs of obfuscation. For every 4104
+    script block on a DC, compute character entropy and compare its letter-frequency profile against a
+    normal-PowerShell baseline. Alert when a script contains ''AllowReversiblePasswordEncryption'' AND
+    its entropy exceeds the 98th-percentile baseline OR its letter-frequency cosine-distance from normal
+    exceeds a threshold. Obfuscation around a sensitive cmdlet is a strong signal that the operator is
+    deliberately hiding malicious intent rather than performing a documented administrative change.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104 Computer IN (domain_controllers)
+
+      | search ScriptBlockText="*AllowReversiblePasswordEncryption*"
+
+      | eval entropy=shannon(ScriptBlockText), cos=cosine_dist(charfreq(ScriptBlockText), normal_ps_charfreq)
+
+      | where entropy>p98_entropy OR cos>cos_threshold'
+- question: Does a Gradient Boosting/XGBoost classifier trained on 4104 content (AST feature hashing,
+    cmdlet co-occurrence, encoding-function presence, obfuscation metrics) return a 'malicious' verdict
+    for a script that includes Set-ADUser + AllowReversiblePasswordEncryption?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A PowerShell script block log (Windows
+    Event ID 4104) is observed containing script content that sets the ''AllowReversiblePasswordEncryption''
+    property on an AD user object, especially if the script exhibits signs of obfuscation. Train a classifier
+    (Gradient Boosting/XGBoost) on 4104 content using AST feature hashing, cmdlet co-occurrence, encoding-function
+    presence (e.g., FromBase64String), and string-obfuscation metrics; optionally use AMSI post-deobfuscation
+    contextual embeddings. A ''malicious'' verdict on a script including Set-ADUser plus AllowReversiblePasswordEncryption
+    is high-fidelity. Surface the top-3 features (e.g., encoding calls, entropy, AST anomaly) in the alert
+    so the analyst understands why the script was flagged and can prioritize response.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=xgb_powershell features=[ast_hash, cmdlet_cooccurrence, encoding_calls(FromBase64String),
+      obfuscation_metrics, amsi_embeddings]
+
+      | score events where EventCode=4104 AND ScriptBlockText CONTAINS "AllowReversiblePasswordEncryption"
+
+      | where verdict="malicious"
+
+      | output top3_features(encoding_calls,entropy,ast_anomaly)'
+- question: Was a 4738 event setting the reversible-encryption (0x80) flag generated by an account that
+    is NOT on the explicit allow-list of AD security administrators authorized to make this change?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) enabling reversible encryption is attributed to a user
+    account or source host with no history of such changes, or the event occurs at a statistically anomalous
+    time. Maintain an explicit allow-list of ''AD Security Admin'' accounts authorized to enable reversible
+    encryption and generate a high-priority alert when a 4738 event sets the 0x80 flag by any account
+    not on that list. Because the default policy is Disabled, off-list enables are presumptively malicious.
+    This approach attributes the change to a specific actor and immediately separates sanctioned maintenance
+    from abuse, even when the change itself is technically valid.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=0x80)
+
+      | where NOT SubjectUserName IN (ad_security_admin_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: Does a 4738 reversible-encryption enable occur more than 2 sigma from an administrator's normal
+    activity time, or does the per-day rate of such enables exceed the moving mean + 3 sigma?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) enabling reversible encryption is attributed to a user
+    account or source host with no history of such changes, or the event occurs at a statistically anomalous
+    time. Build per-admin baselines of activity hours and modification frequency for 4738 events and alert
+    when an enable occurs more than 2 sigma from the admin''s mean activity time, or when the per-day
+    rate of reversible-encryption enables exceeds the moving mean + 3 sigma. Timing and volume anomalies
+    catch credential-stuffing or compromised-admin scenarios where the legitimate account is used at abnormal
+    hours or to mass-enable the flag across many accounts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as enables by SubjectUserName, date_mday, hour
+
+      | append [| inputlookup admin_4738_baseline]
+
+      | where abs(hour-mean_hour)>2*std_hour OR enables>mean_enables+3*std_enables'
+- question: Does a clustering model over administrative-action features classify a 4738 reversible-encryption
+    enable as a noise point/outlier that deviates from all established admin patterns?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: An Active Directory user account
+    modification event (Windows Event ID 4738) enabling reversible encryption is attributed to a user
+    account or source host with no history of such changes, or the event occurs at a statistically anomalous
+    time. Apply clustering (e.g., DBSCAN) over administrative-action features such as admin account, source
+    host, target object class, and attributes modified. A 4738 enable classified as a noise point (outlier)
+    deviates from every established admin pattern and is therefore suspicious. Report the top-3 features
+    that made it an outlier. This unsupervised approach surfaces never-before-seen combinations of actor/host/action
+    without requiring labeled malicious examples.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=dbscan features=[SubjectUserName, src_host, target_object_class, attrs_modified]
+
+      | fit_predict on EventCode=4738 reversible_enabled=TRUE
+
+      | where cluster_label=-1
+
+      | output top3_outlier_features'
+- question: Following a recent reversible-encryption change, has a Domain Controller executed a known
+    credential-dumping process (Event 4688 / Defender 1116), run 'Invoke-Mimikatz'/'lsadump::dcsync' (4104),
+    or seen directory-replication access (4662 with DRSUAPI GUIDs) from a non-DC source?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A process is executed on a Domain
+    Controller that is associated with known credential access tools or frameworks, such as Mimikatz or
+    PowerSploit, following a recent modification to user account encryption properties. Monitor process
+    creation (Event 4688) and AV detections (Defender Event 1116), alerting when a process hash matches
+    credential-dumping threat intel, when 4104 contains ''Invoke-Mimikatz'' or ''lsadump::dcsync'', or
+    when Event 4662 shows directory replication (GUIDs 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 / 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)
+    from a non-DC source. This is the DCSync payoff that recovers password data after reversible encryption
+    is enabled, so correlating it with a recent flag change confirms the end-to-end credential-theft objective.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=WinEventLog:Security EventCode=4688 process_hash IN (cred_dump_intel))
+
+      OR (source=WinEventLog:Defender EventCode=1116 ThreatName IN (cred_dump_sigs))
+
+      OR (EventCode=4104 ScriptBlockText IN ("*Invoke-Mimikatz*","*lsadump::dcsync*"))
+
+      OR (EventCode=4662 Properties IN ("*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*","*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*")
+      AND src NOT IN (domain_controllers))
+
+      | where exists_recent_4738_reversible_enable(window=24h)
+
+      | table _time, Computer, SubjectUserName, signal'
+- question: On a Domain Controller, is powershell.exe/rundll32.exe spawned from an unusual parent (e.g.,
+    spoolsv.exe, a web worker) that then loads the ActiveDirectory module or makes outbound connections,
+    alongside failed object-access or refused network connections?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A process is executed on a Domain
+    Controller that is associated with known credential access tools or frameworks, such as Mimikatz or
+    PowerSploit, following a recent modification to user account encryption properties. Profile parent-child
+    process lineage on DCs and flag powershell.exe/rundll32.exe spawned from unusual parents (e.g., spoolsv.exe
+    or a web-worker) that then load the ActiveDirectory module or make outbound connections. Also profile
+    failed object-access (4663 access-denied) and Zeek S0/REJ from the host as a probing signal. Anomalous
+    process ancestry on a DC is a hallmark of exploitation or injection used to stage credential theft,
+    and the failure signals indicate reconnaissance preceding success.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4688 Computer IN (domain_controllers)
+
+      | where (NewProcessName IN ("*powershell.exe","*rundll32.exe")) AND (ParentProcessName IN (anomalous_parents)
+      OR NOT parent_child IN (baseline_lineage))
+
+      | join Computer [search EventCode=4663 AccessMask=access_denied OR (source=zeek_conn conn_state
+      IN ("S0","REJ"))]
+
+      | table _time, Computer, ParentProcessName, NewProcessName'
+- question: Does a classifier over sequences of network connections and process API calls label a recent
+    session as DCSync/credential-dumping for an account whose reversible encryption was just enabled?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A process is executed on a Domain
+    Controller that is associated with known credential access tools or frameworks, such as Mimikatz or
+    PowerSploit, following a recent modification to user account encryption properties. Classify credential-dumping
+    behavior from sequences of network connections and process API calls (KAIROS-style provenance learning).
+    If an account recently had reversible encryption enabled and a subsequent session is classified as
+    DCSync/credential-dumping, raise a critical alert. Surface the top-3 contributing features (replication
+    call, non-DC source, recent flag change). Tying the behavioral classification back to the reversible-encryption
+    precondition produces a high-confidence, explainable detection of the full attack.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=kairos_provenance features=[net_conn_seq, process_api_seq]
+
+      | classify sessions where account IN (recent_reversible_enabled_accounts)
+
+      | where label="dcsync_credential_dump"
+
+      | output top3_features(replication_call,non_dc_source,recent_flag_change)'
+- question: On a 4738 event, does bitwise-AND of the old and new userAccountControl with 0x80 show the
+    flag was newly added (old result 0, new result 128), and is the target a member of a privileged group?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A directory service audit event
+    (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED'' flag (0x80) has been
+    added to a user''s ''User Account Control'' attribute, particularly for a high-privilege account.
+    On Event 4738, bitwise-AND the old and new ''User Account Control'' values with 0x80 and alert when
+    the old result is 0 and the new result is 128 (0x80). Escalate priority when the target account is
+    a member of a privileged group, because weakening a high-value account dramatically raises impact.
+    Given the Disabled-by-default policy, this transition is presumptively suspicious; capture the target''s
+    group memberships to drive triage severity.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=128)
+
+      | lookup privileged_groups TargetUserName OUTPUT is_privileged
+
+      | eval severity=if(is_privileged="yes","critical","high")
+
+      | table _time, SubjectUserName, TargetUserName, is_privileged, severity'
+- question: Does the rate of userAccountControl modifications enabling reversible encryption exceed the
+    moving mean + 3 sigma (e.g., more than five accounts in one minute), indicating a mass-enable anomaly?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A directory service audit event
+    (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED'' flag (0x80) has been
+    added to a user''s ''User Account Control'' attribute, particularly for a high-privilege account.
+    Track the rate of userAccountControl modifications enabling reversible encryption, maintaining a moving
+    average and standard deviation, and alert when the rate exceeds mean + 3 sigma (for example, more
+    than five accounts enabled in one minute is a mass-enable anomaly). A sudden burst of enables is inconsistent
+    with deliberate, case-by-case legacy-app configuration and strongly suggests automated, adversary-driven
+    weakening of many accounts at once.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | bin _time span=1m
+
+      | stats count as enables by _time
+
+      | eventstats avg(enables) as mean stdev(enables) as std
+
+      | where enables>mean+3*std OR enables>5'
+- question: Does peer-group analysis flag a userAccountControl change that is typical only for a different
+    peer group (e.g., a marketing user modified like a legacy service account)?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A directory service audit event
+    (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED'' flag (0x80) has been
+    added to a user''s ''User Account Control'' attribute, particularly for a high-privilege account.
+    Group users by role, department, and normal activity, then flag a userAccountControl change that is
+    typical only for a different peer group, such as a marketing user being modified the way a legacy
+    service account would be. Report the peer-group baseline and the top-3 features that drove the anomaly.
+    Peer-group modeling catches changes that look administratively normal in isolation but are out of
+    place for the specific account''s role, a subtle indicator of targeted abuse.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=peer_group_anomaly group_by=[role, department, activity_profile]
+
+      | score EventCode=4738 reversible_enabled=TRUE
+
+      | where change_typical_for_other_peer_group=1
+
+      | output peer_baseline, top3_features'
+- question: Within a tight window, does a 4738 reversible-encryption enable precede a password change
+    (4723) for the same target and then an LSA-secret access attempt (4656/4663 on G$MSRADIUSCHAPKEY)
+    or directory replication (4662) from the same source user/host?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A sequence of events occurs in
+    a short time window: 1) A user account is modified to enable reversible encryption (Windows Event
+    ID 4738), followed by 2) a password change for that account (Windows Event ID 4723), and then 3) an
+    attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`) on a Domain Controller (Windows Event ID
+    4656/4663) or directory replication (Event ID 4662). Build a stateful rule that triggers on a 4738
+    enabling reversible encryption; if within 10 minutes a password change (4723) for the same target
+    occurs, followed by an LSA-secret access attempt (4656 handle request / 4663 object access on G$MSRADIUSCHAPKEY)
+    or directory replication (4662) from the same source user/host, raise a critical credential-access
+    alert. This is the full reversible-encryption attack chain, where the adversary enables the flag,
+    forces a fresh encrypted password, and then steals the key material needed to decrypt it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | join TargetUserName [search EventCode=4723 | where pwchange_time-enable_time<=600]
+
+      | join SubjectUserName,ComputerName [search (EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*")
+      OR EventCode=4662 (DRSUAPI replication GUIDs)]
+
+      | eval severity="critical"
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: After a reversible-encryption enable, does an LSA-secret access (4656/4663) come from a user/host
+    in the 99th percentile of rarity for such access, or with access-denied failures preceding success?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A sequence of events occurs in
+    a short time window: 1) A user account is modified to enable reversible encryption (Windows Event
+    ID 4738), followed by 2) a password change for that account (Windows Event ID 4723), and then 3) an
+    attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`) on a Domain Controller (Windows Event ID
+    4656/4663) or directory replication (Event ID 4662). Baseline the frequency of LSA-secret access (4656/4663)
+    per user and host. An enable-reversible event followed by LSA access from a user/host in the 99th
+    percentile of rarity, or with access-denied (4663) failures preceding a success, is a high-confidence
+    anomaly. LSA-secret access is rare and tightly scoped in normal operations, so rarity plus a preceding
+    failure burst pinpoints the adversary''s attempt to harvest the G$MSRADIUSCHAPKEY material.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*"
+
+      | stats count as accesses by SubjectUserName, ComputerName
+
+      | eventstats perc99(accesses) as p99
+
+      | where rarity_rank>=p99 OR access_denied_then_success=1
+
+      | where exists_recent_4738_reversible_enable(window=1h)'
+- question: Does graph analytics match the attack chain (enable reversible -> change password -> access
+    LSA secret/replicate) as a completing path in the provenance/audit graph within the time window?
+  context: '[Defense Impairment] From a Defense Impairment perspective, enabling reversible password encryption
+    silently degrades the trustworthiness of the credential store and weakens the one-way-hash protection
+    defenders rely on, so detecting the change restores visibility into a covert weakening of authentication
+    controls. This addresses the information requirement: "Is the adversary establishing persistence by
+    modifying account properties for reversible encryption?" Evidence: A sequence of events occurs in
+    a short time window: 1) A user account is modified to enable reversible encryption (Windows Event
+    ID 4738), followed by 2) a password change for that account (Windows Event ID 4723), and then 3) an
+    attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`) on a Domain Controller (Windows Event ID
+    4656/4663) or directory replication (Event ID 4662). Encode the chain as a query graph (nodes = user/host,
+    edges = ''enable reversible'' -> ''change password'' -> ''access LSA secret/replicate'') and match
+    it against the provenance/audit graph (POIROT-style), alerting when the path completes within the
+    time window. Use temporal-graph reconstruction (KAIROS) to localize and explain the subgraph with
+    edge-level contributions. Graph matching detects the multi-step campaign as a single connected story
+    and gives the analyst an explainable subgraph rather than disconnected alerts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'query_graph = nodes[user,host] edges[enable_reversible->change_password->access_lsa_secret|replicate]
+
+      | match against provenance_audit_graph(window)
+
+      | alert when path_complete=TRUE
+
+      | reconstruct temporal_subgraph; output edge_level_contributions'
+- question: Has any Active Directory user account been modified (Windows Event ID 4738) so that the 'Password
+    stored using reversible encryption' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) transitioned
+    from disabled to enabled?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    On every 4738 (''A user account was changed'') event, compute the bitwise difference of the old versus
+    new ''User Account Control'' value and alert when (old & 0x80)==0 and (new & 0x80)==0x80, i.e. the
+    reversible-encryption bit was newly set. This policy is Disabled by default and is only legitimately
+    required for legacy CHAP/IAS/Digest applications, so any enable on an account that is not on a documented
+    allow-list should be treated as actionable. Capture the Subject actor, TargetUserName, and the old/new
+    UAC values from the event to attribute who made the change and which account was staged. A positive
+    result means an account is now storing a recoverable password; a negative result across the range
+    raises confidence that no accounts were weakened.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old_uac=tonumber(OldUACValue,16), new_uac=tonumber(NewUACValue,16)
+
+      | where (old_uac%256<128) AND (new_uac%256>=128) AND ((old_uac & 0x80)=0) AND ((new_uac & 0x80)=0x80)
+
+      | where NOT TargetUserName IN (reversible_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, OldUACValue, NewUACValue, ComputerName'
+- question: For accounts that now have reversible encryption enabled, does any account authenticate (Windows
+    Event ID 4624) after a dormancy period exceeding the environment's 95th-percentile login-inactivity
+    baseline, accompanied by a spike in failed logons or refused network connections?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    Baseline login activity from 4624 for all flagged accounts and compute the 95th-percentile login dormancy
+    (days since last logon) across active accounts; alert when a flagged account suddenly authenticates
+    after exceeding it. In parallel, profile failed logons (Event 4625) and blocked/refused Zeek conn.log
+    connections (conn_state S0/REJ) for the account in the 24-hour window around the change. A burst of
+    failures followed by a success indicates credential probing or replay against a deliberately staged
+    account, which is exactly what you expect when an adversary enables reversible encryption to recover
+    and reuse a credential.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 account IN (reversible_accounts)
+
+      | stats max(_time) as last_logon by TargetUserName
+
+      | eval dormancy_days=(now()-last_logon)/86400
+
+      | eventstats perc95(dormancy_days) as p95
+
+      | where dormancy_days>p95
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline_mean+3*baseline_std]'
+- question: Does the per-user Windows event stream contain a rare, tightly-timed ordering such as [4738
+    enable reversible] -> [4624 logon] within a few minutes that an LSTM log-key sequence model predicts
+    as a low-probability next event?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    Apply an LSTM log-key sequence model (DeepLog-style) over per-user Windows event streams to flag orderings
+    that fall outside the top-g predicted next events, such as a reversible-encryption enable immediately
+    followed by a logon within five minutes. Cross-score the logon source as a low-probability authentication
+    edge or rare ASN/geo via graph or UEBA models. The alert text must surface the top-3 contributing
+    features (e.g., sequence rarity, new source ASN, dormancy) so the analyst can quickly judge the finding.
+    A flagged sequence suggests an automated takeover where the same actor that weakened the account immediately
+    uses it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=deeplog_logkey input=per_user_event_sequence(window=5m)
+
+      | predict next_event given prior_keys
+
+      | flag where observed_seq=[4738_enable_reversible,4624_logon] AND prob(observed) NOT IN top_g
+
+      | enrich logon_source via graph_edge_score, asn_geo_rarity
+
+      | output top3_features(seq_rarity,new_asn,dormancy)'
+- question: Has a Fine-Grained Password Policy (FGPP) object been created (Event ID 5137) or modified
+    (Event ID 5136) so that the 'msDS-PasswordReversibleEncryptionEnabled' attribute is set to TRUE?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Monitor directory service object creation (Event ID 5137) where the Object Class is ''msDS-PasswordSettings''
+    and modification (Event ID 5136) on existing FGPP objects, alerting whenever ''msDS-PasswordReversibleEncryptionEnabled''
+    is set to TRUE. FGPPs let an adversary scope reversible encryption to specific users or groups without
+    touching the default domain policy, making them a stealthier vector. Because this setting is needed
+    only for legacy CHAP/IAS/Digest scenarios, any enable off an approved baseline is high-signal. Record
+    the policy name, the actor, and the target users/groups the PSO applies to.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5137 ObjectClass="msDS-PasswordSettings") OR (EventCode=5136
+      ObjectClass="msDS-PasswordSettings")
+
+      | where AttributeLDAPDisplayName="msDS-PasswordReversibleEncryptionEnabled" AND AttributeValue="TRUE"
+
+      | table _time, SubjectUserName, ObjectDN, AttributeValue, ComputerName'
+- question: Does an FGPP modification that enables reversible encryption occur outside an administrator's
+    normal hours, exceed their normal edit frequency, or come from an account with no prior FGPP-management
+    history?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Maintain a per-administrator profile of FGPP modification frequency and time-of-day. Alert
+    when the per-day count of FGPP edits enabling reversible encryption exceeds the moving mean + 3 standard
+    deviations, when the edit occurs more than 2 sigma from the admin''s mean modification time, or when
+    the modifying account is a first-seen actor with no FGPP-management history. These deviations distinguish
+    a legitimate, routine policy change from opportunistic abuse of a powerful but rarely-used setting.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 ObjectClass="msDS-PasswordSettings" AttributeValue="TRUE"
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as edits, values(hour) as hrs by SubjectUserName, date_mday
+
+      | append [| inputlookup admin_fgpp_baseline]
+
+      | where edits>mean_edits+3*std_edits OR abs(hour-mean_hour)>2*std_hour OR first_seen_actor=1'
+- question: Does a supervised classifier score an FGPP modification (Event 5136) that sets 'msDS-PasswordReversibleEncryptionEnabled'=TRUE
+    as high-risk based on actor, source workstation, timing, and changed attributes?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Score each FGPP modification with a supervised classifier (e.g., Random Forest or Gradient
+    Boosting) using features such as SubjectUserName, source workstation, time-of-day, day-of-week, and
+    the set of changed attributes. A high-risk score for a change enabling reversible encryption indicates
+    a likely malicious modification. The model captures combinations of weak signals (rare actor + off-hours
+    + unusual host) that individual rules miss; emit the top-3 contributing features in the alert so an
+    analyst can validate quickly.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=rf_fgpp_classifier
+
+      features=[SubjectUserName, src_workstation, hour, weekday, changed_attrs]
+
+      | score events where EventCode=5136 AND changed_attrs CONTAINS "msDS-PasswordReversibleEncryptionEnabled=TRUE"
+
+      | where risk_score>=threshold
+
+      | output top3_features'
+- question: For an account with reversible encryption enabled, is a password change (Event ID 4723) followed
+    within five minutes by a successful interactive logon (Event ID 4624, Logon Type 2 or 10) from an
+    external (non-RFC1918) IP address?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Create a stateful rule that, for
+    accounts already flagged with reversible encryption, alerts when a password change (4723) is followed
+    within five minutes by a successful interactive logon (4624, Logon Type 2 or 10) from a non-RFC1918
+    source. The adversary objective once the flag is set is to recover the post-change plaintext, so a
+    reset immediately followed by an external interactive logon is the tell-tale takeover sequence. Capture
+    the source IP, logon type, and timing so the analyst can confirm whether the logon is consistent with
+    legitimate user behavior.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4723 TargetUserName IN (reversible_accounts)
+
+      | join type=inner TargetUserName [search EventCode=4624 LogonType IN (2,10) | where NOT cidrmatch("10.0.0.0/8",IpAddress)
+      AND NOT cidrmatch("172.16.0.0/12",IpAddress) AND NOT cidrmatch("192.168.0.0/16",IpAddress)]
+
+      | where logon_time-pwchange_time<=300
+
+      | table _time, TargetUserName, IpAddress, LogonType'
+- question: Does a reversible-encryption-flagged account authenticate (Event 4624) after an inactivity
+    gap in the 99th percentile of its own time-between-logons baseline, especially preceded by a burst
+    of failed logons?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Model per-account time-between-logons
+    from 4624 and alert when a flagged account authenticates after inactivity in the 99th percentile of
+    its baseline. Jointly profile failed logons (4625) and Zeek conn.log S0/REJ rates; a burst of failures
+    preceding the success strengthens the dormant-account-abuse hypothesis. Long-dormant accounts suddenly
+    waking up are a classic sign of an attacker activating a staged credential, and the failure burst
+    distinguishes brute-force/replay from a benign return-to-work logon.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 TargetUserName IN (reversible_accounts)
+
+      | streamstats current=f last(_time) as prev by TargetUserName
+
+      | eval gap=_time-prev
+
+      | eventstats perc99(gap) as p99 by TargetUserName
+
+      | where gap>p99
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline+3*std]'
+- question: Does a sequence model recognize the takeover chain [4738 enable reversible on User A] -> [4724/4723
+    password reset on A] -> [4624 logon by A from a new host] within roughly 30 minutes?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Use a sequence model (HMM or LSTM)
+    over per-user event logs to recognize the causal chain of enabling reversible encryption, resetting
+    the password, and then logging on from a new host within about 30 minutes. Rank the resulting logon
+    as an anomalous causal login path or low-probability edge using graph models (Hopper/CyberGraph).
+    Output the top-3 features (sequence membership, new host, timing). A matched chain is high-confidence
+    evidence of an end-to-end credential takeover rather than incidental administrative activity.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=lstm_sequence input=per_user_event_logs(window=30m)
+
+      | detect chain [4738_enable_reversible -> 4723|4724_pwreset -> 4624_logon_new_host] same TargetUserName
+
+      | score logon as causal_path_anomaly via graph_edge_model
+
+      | output top3_features(seq_membership,new_host,timing)'
+- question: Has the 'Default Domain Policy' or 'Default Domain Controllers Policy' GPO been modified (Event
+    5136 / domain-policy change Event 4739) to enable 'Store passwords using reversible encryption' (ClearTextPassword
+    = 1 in GptTmpl.inf)?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Monitor modification events (Event 5136 and domain-policy change Event 4739) on the
+    well-known GUIDs for the Default Domain Policy ({31B2F340-016D-11D2-945F-00C04FB984F9}) and Default
+    Domain Controllers Policy ({6AC1786C-016F-11D2-945F-00C04FB984F9}). On change, inspect the SYSVOL
+    GptTmpl.inf for ''ClearTextPassword = 1'' and alert if reversible encryption is enabled. Enabling
+    this at the domain level affects all accounts and is only legitimately required for legacy protocols,
+    so it is a high-impact, high-signal event. Capture the actor and source host that performed the GPO
+    edit.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5136 OR EventCode=4739) ObjectDN IN ("*31B2F340-016D-11D2-945F-00C04FB984F9*","*6AC1786C-016F-11D2-945F-00C04FB984F9*")
+
+      | union [| inputlookup sysvol_gpttmpl WHERE setting="ClearTextPassword" value=1]
+
+      | table _time, SubjectUserName, ComputerName, ObjectDN, setting, value'
+  - technology: Zeek/pseudocode
+    query: '# correlate SYSVOL SMB write to GptTmpl.inf with the policy GUID path
+
+      source=zeek_smb_files path="*\\Policies\\{31B2F340*}*GptTmpl.inf" action=write
+
+      | table ts, id.orig_h, id.resp_h, name, path'
+- question: Is a GPO modification enabling reversible encryption performed by a first-seen host or account,
+    or does the daily count/entropy of source hosts modifying GPOs spike beyond the historical baseline?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Profile the set of hosts and accounts that historically modify GPOs (5136) and alert
+    on a first-seen host or user enabling reversible encryption. Additionally monitor the daily count
+    and Shannon entropy of source hostnames modifying GPOs; a sharp entropy increase or count spike beyond
+    mean + 3 sigma indicates anomalous activity. GPO editing is normally performed by a small, stable
+    set of admins from a few hosts, so novelty and dispersion in that population are strong indicators
+    of compromise.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 (GPO modification)
+
+      | stats count as edits dc(SubjectUserName) as users by ComputerName, date_mday
+
+      | eval entropy=shannon(ComputerName_distribution)
+
+      | where first_seen(ComputerName)=1 OR first_seen(SubjectUserName)=1 OR edits>mean+3*std OR entropy>baseline_entropy+3*std'
+- question: Does an anomaly model score a remote-administration session (by source IP reputation/geo,
+    protocol, and account) as a low-probability edge that is immediately followed by a 5136 enabling reversible
+    encryption?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Score remote-administration sessions with an anomaly model using source IP reputation/geolocation
+    (Zeek conn.log), protocol (WinRM/RDP), and account. If a session scores anomalous as a low-probability
+    authentication edge and is immediately followed by a 5136 enabling reversible encryption, raise a
+    high-priority alert. Linking a suspicious inbound admin session to a damaging policy change ties the
+    who/where to the what, and the top-3 contributing features (new edge, source geo/ASN, protocol) help
+    the analyst confirm the session was not a sanctioned administrator.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=session_anomaly features=[src_ip_reputation, geo, asn, protocol(WinRM/RDP), account]
+
+      | score remote_admin_sessions
+
+      | join host,time [search EventCode=5136 reversible_enabled=TRUE]
+
+      | where session_anomaly_score>=threshold AND policy_change_followed=1
+
+      | output top3_features(new_edge,geo_asn,protocol)'
+- question: Does any PowerShell script block (Event ID 4104) set the reversible-encryption property, matching
+    patterns like 'Set-ADUser ... -AllowReversiblePasswordEncryption $true' or 'Set-ADAccountControl ...
+    -PasswordReversibleEncryption'?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. Detect PowerShell script blocks (Event 4104)
+    matching the regex /(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true/i
+    and the Set-ADAccountControl -PasswordReversibleEncryption variant. Alert on any match, especially
+    on Domain Controllers, because this scripted enable is the action that makes post-change plaintext
+    recovery possible. Capture the full script block, the executing user, and the host so the analyst
+    can assess intent and scope (single account vs. bulk enable).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104
+
+      | regex ScriptBlockText="(?i)(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true"
+
+      | append [search EventCode=4104 | regex ScriptBlockText="(?i)Set-ADAccountControl.*-PasswordReversibleEncryption"]
+
+      | table _time, UserID, Computer, ScriptBlockText'
+- question: Does a 4104 script block on a Domain Controller that references 'AllowReversiblePasswordEncryption'
+    also exhibit high character entropy or a letter-frequency profile far from normal PowerShell, indicating
+    obfuscation?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. For every 4104 script block on a DC, compute
+    character entropy and compare its letter-frequency profile against a normal-PowerShell baseline. Alert
+    when a script contains ''AllowReversiblePasswordEncryption'' AND its entropy exceeds the 98th-percentile
+    baseline OR its letter-frequency cosine-distance from normal exceeds a threshold. Obfuscation around
+    a sensitive cmdlet is a strong signal that the operator is deliberately hiding malicious intent rather
+    than performing a documented administrative change.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104 Computer IN (domain_controllers)
+
+      | search ScriptBlockText="*AllowReversiblePasswordEncryption*"
+
+      | eval entropy=shannon(ScriptBlockText), cos=cosine_dist(charfreq(ScriptBlockText), normal_ps_charfreq)
+
+      | where entropy>p98_entropy OR cos>cos_threshold'
+- question: Does a Gradient Boosting/XGBoost classifier trained on 4104 content (AST feature hashing,
+    cmdlet co-occurrence, encoding-function presence, obfuscation metrics) return a 'malicious' verdict
+    for a script that includes Set-ADUser + AllowReversiblePasswordEncryption?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. Train a classifier (Gradient Boosting/XGBoost)
+    on 4104 content using AST feature hashing, cmdlet co-occurrence, encoding-function presence (e.g.,
+    FromBase64String), and string-obfuscation metrics; optionally use AMSI post-deobfuscation contextual
+    embeddings. A ''malicious'' verdict on a script including Set-ADUser plus AllowReversiblePasswordEncryption
+    is high-fidelity. Surface the top-3 features (e.g., encoding calls, entropy, AST anomaly) in the alert
+    so the analyst understands why the script was flagged and can prioritize response.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=xgb_powershell features=[ast_hash, cmdlet_cooccurrence, encoding_calls(FromBase64String),
+      obfuscation_metrics, amsi_embeddings]
+
+      | score events where EventCode=4104 AND ScriptBlockText CONTAINS "AllowReversiblePasswordEncryption"
+
+      | where verdict="malicious"
+
+      | output top3_features(encoding_calls,entropy,ast_anomaly)'
+- question: Was a 4738 event setting the reversible-encryption (0x80) flag generated by an account that
+    is NOT on the explicit allow-list of AD security administrators authorized to make this change?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Maintain an explicit allow-list of
+    ''AD Security Admin'' accounts authorized to enable reversible encryption and generate a high-priority
+    alert when a 4738 event sets the 0x80 flag by any account not on that list. Because the default policy
+    is Disabled, off-list enables are presumptively malicious. This approach attributes the change to
+    a specific actor and immediately separates sanctioned maintenance from abuse, even when the change
+    itself is technically valid.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=0x80)
+
+      | where NOT SubjectUserName IN (ad_security_admin_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: Does a 4738 reversible-encryption enable occur more than 2 sigma from an administrator's normal
+    activity time, or does the per-day rate of such enables exceed the moving mean + 3 sigma?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Build per-admin baselines of activity
+    hours and modification frequency for 4738 events and alert when an enable occurs more than 2 sigma
+    from the admin''s mean activity time, or when the per-day rate of reversible-encryption enables exceeds
+    the moving mean + 3 sigma. Timing and volume anomalies catch credential-stuffing or compromised-admin
+    scenarios where the legitimate account is used at abnormal hours or to mass-enable the flag across
+    many accounts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as enables by SubjectUserName, date_mday, hour
+
+      | append [| inputlookup admin_4738_baseline]
+
+      | where abs(hour-mean_hour)>2*std_hour OR enables>mean_enables+3*std_enables'
+- question: Does a clustering model over administrative-action features classify a 4738 reversible-encryption
+    enable as a noise point/outlier that deviates from all established admin patterns?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Apply clustering (e.g., DBSCAN) over
+    administrative-action features such as admin account, source host, target object class, and attributes
+    modified. A 4738 enable classified as a noise point (outlier) deviates from every established admin
+    pattern and is therefore suspicious. Report the top-3 features that made it an outlier. This unsupervised
+    approach surfaces never-before-seen combinations of actor/host/action without requiring labeled malicious
+    examples.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=dbscan features=[SubjectUserName, src_host, target_object_class, attrs_modified]
+
+      | fit_predict on EventCode=4738 reversible_enabled=TRUE
+
+      | where cluster_label=-1
+
+      | output top3_outlier_features'
+- question: Following a recent reversible-encryption change, has a Domain Controller executed a known
+    credential-dumping process (Event 4688 / Defender 1116), run 'Invoke-Mimikatz'/'lsadump::dcsync' (4104),
+    or seen directory-replication access (4662 with DRSUAPI GUIDs) from a non-DC source?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Monitor process creation (Event 4688) and AV detections (Defender
+    Event 1116), alerting when a process hash matches credential-dumping threat intel, when 4104 contains
+    ''Invoke-Mimikatz'' or ''lsadump::dcsync'', or when Event 4662 shows directory replication (GUIDs
+    1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 / 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2) from a non-DC source.
+    This is the DCSync payoff that recovers password data after reversible encryption is enabled, so correlating
+    it with a recent flag change confirms the end-to-end credential-theft objective.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=WinEventLog:Security EventCode=4688 process_hash IN (cred_dump_intel))
+
+      OR (source=WinEventLog:Defender EventCode=1116 ThreatName IN (cred_dump_sigs))
+
+      OR (EventCode=4104 ScriptBlockText IN ("*Invoke-Mimikatz*","*lsadump::dcsync*"))
+
+      OR (EventCode=4662 Properties IN ("*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*","*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*")
+      AND src NOT IN (domain_controllers))
+
+      | where exists_recent_4738_reversible_enable(window=24h)
+
+      | table _time, Computer, SubjectUserName, signal'
+- question: On a Domain Controller, is powershell.exe/rundll32.exe spawned from an unusual parent (e.g.,
+    spoolsv.exe, a web worker) that then loads the ActiveDirectory module or makes outbound connections,
+    alongside failed object-access or refused network connections?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Profile parent-child process lineage on DCs and flag powershell.exe/rundll32.exe
+    spawned from unusual parents (e.g., spoolsv.exe or a web-worker) that then load the ActiveDirectory
+    module or make outbound connections. Also profile failed object-access (4663 access-denied) and Zeek
+    S0/REJ from the host as a probing signal. Anomalous process ancestry on a DC is a hallmark of exploitation
+    or injection used to stage credential theft, and the failure signals indicate reconnaissance preceding
+    success.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4688 Computer IN (domain_controllers)
+
+      | where (NewProcessName IN ("*powershell.exe","*rundll32.exe")) AND (ParentProcessName IN (anomalous_parents)
+      OR NOT parent_child IN (baseline_lineage))
+
+      | join Computer [search EventCode=4663 AccessMask=access_denied OR (source=zeek_conn conn_state
+      IN ("S0","REJ"))]
+
+      | table _time, Computer, ParentProcessName, NewProcessName'
+- question: Does a classifier over sequences of network connections and process API calls label a recent
+    session as DCSync/credential-dumping for an account whose reversible encryption was just enabled?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Classify credential-dumping behavior from sequences of network
+    connections and process API calls (KAIROS-style provenance learning). If an account recently had reversible
+    encryption enabled and a subsequent session is classified as DCSync/credential-dumping, raise a critical
+    alert. Surface the top-3 contributing features (replication call, non-DC source, recent flag change).
+    Tying the behavioral classification back to the reversible-encryption precondition produces a high-confidence,
+    explainable detection of the full attack.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=kairos_provenance features=[net_conn_seq, process_api_seq]
+
+      | classify sessions where account IN (recent_reversible_enabled_accounts)
+
+      | where label="dcsync_credential_dump"
+
+      | output top3_features(replication_call,non_dc_source,recent_flag_change)'
+- question: On a 4738 event, does bitwise-AND of the old and new userAccountControl with 0x80 show the
+    flag was newly added (old result 0, new result 128), and is the target a member of a privileged group?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. On Event 4738, bitwise-AND the old and new ''User Account Control'' values with 0x80 and
+    alert when the old result is 0 and the new result is 128 (0x80). Escalate priority when the target
+    account is a member of a privileged group, because weakening a high-value account dramatically raises
+    impact. Given the Disabled-by-default policy, this transition is presumptively suspicious; capture
+    the target''s group memberships to drive triage severity.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=128)
+
+      | lookup privileged_groups TargetUserName OUTPUT is_privileged
+
+      | eval severity=if(is_privileged="yes","critical","high")
+
+      | table _time, SubjectUserName, TargetUserName, is_privileged, severity'
+- question: Does the rate of userAccountControl modifications enabling reversible encryption exceed the
+    moving mean + 3 sigma (e.g., more than five accounts in one minute), indicating a mass-enable anomaly?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. Track the rate of userAccountControl modifications enabling reversible encryption, maintaining
+    a moving average and standard deviation, and alert when the rate exceeds mean + 3 sigma (for example,
+    more than five accounts enabled in one minute is a mass-enable anomaly). A sudden burst of enables
+    is inconsistent with deliberate, case-by-case legacy-app configuration and strongly suggests automated,
+    adversary-driven weakening of many accounts at once.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | bin _time span=1m
+
+      | stats count as enables by _time
+
+      | eventstats avg(enables) as mean stdev(enables) as std
+
+      | where enables>mean+3*std OR enables>5'
+- question: Does peer-group analysis flag a userAccountControl change that is typical only for a different
+    peer group (e.g., a marketing user modified like a legacy service account)?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. Group users by role, department, and normal activity, then flag a userAccountControl change
+    that is typical only for a different peer group, such as a marketing user being modified the way a
+    legacy service account would be. Report the peer-group baseline and the top-3 features that drove
+    the anomaly. Peer-group modeling catches changes that look administratively normal in isolation but
+    are out of place for the specific account''s role, a subtle indicator of targeted abuse.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=peer_group_anomaly group_by=[role, department, activity_profile]
+
+      | score EventCode=4738 reversible_enabled=TRUE
+
+      | where change_typical_for_other_peer_group=1
+
+      | output peer_baseline, top3_features'
+- question: Within a tight window, does a 4738 reversible-encryption enable precede a password change
+    (4723) for the same target and then an LSA-secret access attempt (4656/4663 on G$MSRADIUSCHAPKEY)
+    or directory replication (4662) from the same source user/host?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Build
+    a stateful rule that triggers on a 4738 enabling reversible encryption; if within 10 minutes a password
+    change (4723) for the same target occurs, followed by an LSA-secret access attempt (4656 handle request
+    / 4663 object access on G$MSRADIUSCHAPKEY) or directory replication (4662) from the same source user/host,
+    raise a critical credential-access alert. This is the full reversible-encryption attack chain, where
+    the adversary enables the flag, forces a fresh encrypted password, and then steals the key material
+    needed to decrypt it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | join TargetUserName [search EventCode=4723 | where pwchange_time-enable_time<=600]
+
+      | join SubjectUserName,ComputerName [search (EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*")
+      OR EventCode=4662 (DRSUAPI replication GUIDs)]
+
+      | eval severity="critical"
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: After a reversible-encryption enable, does an LSA-secret access (4656/4663) come from a user/host
+    in the 99th percentile of rarity for such access, or with access-denied failures preceding success?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Baseline
+    the frequency of LSA-secret access (4656/4663) per user and host. An enable-reversible event followed
+    by LSA access from a user/host in the 99th percentile of rarity, or with access-denied (4663) failures
+    preceding a success, is a high-confidence anomaly. LSA-secret access is rare and tightly scoped in
+    normal operations, so rarity plus a preceding failure burst pinpoints the adversary''s attempt to
+    harvest the G$MSRADIUSCHAPKEY material.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*"
+
+      | stats count as accesses by SubjectUserName, ComputerName
+
+      | eventstats perc99(accesses) as p99
+
+      | where rarity_rank>=p99 OR access_denied_then_success=1
+
+      | where exists_recent_4738_reversible_enable(window=1h)'
+- question: Does graph analytics match the attack chain (enable reversible -> change password -> access
+    LSA secret/replicate) as a completing path in the provenance/audit graph within the time window?
+  context: '[Persistence] From a Persistence perspective, an adversary who flips reversible encryption
+    can harvest plaintext passwords created or changed afterward, giving them a durable, low-noise way
+    to re-enter the environment with valid credentials even after eviction. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Encode
+    the chain as a query graph (nodes = user/host, edges = ''enable reversible'' -> ''change password''
+    -> ''access LSA secret/replicate'') and match it against the provenance/audit graph (POIROT-style),
+    alerting when the path completes within the time window. Use temporal-graph reconstruction (KAIROS)
+    to localize and explain the subgraph with edge-level contributions. Graph matching detects the multi-step
+    campaign as a single connected story and gives the analyst an explainable subgraph rather than disconnected
+    alerts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'query_graph = nodes[user,host] edges[enable_reversible->change_password->access_lsa_secret|replicate]
+
+      | match against provenance_audit_graph(window)
+
+      | alert when path_complete=TRUE
+
+      | reconstruct temporal_subgraph; output edge_level_contributions'
+- question: Has any Active Directory user account been modified (Windows Event ID 4738) so that the 'Password
+    stored using reversible encryption' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) transitioned
+    from disabled to enabled?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    On every 4738 (''A user account was changed'') event, compute the bitwise difference of the old versus
+    new ''User Account Control'' value and alert when (old & 0x80)==0 and (new & 0x80)==0x80, i.e. the
+    reversible-encryption bit was newly set. This policy is Disabled by default and is only legitimately
+    required for legacy CHAP/IAS/Digest applications, so any enable on an account that is not on a documented
+    allow-list should be treated as actionable. Capture the Subject actor, TargetUserName, and the old/new
+    UAC values from the event to attribute who made the change and which account was staged. A positive
+    result means an account is now storing a recoverable password; a negative result across the range
+    raises confidence that no accounts were weakened.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old_uac=tonumber(OldUACValue,16), new_uac=tonumber(NewUACValue,16)
+
+      | where (old_uac%256<128) AND (new_uac%256>=128) AND ((old_uac & 0x80)=0) AND ((new_uac & 0x80)=0x80)
+
+      | where NOT TargetUserName IN (reversible_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, OldUACValue, NewUACValue, ComputerName'
+- question: For accounts that now have reversible encryption enabled, does any account authenticate (Windows
+    Event ID 4624) after a dormancy period exceeding the environment's 95th-percentile login-inactivity
+    baseline, accompanied by a spike in failed logons or refused network connections?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    Baseline login activity from 4624 for all flagged accounts and compute the 95th-percentile login dormancy
+    (days since last logon) across active accounts; alert when a flagged account suddenly authenticates
+    after exceeding it. In parallel, profile failed logons (Event 4625) and blocked/refused Zeek conn.log
+    connections (conn_state S0/REJ) for the account in the 24-hour window around the change. A burst of
+    failures followed by a success indicates credential probing or replay against a deliberately staged
+    account, which is exactly what you expect when an adversary enables reversible encryption to recover
+    and reuse a credential.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 account IN (reversible_accounts)
+
+      | stats max(_time) as last_logon by TargetUserName
+
+      | eval dormancy_days=(now()-last_logon)/86400
+
+      | eventstats perc95(dormancy_days) as p95
+
+      | where dormancy_days>p95
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline_mean+3*baseline_std]'
+- question: Does the per-user Windows event stream contain a rare, tightly-timed ordering such as [4738
+    enable reversible] -> [4624 logon] within a few minutes that an LSTM log-key sequence model predicts
+    as a low-probability next event?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    is observed where the ''User Account Control'' field indicates the ''Password stored using reversible
+    encryption'' flag (ADS_UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED / 0x80) was enabled for a user account.
+    Apply an LSTM log-key sequence model (DeepLog-style) over per-user Windows event streams to flag orderings
+    that fall outside the top-g predicted next events, such as a reversible-encryption enable immediately
+    followed by a logon within five minutes. Cross-score the logon source as a low-probability authentication
+    edge or rare ASN/geo via graph or UEBA models. The alert text must surface the top-3 contributing
+    features (e.g., sequence rarity, new source ASN, dormancy) so the analyst can quickly judge the finding.
+    A flagged sequence suggests an automated takeover where the same actor that weakened the account immediately
+    uses it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=deeplog_logkey input=per_user_event_sequence(window=5m)
+
+      | predict next_event given prior_keys
+
+      | flag where observed_seq=[4738_enable_reversible,4624_logon] AND prob(observed) NOT IN top_g
+
+      | enrich logon_source via graph_edge_score, asn_geo_rarity
+
+      | output top3_features(seq_rarity,new_asn,dormancy)'
+- question: Has a Fine-Grained Password Policy (FGPP) object been created (Event ID 5137) or modified
+    (Event ID 5136) so that the 'msDS-PasswordReversibleEncryptionEnabled' attribute is set to TRUE?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Monitor directory service object creation (Event ID 5137) where the Object Class is ''msDS-PasswordSettings''
+    and modification (Event ID 5136) on existing FGPP objects, alerting whenever ''msDS-PasswordReversibleEncryptionEnabled''
+    is set to TRUE. FGPPs let an adversary scope reversible encryption to specific users or groups without
+    touching the default domain policy, making them a stealthier vector. Because this setting is needed
+    only for legacy CHAP/IAS/Digest scenarios, any enable off an approved baseline is high-signal. Record
+    the policy name, the actor, and the target users/groups the PSO applies to.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5137 ObjectClass="msDS-PasswordSettings") OR (EventCode=5136
+      ObjectClass="msDS-PasswordSettings")
+
+      | where AttributeLDAPDisplayName="msDS-PasswordReversibleEncryptionEnabled" AND AttributeValue="TRUE"
+
+      | table _time, SubjectUserName, ObjectDN, AttributeValue, ComputerName'
+- question: Does an FGPP modification that enables reversible encryption occur outside an administrator's
+    normal hours, exceed their normal edit frequency, or come from an account with no prior FGPP-management
+    history?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Maintain a per-administrator profile of FGPP modification frequency and time-of-day. Alert
+    when the per-day count of FGPP edits enabling reversible encryption exceeds the moving mean + 3 standard
+    deviations, when the edit occurs more than 2 sigma from the admin''s mean modification time, or when
+    the modifying account is a first-seen actor with no FGPP-management history. These deviations distinguish
+    a legitimate, routine policy change from opportunistic abuse of a powerful but rarely-used setting.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 ObjectClass="msDS-PasswordSettings" AttributeValue="TRUE"
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as edits, values(hour) as hrs by SubjectUserName, date_mday
+
+      | append [| inputlookup admin_fgpp_baseline]
+
+      | where edits>mean_edits+3*std_edits OR abs(hour-mean_hour)>2*std_hour OR first_seen_actor=1'
+- question: Does a supervised classifier score an FGPP modification (Event 5136) that sets 'msDS-PasswordReversibleEncryptionEnabled'=TRUE
+    as high-risk based on actor, source workstation, timing, and changed attributes?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A Fine-Grained Password Policy (FGPP) object is created (Event ID 5137) or
+    modified (Event ID 5136) where the ''msDS-PasswordReversibleEncryptionEnabled'' attribute is set to
+    ''TRUE''. Score each FGPP modification with a supervised classifier (e.g., Random Forest or Gradient
+    Boosting) using features such as SubjectUserName, source workstation, time-of-day, day-of-week, and
+    the set of changed attributes. A high-risk score for a change enabling reversible encryption indicates
+    a likely malicious modification. The model captures combinations of weak signals (rare actor + off-hours
+    + unusual host) that individual rules miss; emit the top-3 contributing features in the alert so an
+    analyst can validate quickly.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 5137
+  - 'NAI: Domain Controllers, SYSVOL Share'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=rf_fgpp_classifier
+
+      features=[SubjectUserName, src_workstation, hour, weekday, changed_attrs]
+
+      | score events where EventCode=5136 AND changed_attrs CONTAINS "msDS-PasswordReversibleEncryptionEnabled=TRUE"
+
+      | where risk_score>=threshold
+
+      | output top3_features'
+- question: For an account with reversible encryption enabled, is a password change (Event ID 4723) followed
+    within five minutes by a successful interactive logon (Event ID 4624, Logon Type 2 or 10) from an
+    external (non-RFC1918) IP address?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Create a stateful rule that, for
+    accounts already flagged with reversible encryption, alerts when a password change (4723) is followed
+    within five minutes by a successful interactive logon (4624, Logon Type 2 or 10) from a non-RFC1918
+    source. The adversary objective once the flag is set is to recover the post-change plaintext, so a
+    reset immediately followed by an external interactive logon is the tell-tale takeover sequence. Capture
+    the source IP, logon type, and timing so the analyst can confirm whether the logon is consistent with
+    legitimate user behavior.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4723 TargetUserName IN (reversible_accounts)
+
+      | join type=inner TargetUserName [search EventCode=4624 LogonType IN (2,10) | where NOT cidrmatch("10.0.0.0/8",IpAddress)
+      AND NOT cidrmatch("172.16.0.0/12",IpAddress) AND NOT cidrmatch("192.168.0.0/16",IpAddress)]
+
+      | where logon_time-pwchange_time<=300
+
+      | table _time, TargetUserName, IpAddress, LogonType'
+- question: Does a reversible-encryption-flagged account authenticate (Event 4624) after an inactivity
+    gap in the 99th percentile of its own time-between-logons baseline, especially preceded by a burst
+    of failed logons?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Model per-account time-between-logons
+    from 4624 and alert when a flagged account authenticates after inactivity in the 99th percentile of
+    its baseline. Jointly profile failed logons (4625) and Zeek conn.log S0/REJ rates; a burst of failures
+    preceding the success strengthens the dormant-account-abuse hypothesis. Long-dormant accounts suddenly
+    waking up are a classic sign of an attacker activating a staged credential, and the failure burst
+    distinguishes brute-force/replay from a benign return-to-work logon.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4624 TargetUserName IN (reversible_accounts)
+
+      | streamstats current=f last(_time) as prev by TargetUserName
+
+      | eval gap=_time-prev
+
+      | eventstats perc99(gap) as p99 by TargetUserName
+
+      | where gap>p99
+
+      | join TargetUserName [search EventCode=4625 OR (source=zeek_conn conn_state IN ("S0","REJ")) |
+      stats count as fails by TargetUserName | where fails>baseline+3*std]'
+- question: Does a sequence model recognize the takeover chain [4738 enable reversible on User A] -> [4724/4723
+    password reset on A] -> [4624 logon by A from a new host] within roughly 30 minutes?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A successful authentication event (Windows Event ID 4624) occurs for an account
+    with reversible encryption enabled, immediately following a password change (Windows Event ID 4723)
+    or after a statistically significant period of account inactivity. Use a sequence model (HMM or LSTM)
+    over per-user event logs to recognize the causal chain of enabling reversible encryption, resetting
+    the password, and then logging on from a new host within about 30 minutes. Rank the resulting logon
+    as an anomalous causal login path or low-probability edge using graph models (Hopper/CyberGraph).
+    Output the top-3 features (sequence membership, new host, timing). A matched chain is high-confidence
+    evidence of an end-to-end credential takeover rather than incidental administrative activity.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4723
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Authentication Servers, Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=lstm_sequence input=per_user_event_logs(window=30m)
+
+      | detect chain [4738_enable_reversible -> 4723|4724_pwreset -> 4624_logon_new_host] same TargetUserName
+
+      | score logon as causal_path_anomaly via graph_edge_model
+
+      | output top3_features(seq_membership,new_host,timing)'
+- question: Has the 'Default Domain Policy' or 'Default Domain Controllers Policy' GPO been modified (Event
+    5136 / domain-policy change Event 4739) to enable 'Store passwords using reversible encryption' (ClearTextPassword
+    = 1 in GptTmpl.inf)?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Monitor modification events (Event 5136 and domain-policy change Event 4739) on the
+    well-known GUIDs for the Default Domain Policy ({31B2F340-016D-11D2-945F-00C04FB984F9}) and Default
+    Domain Controllers Policy ({6AC1786C-016F-11D2-945F-00C04FB984F9}). On change, inspect the SYSVOL
+    GptTmpl.inf for ''ClearTextPassword = 1'' and alert if reversible encryption is enabled. Enabling
+    this at the domain level affects all accounts and is only legitimately required for legacy protocols,
+    so it is a high-impact, high-signal event. Capture the actor and source host that performed the GPO
+    edit.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security (EventCode=5136 OR EventCode=4739) ObjectDN IN ("*31B2F340-016D-11D2-945F-00C04FB984F9*","*6AC1786C-016F-11D2-945F-00C04FB984F9*")
+
+      | union [| inputlookup sysvol_gpttmpl WHERE setting="ClearTextPassword" value=1]
+
+      | table _time, SubjectUserName, ComputerName, ObjectDN, setting, value'
+  - technology: Zeek/pseudocode
+    query: '# correlate SYSVOL SMB write to GptTmpl.inf with the policy GUID path
+
+      source=zeek_smb_files path="*\\Policies\\{31B2F340*}*GptTmpl.inf" action=write
+
+      | table ts, id.orig_h, id.resp_h, name, path'
+- question: Is a GPO modification enabling reversible encryption performed by a first-seen host or account,
+    or does the daily count/entropy of source hosts modifying GPOs spike beyond the historical baseline?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Profile the set of hosts and accounts that historically modify GPOs (5136) and alert
+    on a first-seen host or user enabling reversible encryption. Additionally monitor the daily count
+    and Shannon entropy of source hostnames modifying GPOs; a sharp entropy increase or count spike beyond
+    mean + 3 sigma indicates anomalous activity. GPO editing is normally performed by a small, stable
+    set of admins from a few hosts, so novelty and dispersion in that population are strong indicators
+    of compromise.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=5136 (GPO modification)
+
+      | stats count as edits dc(SubjectUserName) as users by ComputerName, date_mday
+
+      | eval entropy=shannon(ComputerName_distribution)
+
+      | where first_seen(ComputerName)=1 OR first_seen(SubjectUserName)=1 OR edits>mean+3*std OR entropy>baseline_entropy+3*std'
+- question: Does an anomaly model score a remote-administration session (by source IP reputation/geo,
+    protocol, and account) as a low-probability edge that is immediately followed by a 5136 enabling reversible
+    encryption?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: The Group Policy Object (GPO) for ''Default Domain Policy'' or ''Default Domain
+    Controllers Policy'' is modified to set ''Store passwords using reversible encryption'' to ''Enabled'',
+    with the change originating from a source host or user account that does not typically perform GPO
+    modifications. Score remote-administration sessions with an anomaly model using source IP reputation/geolocation
+    (Zeek conn.log), protocol (WinRM/RDP), and account. If a session scores anomalous as a low-probability
+    authentication edge and is immediately followed by a 5136 enabling reversible encryption, raise a
+    high-priority alert. Linking a suspicious inbound admin session to a damaging policy change ties the
+    who/where to the what, and the top-3 contributing features (new edge, source geo/ASN, protocol) help
+    the analyst confirm the session was not a sanctioned administrator.'
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4739
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, SYSVOL Share, Administrative Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=session_anomaly features=[src_ip_reputation, geo, asn, protocol(WinRM/RDP), account]
+
+      | score remote_admin_sessions
+
+      | join host,time [search EventCode=5136 reversible_enabled=TRUE]
+
+      | where session_anomaly_score>=threshold AND policy_change_followed=1
+
+      | output top3_features(new_edge,geo_asn,protocol)'
+- question: Does any PowerShell script block (Event ID 4104) set the reversible-encryption property, matching
+    patterns like 'Set-ADUser ... -AllowReversiblePasswordEncryption $true' or 'Set-ADAccountControl ...
+    -PasswordReversibleEncryption'?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. Detect PowerShell script blocks (Event 4104)
+    matching the regex /(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true/i
+    and the Set-ADAccountControl -PasswordReversibleEncryption variant. Alert on any match, especially
+    on Domain Controllers, because this scripted enable is the action that makes post-change plaintext
+    recovery possible. Capture the full script block, the executing user, and the host so the analyst
+    can assess intent and scope (single account vs. bulk enable).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104
+
+      | regex ScriptBlockText="(?i)(Set-ADUser|Set-ADAccountControl).*-AllowReversiblePasswordEncryption\s+\$true"
+
+      | append [search EventCode=4104 | regex ScriptBlockText="(?i)Set-ADAccountControl.*-PasswordReversibleEncryption"]
+
+      | table _time, UserID, Computer, ScriptBlockText'
+- question: Does a 4104 script block on a Domain Controller that references 'AllowReversiblePasswordEncryption'
+    also exhibit high character entropy or a letter-frequency profile far from normal PowerShell, indicating
+    obfuscation?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. For every 4104 script block on a DC, compute
+    character entropy and compare its letter-frequency profile against a normal-PowerShell baseline. Alert
+    when a script contains ''AllowReversiblePasswordEncryption'' AND its entropy exceeds the 98th-percentile
+    baseline OR its letter-frequency cosine-distance from normal exceeds a threshold. Obfuscation around
+    a sensitive cmdlet is a strong signal that the operator is deliberately hiding malicious intent rather
+    than performing a documented administrative change.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:PowerShell EventCode=4104 Computer IN (domain_controllers)
+
+      | search ScriptBlockText="*AllowReversiblePasswordEncryption*"
+
+      | eval entropy=shannon(ScriptBlockText), cos=cosine_dist(charfreq(ScriptBlockText), normal_ps_charfreq)
+
+      | where entropy>p98_entropy OR cos>cos_threshold'
+- question: Does a Gradient Boosting/XGBoost classifier trained on 4104 content (AST feature hashing,
+    cmdlet co-occurrence, encoding-function presence, obfuscation metrics) return a 'malicious' verdict
+    for a script that includes Set-ADUser + AllowReversiblePasswordEncryption?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A PowerShell script block log (Windows Event ID 4104) is observed containing
+    script content that sets the ''AllowReversiblePasswordEncryption'' property on an AD user object,
+    especially if the script exhibits signs of obfuscation. Train a classifier (Gradient Boosting/XGBoost)
+    on 4104 content using AST feature hashing, cmdlet co-occurrence, encoding-function presence (e.g.,
+    FromBase64String), and string-obfuscation metrics; optionally use AMSI post-deobfuscation contextual
+    embeddings. A ''malicious'' verdict on a script including Set-ADUser plus AllowReversiblePasswordEncryption
+    is high-fidelity. Surface the top-3 features (e.g., encoding calls, entropy, AST anomaly) in the alert
+    so the analyst understands why the script was flagged and can prioritize response.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Administrative Workstations, PowerShell Transcript Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=xgb_powershell features=[ast_hash, cmdlet_cooccurrence, encoding_calls(FromBase64String),
+      obfuscation_metrics, amsi_embeddings]
+
+      | score events where EventCode=4104 AND ScriptBlockText CONTAINS "AllowReversiblePasswordEncryption"
+
+      | where verdict="malicious"
+
+      | output top3_features(encoding_calls,entropy,ast_anomaly)'
+- question: Was a 4738 event setting the reversible-encryption (0x80) flag generated by an account that
+    is NOT on the explicit allow-list of AD security administrators authorized to make this change?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Maintain an explicit allow-list of
+    ''AD Security Admin'' accounts authorized to enable reversible encryption and generate a high-priority
+    alert when a 4738 event sets the 0x80 flag by any account not on that list. Because the default policy
+    is Disabled, off-list enables are presumptively malicious. This approach attributes the change to
+    a specific actor and immediately separates sanctioned maintenance from abuse, even when the change
+    itself is technically valid.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=0x80)
+
+      | where NOT SubjectUserName IN (ad_security_admin_allowlist)
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: Does a 4738 reversible-encryption enable occur more than 2 sigma from an administrator's normal
+    activity time, or does the per-day rate of such enables exceed the moving mean + 3 sigma?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Build per-admin baselines of activity
+    hours and modification frequency for 4738 events and alert when an enable occurs more than 2 sigma
+    from the admin''s mean activity time, or when the per-day rate of reversible-encryption enables exceeds
+    the moving mean + 3 sigma. Timing and volume anomalies catch credential-stuffing or compromised-admin
+    scenarios where the legitimate account is used at abnormal hours or to mass-enable the flag across
+    many accounts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | eval hour=strftime(_time,"%H")
+
+      | stats count as enables by SubjectUserName, date_mday, hour
+
+      | append [| inputlookup admin_4738_baseline]
+
+      | where abs(hour-mean_hour)>2*std_hour OR enables>mean_enables+3*std_enables'
+- question: Does a clustering model over administrative-action features classify a 4738 reversible-encryption
+    enable as a noise point/outlier that deviates from all established admin patterns?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: An Active Directory user account modification event (Windows Event ID 4738)
+    enabling reversible encryption is attributed to a user account or source host with no history of such
+    changes, or the event occurs at a statistically anomalous time. Apply clustering (e.g., DBSCAN) over
+    administrative-action features such as admin account, source host, target object class, and attributes
+    modified. A 4738 enable classified as a noise point (outlier) deviates from every established admin
+    pattern and is therefore suspicious. Report the top-3 features that made it an outlier. This unsupervised
+    approach surfaces never-before-seen combinations of actor/host/action without requiring labeled malicious
+    examples.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Administrative Workstation Event Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=dbscan features=[SubjectUserName, src_host, target_object_class, attrs_modified]
+
+      | fit_predict on EventCode=4738 reversible_enabled=TRUE
+
+      | where cluster_label=-1
+
+      | output top3_outlier_features'
+- question: Following a recent reversible-encryption change, has a Domain Controller executed a known
+    credential-dumping process (Event 4688 / Defender 1116), run 'Invoke-Mimikatz'/'lsadump::dcsync' (4104),
+    or seen directory-replication access (4662 with DRSUAPI GUIDs) from a non-DC source?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Monitor process creation (Event 4688) and AV detections (Defender
+    Event 1116), alerting when a process hash matches credential-dumping threat intel, when 4104 contains
+    ''Invoke-Mimikatz'' or ''lsadump::dcsync'', or when Event 4662 shows directory replication (GUIDs
+    1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 / 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2) from a non-DC source.
+    This is the DCSync payoff that recovers password data after reversible encryption is enabled, so correlating
+    it with a recent flag change confirms the end-to-end credential-theft objective.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(source=WinEventLog:Security EventCode=4688 process_hash IN (cred_dump_intel))
+
+      OR (source=WinEventLog:Defender EventCode=1116 ThreatName IN (cred_dump_sigs))
+
+      OR (EventCode=4104 ScriptBlockText IN ("*Invoke-Mimikatz*","*lsadump::dcsync*"))
+
+      OR (EventCode=4662 Properties IN ("*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*","*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*")
+      AND src NOT IN (domain_controllers))
+
+      | where exists_recent_4738_reversible_enable(window=24h)
+
+      | table _time, Computer, SubjectUserName, signal'
+- question: On a Domain Controller, is powershell.exe/rundll32.exe spawned from an unusual parent (e.g.,
+    spoolsv.exe, a web worker) that then loads the ActiveDirectory module or makes outbound connections,
+    alongside failed object-access or refused network connections?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Profile parent-child process lineage on DCs and flag powershell.exe/rundll32.exe
+    spawned from unusual parents (e.g., spoolsv.exe or a web-worker) that then load the ActiveDirectory
+    module or make outbound connections. Also profile failed object-access (4663 access-denied) and Zeek
+    S0/REJ from the host as a probing signal. Anomalous process ancestry on a DC is a hallmark of exploitation
+    or injection used to stage credential theft, and the failure signals indicate reconnaissance preceding
+    success.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4688 Computer IN (domain_controllers)
+
+      | where (NewProcessName IN ("*powershell.exe","*rundll32.exe")) AND (ParentProcessName IN (anomalous_parents)
+      OR NOT parent_child IN (baseline_lineage))
+
+      | join Computer [search EventCode=4663 AccessMask=access_denied OR (source=zeek_conn conn_state
+      IN ("S0","REJ"))]
+
+      | table _time, Computer, ParentProcessName, NewProcessName'
+- question: Does a classifier over sequences of network connections and process API calls label a recent
+    session as DCSync/credential-dumping for an account whose reversible encryption was just enabled?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A process is executed on a Domain Controller that is associated with known
+    credential access tools or frameworks, such as Mimikatz or PowerSploit, following a recent modification
+    to user account encryption properties. Classify credential-dumping behavior from sequences of network
+    connections and process API calls (KAIROS-style provenance learning). If an account recently had reversible
+    encryption enabled and a subsequent session is classified as DCSync/credential-dumping, raise a critical
+    alert. Surface the top-3 contributing features (replication call, non-DC source, recent flag change).
+    Tying the behavioral classification back to the reversible-encryption precondition produces a high-confidence,
+    explainable detection of the full attack.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Windows Event ID 4662
+  - Windows Defender Event ID 1116
+  - 'NAI: Domain Controllers, Administrative Workstations, Tier 0 Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=kairos_provenance features=[net_conn_seq, process_api_seq]
+
+      | classify sessions where account IN (recent_reversible_enabled_accounts)
+
+      | where label="dcsync_credential_dump"
+
+      | output top3_features(replication_call,non_dc_source,recent_flag_change)'
+- question: On a 4738 event, does bitwise-AND of the old and new userAccountControl with 0x80 show the
+    flag was newly added (old result 0, new result 128), and is the target a member of a privileged group?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. On Event 4738, bitwise-AND the old and new ''User Account Control'' values with 0x80 and
+    alert when the old result is 0 and the new result is 128 (0x80). Escalate priority when the target
+    account is a member of a privileged group, because weakening a high-value account dramatically raises
+    impact. Given the Disabled-by-default policy, this transition is presumptively suspicious; capture
+    the target''s group memberships to drive triage severity.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738
+
+      | eval old=tonumber(OldUACValue,16), new=tonumber(NewUACValue,16)
+
+      | where ((old & 0x80)=0) AND ((new & 0x80)=128)
+
+      | lookup privileged_groups TargetUserName OUTPUT is_privileged
+
+      | eval severity=if(is_privileged="yes","critical","high")
+
+      | table _time, SubjectUserName, TargetUserName, is_privileged, severity'
+- question: Does the rate of userAccountControl modifications enabling reversible encryption exceed the
+    moving mean + 3 sigma (e.g., more than five accounts in one minute), indicating a mass-enable anomaly?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. Track the rate of userAccountControl modifications enabling reversible encryption, maintaining
+    a moving average and standard deviation, and alert when the rate exceeds mean + 3 sigma (for example,
+    more than five accounts enabled in one minute is a mass-enable anomaly). A sudden burst of enables
+    is inconsistent with deliberate, case-by-case legacy-app configuration and strongly suggests automated,
+    adversary-driven weakening of many accounts at once.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | bin _time span=1m
+
+      | stats count as enables by _time
+
+      | eventstats avg(enables) as mean stdev(enables) as std
+
+      | where enables>mean+3*std OR enables>5'
+- question: Does peer-group analysis flag a userAccountControl change that is typical only for a different
+    peer group (e.g., a marketing user modified like a legacy service account)?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A directory service audit event (Windows Event ID 4738) shows that the ''UF_ENCRYPTED_TEXT_PASSWORD_ALLOWED''
+    flag (0x80) has been added to a user''s ''User Account Control'' attribute, particularly for a high-privilege
+    account. Group users by role, department, and normal activity, then flag a userAccountControl change
+    that is typical only for a different peer group, such as a marketing user being modified the way a
+    legacy service account would be. Report the peer-group baseline and the top-3 features that drove
+    the anomaly. Peer-group modeling catches changes that look administratively normal in isolation but
+    are out of place for the specific account''s role, a subtle indicator of targeted abuse.'
+  answer_sources:
+  - Windows Event ID 4738
+  - 'NAI: Domain Controllers, Active Directory Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=peer_group_anomaly group_by=[role, department, activity_profile]
+
+      | score EventCode=4738 reversible_enabled=TRUE
+
+      | where change_typical_for_other_peer_group=1
+
+      | output peer_baseline, top3_features'
+- question: Within a tight window, does a 4738 reversible-encryption enable precede a password change
+    (4723) for the same target and then an LSA-secret access attempt (4656/4663 on G$MSRADIUSCHAPKEY)
+    or directory replication (4662) from the same source user/host?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Build
+    a stateful rule that triggers on a 4738 enabling reversible encryption; if within 10 minutes a password
+    change (4723) for the same target occurs, followed by an LSA-secret access attempt (4656 handle request
+    / 4663 object access on G$MSRADIUSCHAPKEY) or directory replication (4662) from the same source user/host,
+    raise a critical credential-access alert. This is the full reversible-encryption attack chain, where
+    the adversary enables the flag, forces a fresh encrypted password, and then steals the key material
+    needed to decrypt it.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=WinEventLog:Security EventCode=4738 reversible_enabled=TRUE
+
+      | join TargetUserName [search EventCode=4723 | where pwchange_time-enable_time<=600]
+
+      | join SubjectUserName,ComputerName [search (EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*")
+      OR EventCode=4662 (DRSUAPI replication GUIDs)]
+
+      | eval severity="critical"
+
+      | table _time, SubjectUserName, TargetUserName, ComputerName'
+- question: After a reversible-encryption enable, does an LSA-secret access (4656/4663) come from a user/host
+    in the 99th percentile of rarity for such access, or with access-denied failures preceding success?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Baseline
+    the frequency of LSA-secret access (4656/4663) per user and host. An enable-reversible event followed
+    by LSA access from a user/host in the 99th percentile of rarity, or with access-denied (4663) failures
+    preceding a success, is a high-confidence anomaly. LSA-secret access is rare and tightly scoped in
+    normal operations, so rarity plus a preceding failure burst pinpoints the adversary''s attempt to
+    harvest the G$MSRADIUSCHAPKEY material.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=WinEventLog:Security EventCode IN (4656,4663) ObjectName="*G$MSRADIUSCHAPKEY*"
+
+      | stats count as accesses by SubjectUserName, ComputerName
+
+      | eventstats perc99(accesses) as p99
+
+      | where rarity_rank>=p99 OR access_denied_then_success=1
+
+      | where exists_recent_4738_reversible_enable(window=1h)'
+- question: Does graph analytics match the attack chain (enable reversible -> change password -> access
+    LSA secret/replicate) as a completing path in the provenance/audit graph within the time window?
+  context: '[Credential Access] From a Credential Access perspective, reversible encryption is the precondition
+    for recovering plaintext passwords (G$RADIUSCHAP/G$RADIUSCHAPKEY plus the G$MSRADIUSCHAPKEY LSA secret),
+    so this activity is a direct stepping-stone to mass credential theft. This addresses the information
+    requirement: "Is the adversary establishing persistence by modifying account properties for reversible
+    encryption?" Evidence: A sequence of events occurs in a short time window: 1) A user account is modified
+    to enable reversible encryption (Windows Event ID 4738), followed by 2) a password change for that
+    account (Windows Event ID 4723), and then 3) an attempt to access LSA secrets (e.g., `G$MSRADIUSCHAPKEY`)
+    on a Domain Controller (Windows Event ID 4656/4663) or directory replication (Event ID 4662). Encode
+    the chain as a query graph (nodes = user/host, edges = ''enable reversible'' -> ''change password''
+    -> ''access LSA secret/replicate'') and match it against the provenance/audit graph (POIROT-style),
+    alerting when the path completes within the time window. Use temporal-graph reconstruction (KAIROS)
+    to localize and explain the subgraph with edge-level contributions. Graph matching detects the multi-step
+    campaign as a single connected story and gives the analyst an explainable subgraph rather than disconnected
+    alerts.'
+  answer_sources:
+  - Windows Event ID 4738
+  - Windows Event ID 4723
+  - Windows Event ID 4656
+  - Windows Event ID 4663
+  - Windows Event ID 4662
+  - 'NAI: Domain Controllers, LSA Security Audit Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'query_graph = nodes[user,host] edges[enable_reversible->change_password->access_lsa_secret|replicate]
+
+      | match against provenance_audit_graph(window)
+
+      | alert when path_complete=TRUE
+
+      | reconstruct temporal_subgraph; output edge_level_contributions'
