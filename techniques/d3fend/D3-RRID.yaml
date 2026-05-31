@@ -1,0 +1,365 @@
+name: 'D3-RRID: Reverse Resolution IP Denylisting'
+id: 042ec0b2-6e7e-4739-89b1-f4ecbf9ed307
+description: Investigate hosts and external IP addresses involved in reverse-DNS (PTR) resolution to identify
+  candidates for reverse-resolution IP denylisting and to detect reverse-DNS reconnaissance. This playbook
+  helps an analyst isolate reverse lookups (QTYPE=PTR over the IN-ADDR.ARPA/ip6.arpa namespace) in resolver
+  telemetry, decode the IP value encoded in each PTR query name, and reconcile both the requesting source
+  and the target IP against threat intelligence. It covers verifying that the resolver actually enforces
+  denylist policy (RPZ / Windows DNS policy), detecting horizontal reverse-DNS sweeps via sequential hypothesis
+  testing and failure-rate profiling, surfacing volumetric and compositional outliers, and applying unsupervised
+  and supervised models to score per-source behavior and target-IP reputation. Passive-DNS and answer-based
+  enrichment quantify prevalence, reputation, and fast-flux/agile infrastructure dynamism so that low-reputation
+  or churning IPs can be added to the denylist before they appear on public blacklists, all without disrupting
+  benign resolver activity.
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which reverse-lookup (PTR) queries seen on internal resolvers carry a target IP value that
+    matches the UNION of threat-intelligence feeds, and which internal sources are issuing them?
+  context: Isolate reverse lookups by selecting QTYPE=PTR over the IN-ADDR.ARPA/ip6.arpa namespace (RFC
+    1035), decode the IP value encoded in the PTR query name (e.g. 4.3.2.1.in-addr.arpa -> 1.2.3.4), and
+    reconcile BOTH the requesting internal source and the decoded target IP against the UNION of all available
+    threat-intelligence feeds. Reconcile against the union rather than any single feed because feeds are
+    largely disjoint and individually incomplete. A match on the target IP gives immediate, high-confidence
+    justification to denylist that infrastructure (Isolate tactic); a match on the source flags a potentially
+    compromised internal host enumerating attacker infrastructure. A positive hit should drive immediate
+    containment review; a negative result does not exonerate the IP, since feeds lag real-world badness.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM dns.log WHERE qtype_name == "PTR"
+
+      | WHERE query MATCHES /\.(in-addr|ip6)\.arpa$/
+
+      | EVAL target_ip = decode_arpa(query)
+
+      | WHERE target_ip IN ti_union OR id.orig_h IN ti_union
+
+      | TABLE ts, id.orig_h, query, target_ip, answers, rcode'
+- question: For every PTR query whose decoded IP value is on the reverse-resolution denylist, did the
+    resolver actually return a policy-block outcome rather than a valid answer?
+  context: 'Enforcement verification. For each PTR query whose decoded target IP is on the reverse-resolution
+    denylist, confirm the resolver returned a policy block: NXDOMAIN/NODATA by policy, a DROP, or a sinkhole
+    redirect, as defined by DNS Response Policy Zones (RPZ) or a Windows DNS query-resolution policy DENY/IGNORE
+    action. Alert on any denylisted IP whose PTR query returns rcode NOERROR with a valid name, because
+    that means enforcement silently failed or was bypassed. Explicitly reconcile RPZ PASSTHRU / allow
+    exceptions so an override cannot quietly disable enforcement. A positive result (block) confirms the
+    control works; a NOERROR result is a control-gap finding that demands immediate remediation of the
+    resolver policy.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM dns_resolver_log WHERE qtype == "PTR"
+
+      | EVAL target_ip = decode_arpa(query)
+
+      | WHERE target_ip IN reverse_denylist
+
+      | WHERE rcode == "NOERROR" AND answers != null AND policy_action NOT IN ("DENY","DROP","NXDOMAIN","SINKHOLE")
+
+      | ALERT "denylisted PTR not enforced"
+
+      | ALSO list policy_action == "PASSTHRU" for exception review'
+- question: Which internal sources repeatedly perform PTR queries against high-risk infrastructure ranges
+    or reappear after a prior enforcement window, warranting an automated denylist recommendation?
+  context: Persistent high-risk behavior should trigger denylist expansion (Isolate). Flag a source when
+    it repeatedly issues PTR queries against high-risk infrastructure ranges, or when it resumes such
+    activity after a previous enforcement/containment window expired. Confirmed target IPs should be pushed
+    into the resolver client-subnet / response-IP denylist via RPZ or Windows DNS policy. The investigative
+    goal is to distinguish one-off lookups from sustained reconnaissance or C2-staging behavior. A positive
+    result is a recommendation to programmatically add the target IP(s) to the denylist and to re-examine
+    the source host for compromise.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM dns.log WHERE qtype_name == "PTR"
+
+      | EVAL target_ip = decode_arpa(query)
+
+      | WHERE target_ip IN high_risk_ranges OR target_ip IN prior_enforced_ips
+
+      | STATS hits = count(), distinct_targets = dcount(target_ip) BY id.orig_h
+
+      | WHERE hits >= 5 OR (id.orig_h SEEN_IN prior_enforcement_window)
+
+      | RECOMMEND denylist(target_ip)'
+- question: Which sources show a reverse-DNS sweep pattern when each PTR query is treated as a success/failure
+    trial in a sequential hypothesis test?
+  context: 'Apply the Threshold Random Walk (sequential hypothesis testing) per source: treat each PTR
+    query as a success (valid PTR answer) or failure (NXDOMAIN/empty), update a per-source likelihood
+    ratio, and flag the source as a scanner once the ratio crosses the upper threshold (typically after
+    ~4-5 consecutive failures). This catches stealthy, low-volume reverse-DNS reconnaissance that simple
+    counts miss. Provide a deterministic floor by also alerting on any source exceeding a tuned fixed
+    count (start at >20 distinct target IPs with no valid PTR answer in 5 minutes), calibrated to the
+    resolver''s benign distribution. A flagged source is a strong reconnaissance indicator and a candidate
+    for both host investigation and denylisting of the targets it probed.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; evaluate over sliding 5-minute windows
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR each PTR query per source in time order:\n  outcome = (rcode == NXDOMAIN OR answers empty)\
+      \ ? FAILURE : SUCCESS\n  llr += log( P(outcome|scanner) / P(outcome|benign) )\n  IF llr > upper_threshold:\
+      \ FLAG source as reverse-DNS scanner\n# deterministic floor\n| STATS no_ans_targets = dcount_if(target_ip,\
+      \ no_valid_ptr) BY id.orig_h, window=5m\n| WHERE no_ans_targets > 20"
+- question: Which source IPs generate PTR query volumes that exceed the 95th percentile of the resolver's
+    baseline over a 24-hour window?
+  context: 'Volumetric outlier detection. Compute 24-hour PTR query counts per source IP, build baseline
+    distributions from historical data, and flag sources above the 95th percentile as anomalous reverse-resolution
+    activity requiring containment review. Calibrate against empirical scanning baselines: real scanning
+    is characterized by a few but very high-volume sources providing broad horizontal coverage. This statistical
+    screen complements the sequential test by catching loud, high-rate enumeration. A source above the
+    threshold warrants review of which target ranges it touched and whether those targets should be denylisted.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; per-source 24-hour aggregation
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM dns.log WHERE qtype_name == "PTR"
+
+      | BIN ts span=24h
+
+      | STATS ptr_count = count() BY id.orig_h, bin
+
+      | EVENTSTATS p95 = percentile(ptr_count, 95)
+
+      | WHERE ptr_count > p95
+
+      | SORT ptr_count desc'
+- question: Which source IPs show a high PTR query volume combined with a >90% NXDOMAIN/empty-response
+    failure rate, and what horizontal address-space coverage do they exhibit?
+  context: 'Monitor for PTR scan sweeps using the failure-rate channel. Track the ratio of NXDOMAIN/empty
+    responses to total PTR queries per source IP, and alert on sources combining high volume with >90%
+    failure rates, the signature of a reverse-DNS sweep across the network address space. Maintain a per-host
+    NXDOMAIN-rate EWMA / robust z-score over a 30-day window to flag excursions, since failed resolutions
+    are a distinct high-signal channel. The discriminating sweep feature is horizontal coverage: count
+    distinct /24s or contiguous IN-ADDR.ARPA ranges queried. A positive result is strong evidence of reconnaissance
+    and a trigger to denylist the source and review the probed ranges.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; 30-day EWMA baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM dns.log WHERE qtype_name == "PTR"
+
+      | EVAL fail = (rcode == NXDOMAIN OR answers empty)
+
+      | STATS total = count(), fails = sum(fail), subnets = dcount(/24 of target_ip) BY id.orig_h
+
+      | EVAL fail_rate = fails/total
+
+      | WHERE total > vol_floor AND fail_rate > 0.90
+
+      | EVAL z = robust_z(fail_rate, ewma_30d(id.orig_h))
+
+      | WHERE z > 3 OR subnets > coverage_floor'
+- question: Which sources are statistical outliers when scored on stateless PTR-traffic features (query
+    rate, distinct target IPs/ASNs, name entropy, success/failure ratio)?
+  context: Compute per-source stateless volume/lexical features over PTR traffic and flag statistical
+    outliers, following the line-rate stateless-feature approach for DNS abuse detection. Features should
+    span Volume (PTR query bytes/count per source), Frequency (queries per minute), and State (PTR success
+    vs NXDOMAIN), plus distinct target IP count, distinct target ASN count, and queried-name entropy.
+    This is computable at line rate and does not require per-flow state, making it deployable on busy
+    resolvers. Outliers across these dimensions indicate automated/abnormal reverse-resolution behavior
+    worth containment review and potential denylisting.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; per-minute and per-source aggregation
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM dns.log WHERE qtype_name == \"PTR\"\n| STATS qpm = count()/window_minutes,\n        dst_ips\
+      \ = dcount(target_ip),\n        dst_asns = dcount(asn(target_ip)),\n        name_entropy = shannon_entropy(query),\n\
+      \        sf_ratio = sum(success)/sum(failure) BY id.orig_h\n| EVAL score = outlier_score(qpm, dst_ips,\
+      \ dst_asns, name_entropy, sf_ratio)\n| WHERE score > threshold"
+- question: Which source IPs fall into outlier clusters when their DNS behavior is grouped by total queries,
+    PTR failure ratio, distinct-target count, name entropy, and TLD diversity?
+  context: Unsupervised clustering surfaces covert scanners and C2-staging behavior for proactive denylisting.
+    Cluster source IP behavior on total queries, PTR failure ratio, distinct-target-IP count, queried-name
+    entropy, and TLD diversity to identify outlier groups. Use an Isolation Forest over the same per-source
+    feature vectors so detection runs label-free directly on internal logs, and surface the top-3 contributing
+    features (e.g. failure ratio, distinct-target count, entropy) in the alert text so analysts understand
+    the driver. A source landing in an anomalous cluster is a candidate for investigation and for denylisting
+    the infrastructure it targeted (Isolate).
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = per_source[total_q, ptr_fail_ratio, distinct_target_ips, name_entropy, tld_diversity]
+
+      model = IsolationForest().fit(features)   # label-free
+
+      scores = model.decision_function(features)
+
+      ALERT sources WHERE anomaly_score high
+
+      EMIT top_3_contributing_features per alert'
+- question: Which sources produce reconstruction-error spikes in an online autoencoder-ensemble scoring
+    incrementally-computed per-source reverse-lookup statistics?
+  context: 'Run an online autoencoder-ensemble detector (Kitsune-style) over incrementally computed per-source
+    DNS statistics: PTR query rate, distinct target IPs/ASNs across multiple time windows, and failure
+    rate. Alert on reconstruction-error spikes. The detector is unsupervised, low-compute for continuous
+    deployment, and emits per-feature reconstruction error so analysts can see which feature drove the
+    score. This catches drifting/novel reverse-resolution abuse in streaming fashion without labeled data,
+    complementing batch methods. A reconstruction-error spike flags the source for containment review
+    and the targeted IPs for denylist consideration.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; streaming/online scoring
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "for each event stream per source:\n  x = incremental_features(ptr_rate, dcount_target_ip[w],\
+      \ dcount_asn[w], fail_rate)\n  err = kitsune_ensemble.score(x)        # online, unsupervised\n \
+      \ if err > dynamic_threshold:\n     ALERT source with per_feature_reconstruction_error"
+- question: Which failed (NXDOMAIN) reverse lookups in first-party resolver logs are classified as malicious
+    automation versus benign failures by a supervised model?
+  context: Apply a Random Forest over structural/statistical features of failed (NXDOMAIN) PTR lookups
+    in first-party resolver logs to separate benign automated failures from malicious ones, following
+    the FANCI approach. Failed resolutions are a distinct high-signal channel for malware/recon behavior.
+    Confirmed malicious sources/targets should be fed into the denylist, and the alert should emit the
+    top contributing features for analyst review. A positive classification is direct justification for
+    denylisting the target IP and investigating the source host.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytic Event ID 257
+  - Windows DNS Server Analytical Log
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'FROM resolver_log WHERE qtype == "PTR" AND rcode == NXDOMAIN
+
+      | EVAL feats = structural_statistical_features(query, source, timing)
+
+      | EVAL label = RandomForest.predict(feats)   # benign | malicious
+
+      | WHERE label == "malicious"
+
+      | ADD target_ip TO denylist; EMIT top_features'
+- question: Which external IPs appearing as PTR targets are low-prevalence and low-reputation when scored
+    over a 30-day window with passive-DNS and answer-based features?
+  context: For each external IP appearing as a PTR target, compute 30-day query frequency and unique-client
+    prevalence, isolate the lowest 5th percentile, and enrich with answer-based features (distinct resolved
+    IPs/ASNs, short TTL, reverse-DNS structure) to prioritize suspicious low-prevalence IPs for denylist
+    review. This follows passive-DNS feature families from EXPOSURE and the network/zone/evidence reputation
+    features from Notos. Rarely-seen IPs that also exhibit suspicious answer dynamics are strong denylist
+    candidates before they reach public blacklists (Isolate). A flagged IP should be queued for analyst
+    confirmation and denylist expansion.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytical Log
+  - Passive DNS
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; 30-day prevalence window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM dns.log JOIN passive_dns ON target_ip\n| WHERE seen_as_ptr_target == true\n| STATS freq_30d\
+      \ = count(), clients = dcount(id.orig_h),\n        distinct_resolved = dcount(resolved_ip), distinct_asn\
+      \ = dcount(asn),\n        min_ttl = min(ttl) BY target_ip\n| EVENTSTATS p5_prev = percentile(clients,\
+      \ 5)\n| WHERE clients <= p5_prev AND (min_ttl < 300 OR distinct_asn high)\n| RANK for denylist review"
+- question: Which PTR-target IPs are tied to domains showing fast-flux / agile infrastructure dynamism
+    (rapid resolved-IP set growth, many ASNs, short TTLs)?
+  context: Track the resolved-IP set, ASN count, and IP-set growth rate associated with the domains tied
+    to PTR-target IPs over a rolling window, and flag abnormal growth combined with short TTLs. This identifies
+    churning malicious infrastructure (fast-flux) that static denylists miss for weeks, following the
+    FluxBuster approach. Agile infrastructure rotates IPs to evade blocking, so growth rate and TTL are
+    the discriminating features. A positive result identifies an agile infrastructure cluster whose IPs
+    should be denylisted proactively (Isolate) before the next rotation.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytical Log
+  - Passive DNS
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days; rolling-window growth tracking
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM passive_dns WHERE domain IN domains_of(ptr_target_ips)\n| STATS resolved_set = collect(resolved_ip),\
+      \ asn_count = dcount(asn),\n        min_ttl = min(ttl) BY domain, window\n| EVAL growth_rate = delta(size(resolved_set))\
+      \ / window\n| WHERE growth_rate > flux_threshold AND asn_count > asn_floor AND min_ttl < 300\n|\
+      \ FLAG fast_flux; RECOMMEND denylist(resolved_set)"
+- question: Which external IPs targeted by reverse lookups rank as high-confidence malicious by a trained
+    reputation classifier using time, answer-based, TTL, and lexical features?
+  context: Train a decision-tree/reputation classifier on known-good and known-bad IPs using time, answer-based
+    (distinct IPs/ASNs, reverse-DNS presence), TTL, and lexical features, then apply it to the external
+    IPs targeted by reverse lookups to rank high-confidence candidates for denylist expansion. Following
+    EXPOSURE and Notos, the model must surface the top-3 contributing features in the alert text so analysts
+    can validate the score. High-confidence malicious rankings give defensible justification for proactive
+    denylisting (Isolate) ahead of public blacklists.
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytical Log
+  - Passive DNS
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = ip_features[time_of_day, distinct_resolved_ips, distinct_asns, has_reverse_dns,
+      ttl_stats, lexical]
+
+      model = DecisionTreeReputation().fit(known_good, known_bad)
+
+      score = model.predict_proba(ptr_target_ip_features)
+
+      RANK ptr_target_ips BY score desc
+
+      EMIT top_3_contributing_features; RECOMMEND denylist(high_confidence)'
+- question: Which PTR-target IPs share resolved-IP sets or ASN co-occurrence with a confirmed-malicious
+    IP, yielding neighboring denylist candidates?
+  context: 'Cluster target IPs and their associated domains by shared resolved-IP sets and ASN co-occurrence
+    to group related malicious infrastructure, so confirming one IP automatically yields neighboring denylist
+    candidates, per FluxBuster. This expands the denylist efficiently: once one IP in a cluster is confirmed
+    malicious, its co-located infrastructure inherits suspicion. The analyst goal is to map the blast
+    radius of confirmed-bad infrastructure and proactively denylist the cluster (Isolate). A positive
+    result is a set of related IPs/domains recommended for batch denylisting.'
+  answer_sources:
+  - Zeek dns.log
+  - Windows DNS Server Analytical Log
+  - Passive DNS
+  - 'NAI: Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "graph = build_graph(ptr_target_ips, domains, edges=[shared_resolved_ip, shared_asn])\nclusters\
+      \ = community_detect(graph)\nfor cluster in clusters:\n  if cluster contains confirmed_malicious_ip:\n\
+      \     RECOMMEND denylist(all members of cluster)"
