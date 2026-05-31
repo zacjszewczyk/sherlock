@@ -1,0 +1,472 @@
+name: 'D3-PFV: Peripheral Firmware Verification'
+id: 591c59eb-3ab5-4430-8192-a4ae56668028
+description: Investigate the integrity of peripheral and platform firmware (webcams, NICs, storage/USB
+  controllers, BMCs, routers/switches and similar updatable devices) to detect unauthorized modification,
+  supply-chain compromise, and stealth firmware implants. This playbook helps an analyst confirm whether
+  running and stored firmware matches approved per-model golden hashes / Reference Integrity Measurements,
+  whether only signed and version-monotonic images are accepted, and whether TPM measured-boot attestation
+  deviates from the signed RIM database. It also covers statistical detection of mismatch/failure rate
+  spikes, entropy and fuzzy-hash screening of unknown images, software-based attestation timing checks,
+  and machine-learning risk scoring with feature attribution. Finally it corroborates firmware-verification
+  mismatches with post-change device behavior - new listening services/ports, anomalous outbound volume
+  or beaconing, and anomalous host process/device-interface activity - to catch implants that survived
+  or evaded static checks.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there any firmware-verification events where a running or stored peripheral firmware hash
+    or measurement fails to match the approved golden-hash / Reference-Integrity-Measurement (RIM) value
+    for that exact device model?
+  context: Under the Detect tactic the deterministic floor for firmware integrity is an exact comparison
+    of the device's running/stored firmware hash or measurement against the per-model golden-hash/RIM
+    repository, anchored by a Root of Trust for Detection (NIST SP 800-193). Any mismatch means the firmware
+    on the device is not the approved baseline and may have been tampered with, replaced with a malicious
+    image, or drifted to an unapproved version. A single confirmed mismatch is high-severity and must
+    alert immediately; a clean match only confirms the baseline for models that actually have a golden
+    value recorded, so also verify coverage. Capture device model, firmware family/version, host, and
+    whether the value compared was the running image or a stored copy.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=firmware_verification event=hash_compare
+        | lookup golden_hash_repo model AS device_model OUTPUT golden_hash, golden_measurement
+        | where (running_hash != golden_hash) OR (measurement != golden_measurement)
+        | eval severity="high"
+        | table _time, host, device_model, firmware_version, running_hash, golden_hash, source
+        | alert immediate
+- question: Are firmware images being written or run that lack a valid vendor digital signature, or that
+    represent a downgrade (a non-version-monotonic write) to an older or known-vulnerable release?
+  context: The signed-update model (NIST SP 800-147) requires that only images bearing a valid vendor
+    signature verified by the Root of Trust for Update be accepted, and that writes be version-monotonic.
+    Treat any unsigned image, any image failing signature verification, and any write whose version is
+    lower than the currently installed version as a violation. Crucially, a legitimately signed but old
+    or vulnerable image must still be flagged as a downgrade, because adversaries roll back to vulnerable
+    signed firmware to re-open exploited paths (BlackLotus). A hit here means firmware is being installed
+    outside policy; investigate the writing process, account, and whether a maintenance window applies.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=firmware_verification (event=signature_check OR event=firmware_write)
+        | eval unsigned=if(signature_valid!="true",1,0)
+        | eval downgrade=if(new_version < installed_version,1,0)
+        | where unsigned=1 OR downgrade=1
+        | eval reason=case(unsigned=1,"unsigned/invalid_sig",downgrade=1,"rollback_downgrade")
+        | table _time, host, device_model, new_version, installed_version, reason
+- question: For devices that support a TPM and measured boot, do the reported measured-boot / PCR values
+    deviate from the signed Reference Integrity Measurement (RIM) database when checked via remote attestation?
+  context: TPM-backed measured-boot attestation (NIST SP 800-155) extends integrity assurance beyond static
+    file hashing by comparing the runtime PCR/measurement chain reported by the device to a signed RIM
+    database during remote attestation. A deviation indicates the boot/firmware measurement chain no longer
+    matches the approved reference, which can reveal tampering that static hashing of a stored image would
+    miss (e.g., runtime relocation or measurement forgery attempts). Alert on any attestation deviation,
+    and verify the attestation itself was signed/valid to avoid spoofed quotes. A clean attestation strongly
+    corroborates integrity; a deviation is a tamper signal warranting isolation.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=attestation source=tpm_rim event=remote_attestation
+        | lookup signed_rim_db model AS device_model, pcr_index OUTPUT expected_pcr
+        | where reported_pcr != expected_pcr OR quote_signature_valid!="true"
+        | table _time, host, device_model, pcr_index, reported_pcr, expected_pcr, quote_signature_valid
+- question: Do any firmware image hashes match entries on a known-malicious or revoked / known-vulnerable
+    denylist (such as the UEFI DBX), or correlate strongly to a known-bad firmware corpus?
+  context: Running an allowlist (golden-hash) check in parallel with a denylist check closes the gap where
+    an image is simply 'not on the allowlist' versus 'known evil.' Compare firmware hashes against curated
+    known-malicious hashes and revoked/known-vulnerable identifiers (e.g., DBX revocations), and similarity-correlate
+    unknown images to known-bad corpora (Costin et al.). Any denylist or revoked-hash hit is an immediate
+    high-confidence alert (BlackLotus revocations are a concrete example). A hit confirms a malicious
+    or explicitly revoked image is present; absence of a hit does not clear the image since it may simply
+    be unknown.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=firmware_verification event=hash_compare
+        | lookup known_bad_hashes hash AS running_hash OUTPUT malware_family
+        | lookup revoked_hashes hash AS running_hash OUTPUT revocation_id
+        | where isnotnull(malware_family) OR isnotnull(revocation_id)
+        | table _time, host, device_model, running_hash, malware_family, revocation_id
+- question: For each firmware mismatch event, is there an authorized maintenance window and an expected
+    firmware-updater process execution (e.g., Windows Event ID 4688) that explains it, or is the change
+    unexplained?
+  context: Stealth implants can be size-matched to evade naive checks (SYNful Knock), so mismatches must
+    be triaged against legitimate change context. Correlate each mismatch with documented maintenance
+    windows and with the process-creation telemetry (Windows Event ID 4688) showing the approved firmware-updater
+    binary running on that host at that time. A mismatch occurring inside an approved window with the
+    expected updater process is likely benign change; a mismatch with no change ticket and no/unexpected
+    updater process - or an unfamiliar process touching firmware off-hours - should be escalated as probable
+    tampering. This filters routine update noise without suppressing the deterministic alert.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      index=firmware_verification event=hash_compare result=mismatch
+        | join type=left host, _time [ search index=wineventlog EventCode=4688 (NewProcessName IN approved_updaters) ]
+        | lookup change_windows host, _time OUTPUT change_id
+        | where isnull(change_id) OR isnull(NewProcessName)
+        | eval status="unauthorized_change" | table _time, host, device_model, NewProcessName, change_id
+- question: Which peripheral models, firmware versions, or business units show firmware mismatch rates
+    above the 95th percentile or with significant week-over-week increases?
+  context: Beyond single-event alerting, statistical baselining surfaces slow or distributed tampering
+    and supply-chain issues. Compute rolling mismatch rates (count/min and count/week) grouped by peripheral
+    model, firmware version, and business unit, derive per-fleet baselines from verification-log history
+    against golden values (NIST SP 800-193), and flag any group exceeding the 95th percentile or showing
+    a significant week-over-week jump. A flagged model/version cluster may indicate a tainted firmware
+    batch, a compromised update channel, or targeted manipulation of a class of devices. Use this to prioritize
+    where to hunt; corroborate hits with the deterministic mismatch detail.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=firmware_verification result=mismatch
+        | bin _time span=1w
+        | stats count AS mismatches by _time, device_model, firmware_version, business_unit
+        | eventstats p95(mismatches) AS p95 by device_model
+        | delta mismatches AS wow by device_model
+        | where mismatches > p95 OR wow > (0.5*mismatches)
+        | sort - mismatches
+- question: Is there a spike in failed signature verifications or blocked/rejected firmware writes, tracked
+    separately from successful-but-mismatched events?
+  context: Under the signed-update model, attempts that are blocked before installation are an early-warning
+    signal distinct from images that slipped through as mismatches. Track the rate of failed signature
+    verifications and rejected/blocked firmware writes on their own (NIST SP 800-147); a spike means something
+    or someone is repeatedly trying to push firmware that fails policy - reconnaissance of update controls,
+    a misbehaving tool, or active tampering attempts. Rising failed-verification/blocked-write counts
+    often precede a successful bypass, so an early spike warrants investigation of the source host, account,
+    and image being attempted.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=firmware_verification (event=signature_check result=fail) OR (event=firmware_write result IN ("blocked","rejected"))
+        | bin _time span=1h
+        | stats count AS attempts by _time, host, device_model, event
+        | eventstats avg(attempts) AS mu stdev(attempts) AS sd by device_model, event
+        | where attempts > mu + 3*sd
+        | table _time, host, device_model, event, attempts
+- question: Do unknown or unclassified firmware images show anomalous Shannon entropy or low fuzzy-hash
+    similarity to known-good images (and high similarity to known-bad images)?
+  context: For images that are neither on the allowlist nor denylist, content analysis triages them. Compute
+    Shannon entropy to separate expected compressed/encrypted regions from injected code (injected shellcode
+    often perturbs the entropy profile), and use exact plus fuzzy (ssdeep) hashing to score similarity
+    against known-good and known-bad corpora (Costin et al.). Flag images with anomalous entropy or low
+    similarity to any known-good baseline - and especially those with high similarity to known-bad - for
+    manual review. This catches novel or repacked malicious firmware that evades exact-hash matching.
+    A clean, high-similarity-to-good result lowers priority but does not by itself certify the image.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=firmware_verification event=image_analysis class=unknown
+        | eval entropy_anom=if(shannon_entropy<6.0 OR shannon_entropy>7.95,1,0)
+        | eval low_good_sim=if(ssdeep_best_good < 50,1,0)
+        | eval high_bad_sim=if(ssdeep_best_bad > 70,1,0)
+        | where entropy_anom=1 OR low_good_sim=1 OR high_bad_sim=1
+        | table _time, host, device_model, shannon_entropy, ssdeep_best_good, ssdeep_best_bad
+- question: For low-end peripherals without a TPM, does the software-based attestation challenge-response
+    checksum value or its response latency deviate from the golden expectation?
+  context: 'Many cheap peripherals cannot do TPM-backed attestation, so software-based attestation (SWATT)
+    is used: the verifier issues a pseudorandom challenge that forces a checksum computation over the
+    device''s memory, and both the resulting checksum value and the time to respond are compared to a
+    golden expectation. Modified or relocated firmware either yields a wrong checksum or measurably slower
+    response (extra indirection/emulation cost). Alert when either the checksum value mismatches or the
+    response latency deviates beyond tolerance. A value or timing deviation indicates the device memory/firmware
+    is not in the expected state; a clean, on-time checksum corroborates integrity for devices that have
+    no stronger root of trust.'
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=attestation source=swatt event=challenge_response
+        | lookup swatt_golden model AS device_model OUTPUT expected_checksum, expected_latency_ms, latency_tol_ms
+        | where response_checksum != expected_checksum OR abs(response_latency_ms - expected_latency_ms) > latency_tol_ms
+        | table _time, host, device_model, response_checksum, expected_checksum, response_latency_ms, expected_latency_ms
+- question: Is there a statistically significant burst of firmware mismatches or verification failures
+    concentrated on many hosts of the same model within a short time window?
+  context: A coordinated spike - many hosts of one model failing verification within a short window -
+    is a hallmark of supply-chain compromise or mass tampering (a poisoned update pushed fleet-wide),
+    distinct from isolated single-device drift. Monitor hourly mismatch/failure counts and host concentrations
+    and alert on statistically significant bursts (NIST SP 800-193). The key dimensions are the number
+    of distinct hosts affected and how tightly clustered in time and by model the failures are. A positive
+    result should trigger a fleet-wide containment review of that model/firmware and an examination of
+    the common update source; a steady low background rate is normal drift.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      index=firmware_verification result IN ("mismatch","fail")
+        | bin _time span=1h
+        | stats dc(host) AS hosts count AS events by _time, device_model
+        | eventstats avg(hosts) AS mu stdev(hosts) AS sd by device_model
+        | where hosts > mu + 3*sd AND hosts >= 5
+        | sort - hosts
+- question: When firmware events are risk-scored, which events rank highest for likely adversarial involvement
+    based on mismatch metadata, host criticality, process lineage, image entropy/similarity, and post-event
+    behavior?
+  context: To prioritize analyst attention, train a risk model that combines mismatch metadata (type,
+    downgrade flag), host criticality, process lineage of the writing/triggering process, image entropy
+    and fuzzy-hash similarity features (Costin et al.), and subsequent host/network behavior, producing
+    a ranked likelihood that a firmware event is tied to adversarial activity. This is a triage/prioritization
+    aid only - the deterministic mismatch and denylist alerts are never suppressed by the model. Use the
+    ranked output to decide which mismatches to investigate first; a high score on an otherwise unexplained
+    mismatch (no change window, unusual process, anomalous entropy) is a strong escalation signal.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: |-
+      features = [mismatch_type, downgrade_flag, host_criticality, process_lineage_rarity,
+                   image_shannon_entropy, ssdeep_sim_good, ssdeep_sim_bad, post_event_net_anom]
+        score = risk_model.predict_proba(features)
+        if score > 0.7: emit_alert(rank_by=score, note="ML triage only; deterministic alerts unaffected")
+- question: Does every model-scored firmware-risk alert include the top-3 contributing features (e.g.,
+    mismatch type, downgrade flag, entropy delta, host criticality) so analysts can triage the explanation
+    rather than an opaque score?
+  context: Opaque ML scores are hard to action and erode trust, so every model-scored firmware alert must
+    carry feature attribution. Require the top-3 contributing features via SHAP-style attribution (e.g.,
+    mismatch type, downgrade flag, entropy delta, host criticality) attached to each alert (explainable
+    anomaly detection, Fung et al.). This lets the analyst immediately see why the model elevated the
+    event and corroborate it against the deterministic verification record. An alert lacking attribution
+    should be treated as a tooling gap; presence of clear, sensible top features speeds triage and helps
+    catch model errors.
+  answer_sources:
+  - Firmware integrity/verification tool audit logs
+  - TPM/attestation (RIM) verification logs
+  - Windows Event ID 4688
+  - Golden-hash / RIM baseline repository
+  - 'NAI: Endpoint and network devices with updatable peripheral firmware (e.g., webcams, NICs, storage/USB
+    controllers, BMCs, routers/switches) and the centralized log-management/attestation system where verification
+    logs and golden baselines are aggregated.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: |-
+      for alert in scored_firmware_alerts:
+            shap_vals = explainer.shap_values(alert.features)
+            alert.top_features = top_k(shap_vals, k=3)   # e.g. mismatch_type, downgrade_flag, entropy_delta
+            assert alert.top_features is not None  # block alerts without attribution
+- question: After a firmware change on a device, do new listening services/ports or statistically significant
+    increases in outbound byte volume / flow counts appear that were not present in the known-good per-version
+    profile?
+  context: Firmware implants commonly add functionality - a new listener, a command channel, or data exfiltration
+    - that shows up as behavioral drift even when static checks are clean. Build a known-good profile
+    of listening services/ports and outbound byte volume/flow counts per device-firmware version, then
+    alert when new listeners or significant egress increases appear after a firmware change (Costin/Zaddach
+    dynamic analysis). This corroborates a verification mismatch and catches implants that survived or
+    evaded static hashing. A device that begins listening on a new port or sending substantially more
+    data right after a firmware event is a strong tamper indicator; tie the timing to the firmware-change
+    record.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Sysmon (process/network/image-load)
+  - Windows Event ID 4688
+  - 'NAI: Network egress points and endpoint telemetry for devices with updatable peripheral firmware,
+    plus the centralized log store correlating verification events with subsequent host/network behavior.'
+  range: Last 90 days; center correlation on the +/- 72 hours around each firmware-change event
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      # new listeners and egress spikes after firmware change
+        conn.log | join device firmware_change_events (within 72h after change)
+        | stats sum(orig_bytes) AS egress dc(resp_p) AS open_ports values(service) AS svcs by device, fw_version
+        | lookup goodprofile device, fw_version OUTPUT base_egress, base_ports, base_svcs
+        | where egress > 2*base_egress OR open_ports > base_ports OR any(svcs NOT IN base_svcs)
+- question: Following a firmware event, is a device generating management-plane traffic or outbound connections
+    to destinations or protocols outside its explicit allowlist (e.g., covert module-fetch or non-standard
+    channels)?
+  context: Stealth firmware implants reach out to fetch modules or receive commands over channels the
+    device should never use (SYNful Knock). Maintain explicit allowlists of expected management-plane
+    protocols and outbound destinations per device class, and alert on any traffic following a firmware
+    event that falls outside them - especially covert module-fetch HTTP/raw-TCP to unknown hosts or non-standard
+    ports. A hit means the device is communicating in a way its legitimate firmware would not, strongly
+    suggesting an implant; the absence of out-of-allowlist traffic does not fully clear a dormant implant
+    but lowers immediate concern. Pair with the firmware-verification timeline.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Sysmon (process/network/image-load)
+  - Windows Event ID 4688
+  - 'NAI: Network egress points and endpoint telemetry for devices with updatable peripheral firmware,
+    plus the centralized log store correlating verification events with subsequent host/network behavior.'
+  range: Last 90 days; emphasize traffic after the most recent firmware-change event
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      conn.log
+        | lookup device_allowlist device OUTPUT allowed_dests, allowed_proto, allowed_ports
+        | where (resp_h NOT IN allowed_dests) OR (proto NOT IN allowed_proto) OR (resp_p NOT IN allowed_ports)
+        | join device firmware_change_events (traffic after change)
+        | table ts, device, id.resp_h, proto, resp_p, service, orig_bytes
+- question: Does an unsupervised online model of per-device outbound traffic show reconstruction-error
+    spikes or beaconing patterns appearing after a firmware change?
+  context: Signature/allowlist methods miss novel covert channels, so model normal per-device outbound
+    traffic with an unsupervised online autoencoder ensemble over incremental flow statistics - bytes,
+    packet rate, jitter, fan-out (Kitsune). Flag post-firmware-change reconstruction-error spikes or regular
+    beaconing intervals. Because it is unsupervised and online, it adapts per device and needs no labeled
+    attack data, making it well-suited to heterogeneous peripherals. A reconstruction-error spike or steady
+    low-jitter beacon emerging right after a firmware event corroborates implant activity; correlate the
+    anomaly window with the firmware-verification and change records before escalating.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Sysmon (process/network/image-load)
+  - Windows Event ID 4688
+  - 'NAI: Network egress points and endpoint telemetry for devices with updatable peripheral firmware,
+    plus the centralized log store correlating verification events with subsequent host/network behavior.'
+  range: Last 90 days; score continuously, highlight anomalies within 7 days of a firmware change
+  queries:
+  - technology: ML/Pseudocode
+    query: |-
+      per device: feats = incremental_stats(flow)  # bytes, pkt_rate, jitter, fan_out
+        re = kitsune_ensemble.score(feats)
+        if re > device_threshold and within_window(now, last_firmware_change, days=7):
+            emit_alert(device, re, beacon=detect_periodicity(flow))
+- question: Around firmware events, can a provenance-graph model localize anomalous host process/file/device-interface
+    nodes - such as an unexpected updater process accessing a device off-hours?
+  context: Host-side, an implant or unauthorized update leaves a trail in process/file/device-interface
+    relationships. Apply a provenance-graph GNN to host telemetry (Sysmon, EID 4688) to localize anomalous
+    nodes around firmware events without labeled attack data (ThreaTrace) - for example an unexpected
+    updater process touching a device interface off-hours, or a firmware tool spawned by an unusual parent.
+    This pinpoints the specific process/file involved so the analyst can pivot quickly. A localized anomalous
+    node coinciding with a firmware-verification mismatch is strong corroboration; absence of host-side
+    anomalies suggests the change may have been remote/network-side or benign.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Sysmon (process/network/image-load)
+  - Windows Event ID 4688
+  - 'NAI: Network egress points and endpoint telemetry for devices with updatable peripheral firmware,
+    plus the centralized log store correlating verification events with subsequent host/network behavior.'
+  range: Last 90 days; center the graph window on each firmware-change event
+  queries:
+  - technology: ML/Pseudocode
+    query: |-
+      G = build_provenance_graph(sysmon + eid4688)   # process/file/device-interface nodes
+        scores = threatrace_gnn.node_anomaly(G)
+        for n in scores.top(k=10):
+            if n.near(firmware_event) and (n.off_hours or n.rare_parent):
+                emit_alert(node=n.proc, device=n.device_iface, ts=n.ts)
+- question: Does each behavioral-anomaly alert carry the top-3 ranked contributing features (e.g., new
+    port, egress-volume delta, off-hours device access) so analysts can corroborate it with the firmware-verification
+    event?
+  context: As with firmware-risk scoring, behavioral-anomaly alerts must be explainable to be actionable.
+    Attach the top-3 ranked contributing features - for instance a newly opened port, an egress-volume
+    delta, or off-hours device access - to each behavioral-anomaly alert via SHAP-style attribution (explainable
+    anomaly detection, Fung et al.). This lets the analyst directly connect the network/host anomaly to
+    the corresponding firmware-verification event and decide whether the two together constitute an implant.
+    An alert without ranked features is a tooling gap; clear attribution accelerates corroboration and
+    reduces false escalations.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Sysmon (process/network/image-load)
+  - Windows Event ID 4688
+  - 'NAI: Network egress points and endpoint telemetry for devices with updatable peripheral firmware,
+    plus the centralized log store correlating verification events with subsequent host/network behavior.'
+  range: Last 90 days; align attribution window with the related firmware-change event
+  queries:
+  - technology: ML/Pseudocode
+    query: |-
+      for alert in behavioral_anomaly_alerts:
+            shap_vals = explainer.shap_values(alert.features)
+            alert.top_features = top_k(shap_vals, k=3)  # e.g. new_port, egress_delta, offhours_device_access
+            assert alert.top_features is not None
