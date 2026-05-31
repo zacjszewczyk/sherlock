@@ -1,0 +1,233 @@
+name: 'D3-FCR: File Content Rules'
+id: c2ef6ee9-0740-405f-9f5c-62970f9d1943
+description: Assess how effectively file content rules (signatures such as YARA and ClamAV) detect malicious
+  files at rest and in transit across the environment. This playbook helps an analyst evaluate rule-hit
+  fidelity, false-positive behavior, scan-failure rates, and coverage gaps that require rule tuning. It
+  guides scanning files extracted from network traffic and written to disk with curated rule packs, applying
+  structure-aware and normalized matching to catch obfuscated content, correlating rule hits with subsequent
+  execution and outbound traffic, measuring per-rule precision and drift, hunting likely misses via entropy
+  and byte-frequency outliers, profiling scan-failure and error rates as evasion signals, and using supervised
+  models to recommend new rule candidates and explain alerts so model insight feeds back into the deterministic
+  rule base.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which files written to disk (Sysmon Event ID 11) or extracted from network traffic (Zeek files.log)
+    match high-confidence, curated YARA/ClamAV signatures for webshells, malware families, or known-bad
+    hashes, and what are the source host, user, path, file size, and transfer metadata for each hit?
+  context: 'Deploying and enforcing curated rule packs is the enforcement floor for File Content Rules.
+    Scan files extracted from Zeek files.log and written per Sysmon Event ID 11 using open-source and
+    internally developed YARA and ClamAV rules, prioritizing curated corpora such as Neo23x0 signature-base
+    and NSA/ASD Mitigating Web Shells. Treat high-confidence hits (webshell or malware-family signatures,
+    hash matches) as immediate triage alerts. Use deterministic conditions with explicit thresholds (string-count
+    #s > N, filesize bounds, PE section offsets) so each alert names the exact matched rule and string.
+    A positive result is a named rule match with full provenance; a negative result means no curated rule
+    fired, which on its own does not prove the file is benign. Relevant to the Detect tactic: confirming
+    our deployed rules actually fire on malicious content in the locations adversaries stage files.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'scan = yara_clamav_scan(files where source in [Sysmon_EID11.TargetFilename, Zeek_files.extracted])
+
+      match = scan.hits where rule_confidence == ''high'' OR sha256 in known_bad_hashes
+
+      match = match where (string_count > N AND filesize within [min,max]) OR pe_section_offset matches
+
+      alert = emit(host, user, path, filesize, transfer_meta, matched_rule, matched_string)'
+- question: For files that raw-byte signatures miss, do structure-aware and normalized matching techniques
+    (ClamAV logical signatures, YARA pe/math modules, script AST normalization) surface malicious content
+    that was encoded or obfuscated to evade simple pattern matching?
+  context: 'Simple signatures against raw content cannot match encoded, encrypted, or sufficiently obfuscated
+    content. Apply parsing/normalization before matching: ClamAV logical signatures and YARA pe/math modules
+    for PE structure, and AST-level normalization for scripts (e.g., PHP webshell AST simplification).
+    This raises fidelity against the obfuscated content the D3-FCR considerations call out, without removing
+    the raw-content rules. A positive result is a normalized/structure-aware match on a file that raw-byte
+    rules did not flag, indicating an evasion attempt; a negative result increases confidence the file
+    is clean. Relevant to the Detect tactic: ensuring obfuscation does not create blind spots in our file
+    content detection.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'miss = files where raw_byte_signature_hit == false
+
+      normalized = parse_and_normalize(miss)  // ClamAV logical sigs, YARA pe/math, script AST simplify
+
+      match = scan(normalized) with structure_aware_rules
+
+      alert if match where raw_match == false  // obfuscation-evasion candidate'
+- question: When a file matches a content rule, is that file subsequently executed (Windows Event ID 4688)
+    and does it immediately generate outbound network connections (Zeek conn.log), indicating the threat
+    reached a live execution state rather than being quarantined?
+  context: 'Join file-rule hits with subsequent process execution (Windows Event ID 4688) and outbound
+    connections (Zeek conn.log), using lineage/behavior rules such as those in SigmaHQ. Escalate to containment
+    where a matched file is executed (success state) and immediately generates outbound traffic; de-prioritize
+    hits on files that are quarantined or never execute (blocked/fail state). A positive result is a rule-matched
+    file that ran and beaconed/exfiltrated, demanding immediate containment; a negative result (matched
+    but never executed) can be triaged at lower priority. Relevant to the Detect tactic: correlating detection
+    with outcome state so analysts prioritize active threats over neutralized ones.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days; correlate execution and network events within a short window (e.g., +/- 10 minutes)
+    of each file-rule hit.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'hits = file_rule_hits(window=90d)
+
+      exec = join(hits, EID4688) on sha256/path within 10m
+
+      net  = join(exec, Zeek_conn) on host,pid within 10m of exec
+
+      if exec AND net.bytes_out > 0: escalate(containment, state=''success'')
+
+      elif file.quarantined OR no exec: deprioritize(state=''blocked/fail'')'
+- question: Which file content rules show degrading precision or rising false-positive rates over rolling
+    30-day windows, exceeding their own baseline by more than 2 standard deviations or dropping below
+    a precision floor (e.g., 0.7), and should be queued for tuning?
+  context: 'Following signature-IDS tuning methodology (Diaz-Verdejo et al.), compute per-rule hit volume,
+    true-positive rate, and false-positive rate over rolling 30-day windows. Flag rules whose false-positive
+    rate exceeds their own baseline by more than 2 standard deviations (or whose precision drops below
+    a locally derived floor, e.g., 0.7) and queue them for tuning rather than blanket disablement. Track
+    hit frequency (hits/host/min) to catch broken or runaway rules. A positive result is a rule flagged
+    for drift; this informs maintenance, not necessarily an incident. Relevant to the Detect tactic: keeping
+    the rule base healthy so detection stays trustworthy and analysts are not buried in false positives.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days; evaluate over rolling 30-day windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for rule in rules:\n  per_window = rolling(30d).group(rule)\n  fp_rate = false_positives/total_hits\n\
+      \  precision = tp/(tp+fp)\n  baseline = mean_std(fp_rate, history)\n  if fp_rate > baseline.mean\
+      \ + 2*baseline.std OR precision < 0.7: flag_for_tuning(rule)\n  if hits_per_host_per_min > runaway_threshold:\
+      \ flag(rule, 'runaway')"
+- question: Within file cohorts grouped by type, service, and location, which files exhibit whole-file
+    or section Shannon entropy above packed/encrypted thresholds, or byte-frequency distributions that
+    deviate strongly from a type/length baseline, suggesting they evade existing rules and warrant new
+    rule authoring?
+  context: 'For file cohorts by type, service, and location, compute Shannon entropy and byte-frequency
+    distributions. Flag files whose whole-file or section entropy exceeds packed/encrypted thresholds
+    (>7.2 per Lyda and Hamrock; per-service baselines >7.0) or whose 1-gram byte distribution deviates
+    by Mahalanobis distance from a type/length baseline as in PAYL. Use KL-divergence against character-frequency
+    baselines for short strings/filenames per Downing. Files that evade existing rules but exceed the
+    95th-percentile anomaly threshold (and report a high ratio of high-entropy bytes to total bytes) are
+    queued as candidate misses for new rule authoring. A positive result is a high-entropy/anomalous file
+    with no rule hit, a likely miss; a negative result means the file fits its cohort''s normal distribution.
+    Relevant to the Detect tactic: finding the malicious files our current signatures cannot see.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for cohort in group(files, by=[type,service,location]):\n  e = shannon_entropy(file); sect_e\
+      \ = max(section_entropy(file))\n  if e > 7.2 OR sect_e > 7.2 OR per_service_entropy(file) > 7.0:\
+      \ candidate\n  d = mahalanobis(byte_1gram(file), cohort.baseline_mean, cohort.cov)\n  kl = kl_divergence(char_freq(file.name),\
+      \ cohort.name_baseline)\n  if (d > pctl(95) OR kl high) AND no_rule_hit AND high_entropy_ratio:\
+      \ queue_candidate_miss(file)"
+- question: Are there spikes in scan failures - unparseable/corrupt files, scan timeouts, archive-depth
+    or size-limit aborts, and rule-engine exceptions - per host and file type that could indicate evasion
+    attempts or rule breakage independent of any rule hit?
+  context: 'Treat scanning failures as first-class signals: baseline rates of unparseable/corrupt files,
+    scan timeouts, archive-depth/size limit aborts, and rule-engine exceptions per host and file type.
+    Spikes in unscannable files or sudden per-rule FP surges (per Diaz-Verdejo et al.) indicate evasion
+    attempts or rule breakage and should alert independently of any rule hit. A positive result is an
+    anomalous spike in scan failures localized to a host or file type, which may mean an adversary is
+    crafting content to defeat the scanning engine, or a rule/engine is broken. Relevant to the Detect
+    tactic: ensuring failure modes do not become silent detection gaps.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days; baseline per host and file type and alert on deviation.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for (host, ftype) in scan_log:\n  fails = count(unparseable, timeouts, archive_depth_abort,\
+      \ size_limit_abort, engine_exception)\n  baseline = mean_std(fails, history)\n  if fails > baseline.mean\
+      \ + k*baseline.std: alert('scan-failure spike', host, ftype)\n  // alerts independently of any rule\
+      \ hit"
+- question: Does a supervised static-feature classifier (LightGBM/XGBoost trained on byte/entropy histograms,
+    PE header/section/import features, string statistics, signer status, size, and prevalence) flag high-confidence,
+    high-prevalence files that current rules miss and could be promoted to new YARA/ClamAV rule candidates?
+  context: 'Train a supervised gradient-boosted classifier on static file features such as byte and byte-entropy
+    histograms, PE header/section/import features, string statistics, signer status, size, and prevalence,
+    using a benchmark like EMBER2024 and validation practices from Catak et al. Promote high-confidence,
+    high-prevalence unlabeled hits to candidate YARA/ClamAV rules to extend coverage against novel variants;
+    never auto-block on score alone - keep deterministic rules as the enforcement floor. A positive result
+    is a high-score file that existing signatures did not catch, a candidate for new rule authoring; a
+    negative result means the model agrees the file is benign. Relevant to the Detect tactic: using ML
+    to expand signature coverage against novel malware variants.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "X = static_features(file)  // byte+entropy histograms, PE header/section/import, string stats,\
+      \ signer, size, prevalence\nmodel = gbdt_train(EMBER2024, validation=catak_et_al)\nscore = model.predict(X)\n\
+      if score > 0.9 AND prevalence high AND no_existing_rule_hit:\n  promote_candidate_rule(file)  //\
+      \ never auto-block on score alone"
+- question: For each model-generated alert, what are the top-3 contributing features (e.g., section entropy,
+    suspicious imports like VirtualAllocEx/WriteProcessMemory, rare n-grams) per SHAP/LIME attributions,
+    and can recurring high-attribution feature interactions be converted into deterministic content rules?
+  context: 'Require every model alert to list the top-3 contributing features using SHAP/LIME attributions.
+    Where possible convert recurring high-attribution feature interactions into deterministic rules via
+    TreeSHAP rule extraction (Anthony et al.), so model insight feeds back into the symbolic rule base.
+    A positive result is an explainable alert whose driving features make sense to an analyst and can
+    seed a new YARA/ClamAV rule; a negative/uninterpretable result warrants skepticism of the model output.
+    Relevant to the Detect tactic: making ML detections actionable and feeding them back into the deterministic
+    rule base for durable coverage.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "for alert in model_alerts:\n  contrib = shap_values(model, alert.X)\n  top3 = topk(contrib,\
+      \ 3)  // e.g., section_entropy, imports[VirtualAllocEx,WriteProcessMemory], rare_ngrams\n  attach(alert,\
+      \ top3)\n  recurring = treeshap_rule_extraction(model, high_attribution_interactions)\n  emit_candidate_deterministic_rule(recurring)"
+- question: For script and webshell file types where signatures degrade under obfuscation, do learned
+    detectors operating on normalized/AST features identify malicious files with high confidence, and
+    can the recovered structure and matched constructs be captured as new content-rule candidates?
+  context: 'For script and webshell file types where signatures degrade under obfuscation, deploy learned
+    detectors operating on normalized/AST features as in PHP webshell AST simplification. Route high-confidence
+    detections to triage with the recovered structure and matched constructs included, and feed confirmed
+    samples back as new content-rule candidates. A positive result is a learned-model detection of an
+    obfuscated script/webshell that signatures missed; a negative result increases confidence the script
+    is benign. Relevant to the Detect tactic: closing the obfuscation gap for scripts and webshells, a
+    common foothold for external actors on public-facing web servers.'
+  answer_sources:
+  - Windows Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: Public-facing web servers, user endpoint devices, and internal file servers/shares.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: 'scripts = files where type in [php,js,vbs,ps1,webshell]
+
+      feat = ast_normalize_features(scripts)  // AST simplification, deobfuscation
+
+      score = learned_detector.predict(feat)
+
+      if score > 0.9: triage(recovered_structure, matched_constructs); feed_back_as_rule_candidate(file)'
