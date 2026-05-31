@@ -1,0 +1,240 @@
+name: 'D3-CI: Configuration Inventory'
+id: 9239332c-6f42-4a42-97fa-91e19b52196d
+description: >-
+  Investigate the current configuration state of critical systems and detect deviations from the established
+  golden-image/CMDB baseline. This playbook helps an analyst confirm which software packages, services,
+  and registry-backed settings are present on critical application servers, compare them deterministically
+  against approved manifests, and surface drift that may indicate unauthorized change, persistence, tampering,
+  or instability. It covers baseline-violation detection from install and service-creation events, correlation
+  of service installs with process execution and change-control records, first-seen software/service tracking
+  per host class, peer-relative configuration prevalence (rarity) outliers, configuration churn and failure-rate
+  monitoring, isolation-based per-host configuration fingerprint scoring, and provenance-graph learning
+  for configuration-change anomalies. Together these support a defensible, explainable configuration inventory
+  aligned to NIST SP 800-128/800-137 and SCAP (XCCDF/OVAL) so each finding is auditable for a SOC analyst.
+type: technique
+related:
+- tactic_id: D3-M
+  tactic_name: Model
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Which installed software packages and newly created services on critical application servers are NOT
+    present on the approved golden-image/CMDB baseline for that asset class?
+  context: >-
+    Within the Model tactic the goal is to maintain an accurate, current record of configuration and measure
+    how it deviates from the approved baseline. Parse Windows Event ID 11707 (software install completed)
+    and 7045 (new service installed) to inventory installed software and newly created services, then
+    compare each item against the approved golden-image/CMDB manifest for the host's asset class; any
+    item not on the baseline is a reportable deviation (NIST SP 800-128). Pay particular attention to
+    unapproved packages, unsigned service binaries, and unexpected service start types (e.g., Auto-start
+    for a binary outside %SystemRoot% or Program Files). Encode the expected state as SCAP XCCDF/OVAL
+    checks so every failed check is an explainable, auditable finding (NIST SP 800-126r3). A positive
+    result is software/services off-baseline; a negative result confirms the host matches its sanctioned
+    configuration model.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      parse install_events = WinEventID==11707; svc_events = WinEventID==7045;
+      inventory = union(install_events.software, svc_events.service);
+      baseline = lookup golden_image_manifest(asset_class);
+      for item in inventory:
+        if item not in baseline OR item.signed==false OR (item.start_type=='Auto' and item.path not in ['%SystemRoot%','%ProgramFiles%']):
+          alert(host, item, scap_check=failed_xccdf_oval_rule)
+- question: >-
+    Were any service installations performed outside an approved change window, or with binaries that
+    are unsigned or launched from temporary/user-writable paths, and can each install be tied to a matching
+    change-control ticket?
+  context: >-
+    Accurate configuration modeling requires linking observed changes to authorized change-control activity.
+    Correlate 7045 service-creation events with nearby 4688 and Sysmon Event ID 1 process executions to
+    reconstruct the installer chain, then cross-reference the change-control/CMDB record so changes made
+    outside an approved change window are flagged (NIST SP 800-128). Escalate the state signal when the
+    service binary is unsigned, launched from temporary or user-writable paths (%TEMP%, %APPDATA%, C:\\Users\\Public),
+    or when the install lacks a matching approved change ticket. A positive result indicates an unauthorized
+    or out-of-process configuration change worth deeper investigation; a negative result shows the install
+    maps cleanly to sanctioned change management.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: >-
+    Last 90 days, with event-centered correlation of service-creation and process-execution events within
+    a short window (e.g., +/- 10 minutes).
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: |-
+      svc = WinEventID==7045;
+      proc = (WinEventID==4688 OR SysmonID==1) within 10m of svc by host;
+      ticket = lookup change_control(host, svc.time);
+      if ticket==none OR svc.time not in approved_window OR svc.binary.signed==false
+         OR svc.binary.path in ['%TEMP%','%APPDATA%','C:\\Users\\Public']:
+        alert(host, svc, installer_chain=proc, ticket)
+- question: >-
+    Has any software package, service name, or service binary hash appeared for the first time on a host
+    or asset class, and is that first-seen item absent from the approved baseline?
+  context: >-
+    First-seen tracking is a core modeling technique: maintain a per-host and per-asset-class set of previously
+    observed package names, service names, and binary hashes, then alert on any first-seen item that is
+    not on the approved baseline. This catches novel additions that deterministic baseline checks may
+    miss if the manifest is incomplete. For explainability the alert text must name the new item, the
+    host, and the days-since-last-baseline-update so the analyst can judge whether the novelty reflects
+    a sanctioned but undocumented change or unauthorized activity. A positive result is a genuinely new,
+    off-baseline configuration item; a negative result means the item has been observed before or is already
+    approved.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: >-
+    Last 90 days, compared against the full historical first-seen set where available.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      seen = state_set(host, asset_class) of {package, service, binary_hash};
+      for item in current_inventory(host):
+        if item not in seen and item not in baseline:
+          alert(text=f'first-seen {item} on {host}, days_since_baseline={days_since_baseline_update}')
+        seen.add(item)
+- question: >-
+    Which configuration items (services, packages, registry values) are statistically rare across the
+    peer population of same-class hosts, and which hosts carry binaries that appear on fewer than N peers?
+  context: >-
+    Peer-relative rarity is a powerful way to model expected configuration without a perfect manifest.
+    Treat the peer population as the baseline and Bayesian-rank each host's configuration items by rarity
+    across peer-class hosts, surfacing the top suspect items (PeerPressure). Apply a frequency-of-least-occurrence
+    filter to service binaries: alert when a binary appears on fewer than N hosts (start with N<=2 in
+    homogeneous fleets, and derive a per-fleet N from the 1st percentile of the host-count distribution)
+    (CAR-2013-09-005). The alert must list the top-3 rarest items and their enterprise host counts so
+    the analyst can prioritize. A positive result is an item present on very few peers (possible drift
+    or implant); a negative result is configuration broadly shared across the peer group.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: Last 90 days, evaluated across the current peer-class host population.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      pop = peer_class_hosts; counts = host_count_per_item(pop);
+      rank = bayesian_rarity(host.items, pop)  # PeerPressure;
+      N = max(2, percentile_1(distribution(counts)));
+      for b in host.service_binaries:
+        if counts[b] < N: candidate.add(b)
+      alert(host, top3_rarest=rank[:3], enterprise_host_counts=counts)
+- question: >-
+    Is the rate of configuration change (software additions/removals, service changes) or the rate of
+    configuration failures (failed installs, denied service starts, SCAP non-compliance) abnormally high
+    for a host class outside maintenance windows?
+  context: >-
+    Modeling configuration health includes watching both change velocity and failure state. Compute per-host-class
+    weekly counts of software additions, removals, and service changes (frequency) plus total changed
+    configuration items (volume), and alert when the rate exceeds the rolling mean + 3 sigma outside maintenance
+    windows (Dwyer & Truta). Separately profile failure/error state as a distinct signal: spikes in failed
+    installs (Event ID 11708), denied/blocked service starts (Event IDs 7000/7009), or SCAP compliance-scan
+    errors and non-compliant counts can indicate tampering or instability (NIST SP 800-137). Derive thresholds
+    from each fleet's historical compliance percentage and change-rate tolerances. A positive result is
+    anomalous churn or a failure spike; a negative result is steady, in-tolerance configuration behavior.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: >-
+    Last 90 days, with weekly aggregation and rolling-baseline comparison; exclude scheduled maintenance
+    windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      change_rate = weekly_count(add+remove+svc_change) by asset_class;
+      if change_rate > rolling_mean+3*sigma and time not in maintenance_window:
+        alert(asset_class, change_rate);
+      fail = count(WinEventID in [11708,7000,7009]) + scap_noncompliant_or_error;
+      if fail > historical_baseline(asset_class): alert(asset_class, failure_spike=fail)
+- question: >-
+    Which hosts have configuration fingerprints (software/service/registry feature vectors) that an isolation-based
+    outlier detector flags as anomalous relative to the fleet, and what features drive the anomaly?
+  context: >-
+    To model normal configuration at scale, build per-host feature vectors from the software/service/registry
+    inventory (counts by category, presence flags, signer ratios, autostart counts, rare-path counts)
+    and score them with an Isolation Forest, flagging hosts with anomalously short isolation paths (Liu
+    et al.). Surface the top-3 contributing features (e.g., unsigned-service count, rare-binary count,
+    install-path anomalies) in the alert text for explainability. Run this in parallel with deterministic
+    baseline checks, never as a replacement, so unsupervised signals augment rather than mask auditable
+    findings. A positive result is a host whose overall configuration profile is an outlier worth review;
+    a negative result is a host that resembles its peers.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: >-
+    Last 90 days for feature extraction and model scoring; retrain periodically as the fleet evolves.
+  queries:
+  - technology: ML/Isolation Forest pseudocode
+    query: |-
+      vec = features(host){counts_by_category, presence_flags, signer_ratio,
+                           autostart_count, rare_path_count};
+      model = IsolationForest(fit=fleet_vectors);
+      score = model.anomaly_score(vec);
+      if score >= threshold:
+        alert(host, score, top3_features=explain(vec))
+      # run alongside deterministic baseline checks, not as replacement
+- question: >-
+    Do whole-system provenance graphs reveal unauthorized configuration changes such as anomalous service
+    parents, installs from user-writable paths, or persistence registrations whose reconstruction error
+    exceeds the learned benign envelope?
+  context: >-
+    Provenance-graph learning models host state as a causal graph and flags configuration changes whose
+    structure deviates from learned-benign behavior, using the reconstructed subgraph as the explanation
+    (KAIROS). Anomalous service parents, installs from user-writable paths, and persistence registrations
+    appear as subgraphs with high reconstruction error. For node-level localization of the specific drifted
+    service/process/registry node use inductive GraphSAGE (ThreaTrace); for drift-adaptive entity outlier
+    scoring as legitimate baselines evolve use masked graph representation learning (MAGIC); for time-windowed
+    detection of change bursts use graph-level embeddings (PROGRAPHER). A positive result is a high-error
+    subgraph pinpointing an unauthorized change with causal context; a negative result is configuration
+    activity consistent with the benign envelope.
+  answer_sources:
+  - Windows Event ID 11707
+  - Windows Event ID 7045
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - 'NAI: Critical Application Servers'
+  range: >-
+    Last 90 days for graph construction and scoring, with time-windowed evaluation to catch change bursts.
+  queries:
+  - technology: ML/Provenance-graph pseudocode
+    query: |-
+      G = build_provenance_graph(host)  # processes, files, services, registry;
+      err = KAIROS.reconstruction_error(G);
+      if err > learned_benign_envelope:
+        subg = anomalous_subgraph(G);
+        node = ThreaTrace.localize(subg)  # GraphSAGE node-level;
+        drift = MAGIC.entity_outlier(G); burst = PROGRAPHER.window_embed(G);
+        alert(host, explanation=subg, drifted_node=node, drift, burst)
