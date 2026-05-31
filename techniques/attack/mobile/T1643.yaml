@@ -1,0 +1,285 @@
+name: 'T1643: Generate Traffic from Victim'
+id: 75f194d1-fbd4-4d1f-8e7c-5b4f8bc5f2b7
+description: 'Investigate whether an adversary is using managed mobile devices to generate fraudulent
+  or malicious outbound traffic -- typically to commit carrier/SMS toll-fraud or to manipulate app-store
+  rankings, ratings, ad impressions, and clicks (MITRE ATT&CK T1643). This playbook helps an analyst pursue
+  two complementary evidence trails. The first trail covers abusive SMS sending from managed devices:
+  outbound SMS to known fraudulent or premium-rate numbers, apps holding the SEND_SMS permission with
+  hidden SMS-sink data flows, abnormal SMS volume or burst rates from non-messaging apps, surges in send
+  failures/carrier rejections, and ML scoring of individual SMS events and app behavior. The second trail
+  covers automated/fraudulent network activity from mobile IP ranges: DNS/HTTP indicator matches against
+  ad-fraud and click-fraud threat intel, background ad requests and clicks issued without foreground user
+  interaction, statistically anomalous low-entropy high-volume traffic, elevated DNS/HTTP failure rates,
+  unsupervised Isolation-Forest anomaly detection, and specialized click-reuse and app-ranking manipulation
+  models. Each trail provides symbolic-logic, statistical, and machine-learning detection approaches so
+  an analyst can confirm whether a device is being driven to produce traffic that manipulates external
+  billing or marketplace outcomes.'
+type: technique
+related:
+- tactic_id: TA0034
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does any outbound SMS message from a managed device have a destination number or short code
+    that matches an ingested threat-intelligence list of fraudulent or premium-rate numbers, and was that
+    send made without explicit user consent?
+  context: Toll-fraud malware monetizes infected devices by silently sending SMS to premium-rate numbers
+    and short codes. Per MITRE ATT&CK T1643 (Impact), sending to premium numbers is supposed to require
+    explicit user consent, so an unconsented premium-destination send is inherently suspicious. Build
+    a deterministic rule comparing the destination of every outbound SMS in carrier billing logs against
+    a curated feed of fraudulent/premium numbers and short codes (premium-SMS toll-fraud families such
+    as BeanBot, FakeInst, and Mazarbot are labeled in CICAndMal2017). A match is a high-confidence indicator
+    of billing fraud in progress; surface the source device, user, destination number, and the originating
+    application name from MDM data so the analyst can immediately quarantine the device and identify the
+    responsible app. A negative result does not clear the device because premium destinations rotate,
+    so keep the statistical and ML detections running in parallel.
+  answer_sources: &id001
+  - Carrier billing records
+  - Mobile Device Management (MDM) application inventory logs
+  - MDM application permission logs
+  - 'NAI: Managed mobile device fleet, MDM servers, and Telecommunications provider billing systems'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM carrier_billing_sms\nJOIN mdm_app_inventory ON device_id\nWHERE dest_number IN threatintel.premium_fraud_numbers\n\
+      \   OR dest_shortcode IN threatintel.premium_fraud_shortcodes\n   OR (user_consent == false AND\
+      \ dest_is_premium == true)\nEMIT severity=high WITH device_id, user, dest_number, originating_app"
+- question: Does any installed app that holds the SEND_SMS permission contain a taint data flow that reaches
+    an SMS sink (SmsManager.sendTextMessage / sendMultipartTextMessage) from a tainted or user-hidden
+    source, or send to a hard-coded/obfuscated destination number, particularly when the app is not a
+    messaging client?
+  context: SEND_SMS is rarely needed by legitimate non-messaging apps, so an app that both requests it
+    and silently routes data into an SMS sink is a strong toll-fraud candidate. Statically vet every SEND_SMS-holding
+    app before and after deployment using lifecycle-aware taint analysis (FlowDroid, validated on the
+    open DroidBench suite) to find flows from tainted/user-hidden sources to sendTextMessage/sendMultipartTextMessage,
+    and flag hard-coded or obfuscated destination numbers. Scale this gate on app-store/MDM ingestion
+    with certificate-checked data-flow verification (DCert). Treat the deterministic rule 'SEND_SMS held
+    by a non-messaging app + SMS sink reachable from a hidden source' as a high-confidence block for the
+    Impact tactic. A positive result justifies blocking or removing the app via MDM before it generates
+    fraudulent SMS traffic.
+  answer_sources: *id001
+  range: Per app install/update; re-vet inventory every 90 days
+  queries:
+  - technology: App-vetting/Rule pseudocode
+    query: "FOR each app WHERE 'SEND_SMS' IN requested_permissions:\n  flows = FlowDroid.taint_analysis(apk,\n\
+      \            sources=[tainted, user_hidden],\n            sinks=['SmsManager.sendTextMessage','sendMultipartTextMessage'])\n\
+      \  IF flows NOT empty OR dest_number IS hardcoded/obfuscated:\n    IF app.category != 'Messaging':\
+      \ EMIT severity=high BLOCK app\n    ELSE EMIT severity=medium WITH package, flow_path"
+- question: For each device, does the daily SMS volume sent by a non-messaging app holding SEND_SMS exceed
+    that app's 30-day rolling 99th-percentile baseline, and does the per-minute burst rate also exceed
+    its 99th-percentile baseline?
+  context: Bulk automated SMS sending is the operational signature of toll fraud. Using MDM logs, identify
+    apps that hold SEND_SMS but are not categorized as 'Messaging' (a known DREBIN static feature for
+    SMS-trojan apps). For each such app, compute a 30-day rolling 99th-percentile baseline for daily SMS
+    volume and a separate short-window burst rate (messages/minute) from carrier logs. Raise a medium-severity
+    alert when daily SMS count from a non-messaging app exceeds its baseline, and escalate to high severity
+    when the per-minute burst rate also exceeds its 99th-percentile baseline, indicating automated bulk
+    sending rather than human use. Derive both thresholds per-fleet from its own history rather than fixed
+    constants so the detection adapts to your environment and supports the Impact tactic by catching billing-fraud
+    bursts.
+  answer_sources: *id001
+  range: Last 90 days; baseline window 30 days rolling
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM carrier_billing_sms JOIN mdm_app_inventory
+
+      WHERE app.category != ''Messaging'' AND ''SEND_SMS'' IN app.permissions
+
+      STATS daily_count, msgs_per_min BY device_id, app, day
+
+      JOIN baseline_p99(device_id, app, lookback=30d) AS bl
+
+      WHEN daily_count > bl.daily_p99: EMIT severity=medium
+
+      WHEN daily_count > bl.daily_p99 AND msgs_per_min > bl.burst_p99: EMIT severity=high'
+- question: For each device/app, does the hourly count of SMS send failures, carrier rejections, and blocked
+    premium-short-code attempts exceed the device's 95th-percentile hourly baseline?
+  context: Toll-fraud attempts often fail or are blocked by the carrier before they ever bill, so a surge
+    in failed/blocked sends is an early signal that precedes successful fraud. Explicitly baseline the
+    state of SMS sending per device/app by counting send failures, carrier rejections, and blocked premium-short-code
+    attempts per hour (analogous to using failure-rate signals such as NXDOMAIN/blocked connections as
+    independent detection features per Nadler et al.). Alert when the combined failed+blocked send count
+    exceeds the device's 95th-percentile hourly baseline, and surface the destination numbers and originating
+    app so the analyst can spot premium short codes being rejected. This gives early warning of toll fraud
+    (Impact) even before the carrier billing records show charges.
+  answer_sources: *id001
+  range: Last 90 days; baseline window 30 days, evaluate hourly
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM carrier_billing_sms\nSTATS count(status IN ('failed','rejected','blocked_shortcode'))\
+      \ AS fails\n      BY device_id, app, hour\nJOIN baseline_p95(device_id, lookback=30d) AS bl\nWHEN\
+      \ fails > bl.hourly_p95:\n  EMIT severity=medium WITH device_id, app, top_dest_numbers"
+- question: Does a supervised classifier (e.g., Random Forest) score any individual outbound SMS event
+    as fraudulent with confidence greater than 0.95, and which top-3 features drive that verdict?
+  context: Single-dimension rules miss fraud that only emerges from a combination of weak signals. Train
+    a supervised model (e.g., Random Forest) on labeled historical SMS data such as the SMS-malware subset
+    of CICAndMal2017, engineering features including the sending app category (MDM), SEND_SMS permission
+    status, time of day, destination country code and short-code novelty, the device's historical SMS
+    frequency, per-minute burst rate, send success/failure ratio, and whether the destination is a new
+    contact for the user. Score each outbound SMS event and require the alert to surface the top-3 contributing
+    features (e.g., 'non-messaging app', 'premium short code', 'burst rate 50x baseline') for analyst
+    triage. Automatically raise a high-severity alert and trigger an MDM device-quarantine policy for
+    any event classified fraudulent with confidence > 0.95. This catches toll-fraud (Impact) that evades
+    deterministic and percentile rules; keep those running in parallel as the floor and retrain to counter
+    drift.
+  answer_sources: *id001
+  range: Last 90 days; retrain periodically
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = extract(sms_event:\n  app_category, send_sms_perm, hour_of_day, dest_country,\n\
+      \  shortcode_novelty, device_sms_freq, burst_rate,\n  success_fail_ratio, dest_is_new_contact)\n\
+      p = RandomForest.predict_proba(features, classes=['benign','fraudulent'])\nWHEN p['fraudulent']\
+      \ > 0.95:\n  EMIT severity=high WITH device_id, top3_features(p)\n  TRIGGER mdm_quarantine(device_id)"
+- question: Does an obfuscation-robust app classifier (MaMaDroid Markov-chain API transitions and/or DREBIN
+    static linear-SVM features) flag any installed app as matching known SMS-trojan or adware behavior,
+    and which API packages/permissions drive the verdict?
+  context: As a parallel app-vetting layer to the deterministic SMS-sink rule, score each app's behavior
+    with classifiers that resist obfuscation. MaMaDroid models API call sequences as Markov-chain transition
+    probabilities, while DREBIN provides explainable static linear-SVM features (permissions, restricted/suspicious
+    API calls, network addresses). Train on the Drebin corpus and the CICAndMal2017 SMS-malware/adware
+    subsets. Flag apps whose call-sequence or feature profile matches known SMS-trojan/adware behavior,
+    surface the top contributing API packages/permissions in the alert, and feed positives into the MDM
+    quarantine workflow alongside the deterministic SMS-sink rule. This identifies fraud-capable apps
+    (Impact) before they generate traffic; because models drift and adversaries repackage, retrain periodically
+    and corroborate with runtime SMS-volume evidence.
+  answer_sources: *id001
+  range: Per app install/update; re-score inventory every 90 days
+  queries:
+  - technology: App-vetting/ML pseudocode
+    query: "features = extract(apk:\n  api_call_markov_transitions,   # MaMaDroid\n  permissions, restricted_api,\
+      \ suspicious_api, network_addrs)  # DREBIN\nlabel = ensemble(MaMaDroid_clf, DREBIN_SVM).predict(features)\n\
+      WHEN label IN ('sms_trojan','adware'):\n  EMIT alert WITH package, top_contributing_api_packages_permissions\n\
+      \  FEED mdm_quarantine_workflow"
+- question: Does any DNS query (Zeek dns.log query field) or HTTP request (Zeek http.log host/uri fields)
+    from mobile IP ranges match an ingested threat-intelligence feed for ad fraud, click fraud, or app-ranking
+    manipulation?
+  context: Fraudulent traffic generation reaches out to known ad-fraud, click-fraud, and ranking-manipulation
+    infrastructure. Build a real-time rule inspecting the query field in Zeek dns.log and the host and
+    uri fields in Zeek http.log for traffic from mobile IP ranges, comparing them against ingested threat-intel
+    feeds for these fraud categories. Trigger a medium-severity alert on a match, including source IP,
+    destination FQDN/URL, the user_agent string, and the matched threat feed so the analyst can attribute
+    the traffic to a device, user, and responsible app. A match is high-confidence evidence the device
+    is participating in fraud traffic (Impact); a negative result does not clear the device because fraud
+    infrastructure rotates, so run the statistical and ML detections in parallel.
+  answer_sources: &id002
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Corporate Wi-Fi network gateways, DNS resolvers, and Internet web proxies'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM dns.log, http.log\nWHERE id.orig_h IN mobile_device_subnets\n  AND (dns.query IN threatintel.fraud_domains\n\
+      \       OR http.host IN threatintel.fraud_domains\n       OR http.uri MATCHES threatintel.fraud_url_patterns)\n\
+      EMIT severity=medium WITH id.orig_h, dest_fqdn_or_url, user_agent, matched_feed"
+- question: Are there ad-network ad requests or click URLs in Zeek http.log that originate while the responsible
+    app holds no foreground UI, or click events that lack any preceding user-interaction/ad-impression
+    request in the HTTP request tree?
+  context: 'Click fraud and ad fraud are characterized (per MAdFraud) by ad traffic that no human triggered.
+    Correlate Zeek http.log ad-network requests/clicks with device foreground/background state from MDM
+    app-usage telemetry, then alert on two deterministic invariants: (1) ad-network ad requests or click
+    URLs originating while the responsible app holds no foreground UI, and (2) click events lacking any
+    preceding user-interaction or ad-impression request in the HTTP request tree. These no-foreground-state
+    and click-without-impression conditions are high-confidence automation rules independent of any volume
+    threshold. A positive result indicates the device is fabricating ad impressions/clicks to commit fraud
+    (Impact); these rules complement the volume/entropy statistical detection and avoid baseline tuning.'
+  answer_sources: *id002
+  range: Last 90 days; correlate click trees within the session window
+  queries:
+  - technology: Zeek/Rule pseudocode
+    query: 'FROM http.log
+
+      WHERE host IN ad_network_domains
+
+      JOIN mdm_app_usage ON device_id, time AS state
+
+      FLAG (ad_request OR click_url) AND state.foreground_app != responsible_app
+
+      FLAG click_event AND NOT EXISTS(preceding impression_request IN request_tree)
+
+      EMIT alert WITH device_id, responsible_app, url, condition'
+- question: For each mobile device IP, does the hourly connection count or connection-to-byte ratio exceed
+    the 95th percentile while DNS query Shannon entropy falls below the 5th percentile of the device's
+    own 30-day baseline for that hour-of-day?
+  context: 'Automated traffic generation produces high volume with low randomness -- many repetitive connections
+    to a small set of destinations. For each mobile device IP, run an hourly query computing three metrics
+    from Zeek logs over the past hour: total connection count (conn.log), Shannon entropy of DNS queries
+    (dns.log), and the ratio of connection count to total bytes transferred. Compare each against the
+    device''s own 30-day rolling baseline for that specific hour-of-day. Trigger a medium-severity alert
+    when the connection count or connection/byte ratio exceeds the 95th percentile AND the DNS query entropy
+    falls below the 5th percentile. This high-volume + low-randomness combination characterizes automated
+    traffic generation (Impact); the stateless entropy/volume features are validated for real-time anomaly
+    detection in Nadler et al. Derive thresholds per-device so the detection adapts to each device''s
+    normal behavior.'
+  answer_sources: *id002
+  range: Last 90 days; baseline window 30 days, evaluate hourly per hour-of-day
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "FOR each device_ip, hour:\n  conn_cnt = count(conn.log)\n  dns_entropy = shannon_entropy(dns.log\
+      \ query)\n  conn_byte_ratio = conn_cnt / sum(orig_bytes + resp_bytes)\n  bl = baseline(device_ip,\
+      \ hour_of_day, lookback=30d)\n  WHEN (conn_cnt > bl.p95 OR conn_byte_ratio > bl.p95)\n       AND\
+      \ dns_entropy < bl.p5:\n    EMIT severity=medium WITH device_ip, conn_cnt, dns_entropy, conn_byte_ratio"
+- question: For each device per hour, does the count of NXDOMAIN responses, HTTP 4xx/5xx responses, or
+    blocked/rejected connections (REJ/RSTO) exceed the device's 95th-percentile hourly baseline?
+  context: 'Automated fraud/bot traffic and stale fraud infrastructure produce abnormally high failure
+    rates, making failure-rate an independent detection feature (per Nadler et al.). Explicitly baseline
+    the failure state of mobile traffic per device per hour: count NXDOMAIN responses (Zeek dns.log rcode),
+    HTTP 4xx/5xx responses (http.log status_code), and blocked/rejected connections (conn.log history/conn_state
+    such as REJ/RSTO). Alert when any failure count exceeds the device''s 95th-percentile hourly baseline,
+    and surface the top failing domains/URLs and the responsible user-agent. A spike in failures often
+    accompanies fraud traffic hitting dead or defended infrastructure (Impact) and provides an early independent
+    signal; corroborate with the volume/entropy and intel-match detections.'
+  answer_sources: *id002
+  range: Last 90 days; baseline window 30 days, evaluate hourly
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "FOR each device_ip, hour:\n  nxdomain = count(dns.log WHERE rcode=='NXDOMAIN')\n  http_err\
+      \ = count(http.log WHERE status_code >= 400)\n  conn_fail = count(conn.log WHERE conn_state IN ('REJ','RSTO'))\n\
+      \  bl = baseline_p95(device_ip, lookback=30d)\n  WHEN nxdomain > bl.nx_p95 OR http_err > bl.http_p95\
+      \ OR conn_fail > bl.conn_p95:\n    EMIT severity=medium WITH device_ip, top_failing_domains, user_agent"
+- question: Does an unsupervised Isolation Forest model over 5-minute aggregated Zeek features for a mobile
+    device IP produce an anomaly score indicating significant deviation from its 30-day learned baseline,
+    and which top-3 features drive the anomaly?
+  context: Automated traffic generation is best caught as a multivariate anomaly against each device's
+    own norm. Implement an unsupervised Isolation Forest on 5-minute aggregated windows per device IP,
+    engineering Zeek features including connection count, DNS query entropy, ratio of distinct destination
+    IPs to total connections, distribution of destination ports (count of 80/443/other), average connection
+    duration, NXDOMAIN/4xx failure rate, and the count of unique user_agent strings. Train on at least
+    30 days to learn each device's normal behavior, then score new data in near real-time and alert on
+    significant deviations, surfacing the top-3 contributing features via per-feature path-length attribution
+    so analysts can triage. Validate against the CICAndMal2017 adware/SMS-malware traffic (Isolation Forest
+    is validated for real network anomaly detection at >95% accuracy in Nadler et al.). This catches novel
+    fraud-traffic patterns (Impact) that fixed rules miss; keep the deterministic intel-match and percentile
+    rules running as the floor and retrain to counter drift.
+  answer_sources: *id002
+  range: Last 90 days; train on >=30 days, score 5-minute windows
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = aggregate(conn.log,dns.log,http.log, window=5m, per=device_ip:\n  conn_count, dns_entropy,\
+      \ distinct_dst_ip/conn,\n  port_dist(80,443,other), avg_conn_duration,\n  nxdomain_4xx_fail_rate,\
+      \ distinct_user_agents)\nmodel = IsolationForest.fit(features, lookback=30d, per=device_ip)\nWHEN\
+      \ model.anomaly_score(window) > threshold:\n  EMIT alert WITH device_ip, top3_features(path_length_attribution)"
+- question: Where ad/marketplace vantage is available, does a click-fraud model (Clicktok mimicry/bait-click)
+    detect reused or replayed click patterns from a small pool of source IPs, or does the FairPlay PCF
+    model flag lock-step reviewer co-activity and rating spikes for an app?
+  context: 'When ad-network or app-store telemetry is available, layer specialized fraud inference in
+    parallel with the network detections. For click fraud, apply the mimicry/bait-click techniques of
+    Clicktok to detect reused/replayed click patterns in the device''s clickstream and threshold violations
+    such as a small pool of source IPs (the mimicry defense detects ~81% of stealthy fake clicks). For
+    app-store ranking/rating manipulation, apply the FairPlay PCF model to flag lock-step reviewer co-activity
+    and rating spikes (>95% accuracy on labeled data). Alert with the contributing evidence -- the reused-click
+    cluster, co-review group, or rating-spike window. These directly target the external-outcome manipulation
+    goals of T1643 (Impact): inflating ad clicks and gaming marketplace rankings/ratings.'
+  answer_sources: *id002
+  range: Last 90 days; evaluate rating-spike windows and click clusters
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "# Click fraud (Clicktok)\nclusters = Clicktok.detect_reused_replayed(device_clickstream)\n\
+      WHEN clusters.found OR distinct_source_ips < pool_threshold:\n  EMIT alert WITH reused_click_cluster\n\
+      # App-ranking/rating manipulation (FairPlay PCF)\ngroups = FairPlay.pcf(reviews, ratings)\nWHEN\
+      \ lockstep_co_activity OR rating_spike:\n  EMIT alert WITH co_review_group, rating_spike_window"
