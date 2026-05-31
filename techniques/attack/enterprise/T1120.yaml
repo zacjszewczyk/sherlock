@@ -1,0 +1,466 @@
+name: 'T1120: Peripheral Device Discovery'
+id: 2a08def6-4491-474a-91a8-0b136efeadb7
+description: 'Investigate potential adversary peripheral device discovery on Windows, Linux, and macOS
+  hosts. Adversaries enumerate attached peripherals and components - keyboards, printers, cameras, smart
+  card readers, and especially removable storage - to build awareness of the host and network and to plan
+  follow-on collection or exfiltration. This playbook helps an analyst hunt for: execution of known discovery
+  tools (by hash/script-block match), abuse of built-in peripheral-enumeration utilities and cmdlets (systeminfo,
+  driverquery, fsutil fsinfo drives, Get-PnpDevice, Get-CimInstance Win32_PnPEntity, wmic Win32_USBControllerDevice,
+  lsusb, lshw, udevadm, /sys and /proc reads, system_profiler SPUSBDataType, ioreg), discovery commands
+  spawned by anomalous parents (browsers, Office apps, web/service processes), statistically significant
+  bursts of enumeration activity on a single host or account, and suspicious sequences such as remote
+  logon -> device discovery -> access to a removable drive. It combines deterministic watchlists, statistical
+  baselining, and machine-learning detections so an analyst can confirm or refute peripheral device discovery
+  and assess intent toward collection and exfiltration.'
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process or script execute on a Windows, Linux, or macOS host whose file hash or PowerShell
+    script-block content matches a known-malicious peripheral/host discovery tool (e.g., Seatbelt, SharpHound,
+    or a custom USB-enumeration script)?
+  context: This is the deterministic floor of the playbook. Adversaries frequently drop named recon tooling
+    to enumerate peripherals and the host. Continuously match file hashes from process-creation telemetry
+    (Windows EID 4688/Sysmon EID 1, auditd execve, macOS unified log) and script-block content hashes
+    (Windows EID 4104) against a curated threat-intel feed of known discovery-tool hashes. A match is
+    a high-confidence Discovery indicator and should generate a high-severity alert; pivot to the user/host,
+    parent process, and any subsequent removable-media or network activity. A negative result does not
+    clear the host - move to the behavioral and statistical questions. Never remove this watchlist, only
+    extend it.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, macos_exec, EID4104)
+
+      | eval h = coalesce(process_hash, scriptblock_hash)
+
+      | lookup discovery_tool_hashes hash AS h OUTPUT tool_name
+
+      | where isnotnull(tool_name)
+
+      | alert severity=high msg="Known discovery tool: " + tool_name + " on " + host'
+- question: For process executions that do NOT match a known discovery-tool hash, is the command line
+    statistically anomalous (high Shannon entropy) relative to the host's and user's normal command lines,
+    suggesting obfuscated or encoded discovery activity?
+  context: Adversaries obfuscate or encode discovery commands to evade signature matching. Compute the
+    Shannon entropy of each command line and maintain a per-user/per-host 30-day baseline distribution.
+    Executions above the 99th percentile (often entropy > ~4.5 bits/char on Windows shells) are candidate
+    obfuscated discovery. Also track base64/decode failures and malformed-argument counts as a distinct
+    failure-state signal. High entropy alone is not proof - correlate with parent process, user context,
+    and any peripheral-enumeration keywords. This supports the Discovery tactic by catching recon that
+    deliberately hides its intent.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, macos_exec, EID4104)
+
+      | eval ent = shannon_entropy(command_line)
+
+      | stats p99(ent) AS thr by user, host (window=30d)
+
+      | where ent > thr
+
+      | eval decode_fail = like(command_line, "%base64%") AND decode_error
+
+      | alert msg="High command-line entropy (possible obfuscated discovery)"'
+- question: When a supervised classifier scores process executions for discovery behavior, which executions
+    receive high scores, and what features (parent image, command tokens, hash reputation, user context,
+    signing status) drove that score?
+  context: A gradient-boosted classifier (XGBoost) trained on features [parent image, command tokens,
+    file-hash reputation, user context, signing status] can surface discovery executions that evade both
+    hash and entropy checks. The alert should emit the top-3 contributing features for explainability
+    so the analyst can quickly judge whether the score reflects real recon. Run this in parallel with
+    the hash watchlist - model scores must never suppress deterministic matches. A high score on an unsigned
+    binary spawned by an unusual parent and invoking enumeration tokens is strong evidence of Discovery;
+    investigate accordingly.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "model = xgboost_load(\"discovery_process_clf\")\nfor e in process_events:\n  feats = [parent_image,\
+      \ tokenize(command_line), hash_reputation, user_context, signing_status]\n  score, top3 = model.predict_explain(feats)\n\
+      \  if score > 0.8: alert(msg=\"Discovery classifier hit\", features=top3)"
+- question: Did a non-administrative user or process execute a built-in peripheral-enumeration utility/cmdlet
+    - on Windows (systeminfo, driverquery, fsutil fsinfo drives, Get-PnpDevice, Get-CimInstance Win32_PnPEntity,
+    wmic path Win32_USBControllerDevice), Linux (lsusb, lshw, udevadm info, reads of /sys/bus/usb or /proc),
+    or macOS (system_profiler SPUSBDataType, ioreg)?
+  context: Native, signed utilities (LOLBins) are the adversary's preferred way to enumerate peripherals
+    without dropping tools. Maintain a cross-platform watchlist of these commands/cmdlets and alert when
+    they are executed by users outside a defined IT-admin group. Prioritize rarity and context over mere
+    presence - admins legitimately run these. A non-admin user running Get-PnpDevice or system_profiler
+    SPUSBDataType, especially shortly after gaining access, is a meaningful Discovery signal. Pivot to
+    what device data was returned and what the user did next (removable-media access, staging, exfil).
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - linux:osquery hardware_events
+  - macos:unifiedlog process exec
+  - macos:osquery usb_devices
+  - 'NAI: User Workstations, Domain Controllers, File Servers, Linux/macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, macos_exec, osquery)
+
+      | where match(command_line, peripheral_enum_watchlist)
+
+      | lookup it_admins user OUTPUT is_admin
+
+      | where is_admin != true
+
+      | alert msg="Peripheral enumeration by non-admin: " + user + " / " + command_line'
+- question: Did any process enumerate or read peripheral devices that are NOT on the host's approved-peripheral
+    inventory, and were there denied or blocked device-access attempts?
+  context: Beyond watching commands, compare the devices actually enumerated/read against a per-host inventory
+    of approved attached peripherals. Processes touching non-allowlisted devices indicate either unauthorized
+    hardware or reconnaissance of devices the user should not be probing. Separately profile denied/blocked
+    device-access attempts as a failure-state signal - repeated access-denied reads of USB/storage nodes
+    can reveal an adversary probing for accessible peripherals. This host-based allowlisting model is
+    especially valuable on sensitive endpoints and ICS-adjacent systems, supporting Discovery detection
+    by flagging deviation from a known-good hardware baseline.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - linux:osquery hardware_events
+  - macos:unifiedlog process exec
+  - macos:osquery usb_devices
+  - 'NAI: User Workstations, Domain Controllers, File Servers, Linux/macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (osquery_hardware_events, osquery_usb_devices, auditd_open_read)
+
+      | lookup approved_peripherals host, device_id OUTPUT approved
+
+      | where approved != true OR access_result="denied"
+
+      | alert msg="Non-allowlisted or denied peripheral access on " + host'
+- question: Has any user or host exceeded its 30-day baseline frequency (or distinct-command count) for
+    peripheral-enumeration commands within a 24-hour window, and does it stand out from peer hosts?
+  context: A single recon session often produces an unusual burst of enumeration commands. For each watchlist
+    command, baseline execution frequency per host and per user over a 30-day rolling window and compute
+    the 95th percentile and distinct-command count. Alert when a user/host exceeds the threshold within
+    24h, indicating an enumeration burst. Add peer-group comparison so a host enumerating far more than
+    its peers surfaces even if it lacks a long history. This statistical lens catches Discovery activity
+    that individual commands (each benign) would not, while peer context suppresses naturally busy admin
+    systems.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - linux:osquery hardware_events
+  - macos:unifiedlog process exec
+  - macos:osquery usb_devices
+  - 'NAI: User Workstations, Domain Controllers, File Servers, Linux/macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, osquery)
+
+      | where match(command_line, peripheral_enum_watchlist)
+
+      | bin _time span=24h
+
+      | stats count AS c, dc(command) AS distinct_cmds by user, host, _time
+
+      | eventstats p95(c) AS thr, avg(c) AS peer_avg by peer_group
+
+      | where c > thr OR c > 3*peer_avg
+
+      | alert msg="Peripheral enumeration burst on " + host'
+- question: When command lines are scored with unsupervised embeddings (or an Isolation Forest over [command,
+    user, host, hour, parent]), which peripheral-enumeration commands cluster apart from benign norms
+    as rare or obfuscated?
+  context: Rare and obfuscated enumeration commands are hard to enumerate exhaustively. Score command
+    lines with unsupervised embeddings (BERT/ELECTRA-style) so that anomalous commands cluster away from
+    benign norms; surface the nearest-benign exemplar and top tokens in the alert so the analyst sees
+    why it was flagged. Keep an Isolation Forest over tabular features [command, user, host, hour, parent]
+    as a robust fallback. Outliers here are candidate Discovery activity - particularly when paired with
+    an odd parent or off-hours timing. Use the exemplar and token explanation to triage quickly and reduce
+    false positives.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - linux:osquery hardware_events
+  - macos:unifiedlog process exec
+  - macos:osquery usb_devices
+  - 'NAI: User Workstations, Domain Controllers, File Servers, Linux/macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'emb = embed(command_line)  # BERT/ELECTRA
+
+      dist = nearest_benign_distance(emb)
+
+      if dist > thr: alert(msg="Anomalous enumeration command", exemplar=nearest_benign, tokens=top_tokens)
+
+      # fallback
+
+      iso = IsolationForest.score([command, user, host, hour, parent])
+
+      if iso < -thr2: alert(msg="IsolationForest discovery outlier")'
+- question: Was a peripheral-device discovery command spawned by an anomalous parent process - for example
+    cmd.exe/powershell.exe/wmic.exe enumeration launched by WINWORD.EXE, OUTLOOK.EXE, CHROME.EXE, or w3wp.exe,
+    or bash/python invoking lsusb/system_profiler from an unexpected service host?
+  context: 'Discovery commands spawned by document/browser/web processes are a hallmark of post-exploitation
+    following phishing or web compromise. Enforce a forbidden parent-child list: alert when a discovery
+    process (enumeration via cmd/powershell/wmic, or *nix bash/python invoking lsusb/system_profiler)
+    is spawned by an Office app, browser, web server worker (w3wp.exe), or an unexpected service host.
+    A hit strongly suggests an attacker has code execution inside an exploited application and is now
+    orienting - investigate the initial-access vector and any follow-on collection. This maps directly
+    to the Discovery tactic and is high signal with low false-positive cost.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Web Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, macos_exec)
+
+      | where match(command_line, peripheral_enum_watchlist)
+
+      | where parent_image IN ("WINWORD.EXE","OUTLOOK.EXE","CHROME.EXE","w3wp.exe") OR parent_image IN
+      service_hosts
+
+      | alert severity=high msg="Discovery command from anomalous parent: " + parent_image + " -> " +
+      image'
+- question: Given the historical frequency table of (parent_image, child_image) pairs, is the parent of
+    this discovery command historically rare or previously unseen (conditional probability p < 0.01),
+    and were any child spawns policy-blocked or sandboxed?
+  context: Forbidden-list rules catch known-bad pairs; a probabilistic baseline catches the unknown ones.
+    Build a frequency table of (parent_image, child_image) pairs from historical data and compute the
+    conditional probability of a discovery command given its parent. Alert on executions whose parent
+    is historically rare or unseen (p < 0.01). Separately track the rate of policy-blocked or sandboxed
+    child spawns as a failure-state signal - blocked attempts can reveal an adversary probing despite
+    controls. This statistical approach generalizes the Discovery detection beyond a hardcoded forbidden
+    list and adapts to each environment.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Web Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (EID4688, Sysmon1, auditd_execve, macos_exec)
+
+      | stats count by parent_image, child_image (baseline=90d)
+
+      | eval p = count / total_by(parent_image)
+
+      | where match(child_command, peripheral_enum_watchlist) AND p < 0.01
+
+      | alert msg="Rare parent for discovery command (p=" + p + ")"'
+- question: Does an LSTM/next-event sequence model assign low likelihood (high reconstruction error) to
+    a process-execution chain that contains a peripheral-discovery command, and which step in the parent->child->grandchild
+    chain is anomalous?
+  context: Some malicious chains look benign step-by-step but are anomalous as a sequence. Apply an LSTM
+    next-event model to process-execution chains (parent->child->grandchild) trained on benign sequences,
+    flagging discovery-bearing chains with low likelihood or high reconstruction error and reporting the
+    offending step. Pair it with a gradient-boosted lineage classifier for explainable feature attribution.
+    A low-likelihood chain that includes device enumeration is a candidate Discovery sequence worth deep
+    triage - reconstruct the full lineage and confirm whether the chain represents legitimate automation
+    or attacker activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - auditd:SYSCALL execve
+  - macos:unifiedlog process exec
+  - 'NAI: User Workstations, Web Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "chain = build_lineage(parent, child, grandchild)\nlik = lstm_next_event.likelihood(chain)\n\
+      if lik < thr or recon_error(chain) > thr2:\n  step = most_anomalous_step(chain)\n  feats = gbt_lineage.explain(chain)\n\
+      \  alert(msg=\"Anomalous discovery chain\", step=step, features=feats)"
+- question: Did a single source host execute more than 10 distinct device-discovery commands within a
+    5-minute window, OR target more than 5 remote hosts with RPC device-enumeration calls (Zeek dce_rpc.log)
+    in that window?
+  context: A concrete burst threshold is the deterministic floor for volumetric Discovery. Alert if one
+    source host runs >10 distinct device-discovery commands (EID 4688/auditd execve) OR targets >5 remote
+    hosts with RPC device-enumeration calls (Zeek dce_rpc.log) within 5 minutes. This pattern indicates
+    scripted or automated reconnaissance sweeping the host or network for peripherals. Tune the counts
+    to your environment using insider-threat baselines, but keep the rule - it is a reliable, explainable
+    trip-wire. A hit should trigger investigation of the source host's intent and any subsequent collection
+    or lateral movement.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek dce_rpc.log
+  - Zeek conn.log
+  - auditd:SYSCALL execve
+  - 'NAI: User Workstations, Domain Controllers, Network Segments (monitored by Zeek)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'local: source IN (EID4688, auditd_execve)
+
+      | where match(command_line, peripheral_enum_watchlist)
+
+      | bin _time span=5m | stats dc(command) AS cmds by host, _time | where cmds > 10
+
+      remote: source=zeek_dce_rpc | bin _time span=5m | stats dc(dest_host) AS targets by src_host, _time
+      | where targets > 5
+
+      | alert msg="Peripheral discovery burst"'
+- question: Within any 1-minute bin, does a host's peripheral-discovery command count exceed its 30-day
+    mean by more than 3 standard deviations (Z>3), and is there a correlated spike in failed/blocked enumeration
+    or removable-media I/O byte volume?
+  context: Where the fixed threshold is too coarse, a per-host Z-score adapts to each host's norm. Aggregate
+    discovery-command counts into 1-minute bins per host, compute mean/stdev over a 30-day baseline, and
+    alert when a bin exceeds mean + 3 stdev (Z>3). Separately bin failed/blocked enumeration attempts
+    (denied WMI, access-denied device reads) as a distinct state metric, and track the byte-volume of
+    any follow-on removable-media I/O. A statistically significant spike - especially alongside denied
+    attempts or large removable-media transfers - is strong evidence of active Discovery feeding collection/exfiltration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek dce_rpc.log
+  - Zeek conn.log
+  - auditd:SYSCALL execve
+  - 'NAI: User Workstations, Domain Controllers, Network Segments (monitored by Zeek)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (EID4688, EID4104, auditd_execve)
+
+      | where match(command_line, peripheral_enum_watchlist)
+
+      | bin _time span=1m | stats count AS c by host, _time
+
+      | eventstats avg(c) AS m, stdev(c) AS s by host (baseline=30d)
+
+      | eval z=(c-m)/s | where z > 3
+
+      | alert msg="Per-host discovery Z-score " + z'
+- question: Does a per-host time-series forecast (SARIMA/Prophet) of peripheral-discovery volume show
+    observed activity outside the prediction interval, and does peer-group scoring confirm it is anomalous
+    rather than a globally-busy admin host?
+  context: Volume that is abnormal for the time of day/week can be missed by static thresholds. Fit a
+    per-host time-series model (SARIMA/Prophet) on historical discovery volume and alert when observed
+    activity falls outside the prediction interval; report the predicted-vs-observed delta and the contributing
+    time window. Use peer-group anomaly scoring to suppress globally-busy admin hosts that legitimately
+    enumerate often. An out-of-band spike that peers do not share points to targeted Discovery on that
+    host - correlate with logon source, parent processes, and removable-media activity to confirm.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Zeek dce_rpc.log
+  - Zeek conn.log
+  - auditd:SYSCALL execve
+  - 'NAI: User Workstations, Domain Controllers, Network Segments (monitored by Zeek)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "model = prophet_fit(host_discovery_volume_history)\nyhat, lo, hi = model.predict(now)\nif\
+      \ observed > hi:\n  if peer_group_score(host) > thr:\n    alert(msg=\"Discovery volume above forecast\"\
+      , delta=observed-yhat, window=current_window)"
+- question: Did the same user/host, within 30 minutes, perform a successful remote logon (EID 4624 Logon
+    Type 3/10), then drive/device enumeration (e.g., fsutil fsinfo drives or Get-PnpDevice via EID 4688),
+    then access an object on a removable drive (EID 4663 with a removable drive letter)?
+  context: 'The most actionable Discovery signal is the full kill-chain sequence. Use stateful correlation
+    that fires when, from the same user/host within 30 minutes: (1) a successful remote logon (EID 4624
+    Logon Type 3/10); (2) drive/device enumeration (fsutil fsinfo drives or Get-PnpDevice via EID 4688);
+    and (3) access to an object on a removable drive (EID 4663 with a removable drive letter). This chain
+    - remote access, then orientation, then touching removable media - closely matches removable-media
+    exfiltration scenarios and insider-threat patterns. A complete sequence is high-confidence malicious
+    behavior linking Discovery to Collection/Exfiltration and warrants immediate response.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers, User Workstations with removable media access, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "sequence by user, host within 30m:\n  1) EID4624 logon_type IN (3,10)\n  2) EID4688 command_line\
+      \ MATCHES (\"fsutil fsinfo drives\" OR \"Get-PnpDevice\")\n  3) EID4663 object_name MATCHES removable_drive_letter\n\
+      | alert severity=high msg=\"Remote logon -> device discovery -> removable media access\""
+- question: When discrete events are risk-scored (remote logon from new geo +10, Get-PnpDevice/lsusb +5,
+    write to removable media +15, off-hours +5) and summed per user/host over a rolling 1-hour window,
+    which entities exceed the 99th percentile of scores, and what failed/blocked steps appear in the breakdown?
+  context: Not every malicious sequence completes cleanly, so a cumulative risk score catches partial
+    or fuzzy chains. Assign points to discrete events (remote logon from new geo +10, Get-PnpDevice/lsusb
+    +5, write to removable media +15, off-hours +5) and sum per user/host over a rolling 1-hour window;
+    alert above the 99th percentile of scores across the population, with peer-group context. Include
+    failed/blocked steps as negative-state evidence in the breakdown shown to analysts. A high aggregate
+    score concentrates weak Discovery signals into one prioritized, explainable alert tying recon to potential
+    removable-media exfiltration.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers, User Workstations with removable media access, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'events scored: remote_logon_new_geo=10, get_pnpdevice_or_lsusb=5, removable_write=15, off_hours=5
+
+      | bin rolling 1h by user, host
+
+      | stats sum(score) AS risk, values(blocked_step) AS failures by user, host
+
+      | eventstats p99(risk) AS thr by peer_group
+
+      | where risk > thr
+
+      | alert msg="High discovery risk score " + risk + " breakdown=" + failures'
+- question: Does a temporal provenance graph (users/hosts/processes/files) contain an anomalous subgraph
+    matching 'Remote Logon -> Device Discovery -> Staging on Removable Media', as flagged by a graph neural
+    network, and what are the top contributing nodes/edges?
+  context: The richest correlation models the environment as a temporal provenance graph linking users,
+    hosts, processes, and files, then uses a graph neural network to flag anomalous subgraphs matching
+    'Remote Logon -> Device Discovery -> Staging on Removable Media'. The system auto-reconstructs the
+    candidate attack subgraph for triage and surfaces the top contributing nodes/edges - typically the
+    discovery and removable-write events - for explainability. A flagged subgraph is a strong, context-rich
+    indicator that Discovery is feeding staging/exfiltration; use the reconstructed graph to scope the
+    incident across the involved entities quickly.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers, User Workstations with removable media access, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "G = build_provenance_graph(users, hosts, processes, files, window=1h)\nsubs = gnn.detect_anomalous_subgraphs(G,\
+      \ pattern=\"RemoteLogon->DeviceDiscovery->RemovableStaging\")\nfor s in subs:\n  if s.score > thr:\n\
+      \    alert(msg=\"Anomalous discovery->staging subgraph\", nodes=s.top_nodes, edges=s.top_edges)"
