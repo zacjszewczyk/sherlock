@@ -1,0 +1,585 @@
+name: 'T1106: Native API'
+id: 4aab3250-ce52-4160-95c2-2f63264fbf4c
+description: 'This playbook helps an analyst investigate whether an adversary is abusing native operating
+  system APIs (e.g., NtCreateProcess/CreateProcess, fork, mmap, ptrace, CoreServices/Foundation) to execute
+  malicious code and subvert user-mode detection. It guides the hunt across several observable behaviors:
+  process creation and module-load events whose file hashes match threat intelligence or are anomalously
+  rare; legitimate system binaries (LOLBAS such as rundll32.exe and regsvr32.exe) launched with suspicious
+  command-line arguments; cross-process handle requests with high-risk access rights and full memory-injection
+  API chains (VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread); command interpreters spawned
+  by atypical parents (Office apps, browsers, web services) including direct/manual syscall call-stacks
+  that bypass API hooks; and newly created processes from unusual paths that immediately beacon to rare
+  or malicious external destinations. For each behavior it pairs symbolic-logic rules, statistical baselining,
+  and machine-learning approaches across Windows (Event ID 4688, Sysmon), Linux auditd, macOS unified/EndpointSecurity
+  logs, and Zeek network telemetry.'
+type: technique
+related:
+- tactic_id: TA0002
+  tactic_name: Execution
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process creation (Sysmon Event ID 1 / Windows 4688) or module load (Sysmon Event ID
+    7) event carry a file hash (MD5, SHA1, or SHA256) that matches a known-malware entry on a high-confidence
+    threat intelligence feed?
+  context: Adversaries abusing native OS APIs frequently do so through binaries or DLLs that are already
+    catalogued in malware intelligence. Matching observed process- and module-load hashes against curated,
+    high-confidence threat-intel feeds is the cheapest, highest-precision way to catch known malware variants
+    invoking native APIs. A positive match against an active feed is a near-certain incident indicator
+    and should trigger immediate host isolation and triage; a clean result does not exonerate the host,
+    because novel or recompiled payloads will not match and must be pursued with the rarity and ML methods
+    below. This directly supports the Execution tactic by flagging adversary-controlled code the moment
+    it runs or is loaded.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Threat Intelligence Feeds
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, particularly those with EDR agents capable of file hashing
+    and process monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=endpoint (sourcetype=Sysmon EventCode IN (1,7)) OR (sourcetype=WinEventLog EventCode=4688)
+
+      | eval h=coalesce(SHA256,SHA1,MD5,Hashes)
+
+      | lookup ti_malware_hashes hash AS h OUTPUT feed, confidence
+
+      | where isnotnull(feed) AND confidence>="high"
+
+      | table _time host Image ImageLoaded h feed confidence'
+- question: For binaries that do NOT match any threat-intel feed, which executed file hashes are anomalously
+    rare across the fleet (seen on 5 or fewer hosts, or under 0.1% of endpoints), especially when signed
+    by an unknown publisher?
+  context: Sophisticated actors use custom or freshly compiled tooling whose hashes are absent from intelligence
+    feeds, so prevalence becomes the key discriminator. By computing fleet-wide frequency for every unique
+    hash and alerting on the rarest tail, an analyst surfaces never-before-seen executables that nonetheless
+    ran with native-API behavior. Derive the host-count threshold from the 1st percentile of your environment's
+    hash-prevalence distribution rather than a fixed number, so the baseline adapts per environment. A
+    rare hash combined with an unknown or absent code-signing publisher is strongly suspicious for the
+    Execution tactic; common hashes are likely benign software and can be deprioritized.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Threat Intelligence Feeds
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, particularly those with EDR agents capable of file hashing
+    and process monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint sourcetype=Sysmon EventCode=1
+
+      | eval h=coalesce(SHA256,SHA1,MD5)
+
+      | where NOT [| inputlookup ti_malware_hashes | fields hash | rename hash AS h]
+
+      | stats dc(host) AS host_count values(Signed) AS signed by h Image
+
+      | eventstats perc1(host_count) AS p1_threshold
+
+      | where host_count<=coalesce(p1_threshold,5) AND (signed="false" OR isnull(signed))'
+- question: When an unknown binary executes, how does a trained reputation model (Gradient Boosting Machine
+    / XGBoost) score it based on its signer, size, entropy, path, and imported native APIs, and what top-3
+    explanatory features drive a malicious verdict?
+  context: Neither TI matching nor pure rarity explains WHY an unknown file is dangerous. A GBM/XGBoost
+    classifier trained on static features of executed files (signer, size, Shannon entropy, install path,
+    and the set of imported native APIs such as VirtualAllocEx) produces a reproducible, explainable maliciousness
+    score for every unknown hash. The alert must surface the top-3 SHAP-ranked contributing features so
+    an analyst can quickly validate the verdict (e.g., 'unsigned + high entropy + imports WriteProcessMemory').
+    High model scores with injection-related API imports strongly indicate native-API abuse for Execution;
+    the SHAP explanation enables fast, defensible triage and tuning.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Threat Intelligence Feeds
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, particularly those with EDR agents capable of file hashing
+    and process monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "model = load(\"xgb_file_reputation.pkl\")\nfor f in unknown_executed_files:\n  x = features(signer,size,entropy,path,imported_native_apis)\n\
+      \  score = model.predict_proba(x)[malicious]\n  if score >= THRESH:\n    shap = explain(model,x);\
+      \ top3 = shap.rank()[:3]\n    alert(file=f, score=score, top_features=top3)"
+- question: Were any LOLBAS binaries (rundll32.exe, regsvr32.exe, msiexec.exe, etc.) executed with command-line
+    arguments matching malicious patterns such as URL schemes (http/ftp), remote script extensions (.sct,
+    .hta), or Base64-encoded blobs?
+  context: Living-off-the-land binaries are signed, trusted system utilities that invoke native APIs to
+    load and run code, making them a favorite for evading allowlists. Adversaries pass them tell-tale
+    arguments - URLs to fetch remote scriptlets, scriptlet/HTA extensions, or Base64-encoded payloads.
+    A regex denylist over the command line of known LOLBAS binaries catches these high-signal patterns
+    immediately. A match (e.g., rundll32 invoking a remote .sct over http) is a strong Execution indicator
+    warranting investigation of the downloaded content and resulting child processes; absence of a match
+    does not clear the host, since attackers may use less obvious argument forms caught by the statistical/ML
+    methods.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations, application servers, and domain controllers where common Living-Off-the-Land
+    Binaries and Scripts (LOLBAS) are present.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=endpoint (EventCode=1 OR EventCode=4688)
+
+      | where lower(Image) IN ("*\\rundll32.exe","*\\regsvr32.exe","*\\msiexec.exe","*\\mshta.exe")
+
+      | regex CommandLine="(?i)(https?://|ftp://|\.sct|\.hta|[A-Za-z0-9+/]{40,}={0,2})"
+
+      | table _time host ParentImage Image CommandLine User'
+- question: For each LOLBAS binary, does any single execution have a command-line length or Shannon entropy
+    that exceeds the 95th percentile or 3 standard deviations above that binary's historical baseline?
+  context: Malicious LOLBAS invocations often embed encoded or obfuscated payloads that inflate the command
+    line far beyond the binary's normal administrative usage. By baselining command-line length and entropy
+    per binary and alerting on statistical outliers, an analyst catches obfuscation even when it does
+    not match a known regex. High entropy suggests encoding/encryption; unusual length suggests inlined
+    payloads. An outlier for, say, regsvr32 is a meaningful Execution lead; values within the normal band
+    for that specific binary are expected and can be ignored, which keeps false positives low by comparing
+    each tool to itself rather than a global threshold.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations, application servers, and domain controllers where common Living-Off-the-Land
+    Binaries and Scripts (LOLBAS) are present.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint (EventCode=1 OR EventCode=4688) Image IN (lolbas_list)
+
+      | eval cmd_len=len(CommandLine), cmd_entropy=shannon_entropy(CommandLine)
+
+      | eventstats mean(cmd_len) AS m_len stdev(cmd_len) AS sd_len perc95(cmd_entropy) AS p95_ent by Image
+
+      | where cmd_len > (m_len+3*sd_len) OR cmd_entropy > p95_ent'
+- question: After tokenizing and vectorizing LOLBAS command lines, do any executions fall into DBSCAN
+    outlier (noise) clusters that deviate from the dense clusters of standard administrative usage?
+  context: Some malicious LOLBAS usage is neither a known regex nor a simple length/entropy outlier, but
+    is still structurally unlike legitimate admin commands. Tokenizing and vectorizing the argument strings
+    and applying DBSCAN density clustering groups the bulk of normal usage into dense clusters while leaving
+    anomalous executions as unclustered noise points. Reviewing the noise set surfaces novel abuse patterns
+    of system binaries that bypass signature methods. Outlier cluster membership is an Execution lead
+    requiring analyst review of the full command and process tree; points inside large benign clusters
+    represent routine administration. This method adapts to each environment's actual admin behavior.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations, application servers, and domain controllers where common Living-Off-the-Land
+    Binaries and Scripts (LOLBAS) are present.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "args = [tokenize(cmdline) for cmdline in lolbas_executions]\nX = tfidf_vectorize(args)\nlabels\
+      \ = DBSCAN(eps=tuned, min_samples=tuned).fit_predict(X)\nfor i,l in enumerate(labels):\n  if l ==\
+      \ -1:  # noise / outlier\n    alert(execution=lolbas_executions[i])"
+- question: For LOLBAS processes, does a dynamically traced native API/syscall sequence align strongly
+    (via Smith-Waterman local alignment) with known-malicious chains such as the DLL/code-injection chain
+    OpenProcess -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread?
+  context: Beyond the command line, the runtime behavior of a LOLBAS process reveals intent. Capturing
+    the ordered native API/syscall sequence and scoring it with Smith-Waterman local sequence alignment
+    against a library of known-malicious chains highlights executions that perform classic injection regardless
+    of how they were launched. The canonical OpenProcess->VirtualAllocEx->WriteProcessMemory->CreateRemoteThread
+    chain occurs almost exclusively in malware, so a high alignment score is a very strong Execution/injection
+    signal. Low alignment to all malicious templates suggests benign behavior. This dynamic check complements
+    the static command-line methods and resists argument obfuscation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations, application servers, and domain controllers where common Living-Off-the-Land
+    Binaries and Scripts (LOLBAS) are present.'
+  range: Last 90 days
+  queries:
+  - technology: EDR/API-trace pseudocode
+    query: "malicious_chain = [OpenProcess,VirtualAllocEx,WriteProcessMemory,CreateRemoteThread]\nfor\
+      \ proc in lolbas_processes:\n  seq = trace_native_api(proc)\n  score = smith_waterman(seq, malicious_chain)\n\
+      \  if score >= ALIGN_THRESH:\n    alert(process=proc, alignment_score=score)"
+- question: Did any process that is NOT a sanctioned security tool request a handle to a critical system
+    process (lsass.exe, winlogon.exe) with high-risk access rights such as PROCESS_ALL_ACCESS, PROCESS_VM_WRITE,
+    or PROCESS_CREATE_THREAD?
+  context: Native-API process injection and credential theft begin with opening a handle to a target process
+    with rights permitting memory writes or remote thread creation. Alerting when a non-security process
+    requests PROCESS_ALL_ACCESS / PROCESS_VM_WRITE / PROCESS_CREATE_THREAD against sensitive targets like
+    lsass.exe (credential dumping) or winlogon.exe (injection) catches the opening move of these attacks.
+    A maintained allowlist of legitimate security/EDR accessors keeps noise down. A hit is a high-severity
+    Execution/Credential-Access indicator; expected accesses from AV/EDR are filtered. Focus especially
+    on Domain Controllers and developer workstations where such access is unusual and high-impact.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, with a focus on high-value assets such as Domain Controllers
+    (for lsass.exe access) and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=endpoint sourcetype=Sysmon EventCode=10
+
+      | where TargetImage IN ("*\\lsass.exe","*\\winlogon.exe")
+
+      | where match(GrantedAccess,"0x1F0FFF|0x1FFFFF|0x0020|0x0002")  /* ALL_ACCESS, VM_WRITE, CREATE_THREAD
+      */
+
+      | search NOT [| inputlookup security_tool_images | fields SourceImage]
+
+      | table _time host SourceImage TargetImage GrantedAccess CallTrace'
+- question: Within a single source process, do memory-allocation (VirtualAllocEx/NtAllocateVirtualMemory),
+    memory-write (WriteProcessMemory/NtWriteVirtualMemory), and remote-execution (CreateRemoteThread/NtCreateThreadEx/QueueUserAPC)
+    native APIs occur in order against a SHARED target memory address?
+  context: Any single injection API can appear in benign software, generating noise, but the complete
+    ordered chain bound to the same target memory address is the definitive signature of code injection.
+    Requiring temporal correlation of allocate -> write -> execute against a shared address within one
+    source process suppresses benign single-API use and fires only on real injection. A positive correlation
+    is among the strongest possible Execution indicators and should drive immediate response on both source
+    and target processes. Missing any link in the chain materially lowers confidence. This precise correlation
+    is what separates true injection from incidental API usage.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, with a focus on high-value assets such as Domain Controllers
+    (for lsass.exe access) and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: EDR/API-trace correlation pseudocode
+    query: "for src in source_processes:\n  events = native_api_events(src) ordered by time\n  if exists\
+      \ alloc in {VirtualAllocEx,NtAllocateVirtualMemory}\n     and write in {WriteProcessMemory,NtWriteVirtualMemory}\n\
+      \     and exec in {CreateRemoteThread,NtCreateThreadEx,QueueUserAPC}\n     where alloc.time<write.time<exec.time\n\
+      \       and alloc.target_addr==write.target_addr==exec.target_addr:\n    alert(source=src, target=alloc.target_process)"
+- question: Which source processes are generating a burst of FAILED high-rights handle opens (OpenProcess/NtOpenProcess
+    returning ACCESS_DENIED, or ptrace/process_vm_writev returning EPERM/EACCES on Linux) - for example
+    more than 5 per minute - exceeding the per-host 99th percentile?
+  context: Before a successful injection, malware often probes many processes or retries against protected
+    targets, producing a spike of access-denied failures distinct from quiet, successful access. Tracking
+    per-source-process counts of failed high-rights handle opens (Windows ACCESS_DENIED; Linux EPERM/EACCES
+    from ptrace/process_vm_writev) and alerting on bursts above the host's 99th percentile reveals handle-spraying
+    and privilege probing that successful-access rules miss. A rapid burst of failures from one process
+    is a strong reconnaissance/Execution-prep indicator. Sparse, occasional failures are normal. Baselining
+    per host prevents busy admin/security tools from triggering false alarms.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, with a focus on high-value assets such as Domain Controllers
+    (for lsass.exe access) and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '(index=endpoint EventCode=10 GrantedAccess="0x0") OR (index=linux type=SYSCALL comm IN (ptrace,process_vm_writev)
+      exit IN (-1,-13,-1))
+
+      | bin _time span=1m
+
+      | stats count AS fails by _time SourceImage host
+
+      | eventstats perc99(fails) AS p99 by host
+
+      | where fails>p99 AND fails>5'
+- question: Which (SourceImage, TargetImage, GrantedAccess) process-access tuples fall into the rarest
+    1% of all such tuples observed over a rolling 30-day window?
+  context: Most cross-process access in an environment follows a small set of common, legitimate patterns;
+    injection introduces unusual source-target-rights combinations. Maintaining a frequency table of (SourceImage,
+    TargetImage, GrantedAccess) tuples and alerting on the rarest 1% surfaces atypical access relationships
+    (e.g., an Office app opening lsass with write rights) without needing a hardcoded denylist. Rare tuples
+    are Execution leads warranting review of the source binary and intent; common tuples reflect normal
+    operation. The 30-day window keeps the baseline current as the environment changes, and the data-driven
+    approach catches novel pairs that static rules would miss.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, with a focus on high-value assets such as Domain Controllers
+    (for lsass.exe access) and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint sourcetype=Sysmon EventCode=10 earliest=-30d
+
+      | stats count AS tuple_count by SourceImage TargetImage GrantedAccess
+
+      | eventstats sum(tuple_count) AS total
+
+      | eval freq=tuple_count/total
+
+      | where freq <= percentile(freq,1)
+
+      | sort freq'
+- question: When process-access events are modeled as a directed graph (processes as nodes, handle requests
+    as edges), do graph-learning models (GraphSAGE / temporal autoencoder) flag any anomalous edges that
+    violate normal community structure, such as Word injecting into Notepad?
+  context: 'Process-access relationships form a graph whose normal structure (communities of related processes)
+    can be learned. GraphSAGE or graph temporal autoencoders detect edges that violate that learned structure
+    - precisely the unusual injector->target relationships injection creates. Node/edge-level localization
+    makes the alert explainable: the analyst sees exactly which process pair and access right is anomalous.
+    An anomalous edge (e.g., winword.exe -> notepad.exe with write rights) is a strong Execution-via-injection
+    indicator; edges consistent with learned communities are benign. This captures relational anomalies
+    that per-event rarity scoring can overlook, and provides triage-ready context.'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Auditd
+  - 'NAI: All Windows endpoints and servers, with a focus on high-value assets such as Domain Controllers
+    (for lsass.exe access) and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Graph pseudocode
+    query: "G = build_graph(nodes=processes, edges=process_access_events)\nmodel = GraphSAGE_or_temporal_autoencoder.fit(G_baseline)\n\
+      for e in G.edges:\n  err = model.reconstruction_error(e)\n  if err >= THRESH:\n    alert(src=e.source,\
+      \ dst=e.target, access=e.granted, score=err)"
+- question: Did any known-suspicious parent-child process relationship occur, such as winword.exe -> cmd.exe,
+    outlook.exe -> powershell.exe, or w3wp.exe -> net.exe?
+  context: When an adversary uses native APIs (e.g., CreateProcess) to spawn a shell from a document,
+    email, or web application, it produces parent-child relationships that essentially never occur in
+    legitimate use. A curated denylist of such pairs (Office/browser/mail/web-service parents launching
+    interpreters or admin tools) provides immediate, high-precision detection of exploitation and macro/script
+    execution. A match is a strong Execution indicator and frequently the first sign of initial access
+    or lateral movement, warranting review of the full process tree and the parent's recent file/network
+    activity. The denylist is fast and reliable but finite, so pair it with the statistical and ML genealogy
+    methods to catch novel parent-child abuse.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations (for Office/browser parents), critical servers (for service parents), and
+    mail servers (for email client parents).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=endpoint (EventCode=1 OR EventCode=4688)
+
+      | eval pc=lower(ParentImage)."->".lower(Image)
+
+      | search pc IN ("*winword.exe->*cmd.exe","*outlook.exe->*powershell.exe","*w3wp.exe->*net.exe","*excel.exe->*wscript.exe")
+
+      | table _time host ParentImage Image CommandLine User'
+- question: Using kernel ETW Threat-Intelligence (or equivalent EDR call-stack telemetry), did any native
+    syscall/API invocation have a return call stack that does NOT terminate in a backed module (ntdll.dll/kernel32.dll)
+    or that originated from unbacked (private, RX) memory?
+  context: To bypass user-mode API hooks, advanced actors issue manual/direct syscalls or run shellcode
+    from private executable memory, so the call stack for a syscall does not unwind back through legitimate
+    ntdll/kernel32 module code. By inspecting kernel ETW Threat-Intelligence (or EDR) call stacks and
+    alerting when a syscall's return stack does not terminate in a backed module or originates from unbacked
+    RX memory, an analyst detects the very hook-evasion that signature tools are blind to. This is a high-fidelity
+    Execution indicator of in-memory threats and shellcode; normal applications call native APIs through
+    backed modules. It is one of the strongest available signals for sophisticated native-API abuse.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations (for Office/browser parents), critical servers (for service parents), and
+    mail servers (for email client parents).'
+  range: Last 90 days
+  queries:
+  - technology: EDR/ETW call-stack pseudocode
+    query: "for ev in etw_threatintel_syscalls:\n  frames = ev.return_call_stack\n  top = frames[-1]\n\
+      \  if top.module NOT IN (ntdll.dll,kernel32.dll,kernelbase.dll)\n     or top.memory_type IN (PRIVATE,MAPPED)\
+      \ and top.protect==RX:\n    alert(process=ev.process, syscall=ev.api, stack=frames)"
+- question: Which observed parent-child process pairs have a conditional probability P(Child | Parent)
+    below 0.0001, marking them as statistically rare process genealogy?
+  context: Rather than relying on a finite denylist, computing the conditional probability of each child
+    given its parent across historical data lets an analyst flag any parent-child pair that is statistically
+    vanishingly rare (P < 0.0001). This catches novel abusive lineages - any unusual interpreter or utility
+    spawned by an application or service - that a hardcoded list would miss. A rare pair is an Execution
+    lead requiring review of how and why the parent spawned the child; common pairs reflect normal software
+    behavior. Because the threshold is probabilistic and learned from the environment, it adapts automatically
+    and surfaces emerging attack patterns without manual rule maintenance.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations (for Office/browser parents), critical servers (for service parents), and
+    mail servers (for email client parents).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint (EventCode=1 OR EventCode=4688)
+
+      | stats count AS pair_count by ParentImage Image
+
+      | eventstats sum(pair_count) AS parent_total by ParentImage
+
+      | eval p_child_given_parent=pair_count/parent_total
+
+      | where p_child_given_parent < 0.0001'
+- question: For each program, what proportion of its short fixed-length syscall n-grams (auditd SYSCALL
+    on Linux; ETW/EDR on Windows) are previously unseen, and does any execution's mismatch rate exceed
+    the tuned anomaly threshold?
+  context: A program's normal native-API/syscall behavior can be characterized by the set of short fixed-length
+    n-grams it emits. Building per-program baselines and scoring each execution by its proportion of previously-unseen
+    n-grams (the mismatch rate) detects hijacked or injected control flow, since malicious behavior introduces
+    novel syscall sequences. Augmenting each syscall with call-stack return addresses sharpens discrimination
+    of control-flow hijacking. A high mismatch rate for a given program is an Execution anomaly worth
+    investigating; a low rate matches the learned profile. This sequence-based method catches behavior
+    that single-event rules miss and is effective on both Linux (auditd) and Windows (ETW/EDR) telemetry.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations (for Office/browser parents), critical servers (for service parents), and
+    mail servers (for email client parents).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "/* baseline: per-program set of known syscall n-grams */\nfor exec in process_executions:\n\
+      \  ngrams = sliding_window(syscall_seq(exec), n=5)\n  unseen = count(g for g in ngrams if g not\
+      \ in baseline[exec.program])\n  mismatch = unseen/len(ngrams)\n  if mismatch > MISMATCH_THRESH:\n\
+      \    alert(program=exec.program, host=exec.host, mismatch=mismatch)"
+- question: When an Isolation Forest is trained on process-creation features (ParentImage, Image, User,
+    CommandLine), which events receive high anomaly scores indicating abnormal process genealogy?
+  context: Isolation Forest efficiently isolates outliers in high-dimensional, mixed categorical feature
+    spaces, making it well suited to scoring process-creation events on combined features like parent
+    image, child image, user, and command line. Events that are easy to isolate (high anomaly score) represent
+    abnormal genealogy - unusual combinations of parent, child, user, and arguments that a human-maintained
+    list could not enumerate. A high-scoring event is an Execution lead for analyst review; low scores
+    reflect typical activity. This unsupervised method requires no labeled malware and adapts to each
+    environment, complementing the denylist and conditional-probability methods to provide broad coverage
+    of anomalous process spawning.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Auditd
+  - 'NAI: User workstations (for Office/browser parents), critical servers (for service parents), and
+    mail servers (for email client parents).'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "X = features(ParentImage, Image, User, CommandLine) for process_creation_events\nmodel = IsolationForest(n_estimators=200,\
+      \ contamination=auto).fit(X)\nscores = -model.score_samples(X)\nfor i,s in enumerate(scores):\n\
+      \  if s >= THRESH:\n    alert(event=events[i], anomaly_score=s)"
+- question: Did a process launched from a user-writable directory (%TEMP%, Downloads) connect to a domain
+    on a threat-intel blocklist within 60 seconds of its creation, correlating Sysmon Event 1 with Zeek
+    conn.log?
+  context: Dropped malware that uses native APIs to execute often beacons to command-and-control almost
+    immediately after launch. Correlating process creation (Sysmon Event 1) from user-writable paths with
+    outbound connections (Zeek conn.log) to TI-blocklisted domains within a tight 60-second window yields
+    a high-precision detection of staged payloads calling home. A match strongly indicates Execution followed
+    by Command-and-Control and warrants immediate containment of the host and the destination. The short
+    time window and user-writable-path filter keep precision high; legitimate software installed to system
+    paths or contacting known-good infrastructure will not trigger. Pursue by examining the binary hash,
+    parent process, and full connection details.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, web-facing servers, and network egress points instrumented with Zeek.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '| from sysmon EventCode=1 WHERE Image IN ("*\\Temp\\*","*\\Downloads\\*","*\\AppData\\Local\\Temp\\*")
+      AS p
+
+      | join host [from zeek conn.log AS c]
+
+      | where c.ts - p.ts <= 60s
+
+      | lookup ti_blocklist domain AS c.query
+
+      | where isnotnull(ti_blocklist.feed)
+
+      | table p._time host p.Image c.id.resp_h c.query'
+- question: Does any newly created process have an image-path Shannon entropy in the 95th percentile AND
+    connect to a domain seen on fewer than 5 hosts in the environment?
+  context: Malware frequently runs from randomly named files (high-entropy paths) and contacts rare, attacker-controlled
+    infrastructure. Combining a high-entropy image-path score (95th percentile) with a rare-destination
+    filter (domain seen on < 5 hosts) produces a compound anomaly far more specific than either signal
+    alone. The conjunction means a randomly named binary talking to obscure infrastructure - a classic
+    dropped-payload-plus-C2 pattern under the Execution and Command-and-Control tactics. A match warrants
+    investigation of the file's origin and the destination's reputation; common destinations or human-readable
+    paths will not trigger. Tuning entropy and host-count thresholds to the environment keeps false positives
+    manageable.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, web-facing servers, and network egress points instrumented with Zeek.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=endpoint sourcetype=Sysmon EventCode=1
+
+      | eval path_entropy=shannon_entropy(Image)
+
+      | eventstats perc95(path_entropy) AS p95
+
+      | join host Image [search sourcetype=Sysmon EventCode=3 | stats dc(host) AS dest_hosts by DestinationHostname
+      | rename DestinationHostname AS domain]
+
+      | where path_entropy>=p95 AND dest_hosts<5'
+- question: Which newly created processes generate a high ratio of failed/rejected connections (Zeek conn.log
+    states S0/REJ, e.g., >30%) or a high NXDOMAIN rate (Zeek dns.log, e.g., >10/min), exceeding the per-host
+    99th percentile?
+  context: 'C2 retry loops and DGA-based malware produce distinctive failure signatures: many half-open/rejected
+    connections and bursts of NXDOMAIN responses as the malware cycles through dead infrastructure or
+    algorithmically generated domains. Profiling per-process connection-state outcomes from Zeek conn.log
+    (S0/REJ) and DNS NXDOMAIN rates from dns.log, then alerting on the per-host 99th percentile, isolates
+    this behavior from normal egress. A newly created process with >30% failed connections or >10 NXDOMAIN/min
+    is a strong Command-and-Control indicator stemming from native-API execution. Normal applications
+    resolve and connect successfully most of the time. Baselining per host prevents noisy-but-legitimate
+    apps from dominating alerts.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, web-facing servers, and network egress points instrumented with Zeek.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "conn = read(conn.log); dns = read(dns.log)\nper_proc_fail = conn | where conn_state in (S0,REJ)\
+      \ | bin(1m) | stats fails, total by host proc\nnxd = dns | where rcode_name==\"NXDOMAIN\" | bin(1m)\
+      \ | stats nx by host proc\njoin per_proc_fail, nxd\nwhere (fails/total) > 0.30 OR nx > 10\n  and\
+      \ value > perc99(value) by host\n-> alert(proc, host, fail_ratio, nx_rate)"
+- question: When the ordered native API/syscall stream of a newly created process is scored by an LSTM
+    or CNN-LSTM sequence classifier (trained on benign vs. malicious sequences such as Mal-API-2019),
+    is it classified as malicious, and what top-3 SHAP/attention features explain the verdict?
+  context: The temporal order of native API/syscall calls encodes malicious intent even when surface features
+    are obfuscated. LSTM or CNN-LSTM models trained on labeled benign/malicious API sequences (e.g., Mal-API-2019)
+    detect metamorphic execution at high accuracy and resist surface obfuscation that defeats signatures.
+    Scoring the call stream of newly created processes and surfacing the top-3 SHAP/attention features
+    makes each verdict explainable and triage-ready. A malicious classification is a strong Execution
+    indicator of native-API abuse; benign scores reflect normal behavior. Because the model learns from
+    sequence structure rather than static strings, it generalizes to novel and packed samples, complementing
+    the hash- and rule-based methods.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, web-facing servers, and network egress points instrumented with Zeek.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Sequence pseudocode
+    query: "model = load(\"lstm_api_seq.h5\")  # trained on Mal-API-2019 benign/malicious\nfor proc in\
+      \ new_processes:\n  seq = native_api_stream(proc)\n  p_mal = model.predict(encode(seq))\n  if p_mal\
+      \ >= THRESH:\n    feats = attention_or_shap(model, seq)[:3]\n    alert(process=proc, score=p_mal,\
+      \ top_features=feats)"
+- question: Does a time-series model (e.g., LSTM) on per-process outbound connection counts or byte volume
+    reveal sudden, sustained spikes indicating beaconing or massive data egress from a single process?
+  context: 'Once native-API-executed malware establishes C2, its network behavior over time betrays it:
+    regular beaconing produces a steady, periodic connection cadence, while exfiltration produces large
+    sustained byte-count spikes. Training a time-series model (such as an LSTM) on per-process outbound
+    connection counts and data volume, then alerting on sudden, sustained deviations, catches both beaconing
+    and bulk egress that point-in-time rules miss. A sustained spike from a single process is a strong
+    Command-and-Control / Exfiltration indicator following Execution and warrants packet-level review
+    and host containment. Normal processes show stable, expected network rhythms. This temporal view adds
+    depth to the connection-failure and correlation methods above.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, web-facing servers, and network egress points instrumented with Zeek.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Time-series pseudocode
+    query: "for proc in processes:\n  series = per_minute(outbound_conn_count(proc), egress_bytes(proc))\n\
+      \  pred = lstm_forecast(series.history)\n  resid = series.actual - pred\n  if sustained(resid >\
+      \ k*sigma, window>=N):\n    alert(process=proc, pattern=\"beacon/exfil spike\", residual=resid)"
