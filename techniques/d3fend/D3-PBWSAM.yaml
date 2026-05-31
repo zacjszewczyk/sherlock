@@ -1,0 +1,253 @@
+name: 'D3-PBWSAM: Proxy-based Web Server Access Mediation'
+id: e11240d2-c6e5-4cdd-9b8c-8b3474a0382c
+description: This playbook helps an analyst investigate whether public-facing/origin web servers are properly
+  isolated behind sanctioned reverse-proxy/CDN infrastructure, or whether they are receiving direct, unproxied
+  HTTP/HTTPS sessions that bypass that mediation layer. Origin-IP exposure is the canonical proxy-mediation
+  bypass (research found ~71.5% of cloud-protected sites leak their origin), enabling attackers to reach
+  the origin directly, evade WAF/CDN controls, scan for admin interfaces, and exfiltrate data. The questions
+  below hunt for direct-to-origin flows that are not on the approved proxy/CDN egress allow-list, TLS
+  SNI/HTTP Host and certificate mismatches, missing proxy-injected headers (X-Forwarded-For, CF-Connecting-IP,
+  X-Amz-Cf-Id), non-front-end TLS/HTTP fingerprints (JA3/JA3S, JA4/JA4H), recon-tool User-Agents, unapproved
+  administrative access, and bursts of blocked/refused direct-access attempts that indicate origin-IP
+  discovery. It combines deterministic allow-list (symbolic-logic) detections with statistical baselining
+  of source diversity, traffic concentration, beaconing cadence, latency/RTT path separation, and machine-learning
+  anomaly scoring (autoencoders, one-class models, encrypted-traffic classifiers) to surface proxy-bypass
+  campaigns even under TLS 1.3/Encrypted ClientHello.
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any public source addresses connecting directly to a protected origin web server on tcp/80
+    or tcp/443 without being on the approved reverse-proxy/CDN egress allow-list?
+  context: 'This is the deterministic allow-list floor for the Isolate tactic: under a default-deny origin-ingress
+    posture (NIST SP 800-44 v2 / SP 800-41 r1), the only legitimate inbound web traffic to an origin should
+    originate from sanctioned reverse-proxy or CDN egress ranges (e.g., CloudFront, Cloudflare, Fastly
+    published CIDRs plus internal proxy IPs). Any flow from a public id.orig_h that is NOT in that allow-list
+    is, by definition, a proxy-mediation bypass. A positive result means an attacker or scanner has discovered
+    the origin IP and is reaching it directly, evading the WAF/CDN security layer; a negative result confirms
+    isolation is holding. Maintain the CIDR allow-list per provider and update it as ranges change.'
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek http.log
+  - Web Server Access Logs
+  - Firewall Logs
+  - 'NAI: Network segments containing public-facing/origin web servers and perimeter ingress points; the
+    firewall/segmentation boundary that should restrict origin ingress to reverse-proxy/CDN egress ranges.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: FROM conn.log WHERE id.resp_h IN protected_origin_ips AND id.resp_p IN (80,443) AND is_public(id.orig_h)
+      AND id.orig_h NOT IN proxy_cdn_egress_allowlist => RAISE proxy_bypass_incident(severity=high)
+- question: Are there sessions to the origin where the TLS SNI or HTTP Host does not match the sanctioned
+    front-end domain, or where requests lack proxy-injected headers such as X-Forwarded-For, Forwarded,
+    CF-Connecting-IP, or X-Amz-Cf-Id?
+  context: 'Legitimate proxy/CDN-mediated traffic carries telltale markers: the SNI/Host matches the published
+    front-end domain and the CDN injects forwarding headers. Direct-to-origin connections frequently mismatch
+    the SNI/Host (the domain-fronting bypass primitive) or omit the proxy-injected headers entirely because
+    they never transited the proxy. Flagging these mismatches catches bypass attempts even when the source
+    IP is not yet on the deny-list. For the Isolate tactic, a positive result indicates traffic reaching
+    the origin out-of-band of the mediation layer; investigate whether the origin is leaking its address
+    or the attacker is fronting.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: FROM ssl.log JOIN http.log ON uid WHERE id.resp_h IN protected_origin_ips AND (ssl.server_name
+      NOT IN sanctioned_frontend_domains OR http.host NOT IN sanctioned_frontend_domains OR NONE(http.headers
+      IN ['X-Forwarded-For','Forwarded','CF-Connecting-IP','X-Amz-Cf-Id'])) => ALERT sni_host_proxy_marker_mismatch
+- question: Do any origin-bound sessions present a TLS/HTTP fingerprint (JA3/JA3S or JA4/JA4H) that is
+    not part of the small, stable set used by the sanctioned reverse-proxy/CDN front-end?
+  context: A reverse proxy or CDN front-end produces a limited, predictable set of TLS and HTTP client/server
+    fingerprints. Direct connections from attacker tooling, scanners, or scripts will exhibit JA3/JA3S
+    or JA4/JA4H hashes outside that allow-list. Maintaining a front-end fingerprint allow-list lets you
+    catch direct access even when source IP rotates or when headers are spoofed. For Isolate, a non-allow-listed
+    fingerprint hitting the origin strongly suggests something other than the sanctioned proxy is talking
+    to the server.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: FROM ssl.log/http.log WHERE id.resp_h IN protected_origin_ips AND (ja3 NOT IN frontend_ja3_allowlist
+      OR ja3s NOT IN frontend_ja3s_allowlist OR ja4 NOT IN frontend_ja4_allowlist OR ja4h NOT IN frontend_ja4h_allowlist)
+      => ALERT non_frontend_fingerprint
+- question: Are recon/automation User-Agents (curl, wget, python-requests, nikto, sqlmap, masscan, nmap)
+    appearing in web-server access logs for requests whose source is not a sanctioned proxy?
+  context: Sanctioned proxy/CDN traffic normalizes or forwards real browser User-Agents; direct hits from
+    recon and exploitation tooling expose non-browser User-Agent strings. Using the Sigma suspicious-User-Agents
+    watchlist as a floor (and growing it into an enterprise allow/deny list), match these strings on access
+    logs where the source is not the proxy. For Isolate, a positive result indicates automated reconnaissance
+    or scanning reaching the origin directly — a precursor to exploitation that the proxy should have
+    absorbed or blocked.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FROM web_access_logs WHERE src_ip NOT IN proxy_cdn_egress_allowlist AND user_agent MATCHES
+      recon_tool_ua_watchlist (curl|wget|python-requests|nikto|sqlmap|masscan|nmap) => ALERT recon_useragent_direct_access
+- question: Are there successful direct sessions to management URIs or administrative ports on web servers
+    originating from non-proxy sources?
+  context: 'Administrative endpoints (e.g., /admin, /manager, /wp-admin, management ports) represent control-plane
+    exposure: a successful direct hit from outside the proxy egress ranges can mean credential abuse,
+    default-credential exploitation, or control-plane takeover. Tie Zeek conn.log id.resp_p and the requested
+    URI to the origin-ingress allow-list and escalate as high risk. For Isolate, this is among the most
+    dangerous bypass outcomes because it can convert origin exposure into full server compromise.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: FROM conn.log JOIN http.log WHERE id.resp_h IN protected_origin_ips AND (uri MATCHES admin_uri_patterns
+      OR id.resp_p IN admin_ports) AND id.orig_h NOT IN proxy_cdn_egress_allowlist AND status_code IN
+      (200..399) => ESCALATE unapproved_admin_access(severity=high)
+- question: Is there a burst of blocked, refused, reset, or unanswered direct-to-origin connection attempts
+    (Zeek S0/REJ/RSTO/RSTR plus firewall-denied events) per origin IP or per external source?
+  context: 'Even when the allow-list floor is holding, connection-failure state is itself a signal. A
+    spike of S0 (no reply), REJ (refused), or RSTO/RSTR (reset) flows, plus firewall denies, against an
+    origin IP indicates origin-IP discovery and scanning (Cloudpiercer-style enumeration) — the attacker
+    is probing to confirm the origin before mounting a bypass. For Isolate, this is early warning: the
+    isolation is working but the origin is being actively hunted; consider rotating the origin IP and
+    tightening filtering.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: FROM conn.log WHERE id.resp_h IN protected_origin_ips AND conn_state IN ('S0','REJ','RSTO','RSTR')
+      UNION firewall_denied_events | COUNT BY id.orig_h, id.resp_h OVER 1h => ALERT IF count > baseline_burst_threshold
+      (origin_scan_suspected)
+- question: Does the count of unique sources, ASNs, or geographies for direct (non-proxy) traffic to a
+    web server exceed its own historical baseline (e.g., mean + 3 sigma)?
+  context: When isolation is enforced, an origin should see source diversity dominated by a few proxy/CDN
+    egress ranges. Build 30-day per-server baselines of unique source counts, ASNs, and geographies, then
+    flag direct (non-proxy) cohorts that exceed percentile/sigma thresholds derived from each server's
+    own history. A statistically significant rise in distinct direct sources indicates distributed scanning
+    or a bypass campaign. For Isolate, this catches gradual or distributed origin exposure that single-flow
+    rules might miss.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = ROLLING_30D(per_server distinct_count(non_proxy src_ip, asn, geo)); today = per_server
+      distinct_count(non_proxy src_ip, asn, geo); ALERT WHERE today > baseline.mean + 3*baseline.stddev
+- question: Is the daily ratio of direct-vs-proxied sessions, the byte-volume ratio, or the request-success
+    ratio for direct sources drifting upward beyond control limits for any origin server?
+  context: Per origin server, compute the direct-vs-proxied session ratio, the orig/resp byte-volume ratio,
+    and the HTTP success ratio (2xx vs 4xx/5xx) for direct sources. A statistically significant increase
+    in the direct fraction, or sustained drift above control limits, signals a growing bypass problem
+    — successful direct access (rising 2xx from non-proxy sources) is especially concerning. For Isolate,
+    this trend analysis quantifies how much traffic is escaping the mediation layer over time, complementing
+    point-in-time rules.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'PER origin_server, day: direct_ratio = direct_sessions/total_sessions; byte_ratio = orig_bytes/resp_bytes;
+      success_ratio = count(2xx)/count(4xx,5xx) for direct; ALERT WHERE direct_ratio OR success_ratio
+      EXCEEDS control_limit (e.g., > mean+3sigma or upward CUSUM)'
+- question: For each external-source-to-origin pair, is there a dominant periodicity in request timing
+    (low inter-arrival jitter) consistent with scraping, polling, or beaconing rather than human browsing?
+  context: Automated direct access — scrapers, pollers, or C2 beacons bypassing the proxy — exhibits regular
+    cadence. Build a request-time series per (external source, origin) pair and extract dominant periodicity
+    via FFT/autocorrelation with jitter tolerance and benign-automation suppression (BAYWATCH). Low coefficient-of-variation
+    inter-arrival times indicate scripts, not browsers. For Isolate, a strongly periodic direct flow to
+    the origin is a high-confidence indicator of automated bypass activity worth deep inspection.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: PER (src_ip, origin) build inter_arrival_series(request_times); score = FFT_autocorr_periodicity(series,
+      jitter_tolerance); cv = stddev(intervals)/mean(intervals); ALERT WHERE strong_periodicity AND cv
+      < cv_threshold AND NOT benign_automation
+- question: Do any sessions to the origin exhibit a connection RTT/handshake latency profile consistent
+    with a direct path (no interposed proxy hop) rather than the expected proxy-mediated path?
+  context: Mediated access traverses an extra proxy hop with characteristic added latency. Baseline per-server
+    connection RTT and TLS handshake timing for known proxy-mediated sessions, then flag sessions whose
+    latency distribution matches a shorter, direct path. This RTT-difference approach (complementary to
+    JA4L latency fingerprints) can reveal bypass even when fingerprints and headers are spoofed. For Isolate,
+    a direct-path latency signature on traffic claiming to be proxied is a strong tell that the mediation
+    layer was skipped.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = per_server distribution(RTT, tls_handshake_time) for proxy_mediated_sessions; ALERT
+      WHERE session.RTT_profile MATCHES direct_path_distribution (significantly lower than proxied baseline)
+- question: Do any flows deviate from the learned per-flow temporal profile (packet-size and inter-arrival-time
+    series) of normal proxy-mediated web sessions, independent of port or payload?
+  context: Using the single-flow time-series method (69 features from packet-size and inter-arrival sequences),
+    learn the temporal shape of normal proxy-mediated sessions and flag deviating flows in a port/payload-agnostic
+    way. This catches bypass traffic whose flow dynamics differ from proxied sessions even when it uses
+    standard web ports and encryption. For Isolate, deviating flow shapes to the origin warrant investigation
+    as potential direct/unmediated access.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FEATURES = single_flow_time_series(packet_sizes, inter_arrival_times)  # 69-feature SFTS;
+      model = profile(normal proxy_mediated flows); ALERT WHERE distance(flow.FEATURES, model) > anomaly_threshold'
+- question: When scoring origin-ingress flows with an unsupervised model trained on normal proxy-mediated
+    traffic, which flows produce high reconstruction error, and what are the top contributing features?
+  context: Train an unsupervised model (e.g., a Kitsune autoencoder ensemble running online on commodity
+    hardware) on first-party features of normal proxy-mediated ingress — source set, byte ratios, packet
+    timing, TLS/HTTP fingerprints, conn_state — and score incoming flows by reconstruction error. Critically,
+    each alert must surface the top-3 contributing features (e.g., 'non-allowlisted source ASN', 'JA3
+    not in front-end set', 'missing X-Forwarded-For') so analysts can triage, not just a raw score. For
+    Isolate, high-error flows represent ingress that does not look like the sanctioned proxy and may be
+    direct bypass.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: model = train_autoencoder_ensemble(features=[src_set,byte_ratios,packet_timing,ja3,ja3s,conn_state]
+      ON normal_proxy_mediated_ingress); score = reconstruction_error(flow); ALERT WHERE score > threshold
+      WITH top3_feature_attribution
+- question: Does a one-class model (One-Class SVM / Isolation Forest) trained on sanctioned proxy NetFlow/conn.log
+    features flag any origin flow as anomalous, and which features (via LIME) drive that decision?
+  context: Fit a One-Class SVM or Isolation Forest on NetFlow/conn.log features of sanctioned proxy traffic
+    and attribute each anomaly to its top contributing features with LIME. OCSVM is more robust under
+    poisoning, and per-prediction attribution gives the explainability needed to action direct-to-origin
+    alerts. For Isolate, flows the model deems outside the proxy-traffic manifold are candidate bypass
+    sessions; the LIME attribution tells the analyst why (e.g., unusual byte ratio, unexpected duration,
+    off-list source).
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: model = OneClassSVM_or_IsolationForest(train=sanctioned_proxy_conn_features); pred = model.decision(flow);
+      ALERT WHERE pred == anomaly WITH LIME_feature_attribution(top_k)
+- question: Under TLS 1.3 / Encrypted ClientHello where SNI/Host strings are hidden, can flows to the
+    origin be classified as mediated vs direct using flow-shape and timing features that survive encryption?
+  context: When Encrypted ClientHello hides SNI/Host, string-based detections fail. Use self-supervised
+    representation learning and TLS-1.3-resilient flow features (flow shape and timing) to classify mediated
+    vs direct TLS flows without decrypting payload. For Isolate, this preserves bypass detection capability
+    as the ecosystem moves to ECH; flows classified as direct despite encryption should be treated as
+    potential unmediated access to the origin and correlated with other signals.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: features = encryption_resilient_flow_shape_timing(flow); embedding = self_supervised_encoder(features);
+      label = classify_mediated_vs_direct(embedding); ALERT WHERE label == 'direct' for origin-bound TLS1.3/ECH
+      flows
+- question: Can clustering and risk-scoring across source reputation, JA4 handshake traits, session duration,
+    URI behavior, byte ratios, and retry/failure patterns separate normal proxy-origin traffic from coordinated
+    direct-access campaigns?
+  context: Train a clustering and risk-scoring pipeline on source reputation, handshake/JA4 traits, session
+    duration, URI behavior, byte ratios, and retry/failure patterns to separate normal proxy-origin traffic
+    from anomalous direct-access campaigns. Correlate clustered direct sources with origin-exposure enumeration
+    activity and emit the top contributing features per cluster for triage. For Isolate, this elevates
+    individual bypass flows into campaign-level context — distinguishing a one-off scanner from an organized
+    effort to exploit origin exposure.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: features = [src_reputation, ja4_traits, session_duration, uri_behavior, byte_ratios, retry_failure];
+      clusters = cluster(features); risk = score(clusters); ALERT high_risk_clusters WITH per_cluster_top_features;
+      CORRELATE clustered_direct_sources WITH origin_enumeration_events
