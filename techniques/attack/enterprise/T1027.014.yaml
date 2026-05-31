@@ -1,0 +1,334 @@
+name: 'T1027.014: Obfuscated Files or Information: Polymorphic Code'
+id: fe83aab7-dffd-4902-9b18-ad152223780a
+description: 'Investigate whether an adversary is using polymorphic (mutating/metamorphic) code to evade
+  signature-based defenses by changing its runtime footprint on each execution. This playbook helps an
+  analyst hunt for the observable side effects of polymorphism across endpoint and network telemetry:
+  the same executable path being rewritten repeatedly in a short window with successive, distinct hashes
+  and elevated section entropy; processes that launch from user-writable directories and immediately load
+  or map bursts of inconsistently signed modules (runtime unpacking/decryption); single parent processes
+  that rapidly spawn many child executables each with a unique hash; and the same filename being delivered
+  or staged repeatedly with different hashes. It combines symbolic-logic detections (hash churn, entropy
+  gating, YARA on invariant unpacker stubs), statistical baselining (per-path entropy and hash-diversity
+  percentiles, module-load and unique-hash ratios), and machine-learning anomaly models (Isolation Forest,
+  DBSCAN, CNN-LSTM sequence models, XGBoost/Random Forest) so detection survives byte-level mutation.
+  The aim is to give a SOC analyst granular, defensible questions and queries to confirm or refute defense
+  evasion through polymorphic code.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is the same executable path being rewritten multiple times in a short window and then executed
+    with at least three different SHA256 hashes within 24 hours, especially when the path lives in a user-writable
+    directory such as %APPDATA%, %TEMP%, /tmp, or ~/Library?
+  context: 'This question targets the core observable of polymorphic code: a stable on-disk path whose
+    content keeps changing. Correlate file-write events (Sysmon Event ID 11) against subsequent executions
+    (Sysmon Event ID 1 / Windows Event ID 4688) for the same path and count distinct hashes; on Linux
+    pair auditd execve with chmod+write on the same inode, and on macOS use Endpoint Security ES_EVENT_TYPE_NOTIFY_EXEC
+    alongside file writes. Three or more hashes for one path inside 24 hours is a strong staged-mutation
+    signal. Because legitimate updaters also rewrite binaries, prioritize user-writable directories, which
+    are rarely the home of signed, managed software and are the canonical staging ground for malware that
+    mutates itself to defeat signature-based antivirus (the Stealth tactic of blending in while evading
+    detection). A positive result is rapid hash churn from a writable path; a negative result is a single
+    stable hash or rewrites confined to a trusted, signed updater.'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, file servers hosting executables, EDR collection points'
+  range: Last 90 days, correlating file writes and executions of the same path within 24-hour windows.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "writes = file_events(EventID=11) | group by image_path, host\nexecs  = process_events(EventID=1\
+      \ or 4688) | group by image_path, host\njoin writes, execs on (image_path, host)\nalert when distinct(sha256)\
+      \ >= 3 within 24h\n  and image_path matches (%APPDATA%|%TEMP%|/tmp|~/Library)\n// Linux: auditd\
+      \ execve correlated with chmod+write on same inode\n// macOS: ES_EVENT_TYPE_NOTIFY_EXEC + file write\
+      \ on same path"
+- question: For each rewritten image, does any PE/ELF/Mach-O section exhibit Shannon entropy above ~7.2,
+    indicating the body is packed or encrypted as expected of a polymorphic variant?
+  context: Polymorphic bodies are typically packed or encrypted, so even though the file hash changes
+    each time, the mutated variants retain high section entropy. Compute per-section Shannon entropy for
+    every rewritten image and flag sections exceeding 7.2 (native code baselines fall around 5.0-6.5,
+    while packed/encrypted content exceeds 7.0, per Lyda and Hamrock). This entropy gate separates ordinary
+    recompiles/updates from obfuscated payloads and should be tuned from environment-specific baselines
+    because some legitimate compressed resources are also high-entropy. Pairing the entropy gate with
+    the hash-churn signal sharply reduces false positives and directly supports the Stealth hypothesis
+    that the adversary is hiding malicious code behind packing/encryption.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, file servers hosting executables, EDR collection points'
+  range: Last 90 days, evaluated at each file-write/execution of a watched path.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each rewritten image:\n  for each section in pe_elf_macho_sections(image):\n    H = shannon_entropy(section.bytes)\n\
+      \    if H > 7.2: flag(image, section.name, H)\n// tune 7.2 cutoff from per-environment baseline\
+      \ of benign section entropy"
+- question: Do the entropy increase and hash-change frequency for a given path exceed the 98th percentile
+    of its own 30-day baseline, and does its byte-frequency distribution diverge from the path's benign
+    profile?
+  context: This statistical question is designed to survive hash mutation. Build a 30-day baseline of
+    per-path entropy and hash-change frequency, then flag paths whose entropy rise and churn land above
+    the 98th percentile. To catch mutation that keeps the file superficially similar, model the byte-frequency
+    distribution and measure the Mahalanobis distance of each new variant against the path's benign profile
+    (the PAYL approach of Wang and Stolfo). Because polymorphism changes bytes but not the underlying
+    statistical structure dramatically, distribution distance is a more robust signal than any single
+    hash. A positive result is a path whose statistical fingerprint suddenly shifts and churns far beyond
+    its history, consistent with an attacker mutating a payload in place to evade detection.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, file servers hosting executables, EDR collection points'
+  range: Last 90 days, with a rolling 30-day per-path baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_path stats over 30d: entropy, hash_change_freq, byte_freq_profile\nfor each\
+      \ path today:\n  if entropy_delta > p98(baseline.entropy)\n     and hash_churn > p98(baseline.hash_change_freq)\n\
+      \     and mahalanobis(byte_freq(path), baseline.byte_freq_profile) > threshold:\n    alert(path,\
+      \ entropy_delta, hash_churn, distance)"
+- question: When scoring each host/path with an unsupervised anomaly model on unique-hash count, mean
+    section entropy, write frequency, and signature validity, which hosts show spikes consistent with
+    polymorphic mutation?
+  context: This machine-learning question generalizes the prior detections. Engineer per-host/per-path
+    features (unique-hash count, mean section entropy, write frequency, ratio of unsigned executions)
+    and score them with an Isolation Forest (Liu et al), which isolates rare combinations without needing
+    labeled malware. Alert on anomaly spikes that match the polymorphic profile and, for analyst trust
+    and triage speed, surface the top-3 contributing features (e.g., hash churn, entropy delta, unsigned
+    ratio) in the alert text per explainable-AI guidance. This catches mutation patterns that fixed thresholds
+    miss and ties directly to the Stealth tactic by flagging hosts whose binaries behave like self-mutating,
+    signature-evading code.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, file servers hosting executables, EDR collection points'
+  range: Last 90 days, scored on a daily cadence per host/path.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = per host,path: [unique_hash_count, mean_section_entropy,\n                    \
+      \       write_frequency, unsigned_exec_ratio]\nmodel = IsolationForest().fit(historical_features)\n\
+      scores = model.decision_function(today_features)\nalert where score in anomalous tail; include top3_feature_attributions"
+- question: Does a process launched from a user-writable path (%APPDATA%, %TEMP%) immediately load a burst
+    of modules within 60 seconds, or trigger Sysmon Event ID 25 (Process Tampering, "Image is replaced"),
+    indicating runtime unpacking or image overwrite?
+  context: After a polymorphic loader executes it often unpacks or decrypts itself in memory, which shows
+    up as a rapid burst of module loads (Sysmon Event ID 7) right after the process starts, or as an outright
+    image-replacement event (Sysmon Event ID 25). Flag executions from user-writable paths followed by
+    a module-load burst inside 60 seconds, and fire on process-tampering events that signal runtime image
+    overwrite/unpacking. On Linux, correlate auditd mmap calls that set PROT_EXEC after a write; on macOS,
+    use ES_EVENT_TYPE_NOTIFY_MMAP. This behavioral pattern is invariant to byte-level mutation and reveals
+    the moment a self-modifying binary reconstitutes its real payload, directly supporting the hypothesis
+    of polymorphic defense evasion.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, application servers, EDR telemetry pipelines'
+  range: Last 90 days, correlating execution and module loads within a 60-second window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "exec = process_events(EventID=1 or 4688) where image_path in writable_dirs\nloads = module_loads(EventID=7)\
+      \ where pid=exec.pid and ts in [exec.ts, exec.ts+60s]\nalert when count(loads) > burst_threshold\n\
+      \  or process_tamper(EventID=25, type='Image is replaced')\n// Linux: auditd mmap PROT_EXEC after\
+      \ write; macOS: ES_EVENT_TYPE_NOTIFY_MMAP"
+- question: Do module-load counts or the ratio of unsigned/invalidly-signed modules for a given process
+    name exceed the 99th percentile of its 30-day baseline?
+  context: Legitimate applications load a fairly stable set of signed modules. Baseline module-load counts
+    and signer diversity per process name over 30 days, then alert when either the count or the unsigned-module
+    ratio crosses the 99th percentile. Treat invalid/absent signatures and module loads originating from
+    temp paths as distinct failure-mode features, since polymorphic loaders frequently pull in unsigned,
+    mutated components. A positive result is a process whose module-load behavior suddenly diverges from
+    its historical norm with unsigned content, consistent with in-memory unpacking; a negative result
+    is loads that match the established, signed baseline.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, application servers, EDR telemetry pipelines'
+  range: Last 90 days, with a rolling 30-day per-process-name baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per process_name over 30d: module_load_count, unsigned_ratio, signer_set\nfor each\
+      \ process today:\n  if module_load_count > p99(baseline.count)\n     or unsigned_ratio > p99(baseline.unsigned_ratio)\n\
+      \     or any(module.path in temp_dirs):\n    alert(process_name, count, unsigned_ratio)"
+- question: Do YARA rules targeting packer/decryptor stubs, cloaking, and mutation-engine constants match
+    the on-disk image or a memory dump of the suspect process?
+  context: Even when a mutation engine randomizes the payload body, the unpacker/decryptor stub and certain
+    mutation-engine constants tend to remain invariant across variants. Run YARA rules for these family-level
+    commonalities (e.g., the Neo23x0 signature-base packer/cloaking rules) against both the on-disk image
+    and process memory dumps. Scanning memory is important because the decrypted or reconstituted code
+    only appears after unpacking. A hit identifies the malware family or packer that survives per-variant
+    mutation, giving a high-confidence, signature-based corroboration of the polymorphic-evasion hypothesis
+    even when file hashes never repeat.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, application servers, EDR telemetry pipelines'
+  range: Last 90 days, scanning new/changed images and memory dumps of flagged processes.
+  queries:
+  - technology: YARA/pseudocode
+    query: "for image in (on_disk_image, memory_dump(pid)):\n  matches = yara.scan(image, ruleset=packer_decryptor_mutation_stubs)\n\
+      \  if matches: alert(pid, image, matches.rule_names)\n// rulesets: Neo23x0 signature-base packer/cloaking/mutation-engine\
+      \ rules"
+- question: When modeling module-load and API-call sequences with n-grams and a CNN-LSTM (or LSTM over
+    API traces), which processes produce sequences that cluster with known unpacking/mutation behavior?
+  context: Byte-level mutation changes the file but not the behavioral sequence of how a loader unpacks
+    and calls APIs. Model module-load and API-call sequences as n-grams and feed them to a CNN-LSTM (per
+    the opcode/API-call classification work) or an LSTM over API traces (Catak et al). These sequence
+    representations are invariant across mutation, so they detect the polymorphic behavior that static
+    signatures miss. Report the top-3 sequence features driving each alert so an analyst can validate
+    the behavioral rationale. A positive result is a process whose load/API sequence matches the unpacking-then-execute
+    pattern characteristic of self-modifying malware.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, application servers, EDR telemetry pipelines'
+  range: Last 90 days, scored continuously on process API/module-load sequences.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = ordered (module_load + api_call) events per pid
+
+      x = ngram_encode(seq)
+
+      model = CNN_LSTM or LSTM trained on benign vs unpacking/mutation traces
+
+      score = model.predict(x); alert on malicious-sequence cluster
+
+      include top3 sequence feature attributions'
+- question: Does a watchlisted parent process spawn multiple child executables with previously-unseen
+    hashes from user-writable directories within 10 minutes, where at least one child has a section entropy
+    above 7.2?
+  context: Polymorphic generators reveal themselves by emitting many distinct child binaries in a short
+    burst. Alert when a watchlisted parent spawns children with unseen hashes from user-writable directories
+    inside a 10-minute window (Sysmon Event ID 1 / Windows Event ID 4688; auditd execve on Linux; ES_EVENT_TYPE_NOTIFY_EXEC
+    on macOS), and require at least one child section to exceed entropy 7.2 to confirm the children are
+    packed/encrypted variants. This combination distinguishes a malware factory mutating its output from
+    benign tools that legitimately spawn many processes. A positive result is repeated generation of unique,
+    high-entropy children from one parent, a hallmark of polymorphic variant creation for defense evasion.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, Sandboxing/Analysis Environments, File Servers'
+  range: Last 90 days, correlating parent-child spawns within 10-minute windows.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "spawns = process_events(EventID=1 or 4688) | group by parent_proc, host, 10m_window\nalert\
+      \ when parent in watchlist\n  and distinct(child_sha256, where unseen) >= N\n  and any child.image_path\
+      \ in writable_dirs\n  and any child section_entropy > 7.2\n// Linux: auditd execve; macOS: ES_EVENT_TYPE_NOTIFY_EXEC"
+- question: For each parent process, does the ratio of unique child hashes per 10-minute window exceed
+    0.9 or the 98th percentile of its baseline, and is the child execution failure/blocked-launch rate
+    abnormally high?
+  context: A parent that emits a near-unique hash for almost every child is behaving like a mutation engine.
+    Compute unique child-hash ratios per parent per 10-minute window and flag ratios above 0.9 or beyond
+    the 98th percentile of the per-parent baseline. Additionally profile the child execution-failure or
+    blocked-launch rate, because brittle, hastily-generated polymorphic variants often crash or get blocked,
+    which is itself a distinct signal. A positive result is a parent whose children are almost all unique
+    and frequently failing to run cleanly, consistent with automated variant generation rather than normal
+    repeated execution of a stable program.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, Sandboxing/Analysis Environments, File Servers'
+  range: Last 90 days, computed per parent per 10-minute window with a per-parent baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per parent_proc, 10m_window:\n  ratio = distinct(child_sha256) / count(children)\n  fail_rate\
+      \ = blocked_or_failed_children / count(children)\n  if ratio > 0.9 or ratio > p98(baseline[parent]):\n\
+      \    alert(parent_proc, ratio, fail_rate)"
+- question: When clustering parent name, child path entropy, hash uniqueness, and spawn rate with DBSCAN
+    or Isolation Forest, which parents stand out as outlier bursts of variant creation?
+  context: This machine-learning question detects variant-generation bursts that static thresholds miss.
+    Build features from parent name, child path entropy, hash uniqueness, and spawn rate, then apply DBSCAN
+    or an Isolation Forest (Liu et al; with the zero-day unsupervised comparison of Ramaswamy and Palanisamy)
+    to isolate outlier parents. Density-based and isolation methods both surface rare clusters of high-entropy,
+    high-uniqueness, high-rate spawning without labeled data. Include the top-3 contributing features
+    in each alert so the analyst can confirm the polymorphic rationale. A positive result is a parent
+    whose spawning behavior is a statistical outlier consistent with a mutation engine producing many
+    disposable variants.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices, Sandboxing/Analysis Environments, File Servers'
+  range: Last 90 days, scored per parent on a daily cadence.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = per parent: [parent_name_enc, mean_child_entropy,\n                        unique_hash_ratio,\
+      \ spawn_rate]\nlabels = DBSCAN(features)  # or IsolationForest(features)\nalert on outlier/noise\
+      \ points; include top3_feature_attributions"
+- question: Is the same filename being delivered over the network or created on a host with different
+    hashes at least three times within 24 hours, and do those files show section entropy above 7.0-7.2?
+  context: Adversaries often deliver polymorphic payloads under a stable, innocuous filename while the
+    content mutates between deliveries. Alert when Zeek files.log or Sysmon Event ID 11 shows the same
+    filename delivered or created with different hashes on the same host at least three times within 24
+    hours, and raise severity when the delivered files have section entropy above 7.0-7.2 (per the entropy-baseline
+    and Lyda-Hamrock references), indicating packing/encryption. This joins network delivery and endpoint
+    creation to catch staged polymorphic delivery. A positive result is a consistent filename with churning,
+    high-entropy content; a negative result is a stable hash per filename or low-entropy, legitimately-updated
+    files.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Network egress points, endpoint devices, file staging servers'
+  range: Last 90 days, correlating deliveries/creations of the same filename within 24-hour windows.
+  queries:
+  - technology: Zeek/pseudocode
+    query: "files = files.log union sysmon(EventID=11) | group by filename, host\nalert when distinct(sha256)\
+      \ >= 3 within 24h\n  raise severity when section_entropy > 7.0-7.2\noutput filename, host, hashes,\
+      \ entropy, sources"
+- question: Does the unique-hash count for any filename exceed the 99th percentile of its baseline, and
+    does its byte/opcode n-gram (Zipfian) distribution stay stable across the variants?
+  context: This statistical question profiles delivery diversity while exploiting the fact that a mutation
+    engine anchors the underlying byte/opcode distribution. Maintain a baseline of hash diversity per
+    filename and flag filenames whose unique-hash count exceeds the 99th percentile. Complement with byte/opcode
+    n-gram and Zipfian distribution comparison (the NgViz approach), which remains stable across polymorphic
+    variants because the engine constrains the distribution even as hashes change. A positive result is
+    a filename with abnormally many hashes whose n-gram distribution nonetheless matches a common mutated
+    profile, strongly indicating polymorphic delivery rather than ordinary version updates that would
+    show low hash diversity.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Network egress points, endpoint devices, file staging servers'
+  range: Last 90 days, with a rolling per-filename hash-diversity baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per filename: unique_hash_count distribution\nfor each filename:\n  if unique_hash_count\
+      \ > p99(baseline):\n    d = ngram_zipf_distance(variants)\n    if d small (stable distribution across\
+      \ hashes):\n      alert(filename, unique_hash_count, d)"
+- question: When training an Isolation Forest on filename, size, entropy, and hash-change frequency (and
+    an XGBoost/Random Forest ensemble on PE-header + section-entropy feature vectors), which filename
+    deliveries are flagged as anomalous polymorphic delivery?
+  context: This machine-learning question fuses unsupervised anomaly detection with supervised classification.
+    Train an Isolation Forest on filename, size, entropy, and hash-change frequency to surface anomalous
+    polymorphic delivery patterns, and classify static PE-header plus section-entropy feature vectors
+    with an XGBoost/Random Forest ensemble (per the zero-day detection work) to label likely malicious
+    variants. Surface SHAP top-3 feature attributions in alerts (per the LIME/SHAP explainability work)
+    so the analyst sees which features drove the decision. A positive result is a recurring filename whose
+    delivery features are anomalous and whose static structure classifies as malicious, confirming polymorphic
+    payload delivery aimed at evading defenses.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Network egress points, endpoint devices, file staging servers'
+  range: Last 90 days, scoring each delivery/creation event as it is observed.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "anom = IsolationForest.fit([filename_enc, size, entropy, hash_change_freq])\nclf  = XGBoost_or_RandomForest.fit(pe_header\
+      \ + section_entropy vectors)\nfor each delivery:\n  if anom.is_outlier(x) and clf.predict(x)=='malicious':\n\
+      \    alert with SHAP top3 feature attributions"
