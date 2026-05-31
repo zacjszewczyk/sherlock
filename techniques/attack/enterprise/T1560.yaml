@@ -1,0 +1,435 @@
+name: 'T1560: Archive Collected Data'
+id: db7f4505-558a-4661-ae3e-e06231eb6a7d
+description: Investigate whether an adversary has compressed and/or encrypted data they collected on a
+  host before exfiltrating it. Archiving collected data lets an actor shrink the volume sent over the
+  network, obfuscate the contents from inspection, and stage a single object that is convenient to exfiltrate.
+  This playbook helps an analyst hunt for that staging behavior across Windows, Linux, and macOS endpoints
+  and at network egress points. It correlates the execution of compression and encryption utilities (e.g.,
+  7z.exe, rar.exe, makecab.exe, tar, gzip, openssl, zip, ditto, hdiutil, PowerShell Compress-Archive)
+  and the in-process loading of cryptographic libraries (crypt32.dll, bcrypt.dll, ncrypt.dll) with the
+  creation of new archive files. It looks for archive files matching threat-intel hashes or suspicious
+  filename/entropy patterns, archivers spawned by anomalous parent processes, archives written to high-risk
+  or outlier directories and sizes, bursts of file reads across many directories that immediately precede
+  an archive write, and outbound network flows whose byte volume matches a recently created archive. The
+  methods span deterministic symbolic-logic rules, statistical baselining/anomaly scoring, and machine-learning
+  models, giving the analyst layered, explainable signals to confirm data staging tied to the Collection
+  tactic and to scope likely subsequent exfiltration.
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has a newly created archive file (.zip/.rar/.7z/.tar/.gz) appeared whose SHA256 hash matches
+    a known-bad threat-intelligence indicator, whose filename matches a known-malicious regex, or whose
+    body shows high Shannon entropy consistent with compression/encryption?
+  context: 'When an adversary archives collected data they frequently reuse tooling or naming conventions
+    that surface in threat-intel feeds, and the resulting file body is densely packed (compressed or encrypted)
+    so its entropy climbs well above that of native code or text. Monitor Sysmon Event ID 11 for new archive
+    files, compute the SHA256 and compare it against TI hash feeds, test the filename against known-bad
+    patterns (e.g., ^[a-z0-9]{8}\.zip$), and sample the file body to measure Shannon entropy. Benign executables
+    and text typically sit at 5.0-6.5 bits/byte; encrypted or compressed payloads exceed ~7.2 bits/byte.
+    A positive hash/regex match is a high-confidence IOC; an entropy spike alone is suggestive of a staged
+    archive and should be corroborated with process lineage. Tie this to Collection: a high-entropy archive
+    freshly written in a staging area is a strong sign data is being packaged for exfiltration.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User workstations, Staging servers, Publicly accessible web servers, Temporary file system locations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=Sysmon EventID=11 file_ext IN (\"zip\",\"rar\",\"7z\",\"tar\",\"gz\")\n  | eval\
+      \ sha256=hash, fname=file_name\n  | lookup ti_hashes sha256 OUTPUT bad as ti_hit\n  | eval regex_hit=if(match(fname,\"\
+      ^[a-z0-9]{8}\\.zip$\"),1,0)\n  | eval entropy=shannon_entropy(file_sample)\n  | where ti_hit=\"\
+      true\" OR regex_hit=1 OR entropy>7.2"
+  - technology: Endpoint/pseudocode
+    query: ">-\n  for each new_archive: e=shannon_entropy(bytes); if e>7.2 then flag(\"encrypted_or_compressed\"\
+      )"
+- question: Does re-compressing a sample of a newly created archive yield little or no further size reduction,
+    confirming the file already contains compressed or encrypted data rather than raw collectible content?
+  context: Already-compressed or encrypted data has near-maximal entropy and cannot be meaningfully shrunk
+    again, while benign raw data (documents, logs, databases) compresses substantially. Take a sample
+    of the new file, re-compress it with gzip/bzip2, and measure the recompression ratio. A ratio near
+    1.0 (e.g., below a tuned threshold of 1.05) confirms the file is already a compressed/encrypted archive
+    output rather than incidental data, distinguishing genuine adversary-staged archives from large-but-compressible
+    benign files. This is a deterministic confirmation step that reduces false positives from entropy
+    alone and directly supports identifying Collection-stage packaging.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User workstations, Staging servers, Publicly accessible web servers, Temporary file system locations'
+  range: Last 90 days
+  queries:
+  - technology: Endpoint/pseudocode
+    query: ">-\n  sample=read_first_N_bytes(file)\n  ratio = len(sample) / len(gzip_compress(sample))\n\
+      \  if ratio < 1.05 then flag(\"already_compressed_or_encrypted\")"
+- question: Are archive filenames observed in process command lines exhibiting anomalously high Shannon
+    entropy relative to a 30-day baseline, especially when paired with unusually large file sizes or high
+    write rates?
+  context: Automated or scripted archiving (e.g., randomly generated container names) tends to produce
+    filenames with higher character entropy than human-chosen names. Extract archive filenames from Windows
+    Event ID 4688 command lines, compute Shannon entropy per name, and flag names above the 95th percentile
+    against a rolling 30-day baseline. Enrich with the created file's byte size (volume) and write-rate
+    (frequency) so a high-entropy name backed by a large, rapidly written file rises in priority. A positive
+    result suggests programmatic staging of collected data; benign user-created archives usually have
+    recognizable, lower-entropy names. This statistical view complements the deterministic IOC checks
+    for Collection-stage archiving.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User workstations, Staging servers, Publicly accessible web servers, Temporary file system locations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=WinEventLog:Security EventCode=4688 CommandLine=*archive*\n  | rex field=CommandLine\
+      \ \"(?<fname>[\\w-]+\\.(zip|rar|7z|tar|gz))\"\n  | eval ent=shannon_entropy(fname)\n  | eventstats\
+      \ perc95(ent) as p95 by host\n  | where ent>p95\n  | table _time host fname ent file_size write_rate"
+- question: Does a machine-learning classifier flag a file-creation event as suspicious archiving based
+    on process lineage, command line, write-entropy, count of files read, and the fraction of personal
+    files touched?
+  context: 'Adversarial archiving has a recognizable behavioral signature: a process that reads many (often
+    personal) files and then writes a single high-entropy container. Train a Random Forest on Sysmon Event
+    ID 11 features (process, parent, command line, path, file write-entropy, files-touched count, personal-file
+    fraction) labeled benign vs. suspicious, modeled on ShieldFS. Score new archiving events and emit
+    the top-3 contributing features (e.g., write_entropy=7.9, files_read=1450, parent=outlook.exe) so
+    analysts can triage the reason for the alert. A high-confidence suspicious classification with strong
+    contributing features indicates likely Collection-stage packaging; benign archiving (developer builds,
+    backups) should score low. Use ML output to prioritize, not to auto-block.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User workstations, Staging servers, Publicly accessible web servers, Temporary file system locations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  features = [process, parent, cmdline, path, write_entropy, files_read, personal_file_frac]\n\
+      \  model = RandomForest.load(\"archive_clf\")\n  score = model.predict_proba(features)\n  if score\
+      \ > 0.8 then alert(top3=model.feature_importances(features))"
+- question: Was a known archival utility (7z.exe, rar.exe, tar.exe, makecab.exe) spawned by an anomalous
+    parent process such as wmiprvse.exe, powershell.exe, mshta.exe, svchost.exe, services.exe, or outlook.exe
+    rather than a normal user shell?
+  context: Legitimate archiving is usually launched interactively (e.g., from explorer.exe or a user shell).
+    When an archiver is spawned by a service host, scripting engine, mail client, or WMI provider, it
+    strongly suggests automated or injected execution staging collected data. Alert via Windows Event
+    ID 4688 whenever a known archiver's parent is on a watchlist of suspicious parents. This deterministic
+    lineage rule is consistent with the behavioral process-anomaly indicators in Redemption. A positive
+    match is high-signal for Collection-stage activity; tune the watchlist for environments where, for
+    example, scheduled backup jobs legitimately invoke archivers from a service context.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, Application servers, User workstations, Web servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=WinEventLog:Security EventCode=4688\n  NewProcessName IN (\"*7z.exe\",\"*rar.exe\"\
+      ,\"*tar.exe\",\"*makecab.exe\")\n  ParentProcessName IN (\"*wmiprvse.exe\",\"*powershell.exe\",\"\
+      *mshta.exe\",\"*svchost.exe\",\"*services.exe\",\"*outlook.exe\")\n  | table _time host ParentProcessName\
+      \ NewProcessName CommandLine User"
+- question: Is an observed archiver parent-child process pairing rare for the host or fleet, falling below
+    the 5th percentile of historical prevalence (e.g., services.exe -> 7z.exe)?
+  context: Beyond a static watchlist, statistically rare parent-child pairs reveal novel staging behavior
+    the analyst has not pre-enumerated. Baseline archiver parent-child pairs per host over 30 days and
+    compute fleet-wide prevalence; flag pairings below the 5th percentile. Track the count/minute of archiver
+    spawns per parent (frequency) and the share that exit non-zero (failure state) as distinct features,
+    since failed/aborted archiving can indicate experimentation or guardrail collisions. A rare pairing
+    tied to a large archive write is a strong Collection-stage indicator; common pairs (backup agent ->
+    archiver) baseline out and suppress noise.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, Application servers, User workstations, Web servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=WinEventLog:Security EventCode=4688 NewProcessName IN (\"*7z.exe\",\"*rar.exe\"\
+      ,\"*tar.exe\",\"*makecab.exe\")\n  | stats count as pair_ct by ParentProcessName NewProcessName\
+      \ host\n  | eventstats perc5(pair_ct) as p5 by host\n  | where pair_ct<=p5\n  | table host ParentProcessName\
+      \ NewProcessName pair_ct"
+- question: Does provenance-graph machine learning surface a new or anomalous archiver process edge (parent
+    -> archiver -> files read) that deviates from the host's learned execution graph?
+  context: Process and file relationships form a provenance graph; adversary staging introduces novel
+    edges that graph-learning models detect even when individual events look benign. Apply a temporal
+    graph autoencoder (KAIROS) or node-level GraphSAGE classifier (ThreaTrace) to the host provenance
+    graph and surface reconstructed subgraphs (parent, archiver child, files read) with high anomaly scores.
+    Presenting the subgraph — not just a score — lets the analyst see which nodes drive the alert and
+    trace the staging chain. Anomalous archiver edges connected to bulk file reads strongly indicate Collection-stage
+    packaging; well-established edges score low.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, Application servers, User workstations, Web servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  G = build_provenance_graph(events_4688, file_reads)\n  model = TemporalGraphAutoencoder.load(\"\
+      kairos\")\n  anomalies = model.score_edges(G)\n  for e in anomalies where e.score>threshold and\
+      \ e.child in ARCHIVERS:\n    alert(subgraph=G.neighborhood(e), top_nodes=e.contributors)"
+- question: Was an archive file created in a high-risk directory (e.g., C:\Windows\System32, C:\ProgramData,
+    C:\Windows\Temp, root profile paths) where users do not normally write archives?
+  context: Adversaries stage archives in system or temp directories to blend in and avoid user-visible
+    locations. Alert on archive creations (Sysmon Event ID 11, Windows Event ID 4663) in high-risk paths
+    using a static allowlist/blocklist. Additionally profile blocked/denied writes (Event ID 4656/4663
+    with a failure status) in those paths, since denied attempts reveal staging that collided with EDR
+    or ACL controls. A successful archive write in a system path is a strong Collection-stage indicator;
+    a denied attempt indicates intent even if the write failed. Tune for legitimate installers or update
+    agents that legitimately write to these locations.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Sysmon Event ID 11
+  - 'NAI: File servers, User home directories, Shared network drives, Temporary file system locations
+    (e.g., C:\Windows\Temp, %APPDATA%\Local\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (source=Sysmon EventID=11 OR source=WinEventLog:Security EventCode IN (4663,4656))\n\
+      \  file_ext IN (\"zip\",\"rar\",\"7z\")\n  path IN (\"C:\\\\Windows\\\\System32*\",\"C:\\\\ProgramData*\"\
+      ,\"C:\\\\Windows\\\\Temp*\",\"C:\\\\Users\\\\*\\\\\")\n  | eval denied=if(Accesses=\"%%1538\" OR\
+      \ status=\"failure\",1,0)\n  | table _time host process path denied"
+- question: Is the size of a newly created archive a statistical outlier (>3 standard deviations or >99th
+    percentile) versus the 30-day per-host-user baseline, or is it being written at an abnormal frequency?
+  context: Bulk collection produces archives far larger than a user's routine activity. Maintain 30-day
+    per-host-user baselines of archive sizes (volume) and creation frequency, and flag files exceeding
+    3 standard deviations or the 99th percentile, as well as writes occurring at abnormal counts/minute,
+    consistent with multi-time-scale I/O baselining in ShieldFS. A sudden very large archive, or many
+    archives written in quick succession, indicates likely Collection-stage packaging of large data sets.
+    Per-user baselining keeps this realistic for power users who routinely create big archives while still
+    catching genuine spikes.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Sysmon Event ID 11
+  - 'NAI: File servers, User home directories, Shared network drives, Temporary file system locations
+    (e.g., C:\Windows\Temp, %APPDATA%\Local\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=Sysmon EventID=11 file_ext IN (\"zip\",\"rar\",\"7z\")\n  | stats avg(file_size)\
+      \ as mu stdev(file_size) as sd by host user\n  | join host user [search source=Sysmon EventID=11\
+      \ file_ext IN (\"zip\",\"rar\",\"7z\")]\n  | where file_size > mu+3*sd\n  | table _time host user\
+      \ file path file_size"
+- question: Does a time-series forecast of per-host archive counts/bytes show a large positive residual,
+    indicating an unexpected spike in archiving volume?
+  context: Routine archiving follows predictable hourly/daily rhythms; data staging breaks that pattern.
+    Forecast per-host hourly archive counts and bytes using ARIMA or LSTM models and alert on large positive
+    residuals where observed activity greatly exceeds prediction. Report the predicted-vs-observed delta
+    and the top contributing time window so the analyst can verify the spike. A significant positive residual
+    coinciding with sensitive-data access is a strong Collection-stage indicator. Forecasting absorbs
+    normal seasonality (e.g., nightly backups) so only genuine anomalies surface.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4656
+  - Sysmon Event ID 11
+  - 'NAI: File servers, User home directories, Shared network drives, Temporary file system locations
+    (e.g., C:\Windows\Temp, %APPDATA%\Local\Temp)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  series = hourly_archive_bytes(host)\n  model = ARIMA.fit(series[:-1])\n  pred = model.forecast(1)\n\
+      \  resid = observed - pred\n  if resid > k*model.resid_std: alert(host, observed, pred, delta=resid,\
+      \ window=peak_hour)"
+- question: Did a single process read a high volume of files (>1000 reads in under 5 minutes) across many
+    distinct directories and then create a single large archive within the same process chain?
+  context: The classic staging pattern is a process funneling data from many directories into one container.
+    Alert when a PID generates more than 1000 Windows Event ID 4663 read events across multiple distinct
+    directories within a 5-minute window (high read volume plus cross-directory funneling) and then creates
+    a .zip/.rar/.7z via Sysmon Event ID 11 in the same process chain. This sequence — formalized by the
+    directory-traversal and access-frequency indicators in Redemption — is a high-confidence Collection
+    signature. A positive correlation shows data being gathered and immediately packaged; benign indexing
+    or backup processes can mimic this and should be allowlisted by their known signatures.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: Sensitive data repositories (e.g., SharePoint sites, finance department file shares), User workstations
+    of executives or developers, Database servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=WinEventLog:Security EventCode=4663 ObjectType=File\n  | bin _time span=5m\n\
+      \  | stats dc(dir(ObjectName)) as dirs count as reads by _time host pid\n  | where reads>1000 AND\
+      \ dirs>5\n  | join host pid [search source=Sysmon EventID=11 file_ext IN (\"zip\",\"rar\",\"7z\"\
+      )]\n  | table _time host pid reads dirs archive_file"
+- question: Is a process's path entropy and the fraction of the user's personal files it touched over
+    a 10-minute window abnormally high (>98th percentile) at the time it creates an archive?
+  context: Broad, indiscriminate file access spread across many paths produces high path entropy and a
+    high share of personal files touched — hallmarks of bulk collection rather than focused work. Compute
+    per-process path entropy and the fraction of the user's personal files accessed over rolling 10-minute
+    windows, and flag values above the 98th percentile when tied to an archive creation, per the multi-scale
+    behavioral features in ShieldFS. A high score concurrent with archive creation strongly indicates
+    Collection-stage data gathering; focused, repetitive access to a small set of paths scores low and
+    baselines out.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: Sensitive data repositories (e.g., SharePoint sites, finance department file shares), User workstations
+    of executives or developers, Database servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=WinEventLog:Security EventCode=4663\n  | bin _time span=10m\n  | stats values(ObjectName)\
+      \ as paths by _time host pid\n  | eval path_entropy=shannon_entropy(paths), pers_frac=personal_file_fraction(paths,user)\n\
+      \  | eventstats perc98(path_entropy) as p98 by host\n  | where path_entropy>p98 AND archive_created(pid)=1"
+- question: Does a sequence model flag a low-likelihood 'many reads -> archive write' event sequence that
+    deviates from learned benign file-access behavior?
+  context: Benign processes follow predictable read/write/create sequences; mass-read-then-archive sequences
+    are rare and detectable as low-probability paths. Train a Hidden Markov Model (Warrender et al.) or
+    an LSTM log model (DeepLog) on benign read/write/create sequences and alert on low-likelihood sequences
+    such as a burst of reads immediately followed by an archive write. Include the top-3 most anomalous
+    events from the sequence in the alert so the analyst can see what made it improbable. A flagged sequence
+    tightly coupling bulk reads with archive creation is a strong Collection-stage indicator; routine
+    application behavior fits the learned model and scores normal.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: Sensitive data repositories (e.g., SharePoint sites, finance department file shares), User workstations
+    of executives or developers, Database servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  seq = ordered_events(pid)  # reads, writes, creates\n  model = DeepLog.load(\"file_seq_lstm\"\
+      )\n  p = model.sequence_likelihood(seq)\n  if p < threshold and seq.ends_with(\"archive_create\"\
+      ):\n    alert(top3=model.most_anomalous_events(seq))"
+- question: Did a process that is not on the enterprise allowlist load a cryptographic library (crypt32.dll,
+    ncrypt.dll, bcrypt.dll), indicating possible in-process encryption of collected data?
+  context: Adversaries may encrypt collected data in-process using native crypto libraries rather than
+    a standalone tool. Alert when a non-allowlisted process loads crypto DLLs (crypt32.dll, ncrypt.dll,
+    bcrypt.dll) via Sysmon Event ID 7. This deterministic floor catches encryption capability appearing
+    in processes that have no business performing cryptographic operations. A positive match — particularly
+    on a server such as a Domain Controller or CA, or a process that just read many files — is a strong
+    Collection-stage indicator. Build the allowlist from known crypto-using software to keep false positives
+    manageable.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All endpoints and servers, especially critical servers like Domain Controllers and Certificate
+    Authorities'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=Sysmon EventID=7 ImageLoaded IN (\"*crypt32.dll\",\"*ncrypt.dll\",\"*bcrypt.dll\"\
+      )\n  | lookup crypto_allowlist Image OUTPUT allowed\n  | where isnull(allowed)\n  | table _time\
+      \ host Image ImageLoaded User"
+- question: Is a specific (ProcessName, ImageLoaded) crypto-load tuple rare across the enterprise, occurring
+    fewer than five times in a 90-day window?
+  context: A process loading a crypto library for the first (or nearly first) time enterprise-wide is
+    far more suspicious than a routine crypto consumer. Baseline (ProcessName, ImageLoaded) tuples over
+    90 days and flag combinations occurring fewer than five times across the fleet, applying fleet-wide
+    prevalence analysis. Rare crypto-load tuples reveal novel encryption behavior that a static allowlist
+    might miss. A rare tuple tied to a process that handled sensitive data is a strong Collection-stage
+    indicator; ubiquitous crypto consumers (browsers, system services) appear frequently and baseline
+    out.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All endpoints and servers, especially critical servers like Domain Controllers and Certificate
+    Authorities'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=Sysmon EventID=7 ImageLoaded IN (\"*crypt*.dll\",\"*ncrypt.dll\",\"*bcrypt.dll\"\
+      )\n  | stats count as tuple_ct by Image ImageLoaded\n  | where tuple_ct < 5\n  | table Image ImageLoaded\
+      \ tuple_ct"
+- question: Does an anomaly model flag a crypto-library load as outside the learned boundary of benign
+    crypto usage based on path, parent, command line, user, and load frequency?
+  context: Benign crypto usage clusters by predictable features; adversarial in-process encryption falls
+    outside that cluster. Train a one-class SVM or Isolation Forest on benign crypto-load features (path,
+    parent, command line, user, load frequency) and flag events outside the learned boundary. Output the
+    top-3 features driving the anomaly score (e.g., parent=httpd, first-seen tuple, off-hours load) for
+    explainability. An outlier crypto load — especially from a web server, off-hours, with a never-before-seen
+    tuple — is a strong Collection-stage indicator of data being encrypted prior to exfiltration. Normal
+    crypto consumers fall inside the boundary and stay quiet.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All endpoints and servers, especially critical servers like Domain Controllers and Certificate
+    Authorities'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  features = [path, parent, cmdline, user, load_freq]\n  model = IsolationForest.load(\"\
+      crypto_load_if\")\n  score = model.decision_function(features)\n  if score < boundary: alert(top3=model.feature_contributions(features))"
+- question: Is there an outbound network flow whose total bytes sent match (+/-10%) the size of an archive
+    created on the same host within the preceding 15-30 minutes, and is the egressing object high-entropy?
+  context: The clearest end-to-end signal of archive-then-exfiltrate is a network flow whose volume matches
+    a recently written archive. Join Sysmon Event ID 11 archive creations (>50MB) with Zeek conn.log flows
+    and alert when outbound orig_bytes within 15 minutes matches the archive size within +/-10% (volume
+    correlation). Also evaluate the written file's entropy (>7.2 bits/byte) to confirm the egressing object
+    is compressed/encrypted. A tight size match between a fresh high-entropy archive and an outbound flow
+    is a high-confidence indicator that Collection has transitioned to exfiltration. Corroborate with
+    destination reputation to prioritize.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Sysmon Event ID 11
+  - 'NAI: Network egress points (monitored by Zeek), Internal hosts (endpoints and servers), Firewall
+    and proxy servers'
+  range: Last 90 days; center correlation on archive-creation time +/- 30 minutes
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=Sysmon EventID=11 file_ext IN (\"zip\",\"rar\",\"7z\") file_size>50MB\n  | join\
+      \ host [search source=zeek conn.log]\n  | where abs(orig_bytes - file_size) <= 0.10*file_size\n\
+      \    AND (conn_time - file_time) BETWEEN 0 AND 15m\n    AND file_entropy>7.2\n  | table _time host\
+      \ file_size orig_bytes dest_ip"
+  - technology: Zeek/pseudocode
+    query: ">-\n  for conn in conn.log:\n    if exists archive on host within 15m where abs(conn.orig_bytes-archive.size)<=0.10*archive.size:\n\
+      \      notice(\"archive_to_flow_match\", host, conn.id.resp_h, conn.orig_bytes)"
+- question: After an archive creation, was a large outbound transfer (>95th percentile bytes) sent to
+    an IP or domain unseen in the prior 30 days, or were there blocked connections / NXDOMAIN / 4xx failures
+    suggesting a covert channel?
+  context: Exfiltration of staged archives often targets infrastructure the host has never contacted before,
+    and covert channels generate distinctive failure patterns. Baseline each host's outbound destinations
+    over 30 days and flag large transfers (>95th percentile bytes) to IPs/domains unseen in the prior
+    30 days following an archive creation. Also profile blocked connections and NXDOMAIN/4xx failures
+    as a distinct covert-channel signal per Nadler et al. A large transfer to a brand-new, low-reputation
+    destination right after archiving is a strong exfiltration indicator tied directly to the Collection-stage
+    archive; failure bursts can reveal beaconing or DNS/HTTP tunneling attempts.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Sysmon Event ID 11
+  - 'NAI: Network egress points (monitored by Zeek), Internal hosts (endpoints and servers), Firewall
+    and proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=zeek conn.log\n  | stats sum(orig_bytes) as bytes by host dest_ip\n  | eventstats\
+      \ perc95(bytes) as p95 by host\n  | where bytes>p95 AND NOT [search earliest=-30d source=zeek conn.log\
+      \ | stats values(dest_ip)]\n    AND recent_archive(host)=1\n  | table _time host dest_ip bytes"
+  - technology: Zeek/pseudocode
+    query: ">-\n  fail_rate = count(notice.log NXDOMAIN|4xx|blocked by host,dest)/count(conn by host,dest)\n\
+      \  if fail_rate high and recent_archive(host): notice(\"covert_channel_suspect\")"
+- question: Does a traffic-forecast model show a large positive residual in outbound volume when the recent-archive
+    flag is active, or does an anomaly model flag a low-throughput covert channel based on per-destination
+    volume, label entropy, and failure rate?
+  context: Exfiltration may be either a bulk spike or a slow covert trickle, so two complementary ML views
+    help. Forecast expected outbound volume with a regression/ARIMA model using time-of-day, day-of-week,
+    user-role, and recent-archive-creation features, and alert on large positive residuals when the archive
+    flag is active. For covert/low-throughput channels, apply an Isolation Forest over per-destination
+    request volume, label (subdomain) entropy, and failure-rate features per Nadler et al., surfacing
+    the top contributing features in the alert. A positive residual or covert-channel anomaly coinciding
+    with a freshly created archive is a strong sign that Collection-stage data is being exfiltrated; normal
+    traffic fits the forecast and stays inside the boundary.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Sysmon Event ID 11
+  - 'NAI: Network egress points (monitored by Zeek), Internal hosts (endpoints and servers), Firewall
+    and proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  pred = ARIMA_or_regression(host, features=[tod,dow,user_role,recent_archive])\n  if\
+      \ observed_bytes - pred > k*resid_std and recent_archive(host): alert(delta)\n  # covert channel\n\
+      \  if = IsolationForest.fit([req_volume, label_entropy, failure_rate] per dest)\n  if if.score(dest)\
+      \ < boundary: alert(top_features)"
