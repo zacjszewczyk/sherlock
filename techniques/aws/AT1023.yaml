@@ -1,0 +1,295 @@
+name: 'AT1023: Cloud Database Discovery'
+id: 9b2cfb92-a961-4307-b394-6e129cb7ed33
+description: 'Investigate whether an adversary has performed Cloud Database Discovery in AWS by enumerating
+  managed database resources (Amazon RDS instances, clusters, snapshots, parameter groups, and subnet
+  groups) across regions and accounts in a manner inconsistent with the calling principal''s normal job
+  function. This playbook helps an analyst detect the canonical reconnaissance workflow seen in tooling
+  such as Pacu: rapid describe/list of database inventory, permission-probing that generates bursts of
+  AccessDenied errors, and follow-on target prioritization (reads of snapshot metadata, public-access
+  settings, KMS encryption posture, security-group associations, and tags) that may precede credential
+  theft, collection, lateral movement, snapshot share/copy, or exfiltration. It combines deterministic
+  symbolic-logic detections, statistical baselining (volume deviation, first-seen API, sensitive-target
+  focus), and machine-learning models (isolation forest, sequence and graph analysis) to separate benign
+  inventory collection from adversary target selection.'
+type: technique
+related:
+- tactic_id: TA0007
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a single principal or session issue several distinct Amazon RDS database-discovery API
+    calls (such as DescribeDBInstances, DescribeDBClusters, DescribeDBSnapshots, DescribeDBClusterSnapshots,
+    DescribeDBSubnetGroups, or DescribeDBParameterGroups) within a short window, especially when the caller
+    is a human identity, a newly assumed role, or a principal that does not normally administer databases?
+  context: 'This is the deterministic floor for detecting Cloud Database Discovery. Adversaries map accessible
+    data stores and administrative paths by rapidly enumerating RDS inventory, a behavior automated by
+    Pacu''s rds__explore_snapshots module. Alert when a single principal/session emits at least 3 distinct
+    RDS discovery actions within a 5-10 minute window. Scope to eventSource=rds.amazonaws.com and the
+    relevant Describe*/List* eventName selectors (map per the SigmaHQ AWS CloudTrail rules and the emulation-derived
+    Sigma corpus in Recorded Future''s ''Detections in the Sky''). Raise confidence when the caller is
+    a human identity, a freshly assumed role, or a principal outside the normal database-admin cohort.
+    A positive result indicates an enumeration chain worth correlating with subsequent snapshot copy/restore
+    or master-password changes; a known batch inventory job can be tuned out, but do not remove this deterministic
+    floor when layering statistical or ML detections. Tactic context (Discovery): the adversary is orienting
+    and cataloguing data stores before deciding how to act.'
+  answer_sources: &id001
+  - CloudTrail
+  - CloudTrail Lake
+  - Amazon GuardDuty findings
+  - 'NAI: CloudTrail coverage for Amazon RDS control-plane activity, database administration roles in
+    production accounts, and cross-region management activity touching managed database inventory'
+  range: Last 90 days (correlate discovery actions within a 5-10 minute event-centered window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=CloudTrail eventSource="rds.amazonaws.com"
+
+      | where eventName in ("DescribeDBInstances","DescribeDBClusters","DescribeDBSnapshots","DescribeDBClusterSnapshots","DescribeDBSubnetGroups","DescribeDBParameterGroups")
+
+      | bin _time span=10m
+
+      | stats dc(eventName) as distinct_actions, values(eventName) as actions by userIdentity.arn, userIdentity.sessionContext.sessionIssuer.arn,
+      _time
+
+      | where distinct_actions >= 3
+
+      | lookup db_admin_principals arn AS userIdentity.arn OUTPUT is_db_admin
+
+      | where is_db_admin!="true" OR userIdentity.type="AssumedRole" OR userIdentity.type="IAMUser"'
+  - technology: CloudTrail Lake/SQL pseudocode
+    query: "SELECT useridentity.arn, date_trunc('minute', eventtime) AS bucket,\n       count(distinct\
+      \ eventname) AS distinct_actions\nFROM cloudtrail_events\nWHERE eventsource='rds.amazonaws.com'\n\
+      \  AND eventname IN ('DescribeDBInstances','DescribeDBClusters','DescribeDBSnapshots','DescribeDBClusterSnapshots','DescribeDBSubnetGroups','DescribeDBParameterGroups')\n\
+      GROUP BY useridentity.arn, date_trunc('minute', eventtime)\nHAVING count(distinct eventname) >=\
+      \ 3"
+- question: Is a principal accumulating an unusual burst of authorization failures (AccessDenied or Client.UnauthorizedOperation)
+    on RDS Describe*/List* calls, or exhibiting a high ratio of failed-to-total describe calls within
+    a session, indicating permission-probing reconnaissance?
+  context: 'Permission-probing recon generates a characteristic pattern of denied calls as the adversary
+    tests which RDS discovery actions their stolen or assumed credentials are authorized to perform. Flag
+    a principal accruing at least 5 AccessDenied / Client.UnauthorizedOperation errors on RDS Describe*/List*
+    calls within 10 minutes, or whose failed-to-total describe-call ratio exceeds 0.3 within a session.
+    This mirrors the behavioral baselining in Wiz''s IMDS anomaly hunting. A positive result suggests
+    an actor exploring the boundaries of their access (often immediately after credential compromise or
+    role assumption); legitimate misconfiguration or a broken automation job can produce similar bursts,
+    so corroborate with caller novelty and follow-on successful enumeration. Tactic context (Discovery):
+    high denial rates reveal an adversary still mapping what they can control around their entry point.'
+  answer_sources: *id001
+  range: Last 90 days (evaluate failures in 10-minute sliding windows and per-session)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=CloudTrail eventSource="rds.amazonaws.com" (eventName="Describe*" OR eventName="List*")
+
+      | eval is_fail=if(errorCode IN ("AccessDenied","Client.UnauthorizedOperation"),1,0)
+
+      | bin _time span=10m
+
+      | stats sum(is_fail) as fails, count as total by userIdentity.arn, _time
+
+      | eval fail_ratio=fails/total
+
+      | where fails >= 5 OR fail_ratio > 0.3'
+  - technology: CloudTrail Lake/SQL pseudocode
+    query: "SELECT useridentity.arn,\n       sum(CASE WHEN errorcode IN ('AccessDenied','Client.UnauthorizedOperation')\
+      \ THEN 1 ELSE 0 END) AS fails,\n       count(*) AS total\nFROM cloudtrail_events\nWHERE eventsource='rds.amazonaws.com'\
+      \ AND (eventname LIKE 'Describe%' OR eventname LIKE 'List%')\nGROUP BY useridentity.arn\nHAVING\
+      \ fails >= 5 OR (CAST(fails AS double)/count(*)) > 0.3"
+- question: Does a principal's volume of RDS describe/list operations, count of distinct database resources
+    touched, cross-region fan-out, or engine diversity exceed its own trailing baseline or that of its
+    peer-role cohort?
+  context: 'Beyond a fixed threshold, anomalous enumeration is best caught by comparing a principal''s
+    current behavior to its history and peers. Baseline per-principal counts of RDS describe/list operations,
+    distinct database resources touched, region spread, engine diversity, and time-of-day over a trailing
+    30-day window. Flag sessions whose volume, distinct-resource count, or cross-region fan-out exceeds
+    the 95th percentile for the caller or its peer-role cohort. Use the median/MAD modified Z-score (|Z|
+    > 3.5) for robustness against batch jobs, and add peer-group/population comparison as described in
+    Elastic''s CloudTrail ML work. A positive result means the principal is enumerating far more broadly
+    than normal - consistent with adversary mapping; a negative result keeps routine inventory within
+    expected bounds. Tactic context (Discovery): unusually broad fan-out across regions and engines signals
+    an actor cataloguing the whole estate rather than touching a known database.'
+  answer_sources: *id001
+  range: Last 90 days (trailing 30-day baseline per principal and peer cohort)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=CloudTrail eventSource="rds.amazonaws.com" (eventName="Describe*" OR eventName="List*")
+
+      | bin _time span=1d
+
+      | stats count as calls, dc(requestParameters.resourceId) as distinct_res, dc(awsRegion) as regions
+      by userIdentity.arn, _time
+
+      | eventstats median(calls) as med, p50(abs(calls-med)) as mad by userIdentity.arn
+
+      | eval mod_z=0.6745*(calls-med)/mad
+
+      | where abs(mod_z) > 3.5 OR regions > peer_p95_regions OR distinct_res > peer_p95_res'
+  - technology: Athena/SQL pseudocode
+    query: "WITH daily AS (\n  SELECT useridentity.arn AS arn, date(eventtime) AS d,\n         count(*)\
+      \ AS calls, count(distinct awsregion) AS regions\n  FROM cloudtrail WHERE eventsource='rds.amazonaws.com'\n\
+      \    AND (eventname LIKE 'Describe%' OR eventname LIKE 'List%')\n  GROUP BY useridentity.arn, date(eventtime))\n\
+      SELECT * FROM daily\nWHERE calls > (SELECT approx_percentile(calls,0.95) FROM daily d2 WHERE d2.arn=daily.arn)"
+- question: Did a principal issue an RDS Describe*/List* API action it has never previously made within
+    its 30-90 day history, or deviate from its forecasted control-plane call volume and error rate?
+  context: 'Adversaries operating with stolen credentials frequently invoke discovery APIs the legitimate
+    identity has never used. Maintain a 30-90 day per-principal allow-set of RDS API actions (e.g., built
+    via Athena, as in the Netflix CloudTrail Anomaly Detector) and alert when a principal issues a database
+    Describe*/List* action absent from its history. Complement this with forecasting of expected per-principal/per-account
+    control-plane call volume and error rate, flagging deviations outside the predicted band (per time-series
+    intrusion-detection research). A positive result (a genuinely first-seen discovery action) is a strong
+    novelty signal, particularly for service accounts with narrow, stable behavior; account for legitimate
+    role expansion or new automation by reviewing change context. Tactic context (Discovery): first-time
+    use of inventory APIs often marks the moment an adversary begins exploring an unfamiliar account.'
+  answer_sources: *id001
+  range: Last 90 days (compare against a 30-90 day per-principal allow-set)
+  queries:
+  - technology: Athena/SQL pseudocode
+    query: "WITH hist AS (\n  SELECT distinct useridentity.arn AS arn, eventname\n  FROM cloudtrail\n\
+      \  WHERE eventsource='rds.amazonaws.com'\n    AND eventtime BETWEEN now()-interval '90' day AND\
+      \ now()-interval '1' day),\ntoday AS (\n  SELECT useridentity.arn AS arn, eventname, min(eventtime)\
+      \ AS first_seen\n  FROM cloudtrail\n  WHERE eventsource='rds.amazonaws.com' AND eventtime >= now()-interval\
+      \ '1' day\n    AND (eventname LIKE 'Describe%' OR eventname LIKE 'List%')\n  GROUP BY useridentity.arn,\
+      \ eventname)\nSELECT t.* FROM today t LEFT JOIN hist h ON t.arn=h.arn AND t.eventname=h.eventname\n\
+      WHERE h.eventname IS NULL"
+  - technology: SIEM/Stats pseudocode
+    query: 'source=CloudTrail eventSource="rds.amazonaws.com" (eventName="Describe*" OR eventName="List*")
+      earliest=-90d
+
+      | stats min(_time) as first_time by userIdentity.arn, eventName
+
+      | where first_time >= relative_time(now(),"-1d")'
+- question: When discovery sessions are scored by an unsupervised anomaly model over features such as
+    principal novelty, count of describe/list calls, distinct-resource and snapshot counts, region and
+    engine diversity, API sequence order, AccessDenied ratio, and follow-on access, which sessions rank
+    as high-anomaly outliers?
+  context: 'A multivariate model captures combinations of weak signals that individual rules miss. Score
+    discovery sessions with an unsupervised Isolation Forest over features including principal novelty,
+    count of describe/list calls, distinct-resource and snapshot count, region count, engine diversity,
+    sequence order, AccessDenied ratio, and follow-on access. Complement it with sequence models that
+    flag low-probability API ordering (variable-order Markov chains; DeepLog LSTM) and rare-function population
+    jobs (Elastic CloudTrail ML). The alert text must surface the top-3 contributing features (e.g., novel
+    principal, distinct snapshots described, region fan-out) alongside the anomaly score so an analyst
+    can triage quickly. A high score indicates a session that statistically resembles adversary reconnaissance;
+    benign-but-rare automation may also score high, so the explanatory features are essential for disposition.
+    Tactic context (Discovery): the model is designed to separate routine inventory collection from the
+    broad, novel, error-prone enumeration typical of an orienting adversary.'
+  answer_sources: *id001
+  range: Last 90 days (train on trailing 30-90 days; score per session)
+  queries:
+  - technology: ML/pseudocode
+    query: "features = per_session_vector(\n  principal_novelty, describe_list_count, distinct_resources,\
+      \ distinct_snapshots,\n  region_count, engine_diversity, sequence_order_score, access_denied_ratio,\
+      \ followon_access)\nmodel = IsolationForest(n_estimators=200, contamination='auto').fit(history_features)\n\
+      score = -model.score_samples(features)\nif score > threshold:\n    alert(session, score, top_3_shap_features(model,\
+      \ features))"
+  - technology: SIEM/Sequence-model pseudocode
+    query: '// low-probability API ordering
+
+      seq = ordered_api_calls(session, eventSource=''rds.amazonaws.com'')
+
+      p = variable_order_markov.prob(seq)   // or DeepLog LSTM next-token prob
+
+      if p < p_threshold: alert(session, p, surface_rare_transitions(seq))'
+- question: After enumerating database inventory, did the same principal read snapshot metadata, public-access
+    settings, KMS encryption configuration, security-group associations, or tags - and then query secrets,
+    networking controls, or backup APIs, or perform actions like RestoreDBInstanceFromDBSnapshot with
+    publiclyAccessible=true, a ModifyDBInstance master-password change, or a snapshot share/copy?
+  context: 'Discovery followed by configuration-focused reads indicates the adversary is prioritizing
+    targets and preparing to act. Alert when database inventory calls are followed by reads of snapshot
+    metadata, public-access settings, KMS encryption configuration, security-group associations, or tagging
+    that helps identify high-value or externally reachable databases. Raise severity when the same principal
+    then queries secrets (Secrets Manager), networking controls, or backup APIs, or performs RestoreDBInstanceFromDBSnapshot
+    with responseElements.publiclyAccessible=true, a ModifyDBInstance master-password change, or a snapshot
+    share/copy - the snapshot-exfiltration workflow demonstrated in Pacu''s rds__explore_snapshots. A
+    positive result is a strong indicator of an active intrusion moving from reconnaissance toward collection
+    or exfiltration; correlate the full chain on one principal/session. Tactic context (Discovery): this
+    catches the transition where orientation becomes deliberate target selection and staging.'
+  answer_sources: &id002
+  - CloudTrail
+  - CloudTrail Lake
+  - AWS Config
+  - Amazon GuardDuty findings
+  - 'NAI: RDS instances hosting sensitive application data, snapshot inventories, configuration history
+    for public accessibility and encryption settings, and IAM principals with read access to database
+    metadata'
+  range: Last 90 days (chain inventory then config-read then action within a session)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=CloudTrail (eventSource=\"rds.amazonaws.com\" OR eventSource=\"kms.amazonaws.com\"\
+      \ OR eventSource=\"secretsmanager.amazonaws.com\" OR eventSource=\"ec2.amazonaws.com\")\n| transaction\
+      \ userIdentity.arn maxspan=30m\n| where match(eventName,\"DescribeDB\") \n  AND (match(eventName,\"\
+      Snapshot|Attribute|SecurityGroup|Parameter|ListTags\") OR eventSource=\"kms.amazonaws.com\" OR eventSource=\"\
+      secretsmanager.amazonaws.com\")\n| eval high_sev=if(eventName in (\"RestoreDBInstanceFromDBSnapshot\"\
+      ,\"ModifyDBInstance\",\"ModifyDBSnapshotAttribute\",\"CopyDBSnapshot\",\"ShareDBSnapshot\") OR responseElements.publiclyAccessible==\"\
+      true\",1,0)\n| where high_sev=1 OR eventcount>=3"
+  - technology: CloudTrail Lake/SQL pseudocode
+    query: "SELECT useridentity.arn, array_agg(eventname ORDER BY eventtime) AS chain\nFROM cloudtrail_events\n\
+      WHERE eventsource IN ('rds.amazonaws.com','kms.amazonaws.com','secretsmanager.amazonaws.com')\n\
+      GROUP BY useridentity.arn\nHAVING contains(chain,'DescribeDBInstances')\n   AND (contains(chain,'ModifyDBSnapshotAttribute')\
+      \ OR contains(chain,'RestoreDBInstanceFromDBSnapshot') OR contains(chain,'CopyDBSnapshot') OR contains(chain,'ModifyDBInstance'))"
+- question: Is the share of databases a principal enumerated that are production-tagged, internet-reachable,
+    unencrypted, or recently snapshotted disproportionately high compared with the principal's own history
+    or its role cohort's expected scope?
+  context: 'Adversaries selectively focus on high-value or exposed databases, whereas legitimate admins
+    touch a representative mix. Measure the share of enumerated databases that are production-tagged,
+    internet-reachable, unencrypted, recently snapshotted, or otherwise high value (joining CloudTrail
+    discovery events to AWS Config inventory for accessibility, encryption, and tag attributes). Flag
+    sessions that disproportionately focus on sensitive populations versus the caller''s history using
+    the median/MAD modified Z-score (|Z| > 3.5), and compare to the role cohort via population analysis
+    as in Elastic''s CloudTrail ML. A positive result indicates target prioritization toward sensitive
+    data stores - a meaningful escalation signal even when raw call volume looks normal; a negative result
+    reflects a balanced, routine inventory. Tactic context (Discovery): a skew toward sensitive/exposed
+    targets reveals an adversary deciding which databases best serve its objective.'
+  answer_sources: *id002
+  range: Last 90 days (per-session sensitivity share vs. trailing baseline and cohort)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=CloudTrail eventSource="rds.amazonaws.com" eventName="Describe*"
+
+      | lookup config_rds_inventory resourceId OUTPUT is_prod, public_access, encrypted, last_snapshot_age
+
+      | eval sensitive=if(is_prod="true" OR public_access="true" OR encrypted="false" OR last_snapshot_age<7,1,0)
+
+      | stats sum(sensitive) as sens, count as total by userIdentity.arn, session_id
+
+      | eval sens_share=sens/total
+
+      | eventstats median(sens_share) as med, p50(abs(sens_share-med)) as mad by userIdentity.arn
+
+      | eval mod_z=0.6745*(sens_share-med)/mad
+
+      | where abs(mod_z) > 3.5'
+  - technology: Athena/SQL pseudocode
+    query: "SELECT c.useridentity.arn,\n       sum(CASE WHEN i.is_prod OR i.public_access OR NOT i.encrypted\
+      \ THEN 1 ELSE 0 END) AS sensitive,\n       count(*) AS total\nFROM cloudtrail c JOIN config_rds_inventory\
+      \ i ON c.requestparameters.dbinstanceidentifier = i.resourceid\nWHERE c.eventsource='rds.amazonaws.com'\
+      \ AND c.eventname LIKE 'Describe%'\nGROUP BY c.useridentity.arn\nHAVING (CAST(sensitive AS double)/count(*))\
+      \ > 0.7"
+- question: When sequence and graph analysis is applied to a principal's cross-service activity (RDS,
+    KMS, Secrets Manager, EC2 security groups), do the patterns distinguish benign inventory collection
+    from adversary target selection - and which sessions score as likely target prioritization?
+  context: 'Distinguishing benign inventory from target selection benefits from models that understand
+    relationships and order across services. Apply a dynamic principal-role-resource-action graph (GNN-based
+    IAM threat detection) or a tripartite user/service/activity temporal GNN (CS-GAD) to surface cross-service
+    recon spanning RDS, KMS, Secrets Manager, and EC2 security groups, combined with LSTM sequence scoring
+    (DeepLog) over the API stream. Score features such as metadata depth, sensitivity of targeted instances,
+    configuration-risk indicators, and follow-on context, and surface the top-3 contributing features
+    in the alert. A high score indicates a session whose structure and ordering resemble adversary target
+    prioritization (e.g., inventory then encryption/secrets then networking then snapshot action); benign
+    cross-service automation may score high, so the explanatory features and graph context guide disposition.
+    Tactic context (Discovery): the model elevates the recon-to-prioritization transition that precedes
+    collection, lateral movement, or service manipulation.'
+  answer_sources: *id002
+  range: Last 90 days (build graph/sequences per principal-session; train on trailing window)
+  queries:
+  - technology: ML/Graph pseudocode
+    query: "G = build_temporal_graph(nodes=[principal,role,resource,service], edges=api_actions, window='session')\n\
+      emb = TemporalGNN(G)            // GNN-based IAM threat detection / CS-GAD\nscore = anomaly_head(emb[principal_session])\n\
+      if score > threshold:\n    alert(session, score, top_3_features(metadata_depth, target_sensitivity,\
+      \ config_risk, followon))"
+  - technology: ML/Sequence pseudocode
+    query: "seq = api_stream(session, services=['rds','kms','secretsmanager','ec2'])\nprob = DeepLog_LSTM.next_token_prob(seq)\n\
+      if min(prob) < p_threshold:\n    alert(session, surface_low_prob_transitions(seq))"
