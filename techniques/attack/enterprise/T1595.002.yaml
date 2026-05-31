@@ -1,0 +1,501 @@
+name: 'T1595.002: Vulnerability Scanning'
+id: 985457df-b292-41ac-9742-f5f6d5db1278
+description: Investigate evidence that an adversary is actively scanning external-facing infrastructure
+  for vulnerabilities (MITRE ATT&CK T1595.002, Reconnaissance). This playbook helps an analyst determine
+  whether inbound activity reflects vulnerability scanning, port scanning, web vulnerability probing,
+  or banner-grabbing reconnaissance rather than legitimate traffic. It guides the analyst through correlating
+  threat-intelligence matches on inbound source IPs (Zeek conn.log, Windows Event ID 5156), detecting
+  scanner User-Agents and sensitive URI probes (Zeek http.log, Windows Event ID 4688), spotting banner-grab
+  connections that receive a service banner and immediately disconnect, identifying vertical port scans
+  (many ports on one host) and horizontal sweeps (one port across many hosts), and stitching low-fidelity
+  alerts into a multi-stage reconnaissance chain. Each question pairs a deterministic symbolic-logic detection,
+  a statistical baseline, and where appropriate a machine-learning approach so analysts can confirm scanning
+  activity, scope the adversary's interest, and anticipate follow-on initial-access attempts against the
+  exposed services.
+type: technique
+related:
+- tactic_id: TA0043
+  tactic_name: Reconnaissance
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any inbound source IPs in Zeek conn.log or Windows Event ID 5156 records matching threat-intelligence
+    categories for scanners, malicious actors, TOR exit nodes, or anonymizing proxies, and do those same
+    IPs also show a high ratio of refused or failed connections (S0/REJ)?
+  context: 'Reconnaissance via vulnerability scanning frequently originates from infrastructure already
+    catalogued on threat-intel feeds (mass-scanning services, bulletproof hosts, TOR/proxy pools). Joining
+    inbound source IPs from Zeek conn.log and Windows Event ID 5156 (Filtering Platform connection) against
+    TI categories gives a fast, deterministic first filter. Prioritizing matches that also exhibit high
+    S0/REJ failure-state ratios sharpens fidelity because benign clients rarely accumulate refused connections,
+    whereas scanners spray probes at closed ports. A positive result is an IP that is both TI-flagged
+    and failure-heavy, strongly indicating active scanning against your perimeter; a negative result narrows
+    the pool but does not clear an IP, since novel scanning infrastructure may not yet appear on any feed.
+    (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Threat Intelligence Platform, Cloud Network Security Groups'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      inbound = conn.log WHERE local_orig=false
+        JOIN win5156 ON src_ip
+        LOOKUP src_ip IN threat_intel WHERE category IN ('scanner','malicious','tor','proxy')
+        COMPUTE fail_ratio = count(conn_state IN ('S0','REJ')) / count(*)
+        ALERT WHERE ti_match=true AND fail_ratio > 0.5
+- question: For each threat-intelligence-matched source IP, do its 24-hour connection counts and Event
+    ID 5156 deny/drop counts exceed the 95th percentile for its TI category using a robust (median-absolute-deviation
+    / modified z-score) threshold?
+  context: 'A single TI hit is weak on its own; volume and persistence separate opportunistic noise from
+    determined scanning. Tracking per-IP connection and deny/drop counts over 24 hours, then comparing
+    each IP against a per-TI-category baseline at the 95th percentile, surfaces the heavy hitters. Because
+    scan rates and probed ports follow a heavy-tailed distribution dominated by a few service ports, ordinary
+    mean/standard-deviation thresholds are skewed by batch outliers; median-absolute-deviation/modified-z-score
+    thresholding resists that. A positive result is a TI IP whose probe volume is statistically extreme
+    for its peer category, indicating sustained, high-intensity scanning warranting blocking and deeper
+    review. (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Threat Intelligence Platform, Cloud Network Security Groups'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = stats per ti_category: p95(conn_count_24h), mad(conn_count_24h)
+        per src_ip: conn_count_24h, deny_count_24h
+        modz = 0.6745 * (conn_count_24h - median) / mad
+        ALERT WHERE conn_count_24h > p95(ti_category) OR modz > 3.5
+- question: Does a supervised classifier (logistic regression or random forest) over combined Zeek and
+    Windows session features (TI category, 24-hour connection count, distinct ports, conn_state/failure
+    distribution) predict reconnaissance maliciousness above 0.9 for an inbound source IP?
+  context: 'Deterministic rules miss adversaries who blend in; a model trained on labeled flow data (e.g.,
+    the CIC-IDS2017 PortScan class) can weigh many session attributes simultaneously. Running the classifier
+    in parallel with the deterministic CTI+failure rule (kept as the detection floor) captures subtler
+    scanning while preserving explainability. Alerting only above a 0.9 probability and surfacing the
+    top-3 contributing features keeps false positives manageable and makes each alert actionable. A positive
+    result is a high-probability prediction whose driving features (e.g., many distinct ports plus high
+    failure ratio) corroborate scanning; analysts should validate against the raw flows before acting.
+    (Tactic: Reconnaissance; method: Machine Learning.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Threat Intelligence Platform, Cloud Network Security Groups'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = [ti_category, conn_count_24h, distinct_ports, frac_S0, frac_REJ, frac_RSTO]
+        score = model.predict_proba(features)
+        ALERT WHERE score > 0.9 EMIT top3_feature_contributions
+        # deterministic CTI+failure rule remains the floor
+- question: Do any inbound web requests in Zeek http.log carry a User-Agent or URI matching known scanner
+    tools (Nikto, Nessus, OpenVAS, ZAP, sqlmap) or sensitive probe paths (/admin, /.git, CGI or web-shell
+    paths), confirmed by the originating Windows Event ID 4688 process?
+  context: 'Many vulnerability scanners announce themselves through default User-Agent strings or by walking
+    well-known sensitive paths. Matching Zeek http.log user_agent and uri fields against a curated signature
+    list provides a high-confidence, low-cost detection of web vulnerability scanning. Confirming with
+    the initiating Windows process (Event ID 4688) attributes the activity and rules out spoofed UAs where
+    the host is internal. A positive result is a request whose UA or path matches a scanner signature,
+    indicating active web-app probing; a negative result does not clear the source, since attackers routinely
+    randomize User-Agents and avoid signature paths. (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4688
+  - 'NAI: Internet-facing Web Servers, Web Application Firewalls, Application Gateways, Load Balancers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      http.log WHERE local_orig=false AND (
+          user_agent MATCHES scanner_ua_list OR
+          uri MATCHES ['/admin','/.git','/cgi-bin/','*webshell*','*shell.php*'] )
+        JOIN win4688 ON host
+        ALERT EMIT src_ip, user_agent, uri, process_name
+- question: Which source IPs generate a 4xx/5xx HTTP response ratio above 80% over a 5-minute window with
+    at least 20 requests, indicating they are walking non-existent or forbidden paths characteristic of
+    a scanner?
+  context: 'Vulnerability scanners enumerate paths that mostly do not exist, producing a distinctive burst
+    of 4xx/5xx responses that legitimate users rarely generate. Computing per-source error ratios from
+    Zeek http.log status_code over short windows, with a minimum-request floor to avoid noise, isolates
+    this failure-mode signal. Correlating to the initiating Windows process attributes the activity. A
+    positive result is a source whose error ratio and request volume both exceed local thresholds, indicating
+    directory/vulnerability enumeration; the 80% ratio and 20-request floor should be tuned to the site''s
+    local 99th percentile to limit false positives from broken crawlers. (Tactic: Reconnaissance; method:
+    Statistical Method.)'
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4688
+  - 'NAI: Internet-facing Web Servers, Web Application Firewalls, Application Gateways, Load Balancers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      http.log GROUP BY src_ip WINDOW 5min
+        COMPUTE err_ratio = count(status_code >= 400) / count(*), n = count(*)
+        ALERT WHERE n >= 20 AND err_ratio > 0.80
+        JOIN win4688 FOR attribution
+- question: Do any source IPs exhibit unusually high Shannon entropy across requested URIs and status
+    codes over 5-minute windows, exceeding the 99th percentile, indicating broad path dispersion typical
+    of scanning?
+  context: 'Broad web scanners disperse requests across many distinct paths while concentrating failures,
+    which manifests as high Shannon entropy in the URI distribution. Computing per-source URI (and status-code)
+    entropy over 5-minute windows and alerting above the 99th percentile detects this dispersion even
+    when User-Agents are randomized and individual paths are not on a signature list. A positive result
+    is a source whose URI entropy is statistically extreme while its failure rate is elevated, indicating
+    systematic enumeration; legitimate heavy users (e.g., search bots) should be baselined or allowlisted
+    to reduce false positives. (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4688
+  - 'NAI: Internet-facing Web Servers, Web Application Firewalls, Application Gateways, Load Balancers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      http.log GROUP BY src_ip WINDOW 5min
+        COMPUTE uri_entropy = shannon(distribution(uri))
+        base = p99(uri_entropy) over history
+        ALERT WHERE uri_entropy > base AND frac_4xx5xx high
+- question: Does a supervised (or transformer-based NLP) classifier over URIs and request metadata, trained
+    on labeled web-attack traffic (e.g., CIC-IDS2017 Web-Attack), flag frequent non-benign requests from
+    a single source?
+  context: 'Signature lists and entropy thresholds miss obfuscated or novel web-attack payloads. A classifier
+    trained on labeled web-attack traffic scores each URI/request and, when non-benign categories recur
+    from one source, raises an alert with the top-3 driving features for analyst review. Kept behind the
+    signature rule as the floor and run in parallel, it broadens coverage without sacrificing the deterministic
+    baseline. A positive result is a source repeatedly emitting requests the model scores as web-attack;
+    analysts should confirm against raw http.log and the originating process before escalating. (Tactic:
+    Reconnaissance; method: Machine Learning.)'
+  answer_sources:
+  - Zeek http.log
+  - Windows Event ID 4688
+  - 'NAI: Internet-facing Web Servers, Web Application Firewalls, Application Gateways, Load Balancers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      per request: score = web_attack_model.classify(uri, method, headers)
+        GROUP BY src_ip WINDOW 5min
+        ALERT WHERE count(score != 'benign') frequent EMIT top3_features
+        # signature rule remains the floor
+- question: Are external IPs opening short-lived S1/RSTO/RSTR connections to service ports (22/SSH, 3389/RDP,
+    21/FTP) that last under 2 seconds with only banner-sized resp_bytes and no subsequent successful authentication?
+  context: 'Banner-grabbing reconnaissance connects to a service, captures the version banner, and disconnects
+    without authenticating. Linking Zeek conn.log with ssh.log and rdp.log to find short-duration (<2s)
+    S1/RSTO/RSTR connections carrying only banner-sized response bytes and lacking any following auth-success
+    event isolates this behavior. A positive result is a source repeatedly grabbing banners across services,
+    indicating version fingerprinting that precedes targeted exploitation; a negative result helps rule
+    out enumeration on those services. This directly supports the reconnaissance question by exposing
+    what software/versions the adversary is cataloguing. (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssh.log
+  - Zeek rdp.log
+  - Windows Event ID 5156
+  - 'NAI: DMZ Servers, VPN Concentrators, Externally-facing servers hosting SSH/RDP/FTP'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      conn.log WHERE service IN ('ssh','rdp','ftp')
+          AND conn_state IN ('S1','RSTO','RSTR')
+          AND duration < 2s AND resp_bytes < banner_threshold
+        LEFT JOIN ssh.log/rdp.log auth_success
+        ALERT WHERE auth_success IS NULL
+- question: Applying Threshold Random Walk (sequential hypothesis testing) to each source's success/fail
+    outcomes against service ports, which sources cross the likelihood-ratio threshold (typically after
+    ~4-5 failure-dominated attempts) and should be declared scanners?
+  context: 'Threshold Random Walk (TRW) treats each connection outcome as evidence in a sequential hypothesis
+    test, declaring a source a scanner once the accumulated likelihood ratio crosses a bound. Because
+    legitimate clients usually succeed while scanners fail repeatedly against closed/unknown services,
+    TRW detects scanning quickly (often after 4-5 failures) with analytically bounded false positives.
+    A positive result is a source whose failure-dominated outcome sequence crosses the threshold, a statistically
+    principled scanner declaration. This complements rate thresholds by catching slow scanners that stay
+    under volume limits. (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssh.log
+  - Zeek rdp.log
+  - Windows Event ID 5156
+  - 'NAI: DMZ Servers, VPN Concentrators, Externally-facing servers hosting SSH/RDP/FTP'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      per src_ip: maintain log-likelihood ratio L
+        for each new conn outcome:
+          L += log(P[outcome|scanner] / P[outcome|benign])
+        DECLARE scanner WHEN L > eta_1 (e.g. after ~4-5 failures)
+- question: Which source IPs have success-to-attempt ratios per port (correlating Windows Event ID 4625
+    failed logons with refused connections) in the bottom 5th percentile, indicating near-total authentication
+    failure consistent with scanning?
+  context: 'Scanners that touch authenticated services almost never complete a successful logon, so their
+    success-to-attempt ratio collapses toward zero. Tracking per-port success ratios using Windows Event
+    ID 4625 failed logons together with refused connections, then flagging sources in the bottom 5th percentile,
+    profiles this failure rate as a distinct discriminator. A positive result is a source whose authentication
+    success ratio is statistically abnormally low for the port, indicating probing/credential-less enumeration;
+    baselining per port is important because some services legitimately see more failures than others.
+    (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssh.log
+  - Zeek rdp.log
+  - Windows Event ID 5156
+  - 'NAI: DMZ Servers, VPN Concentrators, Externally-facing servers hosting SSH/RDP/FTP'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      GROUP BY src_ip, dst_port
+        COMPUTE succ_ratio = auth_success / (auth_success + win4625_fail + refused)
+        base = p5(succ_ratio) per dst_port
+        ALERT WHERE succ_ratio <= base
+- question: Does an Isolation Forest or DBSCAN over connection duration and resp_bytes grouped by port
+    surface anomalous clusters of short-lived, low-byte connections from single IPs indicative of banner
+    grabbing?
+  context: 'Banner-grab connections cluster tightly in feature space: very short duration, very small
+    response byte counts, repeated from one source across a port. Applying Isolation Forest or DBSCAN
+    to (duration, resp_bytes) grouped by port surfaces these anomalous, dense, low-byte clusters that
+    rule thresholds may miss when attackers vary timing. Surfacing the contributing features (duration,
+    bytes, port) makes alerts explainable. A positive result is a source whose connection profile is an
+    outlier/dense cluster of banner-sized exchanges, indicating systematic banner harvesting; analysts
+    confirm against conn.log before acting. (Tactic: Reconnaissance; method: Machine Learning.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssh.log
+  - Zeek rdp.log
+  - Windows Event ID 5156
+  - 'NAI: DMZ Servers, VPN Concentrators, Externally-facing servers hosting SSH/RDP/FTP'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = conn.log[duration, resp_bytes] GROUP BY dst_port
+        model = IsolationForest()/DBSCAN(eps, minpts)
+        ALERT on anomalies/dense low-byte short-duration clusters
+        EMIT duration, resp_bytes, dst_port, src_ip
+- question: Is any single external source IP contacting more than 50 distinct destination ports on one
+    destination host within 60 seconds, with negative responses (TCP RST / ICMP unreachable / conn_state
+    S0/REJ) dominating?
+  context: 'A vertical scan enumerates many ports on a single target to map its attack surface. Counting
+    distinct destination ports per source-host pair within a 60-second window and requiring negative responses
+    as the discriminator (per the flow-based portscan model) reliably flags this. Implemented as a tunable
+    rate threshold (track by_src, count N ports, seconds T) it is cheap and deterministic. A positive
+    result is a source rapidly probing >50 ports on one host with mostly refused/unanswered connections,
+    a classic vertical scan; the thresholds should be tuned to local traffic to avoid flagging legitimate
+    scanners or vulnerability tools you operate. (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Individual Host Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      conn.log WHERE local_orig=false
+        GROUP BY src_ip, dst_ip WINDOW 60s
+        COMPUTE nports = distinct(dst_port), neg = frac(conn_state IN ('S0','REJ'))
+        ALERT WHERE nports > 50 AND neg dominant
+- question: Which source IPs show destination-port entropy over 5 minutes exceeding the 99th percentile
+    (or a baseline of ~3.5), weighted by their S0/REJ failure ratio, consistent with a vertical port scan?
+  context: 'Vertical scans concentrate on one host while dispersing across many ports, producing high
+    destination-port entropy. Computing per-source destination-port Shannon entropy over 5-minute windows
+    and alerting above the 99th percentile (or ~3.5) detects this dispersion, and weighting by the S0/REJ
+    failure ratio raises confidence that the dispersion is probing rather than legitimate multi-service
+    use. A positive result is a source whose port entropy is statistically extreme and failure-heavy,
+    indicating port enumeration; tune the baseline locally since some applications legitimately span many
+    ports. (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Individual Host Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      conn.log GROUP BY src_ip WINDOW 5min
+        COMPUTE port_entropy = shannon(distribution(dst_port)), fail = frac(S0,REJ)
+        ALERT WHERE port_entropy > max(p99, 3.5) AND fail elevated
+- question: Does DBSCAN over (timestamp, destination port) features per source-host pair reveal dense
+    clusters characteristic of rapid vertical scanning, with sparse benign connections labeled as noise?
+  context: 'Rapid vertical scans appear as dense clusters in (time, port) space, while legitimate connections
+    are sparse. Running DBSCAN per source-host pair surfaces these dense clusters and labels isolated
+    benign connections as noise, catching scans that vary in port range and evade fixed thresholds. Reporting
+    cluster size and time-span makes alerts explainable. A positive result is a dense, fast (timestamp,
+    port) cluster from one source to one host, indicating a vertical scan; analysts validate the cluster
+    against conn.log to rule out backup or monitoring tools. (Tactic: Reconnaissance; method: Machine
+    Learning.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Individual Host Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = conn.log[timestamp, dst_port] GROUP BY (src_ip, dst_ip)
+        model = DBSCAN(eps, min_samples)
+        ALERT on dense clusters EMIT cluster_size, time_span, port_range
+- question: Is a single external source IP contacting more than 20 distinct destination hosts on the same
+    port (e.g., 445/SMB, 3389/RDP) within 60 seconds with negative responses dominating, the canonical
+    portsweep pattern?
+  context: 'A horizontal sweep checks one service across many hosts to find vulnerable instances. Counting
+    distinct destination hosts per source/port within a 60-second window and requiring dominant negative
+    responses flags this canonical portsweep behavior. Deployed as a Suricata/Zeek rate threshold tracked
+    by source, it is deterministic and tunable. A positive result is a source hitting >20 hosts on one
+    port with mostly refused/unanswered connections, indicating service enumeration that often precedes
+    mass exploitation; tune host counts and ports to local norms and exclude legitimate scanners/management
+    hosts. (Tactic: Reconnaissance; method: Symbolic Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Subnet Gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      conn.log WHERE local_orig=false
+        GROUP BY src_ip, dst_port WINDOW 60s
+        COMPUTE nhosts = distinct(dst_ip), neg = frac(conn_state IN ('S0','REJ'))
+        ALERT WHERE nhosts > 20 AND neg dominant
+- question: Grouping by source IP and destination port over 5-minute windows, which sources have unique
+    destination-host counts exceeding that port's locally-derived 99th percentile, accounting for the
+    few service ports that dominate sweeps?
+  context: 'Sweep prevalence is heavily skewed toward a handful of service ports (445, 3389, 22, 80, 443),
+    so a single global threshold misfires. Deriving per-port 99th-percentile baselines for unique destination-host
+    counts and alerting when a source exceeds the baseline for that port adapts detection to empirical
+    scan prevalence. A positive result is a source whose host-fanout on a given port is statistically
+    extreme for that port, indicating a horizontal sweep; per-port baselining reduces false positives
+    from ports that legitimately see broad connectivity. (Tactic: Reconnaissance; method: Statistical
+    Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Subnet Gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      conn.log GROUP BY src_ip, dst_port WINDOW 5min
+        COMPUTE nhosts = distinct(dst_ip)
+        base = p99(nhosts) per dst_port over history
+        ALERT WHERE nhosts > base(dst_port)
+- question: Which sources show high destination-IP entropy while maintaining low destination-port entropy
+    over the window, the signature of a horizontal sweep dispersing across many hosts on a single port?
+  context: 'Horizontal sweeps disperse across many hosts (high destination-IP entropy) on a single port
+    (low destination-port entropy). Computing both entropies per source over the window and alerting when
+    dest-IP entropy is high but dest-port entropy is low distinguishes sweeps from vertical scans and
+    from legitimate multi-service traffic. A positive result is a source with that high-dest-IP/low-dest-port
+    entropy signature, indicating a single-service sweep; combine with failure ratios to suppress benign
+    broadcast/discovery traffic. (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Subnet Gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      conn.log GROUP BY src_ip WINDOW 5min
+        COMPUTE dstip_entropy = shannon(distribution(dst_ip)),
+                port_entropy  = shannon(distribution(dst_port))
+        ALERT WHERE dstip_entropy high AND port_entropy low
+- question: Does time-series modeling of unique destination-host counts per port (or DBSCAN over (timestamp,
+    dest-host) tuples) flag anomalous spikes indicative of horizontal sweeps?
+  context: 'Horizontal sweeps appear as sudden spikes in the number of unique destination hosts contacted
+    on a port. Modeling unique-host counts per port as a time series and flagging anomalous spikes, or
+    clustering (timestamp, dest-host) tuples with DBSCAN, catches sweeps that adapt their rate to evade
+    fixed thresholds. Surfacing the port, host count, and time-span features makes alerts explainable.
+    A positive result is an anomalous spike/dense cluster of new hosts on one port from one source, indicating
+    a sweep; analysts validate against conn.log and exclude scheduled scans. (Tactic: Reconnaissance;
+    method: Machine Learning.)'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network Perimeter Firewall, Edge Routers, Cloud Network Security Groups, Subnet Gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      series = count(distinct dst_ip) per dst_port per minute
+        ALERT on anomalous spike (e.g. > forecast + k*sigma)
+        OR DBSCAN[(timestamp, dst_ip)] dense cluster EMIT port, nhosts, time_span
+- question: For a single external source IP within a 60-minute window, do distinct low-fidelity alerts
+    chain together (e.g., CTI hit -> port scan -> web vulnerability probe) with Windows Event ID 5156/4688
+    tying the sessions, where each later target was noted in the earlier stage?
+  context: 'Individual reconnaissance alerts are low-confidence, but a sequence from one source within
+    an hour is a strong signal of deliberate targeting. Correlating alert chains keyed on the same source
+    IP (e.g., CTI hit, then port scan, then web vulnerability probe) using Zeek and Windows data, and
+    ensuring the later-stage target was identified in the earlier stage, raises a high-confidence meta-alert
+    without requiring external lookups. A positive result is a coherent multi-stage chain from one source,
+    indicating an active reconnaissance campaign progressing toward initial access; this directly answers
+    whether the adversary is scanning your perimeter with intent. (Tactic: Reconnaissance; method: Symbolic
+    Logic.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: SIEM / Log Aggregation Platform, Security Orchestration, Automation, and Response (SOAR) Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      alerts WHERE src_ip = X WINDOW 60min ORDER BY time
+        CHAIN cti_hit -> port_scan -> web_probe
+        REQUIRE later.target IN earlier.discovered_targets
+        JOIN win5156/win4688 ON session
+        RAISE meta_alert
+- question: Summing predefined risk scores per alert type over rolling hours per source IP (weighted by
+    failure-state intensity), which sources exceed dynamic thresholds (99.9th percentile or a score >40)
+    using robust median-absolute-deviation thresholding?
+  context: 'Aggregating risk scores across alert types per source over rolling hours converts many weak
+    signals into a single prioritized score. Weighting stages by their failure-state intensity and using
+    robust (median-absolute-deviation) thresholding against a dynamic baseline (99.9th percentile or a
+    floor of 40) keeps the score resilient to outliers. A positive result is a source whose cumulative
+    risk crosses the threshold, indicating sustained multi-faceted reconnaissance worthy of escalation;
+    the dynamic threshold adapts to environmental noise so analysts focus on the most threatening sources.
+    (Tactic: Reconnaissance; method: Statistical Method.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: SIEM / Log Aggregation Platform, Security Orchestration, Automation, and Response (SOAR) Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      per src_ip ROLLING WINDOW hours:
+          risk = sum(alert_weight[type] * failure_intensity)
+        base = max(p99_9(risk), 40); robust via MAD
+        ALERT WHERE risk > base
+- question: Does mining historical alert sequences (augmented with Windows events) reveal learned malicious
+    TTP flows that match a live source's sequence of reconnaissance alerts?
+  context: 'Adversary reconnaissance often follows recurring sequences (TTP flows) that sequence-mining
+    can learn from labeled multi-stage datasets. Matching a live source''s alert sequence against learned
+    malicious patterns catches campaigns that deterministic correlation might miss, while keeping the
+    model narrowly scoped behind the deterministic correlation rule and surfacing the top contributing
+    stages keeps it explainable and low-noise. A positive result is a live sequence matching a learned
+    malicious flow, indicating a structured reconnaissance campaign; analysts confirm against the underlying
+    alerts and Windows events before escalating. (Tactic: Reconnaissance; method: Machine Learning.)'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: SIEM / Log Aggregation Platform, Security Orchestration, Automation, and Response (SOAR) Platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      train: mine frequent malicious alert sequences from labeled history + win events
+        live: match src_ip alert_sequence against learned patterns
+        ALERT WHERE match_confidence high EMIT top_contributing_stages
+        # deterministic correlation rule remains the floor
