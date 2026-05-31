@@ -1,0 +1,286 @@
+name: 'D3-BDI: Broadcast Domain Isolation'
+id: cfe7c6b0-cbdc-495d-acd2-79c97c1fb7af
+description: This playbook helps an analyst assess whether broadcast-domain (east-west) isolation controls
+  are actually constraining intra-segment traffic to an approved allow-list, and whether an adversary
+  is attempting to move laterally across or within isolated VLANs/segments. It guides investigation of
+  successful intra-broadcast-domain connections that fall outside the approved source-destination-service
+  matrix, unauthorized SMB/DCE-RPC remote-execution and admin-share activity crossing isolation boundaries,
+  statistical outliers in unique-peer counts, destination-port and byte-ratio drift, beaconing/automated
+  east-west sessions, and machine-learning scoring of improbable communication-graph edges and rare lateral
+  traversal paths. It also profiles failed/rejected east-west connection attempts as a distinct detection
+  channel, surfacing scanning and probing against the isolation boundary even when the control successfully
+  blocks the traffic. Applying Zero Trust principles, every intra-segment flow is evaluated against policy
+  because no host is trusted by network location.
+type: technique
+related:
+- tactic_id: D3-ISL
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there any successful intra-subnet (east-west) connections between hosts that fall outside
+    the approved source-destination-service allow-list for their isolated VLAN/segment?
+  context: Under Zero Trust, no host is trusted by network location, so every intra-segment flow must
+    match an explicit deny-by-default allow-list of valid source-destination-service tuples derived from
+    the segmentation/micro-segmentation policy (NIST SP 800-215, SP 800-207). Query Zeek conn.log for
+    successfully established connections (conn_state SF/S1/RSTO with bytes transferred) whose source/destination/service
+    combination is not in the matrix. Each out-of-policy tuple is a direct broadcast-domain isolation
+    violation and warrants investigation as misconfiguration or lateral movement. A negative result (all
+    flows in-policy) indicates the isolation control is holding; positives identify the exact hosts and
+    services breaching the boundary.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "ALLOW = load_segmentation_matrix()  # set of (src_segment, dst_segment, service) tuples\n\
+      from conn.log\nwhere conn_state in ('SF','S1','RSTO') and orig_bytes + resp_bytes > 0\n  and same_or_adjacent_broadcast_domain(id.orig_h,\
+      \ id.resp_h)\nlet tuple = (segment(id.orig_h), segment(id.resp_h), service)\nwhere tuple not in\
+      \ ALLOW\nselect ts, id.orig_h, id.resp_h, id.resp_p, service, orig_bytes, resp_bytes\n-> alert 'isolation\
+      \ allow-list violation'"
+- question: Is unauthorized east-west protocol activity (SMB/DCE-RPC remote execution, admin-share writes,
+    or service creation) occurring between hosts in segments that should never speak those protocols?
+  context: 'Lateral movement frequently rides on SMB and DCE-RPC for remote execution, admin-share file
+    writes (ADMIN$/C$), and remote service creation. Using first-party Zeek smb.log/dce_rpc.log analytics
+    from BZAR, alert on these patterns when observed between hosts in segments whose isolation policy
+    forbids such protocols. Each cross-segment RPC/SMB session is a high-confidence isolation breach.
+    This is tactic-specific to Isolate: a working broadcast-domain control should prevent these protocols
+    crossing boundaries, so any observed instance signals either control failure or an authorized-but-undocumented
+    path needing remediation.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "BZAR_OPS = {'svcctl','atsvc','tsch','scmr'}  # remote-exec / service-create RPC endpoints\n\
+      (from dce_rpc.log where operation in BZAR_OPS)\nUNION (from smb.log where path matches '\\\\\\\\\
+      .*\\\\(ADMIN\\\\$|C\\\\$|IPC\\\\$)' and action == 'write')\nwhere segment(id.orig_h) != segment(id.resp_h)\n\
+      \  and not policy_allows_protocol(segment(id.orig_h), segment(id.resp_h), 'smb/dce_rpc')\nselect\
+      \ ts, id.orig_h, id.resp_h, operation, path\n-> alert 'cross-segment SMB/DCE-RPC (BZAR)'"
+- question: Which hosts show anomalous spikes in their daily count of unique east-west peers or total
+    intra-segment byte volume relative to their own 30-day baseline?
+  context: A host that suddenly contacts many more peers, or moves far more data within its broadcast
+    domain than usual, may be performing reconnaissance, lateral spread, or exfiltration staging. Compute
+    daily unique-peer counts and total east-west byte volume per host within each broadcast domain and
+    flag hosts exceeding a robust threshold (median + k*MAD, start k=6) over a rolling 30-day baseline,
+    per Bohara et al. Robust (MAD-based) statistics resist contamination from a few large days. Tune k
+    per segment and emit the top-3 contributing features (peer count, byte volume, new-peer fraction)
+    so analysts can triage quickly.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days; baseline rolling 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each host, day in conn.log (east-west only):\n  peers      = count_distinct(id.resp_h)\n\
+      \  bytes      = sum(orig_bytes + resp_bytes)\n  new_frac   = fraction_of_peers_not_seen_in_prior_30d\n\
+      baseline med, mad = rolling_30d_median_mad(peers), (bytes)\nflag if peers > med_peers + 6*mad_peers\
+      \ OR bytes > med_bytes + 6*mad_bytes\nemit top3_features(peers, bytes, new_frac) -> alert 'unique-peer/volume\
+      \ outlier'"
+- question: Has any host's destination-port distribution or originator/responder byte ratio drifted significantly
+    from its historical profile, indicating new lateral communication patterns?
+  context: Beyond simple volume, the SHAPE of a host's traffic reveals new behavior. Compute the Jensen-Shannon
+    divergence between each host's current destination-port distribution (and orig:resp byte ratio) and
+    its historical profile built from conn.log fields, and alert on sustained divergence. JS divergence
+    is bounded and symmetric, making it stable for comparing distributions. A sustained shift toward new
+    ports or an inverted byte ratio suggests the host began speaking new services to new peers inside
+    the isolated VLAN, consistent with lateral tooling. Distinguish transient drift (single day) from
+    sustained drift (multi-day) to control false positives.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days; baseline historical per-host profile
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each host:\n  P_hist = normalized dst_port histogram over baseline window\n  P_now  =\
+      \ normalized dst_port histogram over current day\n  jsd    = jensen_shannon(P_hist, P_now)\n  ratio_drift\
+      \ = abs(byte_ratio_now - byte_ratio_hist)\nflag if jsd > 0.3 sustained over >= 2 consecutive days\n\
+      select host, jsd, ratio_drift, new_ports -> alert 'port-mix/byte-ratio drift'"
+- question: Are there periodic, low-jitter (beaconing) east-west connections between intra-segment host
+    pairs that suggest scripted lateral tooling or command-and-control rather than human-driven traffic?
+  context: Automated tooling and C2 generate regular, machine-like communication. Score intra-segment
+    host pairs for beaconing using inter-arrival-time and payload-size regularity (low coefficient of
+    variation, Bowley skewness, MAD) per RITA. Regular low-jitter east-west sessions inside an isolated
+    VLAN are unusual for legitimate human activity and indicate scripted lateral movement or implant check-ins.
+    Confirm by reviewing the connection cadence and destination; legitimate periodic services (backup,
+    monitoring) should be allow-listed to reduce noise so genuine beacons stand out.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each (src,dst) pair east-west in conn.log over >= 24h:\n  iat = sorted_inter_arrival_times(ts)\n\
+      \  cv      = stddev(iat)/mean(iat)\n  skew    = bowley_skewness(iat)\n  size_mad= mad(orig_bytes\
+      \ + resp_bytes)\n  score   = beacon_score(low cv, low |skew|, low size_mad)  # RITA-style\nflag\
+      \ if score > threshold and not allowlisted(src,dst)\n-> alert 'periodic east-west beaconing'"
+- question: Which new east-west communication edges are structurally improbable when scored against the
+    historical host-communication/authentication graph?
+  context: Model the environment as a host-communication/authentication graph and score each new intra-segment
+    edge with unsupervised link prediction (node2vec + logistic regression as in CyberGraph; GNN + temporal
+    recurrence as in EULER). Edges that the model finds highly improbable - connections between hosts
+    that have no structural reason to communicate - are candidate isolation violations or lateral-movement
+    steps. Surface the top-3 structural features (degree change, edge novelty, neighborhood rarity) in
+    the alert. Run this ML channel in parallel with, never replacing, the deterministic allow-list; it
+    catches novel paths the static matrix may not anticipate.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days; graph trained on rolling history
+  queries:
+  - technology: ML/pseudocode
+    query: "G = build_graph(nodes=hosts, edges=east_west_conns over history)\nemb = node2vec(G)      \
+      \      # or temporal GNN (EULER)\nmodel = logistic_regression(train on existing edges vs sampled\
+      \ non-edges)\nfor each new edge (u,v) today:\n  p = model.predict_proba(emb[u], emb[v])\n  flag\
+      \ if p < 0.05\n  emit top3(degree_change, edge_novelty, neighborhood_rarity)\n-> alert 'improbable\
+      \ east-west edge' (parallel to allow-list)"
+- question: Are there rare multi-hop east-west traversal paths (chains of connections/logins) that, when
+    reconstructed and rarity-scored, indicate an adversary moving laterally across the segment?
+  context: Single-edge analysis misses campaigns that hop host-to-host. Reconstruct causal connection/login
+    paths and score their rarity to rank multi-hop east-west traversal, combining Hopper's path-inference
+    and rarity scoring, LMTracker's heterogeneous-graph path embeddings, and Bian et al.'s auth-log sequence
+    features (with feature importance for explainability). A rare, low-probability traversal path that
+    crosses or chains through isolated hosts is strong evidence of lateral movement. The explainable feature
+    importance helps an analyst justify and triage the alert, tying specific hops to the isolation boundary
+    they violate.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "paths = reconstruct_causal_paths(conn.log + auth events)  # Hopper-style\nfor each path (h1->h2->...->hn):\n\
+      \  emb   = heterograph_path_embedding(path)   # LMTracker\n  feats = auth_sequence_features(path)\
+      \       # Bian et al.\n  rarity= rarity_score(emb, feats)\n  flag if rarity > threshold and path\
+      \ crosses isolation boundary\n  emit feature_importance(feats)\n-> alert 'rare lateral traversal\
+      \ path'"
+- question: Has any host migrated to an abnormal behavioral cluster based on its communication fingerprint,
+    suggesting a role change consistent with compromise or misconfiguration?
+  context: Hosts of similar function exhibit similar communication fingerprints (peer diversity, port
+    mix, byte ratios, connection-failure rates). Cluster these fingerprints and monitor each host's cluster
+    assignment over time using a PCA/k-means ensemble per Bohara et al. A host that drifts from its normal
+    cluster into an abnormal one has changed its role on the network - a workstation behaving like a server
+    or scanner, for example - which can indicate compromise, lateral-movement staging, or misconfiguration
+    that weakens isolation. Report the top-3 features driving the shift so analysts can confirm whether
+    the change is benign or hostile.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Zeek smb.log
+  - Zeek dce_rpc.log
+  - Firewall/switch ACL logs
+  - 'NAI: Core and distribution layer switches and segmentation gateways monitoring intra-VLAN/inter-segment
+    traffic.'
+  range: Last 90 days; baseline rolling clustering window
+  queries:
+  - technology: ML/pseudocode
+    query: "features = per_host[peer_diversity, port_mix, byte_ratio, fail_rate]\nX = pca(features); clusters\
+      \ = kmeans(X, k)   # ensemble per Bohara et al.\nfor each host:\n  if cluster_now != cluster_baseline\
+      \ and distance_to_centroid high:\n    emit top3_features driving shift\n    -> alert 'host role/cluster\
+      \ migration'"
+- question: Which internal hosts exceed a fixed floor of failed or rejected east-west connection attempts
+    to many distinct peers or ports within tightly isolated segments?
+  context: 'A working isolation policy converts attacker reconnaissance into a measurable stream of rejected
+    connections. Flag internal hosts whose count of failed-state connections (Zeek conn_state S0/REJ/RSTO,
+    plus firewall/ACL denies) to distinct peers/ports exceeds a fixed floor (start: >20 failed peers or
+    >50 failed attempts in 5 minutes) within segments intended to be tightly isolated. This deterministic
+    threshold reliably catches noisy scanning and probing even when the control blocks the traffic. Tune
+    the floor per segment to reflect normal failure rates; a burst above the floor points directly at
+    a host enumerating the segment.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Firewall/switch ACL deny logs
+  - 'NAI: Segmentation gateways, core/distribution switches, and host firewalls logging denied/rejected
+    intra-segment connections.'
+  range: Last 90 days; 5-minute evaluation windows
+  queries:
+  - technology: Zeek/pseudocode
+    query: "window = 5 minutes\nfrom conn.log where conn_state in ('S0','REJ','RSTO')\n  UNION firewall/ACL\
+      \ deny logs\nwhere isolated_segment(id.orig_h)\ngroup by id.orig_h over window:\n  fail_peers =\
+      \ count_distinct(id.resp_h)\n  fail_attempts = count(*)\nflag if fail_peers > 20 OR fail_attempts\
+      \ > 50\n-> alert 'east-west scan/probe against isolation boundary'"
+- question: Does sequential-hypothesis (TRW/SPRT) scoring of each source's ordered success/failure connection
+    outcomes identify stealthy low-rate east-west scanners that fixed thresholds miss?
+  context: Apply a Threshold Random Walk / Sequential Probability Ratio Test over each source's ordered
+    connection outcomes (success vs failure) to declare a scanner after only a few failed attempts, per
+    Jung et al. Because successful connections to legitimate peers push the score toward 'benign' while
+    failures push toward 'scanner', SPRT detects probing after very few events while bounding false positives.
+    This catches stealthy, low-rate east-west scanning that fixed-count thresholds miss - an adversary
+    deliberately staying under a 50-attempt floor will still accumulate a failure-dominated outcome sequence
+    that TRW flags.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Firewall/switch ACL deny logs
+  - 'NAI: Segmentation gateways, core/distribution switches, and host firewalls logging denied/rejected
+    intra-segment connections.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each src host, walk ordered east-west connection outcomes:\n  on success: L *= (theta1/theta0)\
+      \      # toward benign\n  on failure: L *= ((1-theta1)/(1-theta0))  # toward scanner\n  if L >=\
+      \ upper_bound(eta1): declare 'scanner'\n  if L <= lower_bound(eta0): declare 'benign', reset\n->\
+      \ alert 'SPRT/TRW east-west scanner' (Jung et al.)"
+- question: Is each segment's denied/rejected east-west connection rate deviating robustly from its normal
+    baseline, indicating a surge of probing against the isolation boundary?
+  context: Maintain a rolling baseline of each segment's normal denied/rejected connection rate and alert
+    on robust deviations (median + k*MAD) per Bohara et al. A sudden rise in the REJ/S0 ratio is direct
+    evidence of probing against the isolation boundary, and it is a distinct signal from successful-traffic
+    anomalies - it measures the control actively rejecting traffic rather than allowing it. This channel
+    confirms the isolation policy is being tested at scale; correlate spikes with the per-host failed-attempt
+    and SPRT findings to attribute the probing to specific sources.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek notice.log
+  - Firewall/switch ACL deny logs
+  - 'NAI: Segmentation gateways, core/distribution switches, and host firewalls logging denied/rejected
+    intra-segment connections.'
+  range: Last 90 days; baseline rolling window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each segment, time-bucket:\n  deny_rate = count(conn_state in ('REJ','S0') + acl_denies)\
+      \ / total_conns\nbaseline med, mad = rolling_median_mad(deny_rate)\nflag if deny_rate > med + 6*mad\n\
+      -> alert 'segment probing surge (REJ/S0 ratio spike)'\n   correlate with per-host floor and SPRT\
+      \ findings"
