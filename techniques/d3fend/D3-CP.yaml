@@ -1,0 +1,359 @@
+name: 'D3-CP: Certificate Pinning'
+id: 777c8728-9fd5-403c-9021-758e5136d070
+description: 'Investigate the design, enforcement, and monitoring of certificate pinning on critical client-to-server
+  TLS channels to detect and mitigate man-in-the-middle (MITM) attacks. This playbook helps an analyst
+  inventory candidate pinning channels from TLS telemetry, characterize their volume, frequency, and certificate-identity
+  stability, and establish baselines before enforcing pins so that strict pinning does not brick legitimate
+  services. It then guides detection of interception and rogue-certificate activity: substituted, self-signed,
+  or short-validity certificates on pinned FQDNs; SPKI/issuer/serial drift outside approved rotation windows;
+  certificates absent from Certificate Transparency logs; TLS client-fingerprint (JA3/JA4) versus claimed
+  User-Agent mismatch; and protocol/cipher downgrade offers. Finally it treats pin-validation failures,
+  application TLS errors, and HPKP-style violation reports as high-value telemetry to distinguish genuine
+  MITM/rogue-cert events from operational bricking caused by un-updated pins or silently non-validating
+  clients.'
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which internal hosts and applications repeatedly establish successful TLS sessions to our
+    critical FQDNs, and what is the per-source-host connection inventory that identifies channels we should
+    harden with certificate pinning?
+  context: Before you can pin anything you must know which client-to-service channels are critical, repeatable,
+    and worth hardening. Maintain a watchlist of business-critical FQDNs, then query Zeek ssl.log for
+    successful TLS sessions whose server_name matches that watchlist and join to conn.log for the originating
+    host, byte counts, and conn_state. Produce per-source-host inventories and connection counts so you
+    can identify which applications and hosts should pin. Prioritize channels you operate and channels
+    whose clients may not validate certificates, since these are the most exposed to MITM. A rich, stable
+    inventory is the foundation for the drift-detection and enforcement steps; an empty or noisy result
+    means you need better TLS visibility at the egress before pinning can be planned. This supports the
+    Harden objective of selecting viable pinning targets.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'watchlist = load_critical_fqdns()
+
+      ssl = read(''zeek:ssl.log'') WHERE server_name IN watchlist AND established=true
+
+      join conn = read(''zeek:conn.log'') ON ssl.uid = conn.uid
+
+      group by orig_h, server_name -> count(sessions), sum(orig_bytes+resp_bytes), set(conn_state)
+
+      output inventory sorted by sessions desc'
+- question: For each source-host-to-server channel, has the server's leaf SPKI SHA-256 fingerprint, issuer
+    chain, or serial number changed outside an approved certificate-rotation window or change ticket?
+  context: 'This is the deterministic pin-comparison model at the heart of certificate pinning: store
+    the approved leaf SPKI SHA-256 fingerprint plus the issuer chain and serial from Zeek x509.log for
+    each source-host to server_name path, then alert when the observed SPKI, issuer, or serial changes
+    outside an approved rotation window or change ticket. SPKI fingerprint equality is the pass condition;
+    a mismatch should abort the connection and a backup pin should always be configured. A positive (drift)
+    result on a stable channel is a strong rogue-certificate or MITM indicator; a negative result confirms
+    the pinned identity is intact. Tie any detected change to a known reissue/change ticket to separate
+    legitimate rotation from attack. This directly enables the Harden goal of detecting drift after pins
+    are established.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for each (orig_h, server_name):\n  approved = pinset[(orig_h, server_name)]  # {spki_sha256,\
+      \ issuer, serial}\n  obs = read('zeek:x509.log') joined to ssl.log for this path\n  if obs.spki_sha256\
+      \ != approved.spki_sha256 OR obs.issuer != approved.issuer OR obs.serial != approved.serial:\n \
+      \    if not within_rotation_window(server_name) and not change_ticket(server_name):\n        alert('certificate\
+      \ identity drift', orig_h, server_name, obs)"
+- question: For our owned and pinned FQDNs, does the leaf certificate observed on the wire appear in public
+    Certificate Transparency logs, or has an unexpected new certificate been issued for our domain outside
+    a planned reissue?
+  context: Certificate Transparency (CT) logs publicly record issued certificates within minutes, so unexpected
+    issuance is an early rogue-CA/MITM warning. For owned/pinned FQDNs, reconcile the leaf certificate
+    seen in Zeek x509.log against CT logs and alert when a presented leaf is absent from CT, or when an
+    unexpected new certificate for the domain appears in CT outside a planned reissue. A presented-but-not-in-CT
+    certificate suggests an interception appliance or a privately issued substitute; an unexpected CT
+    entry suggests someone obtained a certificate for your domain you did not request. A clean reconciliation
+    (presented cert is in CT and matches your issuance records) is the negative case. This monitoring
+    of your own CT footprint supports the Harden objective by catching impersonation before clients connect.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "owned = load_owned_fqdns()\nfor cert in read('zeek:x509.log') WHERE certificate.subject_cn\
+      \ IN owned:\n  ct_hits = query_ct_logs(cert.fingerprint)\n  if ct_hits == 0: alert('presented leaf\
+      \ absent from CT', cert)\nfor new in poll_ct_logs(owned):\n  if new.fingerprint not in known_issuance_records:\
+      \ alert('unexpected CT issuance for owned domain', new)"
+- question: Which TLS channels have high connection frequency but low certificate-identity cardinality
+    (ideally only 1-2 distinct SPKIs per quarter), making them the most stable and lowest-risk candidates
+    for strict pinning?
+  context: Pinning is safest on channels that are both heavily used and cryptographically stable. Group
+    Zeek ssl.log by source host and SNI over a 30-day window; compute connection-frequency percentiles
+    (sessions/day), total and median bytes from conn.log, and the count of distinct certificate identities
+    (SPKI). Prioritize channels with high frequency and low identity cardinality (ideally 1-2 SPKIs per
+    quarter) as the most stable pinning targets. Derive the per-service rotation-window threshold from
+    the observed reissue cadence rather than a fixed constant, so your pin maintenance matches reality.
+    A high-frequency/low-cardinality result is an ideal pin target; a high-cardinality result warns that
+    strict pinning would likely brick the channel. This statistical profiling supports the Harden objective
+    of choosing defensible pinning targets.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ssl = read('zeek:ssl.log') last 30d\ngroup by orig_h, server_name:\n  sessions_per_day = count()\
+      \ / days\n  freq_pct = percentile(sessions_per_day)\n  bytes = join conn.log -> sum/median(orig_bytes+resp_bytes)\n\
+      \  spki_card = distinct_count(x509.spki_sha256)\nrank candidates by (freq_pct desc, spki_card asc)\n\
+      rotation_window[server_name] = observed_reissue_interval(server_name)"
+- question: For each candidate service, what are the normal TLS handshake/validation failure rates, certificate
+    validity periods, and renewal intervals, and which services show elevated failures, abnormally short
+    validity, or off-cadence rotation that must be characterized before strict pinning?
+  context: Strict pinning can brick a service if you pin without understanding its failure modes. Per
+    service, track the handshake/validation failure rate, certificate validity period, and renewal interval
+    distributions. Treat elevated failed-handshake counts, abnormally short validity (for example shorter
+    than the issuer's norm), and off-cadence rotation as distinct failure-mode signals that must be characterized
+    before enforcing pins. A service with stable, predictable behavior is safe to pin; a service with
+    erratic rotation or frequent handshake failures needs remediation or a more lenient pinning strategy
+    first. These baselines also become the reference against which post-pinning anomalies are measured.
+    This supports the Harden objective by ensuring pin enforcement does not cause outages.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ssl = read('zeek:ssl.log') last 90d\nper server_name:\n  fail_rate = count(validation_failed\
+      \ or handshake_failed)/count(total)\n  validity_dist = distribution(x509.not_after - x509.not_before)\n\
+      \  renewal_dist = distribution(time between distinct cert first-seen)\nflag service if fail_rate\
+      \ > baseline_p95 OR validity < issuer_norm OR renewal off-cadence"
+- question: After pins are deployed, do per-channel TLS timing, record-size, byte-ratio, and certificate-identity
+    features deviate from the learned baseline in ways that suggest MITM, misconfiguration, or a broken
+    pin set, and which top features explain each anomaly?
+  context: Once pins are live, ongoing drift detection catches interception, misconfiguration, and stale
+    pin sets that simpler rules miss. Train a per-channel anomaly or time-series model on TLS timing,
+    record-size sequences, byte ratios, and certificate-identity features from Zeek conn.log and ssl.log,
+    choosing features that survive TLS 1.3 and Encrypted Client Hello. Alert on post-pinning deviations
+    that suggest MITM, misconfiguration, or broken pin sets, and surface the top-3 contributing features
+    (for example a new SPKI, a bytes-out ratio shift, or an inter-arrival change) in the alert text via
+    Shapley attributions so an analyst can triage quickly. A high anomaly score with a new-SPKI top feature
+    points to certificate substitution; one driven by timing/size shifts may indicate an inline interceptor.
+    Explainable output keeps the model actionable. This supports the Harden objective of sustaining pin
+    integrity over time.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - Zeek x509.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: "model = train_per_channel_anomaly(features=[tls_timing, record_size_seq, bytes_out_ratio,\
+      \ spki_id], data=conn.log+ssl.log, robust_to=['TLS1.3','ECH'])\nfor session in stream:\n  score\
+      \ = model.score(session)\n  if score > channel_threshold:\n     top3 = shap_top_features(model,\
+      \ session, k=3)\n     alert('post-pinning drift', channel, score, top3)"
+- question: On a given channel, does the observed JA3/JA4 TLS client fingerprint contradict the HTTP User-Agent
+    (for example a User-Agent claiming a major browser while the ClientHello matches an interception product
+    or an unexpected stack)?
+  context: Interception products terminate and re-originate TLS, so their ClientHello fingerprint usually
+    does not match the application the User-Agent claims to be. Compare the observed JA3/JA4 client fingerprint
+    from Zeek ssl.log and the HTTP User-Agent from http.log on a given channel against the expected fingerprint
+    for that application/destination. A User-Agent claiming a major browser while the ClientHello fingerprint
+    matches a known interception product or an otherwise unexpected stack is a strong MITM/interception
+    signal. A consistent fingerprint-to-UA mapping is the negative case; a mismatch warrants investigation
+    of the intervening path. This detection directly serves the Harden objective by identifying interception
+    on channels meant to be protected by pinning.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek http.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for session in read('zeek:ssl.log') join http.log on uid:\n  expected = fp_baseline[(application,\
+      \ dest_fqdn)]\n  if session.ja4 != expected.ja4 OR maps_to_interception_product(session.ja3):\n\
+      \     if http.user_agent claims_browser AND session.ja4 not in browser_fps:\n        alert('TLS\
+      \ fingerprint vs claimed client mismatch', orig_h, dest_fqdn, session.ja4, http.user_agent)"
+- question: Does the certificate observed for a pinned FQDN show a self-signed chain, an issuer/JA4X structure
+    outside the approved set, a validity period shorter than the service norm, or an SPKI absent from
+    the pin set?
+  context: A pin-violation event should be flagged on the wire regardless of whether the client itself
+    enforced the pin, because the network record is independent evidence of substitution. Alert when Zeek
+    x509.log for a pinned FQDN shows a self-signed chain, an issuer or JA4X certificate structure not
+    in the approved set, a validity period shorter than the service norm, or an SPKI absent from the pin
+    set. Any of these is treated as a pin-violation event. A matching, approved certificate is the negative
+    case; a self-signed or off-pin certificate strongly suggests interception or rogue issuance. Pairing
+    this with the fingerprint-mismatch and downgrade rules raises confidence. This supports the Harden
+    objective by catching certificate substitution against pinned services.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek http.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "pinset = load_pinset()\nfor cert in read('zeek:x509.log') WHERE fqdn IN pinset.keys():\n \
+      \ if cert.self_signed OR cert.issuer not in pinset[fqdn].approved_issuers OR cert.ja4x not in approved_ja4x\
+      \ OR (cert.not_after-cert.not_before) < service_norm[fqdn] OR cert.spki_sha256 not in pinset[fqdn].spkis:\n\
+      \     alert('pin violation: substituted/self-signed/short-validity cert', fqdn, cert)"
+- question: Per host and service, how often are deprecated protocols (SSLv2, SSLv3) and export-grade ciphers
+    offered or negotiated, and is any residual deprecated-protocol support trending toward zero?
+  context: Downgrade attacks rely on residual support for weak protocols and ciphers, so any such support
+    is an exploitable MITM precursor. Per host/service, count and ratio-track offered and negotiated SSLv2,
+    SSLv3, and export-grade ciphers from Zeek ssl.log. Any residual deprecated-protocol support is a measurable
+    risk signal that should trend to zero over time. A nonzero or rising count flags a downgrade-MITM
+    exposure (and, for SSLv2, DROWN-style risk); a flat-zero trend confirms remediation. Track this as
+    a trend, not a one-off, so you can demonstrate the attack surface shrinking. This supports the Harden
+    objective by eliminating downgrade paths around pinned channels.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek http.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ssl = read('zeek:ssl.log') last 90d\nper orig_h, server_name:\n  legacy = count(version IN\
+      \ ['SSLv2','SSLv3'] OR cipher matches EXPORT)\n  ratio = legacy / count(total)\nemit timeseries(ratio)\
+      \ per service\nalert if ratio > 0 and trend not decreasing"
+- question: For each destination FQDN/AS, which client TLS fingerprints are rare or never-before-seen,
+    and (accounting for browser ClientHello randomization) are they corroborated by certificate mismatch,
+    downgrade, or User-Agent mismatch?
+  context: Rare client fingerprints can indicate an interception tool, but modern browsers randomize ClientHello
+    extensions and emit many JA3 values, so rarity alone is noisy. For each destination FQDN/AS, build
+    the distribution of observed client fingerprints and flag rare or never-before-seen ones, but anchor
+    on JA4 plus destination context and require corroboration (a certificate mismatch, a downgrade offer,
+    or a User-Agent mismatch) rather than fingerprint rarity by itself. A rare JA4 with corroborating
+    signals is a high-confidence interception lead; a rare fingerprint alone, given randomization, is
+    likely benign. This randomization-aware thresholding keeps false positives manageable. This supports
+    the Harden objective by reliably surfacing interception against pinned destinations.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek http.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per dest_fqdn, dest_as:\n  fp_dist = distribution(ja4) last 90d\n  rare = {fp : freq(fp) <\
+      \ p1 or first_seen_recent}\nfor session with ja4 in rare:\n  corrob = cert_mismatch(session) OR\
+      \ downgrade(session) OR ua_mismatch(session)\n  if corrob: alert('rare corroborated fingerprint',\
+      \ dest_fqdn, session.ja4)"
+- question: Using a destination-context model (IP, port, server_name, AS plus ClientHello features), does
+    the inferred expected initiating process for a channel disagree with what is observed in real time,
+    indicating impersonation or interception through TLS 1.3, and which top features explain it?
+  context: Static rules struggle with TLS 1.3 where much of the handshake is encrypted, so a context-aware
+    model helps infer impersonation. Use a destination-context model built on IP, port, server_name, AS,
+    and ClientHello features to infer the expected initiating process per channel, then score deviations
+    that indicate impersonation or interception in real time, including through TLS 1.3. Emit the top-3
+    contributing features (for example a destination-context mismatch, an unexpected cipher/extension
+    set, or a certificate issuer change) in each alert so analysts can triage. A high deviation score
+    with an issuer-change top feature points to certificate substitution; one driven by an unexpected
+    extension set may indicate an interception stack. Explainability keeps the model defensible. This
+    supports the Harden objective of detecting interception on pinned channels.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek http.log
+  - 'NAI: Network Egress/Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: "model = train_context_model(features=[dst_ip, dst_port, server_name, dst_as, clienthello_feats],\
+      \ label=expected_process_per_channel)\nfor session in stream:\n  score = model.deviation(session)\n\
+      \  if score > threshold:\n     top3 = shap_top_features(model, session, k=3)\n     alert('contextual\
+      \ TLS impersonation', session.channel, score, top3)"
+- question: Across ingested pin-violation/Report-Only reports and application pin-failure log lines, are
+    there reports whose presented certificate chain is not in the configured backup-pin set, and is a
+    backup pin configured for every pinned channel?
+  context: 'Pin enforcement telemetry is high-value: it distinguishes genuine rogue-certificate events
+    from operational issues. Ingest pin-violation and Report-Only reports (via report-uri) along with
+    application pin-failure log lines, keyed by FQDN and presented SPKI. Alert on any report whose presented
+    chain is not in the backup-pin set. Critically, require that a backup pin is configured for every
+    pinned channel so that a single certificate change cannot brick the channel. A report with a presented
+    chain outside both primary and backup pins is a strong MITM/rogue-issuance indicator; a report that
+    matches a planned backup pin reflects normal rotation. Confirming backup-pin coverage is itself a
+    hardening finding. This supports the Harden objective by operationalizing pin-failure reporting on
+    the host/endpoint.'
+  answer_sources:
+  - Application logs
+  - HPKP/Report-Only violation reports
+  - Windows EventLog
+  - Zeek ssl.log
+  - 'NAI: Host/Endpoint'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for report in ingest(['hpkp_report_uri','app_pin_failure_logs']):\n  key = (report.fqdn, report.presented_spki)\n\
+      \  pins = pinset[report.fqdn]  # {primary_spkis, backup_spkis}\n  if report.presented_spki not in\
+      \ (pins.primary_spkis | pins.backup_spkis):\n     alert('pin violation report off backup set', report)\n\
+      for fqdn in pinset:\n  if not pinset[fqdn].backup_spkis: flag('no backup pin configured', fqdn)"
+- question: What are the normal per-channel TLS handshake-failure and pin-failure rates, and does an observed
+    spike concentrate on one FQDN with a single new SPKI (suggesting MITM) or spread broadly after a known
+    reissue (suggesting operational pin staleness)?
+  context: 'The shape of a failure spike tells you whether you are seeing an attack or a maintenance problem.
+    Establish per-channel baselines for TLS handshake failures and pin-failure events, then interpret
+    deviations: a sudden spike concentrated on one FQDN with a single new SPKI suggests MITM or rogue
+    issuance, whereas a broad spike across many clients after a known certificate reissue suggests operational
+    pin staleness. Set alert thresholds from each channel''s own failure distribution rather than a global
+    constant. A narrow, single-SPKI spike is a high-priority security event; a broad post-reissue spike
+    is an operational fix (update the pins). This supports the Harden objective by separating MITM from
+    bricking on the host/endpoint.'
+  answer_sources:
+  - Application logs
+  - HPKP/Report-Only violation reports
+  - Windows EventLog
+  - Zeek ssl.log
+  - 'NAI: Host/Endpoint'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per fqdn:\n  base = distribution(handshake_fail + pin_fail) last 90d\n  thr = base.p99\nfor\
+      \ window in recent:\n  if rate(fqdn,window) > thr:\n     if distinct_spki(window)==1 and concentrated_on(fqdn):\n\
+      \        alert('likely MITM/rogue issuance', fqdn, new_spki)\n     elif broad_across_clients and\
+      \ known_reissue(fqdn):\n        notify('operational pin staleness', fqdn)"
+- question: Which internal applications complete TLS to pinned FQDNs but never produce validation failures
+    against intentionally invalid or substituted test certificates, indicating they have certificate verification
+    disabled and are trivially MITM-able?
+  context: Silently non-validating clients are among the easiest MITM targets because they accept any
+    certificate without complaint. Identify internal applications that complete TLS to pinned FQDNs while
+    never producing validation failures when presented with intentionally invalid or substituted test
+    certificates (which indicates disabled verification). Prioritize these for pinning and code review,
+    since a client that never fails validation is trivially intercepted. An application that correctly
+    rejects the invalid test certificate is healthy; one that completes the handshake anyway is a critical
+    finding requiring remediation. Combine this controlled test with normal traffic logs to build a list
+    of at-risk applications. This supports the Harden objective by finding clients that undermine pinning
+    before an attacker does.
+  answer_sources:
+  - Application logs
+  - HPKP/Report-Only violation reports
+  - Windows EventLog
+  - Zeek ssl.log
+  - 'NAI: Host/Endpoint'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "candidates = apps completing TLS to pinned_fqdns (from ssl.log/app logs)\nfor app in candidates:\n\
+      \  present invalid/substituted test cert to app's endpoint\n  observe app logs + zeek:ssl.log validation_status\n\
+      \  if app never logs validation_failure AND handshake completes:\n     flag('non-validating client\
+      \ - verification disabled', app, fqdn)"
