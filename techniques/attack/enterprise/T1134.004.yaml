@@ -1,0 +1,1390 @@
+name: 'T1134.004: Access Token Manipulation: Parent PID Spoofing'
+id: ab2b83f4-2602-47c2-be7f-985201552649
+description: 'This playbook helps an analyst investigate Access Token Manipulation: Parent PID Spoofing
+  (T1134.004), where an adversary forges the parent process identifier of a new process using EXTENDED_STARTUPINFO_PRESENT
+  + UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) via CreateProcess. It addresses two
+  objectives: stealth/defense evasion (forging a trusted parent such as explorer.exe to hide an Office-
+  or LOLBAS-launched child) and privilege escalation (assigning a SYSTEM-level parent such as lsass.exe
+  or services.exe to inherit an elevated token). The questions compare the kernel-observed TRUE creating
+  process (ETW Microsoft-Windows-Kernel-Process) against the reported parent in Sysmon Event ID 1 / Windows
+  Event ID 4688, profile rare parent-child lineages and creator/parent tuples, correlate logon (4624)
+  and special-privilege (4672) context, inspect UAC elevation paths and explorer.exe security context,
+  hash NewProcessName against PPID-spoofing tooling IOCs, and apply statistical baselining and machine-learning
+  anomaly/classification models. The dominant benign source is legitimate UAC elevation (consent.exe/svchost.exe),
+  which must be excluded.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does the kernel-observed true creating process for any new process differ from the parent
+    process ID reported by Sysmon/Security 4688 for the same new ProcessGuid, outside the documented UAC
+    elevation path?
+  context: 'This is the highest-fidelity, lowest-false-positive primitive for Parent PID Spoofing. The
+    Windows kernel (ETW Microsoft-Windows-Kernel-Process) records the TRUE caller of CreateProcess, while
+    an attacker using EXTENDED_STARTUPINFO_PRESENT + UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS)
+    forces a different reported PPID into Sysmon Event ID 1 / Security 4688. Join the two records on the
+    new ProcessGuid and deterministically alert when the kernel creator PID/image != the reported parent
+    PID/image. The only common benign source is the UAC path (consent.exe/svchost.exe assigning the PPID
+    after a SYSTEM-spawned elevation), which must be excluded. A positive result is near-certain evidence
+    of deliberate lineage forgery. In the context of the Stealth tactic, a positive result supports the
+    information requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method
+    (Symbolic Logic): Join each process-start from ETW Microsoft-Windows-Kernel-Process (which records
+    the true creating ProcessId) to the corresponding Sysmon Event ID 1 / Windows Event ID 4688 record
+    (reported ParentProcessId). Alert deterministically whenever the kernel-observed creator PID/image
+    does not equal the reported parent PID/image for the same new ProcessGuid, excluding the documented
+    UAC path (consent.exe/svchost.exe assigning PPID after a SYSTEM-spawned elevation). This is the definitive
+    PPID-spoofing primitive per [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/)
+    and the original [SelectMyParent](https://blog.didierstevens.com/2009/11/22/quickpost-selectmyparent-or-playing-with-the-windows-process-tree/)
+    PoC.'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      JOIN etw_kernel_process AS k ON proc_start (true_creator_pid)
+        WITH (sysmon_id1 OR sec_4688) AS r ON new_process_guid
+      WHERE k.true_creator_pid != r.reported_parent_pid
+         OR lower(k.true_creator_image) != lower(r.reported_parent_image)
+      AND NOT (r.reported_parent_image IN ('consent.exe','svchost.exe') AND uac_elevation_context)
+      => alert severity=high
+- question: How many creator-not-equal-reported-parent mismatch events occur per host per day, and does
+    any host exceed its role baseline (mean + 3 sigma) or involve a non-UAC creator?
+  context: 'Rather than relying on a single observation, this models the RATE of PPID-spoofing API-path
+    events as a frequency metric. Legitimate UAC elevations are the dominant benign source, so a 30-day
+    per-host baseline lets you alert when daily mismatch counts exceed the host-role mean + 3 sigma, or
+    whenever any single mismatch involves a non-UAC creator (Office app, script host, LOLBin). A spike
+    in mismatches on a host that normally has none is a strong stealth signal that an adversary is repeatedly
+    forging lineage to evade process-monitoring defenses. In the context of the Stealth tactic, a positive
+    result supports the information requirement: Has the adversary used Parent PID Spoofing for privilege
+    escalation? Method (Statistical Method): Count creator!=reported-parent mismatch events per host per
+    day. Establish a 30-day baseline (legitimate UAC elevations are the dominant benign source); alert
+    when the per-host daily count exceeds the host-role mean + 3 sigma, or when any single mismatch involves
+    a non-UAC creator. Track the rate of such API-path events as a Frequency metric rather than relying
+    on a single observation, following the rarity-scoring approach of [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = stats count AS c BY host, day WHERE creator != reported_parent
+             eval mean=avg(c), sd=stdev(c) BY host_role over 30d
+      alert WHERE today.c > mean + 3*sd
+         OR (creator NOT IN uac_creators)
+- question: When per-host process provenance graphs are built from the kernel TRUE creator->child edge,
+    which causal paths score as rare outliers (e.g., an Office/script-host creator yielding a child whose
+    reported parent is explorer.exe or a SYSTEM process)?
+  context: 'This ML approach (ProvDetector-style: TF-IDF + doc2vec + Local Outlier Factor) builds provenance
+    graphs using the kernel-observed true creator edge, not the spoofed reported parent, then scores the
+    rarity of each causal path. A spoofed lineage shows up as a rare path because the true origin (Office
+    macro, mshta, wscript) is preserved in the graph even though the reported parent was forged to look
+    benign. Alerts must surface the top-3 contributing edges/features (true creator image, reported parent
+    image, child command-line token) so an analyst can validate the chain quickly. In the context of the
+    Stealth tactic, a positive result supports the information requirement: Has the adversary used Parent
+    PID Spoofing for privilege escalation? Method (Machine Learning): Build per-host process provenance
+    graphs using the kernel TRUE creator->child edge, and score the rarity of each causal path with TF-IDF
+    + doc2vec + Local Outlier Factor as in [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).
+    A spoofed lineage produces a rare path (e.g., Office/script-host creator yielding a child whose reported
+    parent is explorer.exe or a SYSTEM process). Alert text must surface the top-3 contributing edges/features
+    (true creator image, reported parent image, child command-line token) driving the outlier score.'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      build graph edges = (true_creator_image -> child_image) per host
+      vectorize paths via TF-IDF + doc2vec
+      score = LocalOutlierFactor(path_vectors)
+      alert WHERE score in top rare percentile
+        emit top3_features(true_creator, reported_parent, child_cmdline_token)
+- question: For a 4688 child reporting a privileged system binary as its parent, does the surrounding
+    logon (4624) and special-privilege (4672) context fail to match a documented service start, UAC elevation,
+    or scheduled-task pattern?
+  context: 'Correlate each 4688 with the most recent 4624 (logon) and 4672 (special privileges) for the
+    same host/account, plus the ETW true creator where available. A child claiming a privileged parent
+    (lsass.exe, services.exe, wininit.exe) is suspicious only when the launch context does not support
+    a legitimate elevation/service path. Use a legitimate-lineage allowlist to suppress known-good chains.
+    A mismatch where the logon/privilege context cannot explain a privileged parent indicates the adversary
+    forged lineage to ride an elevated token or hide origin. In the context of the Stealth tactic, a positive
+    result supports the information requirement: Has the adversary used Parent PID Spoofing for privilege
+    escalation? Method (Symbolic Logic): Correlate Windows Event ID 4688 with the most recent 4624 (logon)
+    and 4672 (special privileges) records for the same host and account, and where available the ETW true
+    creator. Alert when a child reports a privileged system binary as parent but the launch context does
+    not match a documented service start, UAC elevation, or scheduled-task pattern. Use the legitimate-lineage
+    allowlist from [Unusual Parent-Child Relationship](https://detection.fyi/elastic/detection-rules/windows/privilege_escalation_unusual_parentchild_relationship/)
+    and the creator-vs-parent mismatch logic of [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      FOR each 4688 child:
+        join latest 4624,4672 BY host,logon_id
+        if reported_parent IN privileged_sys_bins
+           AND lineage NOT IN legit_allowlist
+           AND not(service_start OR uac OR sched_task)
+        => alert
+- question: Which parent-child process pairs (by host role and user context) fall below the 1st percentile
+    of frequency or are entirely new over a 30-day baseline, especially where the reported parent is lsass.exe,
+    services.exe, or wininit.exe?
+  context: 'Profile parent-child pairs by host role and user context over 30 days and flag rare/new lineages,
+    weighting heavily when the reported parent is a high-privilege binary that should never spawn arbitrary
+    children. Also profile the token-elevation outcome (success/failure) of the surrounding logon as a
+    State signal. A first-seen lineage with a SYSTEM-level reported parent is a strong indicator of spoofing
+    for privilege escalation, since such parents have a tightly constrained legitimate child set. In the
+    context of the Stealth tactic, a positive result supports the information requirement: Has the adversary
+    used Parent PID Spoofing for privilege escalation? Method (Statistical Method): Profile parent-child
+    process pairs by host role and user context over a 30-day baseline. Flag any lineage whose frequency
+    falls below the 1st percentile or is entirely new, especially when the reported parent is lsass.exe,
+    services.exe, or wininit.exe. Track State by also profiling the success/failure (token elevation outcome)
+    of the surrounding logon, per the rarity methodology of [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline pair_freq = count BY (parent_image,child_image,host_role,user_ctx) over 30d
+      alert WHERE pair_freq < p1 OR first_seen
+         AND parent_image IN ('lsass.exe','services.exe','wininit.exe')
+- question: Does a supervised classifier trained on 4688 lineage features score a process tree as inconsistent
+    with normal elevation, and what are the top-3 contributing features?
+  context: 'Train a supervised model (ProblemChild-style) on 4688 lineage features: parent image, child
+    image, logon type, account type, integrity level, command-line length/entropy, and time-of-day. The
+    model learns the shape of legitimate elevation and service-launch trees, then scores deviations. Spoofed
+    lineages used for privilege escalation present anomalous feature combinations (e.g., interactive logon
+    yet SYSTEM-parented child). Emitting the top-3 contributing features gives the analyst immediate triage
+    context. In the context of the Stealth tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Train
+    a supervised classifier on 4688 lineage features (parent image, child image, logon type, account type,
+    integrity level, command-line length/entropy, time-of-day) as in [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676).
+    Score process trees inconsistent with normal elevation and emit the top-3 contributing features in
+    the alert for analyst triage.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = [parent_img,child_img,logon_type,acct_type,integrity,cmd_len,cmd_entropy,hour]
+      score = classifier.predict_proba(features)
+      alert WHERE score > threshold
+        emit top3_feature_attribution
+- question: Does a 4688/ETW record show a creator process that does not match the reported parent where
+    that reported parent is on a watchlist of privileged system processes (lsass.exe, services.exe, wininit.exe,
+    smss.exe), excluding the UAC consent path?
+  context: 'Deterministic rule: alert when creator != reported parent AND the reported parent is a high-privilege
+    system process that, by invariant, never legitimately spawns arbitrary children (lsass.exe never spawns;
+    services.exe spawns only svchost.exe and known services). Exclude documented Windows management paths
+    such as consent.exe spawning an elevated child. A match means an adversary forged a SYSTEM-level parent
+    to inherit its token or to hide the real origin of the new process. In the context of the Stealth
+    tactic, a positive result supports the information requirement: Has the adversary used Parent PID
+    Spoofing for privilege escalation? Method (Symbolic Logic): Trigger when Windows Event ID 4688 (or
+    ETW) records a creator process that does not match the reported parent and the parent is on a watchlist
+    of privileged system processes (lsass.exe, services.exe, wininit.exe, smss.exe). Exclude known Windows
+    management paths such as consent.exe spawning an elevated child for UAC. Invariant basis: [Non services.exe
+    Spawn of svchost.exe](https://research.splunk.com/endpoint/1d38e5e9-2ff8-4c47-872c-bf1657cefab5/)
+    and lsass-never-spawns guidance in [Process Injection - Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE creator_process_name != parent_process_name
+        AND parent_process_name IN ('lsass.exe','services.exe','wininit.exe','smss.exe')
+        AND NOT uac_consent_path
+      => alert severity=high
+- question: For each mismatched creator-parent tuple, which tuples fall below the 5th percentile of frequency
+    over a 30-day baseline or are first-seen on that host role, particularly tuples involving Office,
+    script hosts, or LOLBins?
+  context: 'For every creator!=parent mismatch, compute the frequency of the (creator,parent) tuple over
+    30 days and flag rare (sub-5th-percentile) or first-seen tuples. This separates rare malicious spoofs
+    from the common, repetitive benign UAC pattern. Newly observed tuples where the creator is an Office
+    app, script host, or LOLBin are especially suspicious because they represent an unusual binary forging
+    a privileged or trusted parent. In the context of the Stealth tactic, a positive result supports the
+    information requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method
+    (Statistical Method): For each mismatched creator-parent tuple, compute frequency over a 30-day baseline
+    and alert on tuples below the 5th percentile or first-seen on that host role. Treat newly observed
+    tuples involving Office, script hosts, or LOLBins as especially suspicious, following the rare-tuple
+    scoring of [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      tuple_freq = count BY (creator_image,parent_image) over 30d WHERE creator!=parent
+      alert WHERE tuple_freq < p5 OR first_seen_on_host_role
+        flag if creator IN office|script_hosts|lolbins
+- question: When process-creation tuples (creator, spoofed parent, child, user context, integrity, logon
+    type) are clustered with an unsupervised model, which records land as noise or in tiny isolated clusters?
+  context: 'Train an unsupervised Isolation Forest / DBSCAN model on process-creation features. Benign
+    activity forms dense clusters; spoofed lineage tends to be isolated as noise or in tiny clusters because
+    its feature combination (rare creator, privileged/trusted reported parent, anomalous integrity) is
+    unlike the majority. Surface the top-3 features (creator image, reported parent, child command-line
+    token) for triage. This catches novel spoofing variants that signature rules miss. In the context
+    of the Stealth tactic, a positive result supports the information requirement: Has the adversary used
+    Parent PID Spoofing for privilege escalation? Method (Machine Learning): Train an unsupervised Isolation
+    Forest / clustering model on process-creation tuples, user context, integrity, and logon type per
+    [Isolation Forest](https://doi.org/10.1145/2133360.2133363). Records landing as noise or in a tiny
+    isolated cluster are likely spoofed lineage; surface the top-3 features (creator image, reported parent,
+    child command-line token) in the alert.'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = [creator,reported_parent,child,user_ctx,integrity,logon_type]
+      model = IsolationForest()/DBSCAN()
+      alert WHERE anomaly_score high OR cluster_size tiny/noise
+        emit top3_features
+- question: Does any 4688 parent-child relationship originate from a privileged system process that is
+    not on the allowlist of expected privileged chains (services.exe->svchost.exe, wininit.exe->services.exe,
+    smss.exe->csrss.exe), especially an interactive shell, script host, or LOLBin child?
+  context: 'Maintain a tight allowlist of legitimate privileged chains and alert on any privileged-parent
+    relationship outside it, weighting heavily when the child is an interactive shell, script host, or
+    LOLBin, or when child integrity is High/System. High-privilege system processes have an extremely
+    constrained legitimate child set, so a deviation strongly suggests an adversary forged the parent
+    to escalate privileges via token inheritance. In the context of the Stealth tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Symbolic Logic): Maintain an allowlist of expected privileged chains (services.exe->svchost.exe,
+    wininit.exe->services.exe, smss.exe->csrss.exe). Alert on any 4688 parent-child relationship from
+    a privileged system process not on the allowlist, especially an interactive shell, script host, or
+    LOLBin child. Allowlist derived from [Unusual Parent-Child Relationship](https://detection.fyi/elastic/detection-rules/windows/privilege_escalation_unusual_parentchild_relationship/)
+    and [Sigma parent-child rules](https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_creation/proc_creation_win_susp_parent_explorer.yml).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      allow = {services.exe->svchost.exe, wininit.exe->services.exe, smss.exe->csrss.exe}
+      WHERE parent_image IN privileged_sys_bins
+        AND (parent_image,child_image) NOT IN allow
+        AND (child IN shells|script_hosts|lolbins OR child_integrity IN High,System)
+      => alert
+- question: Over a 30-day baseline of parent-child pairs by host role, which new pairs or pairs with a
+    z-score above 3 (especially with a high-privilege parent) should be alerted?
+  context: 'Build a per-host-role baseline of parent-child pair frequencies and compute a z-score/rarity
+    score per pair, deriving thresholds from each server class''s own distribution. New pairs or those
+    with z>3 indicate statistically anomalous lineage. When the parent is a high-privilege binary and
+    the child is newly elevated, the anomaly is consistent with PPID spoofing for privilege escalation
+    on critical infrastructure. In the context of the Stealth tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Statistical
+    Method): Build a 30-day baseline of parent-child pairs by host role and compute a z-score/rarity score
+    per pair; alert on new pairs or z>3. Derive dataset-specific thresholds from each server class''s
+    own distribution, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = freq BY (parent_image,child_image,host_role) over 30d
+      z = (obs - mean)/sd
+      alert WHERE z > 3 OR pair is new
+        prioritize parent_image IN privileged_sys_bins
+- question: Does an LSTM-autoencoder over per-host process-creation order produce high reconstruction
+    error for a tree where a privileged parent launches an unusual child, and what are the top-3 deviating
+    steps?
+  context: 'Train a sequence anomaly model (LSTM autoencoder) on per-host process-creation order to learn
+    expected boot/service/admin sequences. A spoofed lineage breaks the learned order (e.g., a SYSTEM-level
+    parent launching an unexpected child mid-session), yielding high reconstruction error. Surfacing the
+    top-3 deviating steps helps the analyst see exactly where the chain departs from normal, supporting
+    detection of stealthy escalation. In the context of the Stealth tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Machine Learning): Use a sequence anomaly model (e.g., LSTM autoencoder) on per-host process-creation
+    order to learn expected boot/service/admin sequences; flag trees with high reconstruction error when
+    a privileged parent launches an unusual child, surfacing the top-3 deviating steps. Graph-context
+    approach mirrors [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      seq = ordered process_creations per host
+      recon_err = LSTM_autoencoder.reconstruct(seq)
+      alert WHERE recon_err > threshold
+        emit top3_deviating_steps
+- question: Does an elevated 4688 process creation follow a 4624/4672 logon but originate from something
+    other than consent.exe (or carry Token Elevation Type 1/2 without consent.exe as parent), indicating
+    UAC bypass via PPID spoofing?
+  context: 'Legitimate interactive elevation flows through consent.exe (the UAC prompt). Alert when an
+    elevated process tied to an admin account follows a logon but does not originate from consent.exe
+    or an approved administrative workflow, or when Token Elevation Type is Type 1/Type 2 yet the parent
+    is not consent.exe. This catches the SYSTEM-token-inheritance escalation path where an adversary assigns
+    a SYSTEM parent to gain an elevated token while skipping the standard UAC prompt. In the context of
+    the Stealth tactic, a positive result supports the information requirement: Has the adversary used
+    Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Alert when a 4688 process creation
+    tied to an elevated account follows a 4624/4672 logon but does not originate from consent.exe or an
+    approved administrative workflow. The SYSTEM-token-inheritance escalation path is documented in [Becoming
+    SYSTEM via Parent Process Token Inheritance](https://blog.xpnsec.com/becoming-system/); legitimate
+    UAC PPID assignment is described in [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE 4688.elevated_token AND preceding 4624/4672 for acct
+        AND parent_process_name != 'consent.exe'
+        AND token_elevation_type IN (Type1,Type2)
+        AND NOT approved_admin_workflow
+      => alert
+- question: Does the distribution of reported parent processes for elevation-related launches per user/host
+    shift sharply (e.g., a new appearance of svchost.exe or lsass.exe as parent), and does the failure
+    rate of nearby elevation attempts change?
+  context: 'Baseline the per-user/host distribution of reported parents for elevation events (normally
+    consent.exe, explorer.exe). Compute entropy and flag sudden drops or the appearance of rare parents
+    like svchost.exe/lsass.exe for user-launched elevation. Also profile the failure/denied rate of nearby
+    4672 elevation attempts as a distinct State signal. A spike toward unusual parents indicates an adversary
+    forging lineage to obtain elevated tokens. In the context of the Stealth tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Statistical Method): Baseline the distribution of reported parent processes for elevation-related
+    launches per user/host. Flag a sharp shift such as a new appearance of svchost.exe or lsass.exe as
+    the reported parent for user-launched elevation. Also profile the failure rate of nearby elevation
+    attempts (denied/failed 4672) as a distinct State signal, extending [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline parent_dist per (user,host) for elevation events
+      entropy_now vs entropy_base
+      alert WHERE entropy drop OR rare_parent IN ('svchost.exe','lsass.exe')
+      also track denied_4672_rate as state
+- question: Does a classifier trained on elevation events (creator image, reported parent, account type,
+    session/integrity, time-of-day) separate routine elevation from bypass, and what are the top-3 contributing
+    features?
+  context: 'Train a decision-tree/gradient-boosted classifier (ProblemChild-style) on elevation features
+    to distinguish routine UAC elevation from bypass. The model learns benign consent.exe-driven elevations
+    versus forged-parent escalations (e.g., svchost.exe/explorer.exe parented child with mismatched session/integrity).
+    Output the top-3 contributing features per alert so analysts can validate whether a real UAC bypass
+    occurred. In the context of the Stealth tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Train
+    a classifier on elevation events (creator image, reported parent, account type, session/integrity,
+    time-of-day) to separate routine elevation from bypass, as in [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676);
+    output the top-3 contributing features per alert.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Windows Event ID 4672
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features=[creator_img,reported_parent,acct_type,session,integrity,hour]
+      score = classifier.predict_proba(features)
+      alert WHERE score>threshold emit top3_features
+- question: For children of explorer.exe or svchost.exe, is the command line or account context inconsistent
+    with interactive use (browser-launched shells, script interpreters, or LOLBins inheriting a trusted
+    parent)?
+  context: 'Trusted parents like explorer.exe and svchost.exe are favorite spoof targets because parent-child
+    detections whitelist them. Flag children of these processes whose command line or account context
+    does not match genuine interactive use - for example a script interpreter or LOLBin with an obfuscated
+    command line claiming explorer.exe as parent. This catches the stealth tactic of masquerading malicious
+    execution as benign user activity. In the context of the Stealth tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Symbolic Logic): For each 4688 event, flag children of explorer.exe or svchost.exe whose command
+    line or account context is inconsistent with interactive use (browser-launched shells, script interpreters,
+    LOLBins inheriting a trusted parent). Trusted-parent abuse patterns from [Process Injection - Red
+    Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/) and [Sigma parent-child
+    rules](https://github.com/SigmaHQ/sigma/blob/master/rules/windows/process_creation/proc_creation_win_susp_parent_explorer.yml).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE parent_image IN ('explorer.exe','svchost.exe')
+        AND child_image IN shells|script_hosts|lolbins
+        AND (cmdline inconsistent_with_interactive OR acct_ctx != interactive_user)
+      => alert
+- question: When a normally common parent (explorer.exe/svchost.exe) launches a process, is the child
+    command line above the 95th percentile of Shannon entropy/length for the host baseline, indicating
+    an obfuscated payload?
+  context: 'Compute Shannon entropy and length (Volume) of each command line and the rarity of each parent-child
+    pair (Frequency) over 30 days. Alert when a normally benign parent launches a child whose command
+    line exceeds the 95th-percentile entropy/length for the host baseline. High-entropy command lines
+    under a trusted, possibly spoofed parent indicate an encoded/obfuscated payload hiding behind a benign-looking
+    lineage. In the context of the Stealth tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Statistical Method):
+    Compute Shannon entropy of each command line (Volume) and the rarity of each parent-child pair (Frequency)
+    over a 30-day baseline. Alert when a normally common parent (explorer.exe) launches a process with
+    a command line above the 95th percentile of entropy/length for the host baseline, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline cmd_entropy,cmd_len per host over 30d
+      alert WHERE parent_image IN common_parents
+        AND (cmd_entropy > p95 OR cmd_len > p95)
+- question: Does a gradient-boosting model trained on process image, reported parent, command-line length/entropy,
+    account type, and session context score a creation as staged to masquerade as benign user activity?
+  context: 'Train a model on process image, reported parent, command-line length/entropy, account type,
+    session context, and name-collision-with-system-binary features, using LOLBin command-line methodology.
+    The model labels creations engineered to look like benign user activity (trusted parent + obfuscated
+    command line) as evasive. Emit the top-3 contributing tokens/features so the analyst can confirm the
+    masquerade. In the context of the Stealth tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Train
+    a model (gradient boosting) on process image, reported parent, command-line length/entropy, account
+    type, and session context to score creations staged to masquerade as benign user activity, using the
+    LOLBin command-line feature methodology of [Living-Off-The-Land Command Detection Using Active Learning](https://arxiv.org/abs/2111.15039);
+    emit top-3 contributing tokens/features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features=[image,reported_parent,cmd_len,cmd_entropy,acct_type,session,name_collision]
+      score = gbm.predict_proba(features)
+      alert WHERE score>threshold emit top3_tokens
+- question: Does a 4688 event show Creator Process Name (e.g., WINWORD.EXE/EXCEL.EXE/CHROME.EXE, an Office
+    app or browser) != Parent Process Name where the reported parent is a common trusted process (explorer.exe/svchost.exe)?
+  context: 'This is the canonical Office-to-explorer.exe spoof: a malicious document or browser exploit
+    spawns a child but forges explorer.exe as the parent to evade detections that block processes spawning
+    directly from Office. Trigger when the creator is an Office app or browser, the reported parent is
+    a common trusted process, and the two differ. A match strongly indicates spearphishing-driven execution
+    hiding its true origin. In the context of the Stealth tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Symbolic
+    Logic): Trigger on Windows Event ID 4688 where ''Creator Process Name'' != ''Parent Process Name'',
+    AND ''Creator Process Name'' is an Office app or browser (WINWORD.EXE, EXCEL.EXE, CHROME.EXE), AND
+    ''Parent Process Name'' is a common trusted process (explorer.exe, svchost.exe) - the canonical Office-to-explorer.exe
+    spoof described in [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE creator_process_name != parent_process_name
+        AND creator_process_name IN ('WINWORD.EXE','EXCEL.EXE','CHROME.EXE', office_apps, browsers)
+        AND parent_process_name IN ('explorer.exe','svchost.exe')
+      => alert
+- question: Among creator/parent mismatch events, which ('Creator Process Name','New Process Name') tuples
+    occur fewer than 5 times in 30 days enterprise-wide?
+  context: 'Build a frequency distribution of (creator, new-process) tuples for all mismatch events and
+    flag those occurring fewer than 5 times in 30 days enterprise-wide. A rare, unusual process being
+    spawned by Word (or another document/browser app) and then hiding its origin via a forged parent is
+    a high-confidence spoofing signal. Rarity scoring separates these from the small set of frequently-repeated
+    benign mismatches. In the context of the Stealth tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Statistical
+    Method): For every creator/parent mismatch, build a frequency distribution of (''Creator Process Name'',''New
+    Process Name'') tuples; flag tuples occurring < 5 times in 30 days enterprise-wide (rare unusual process
+    being spawned by Word then hiding its origin), per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      tuple_freq = count BY (creator_process_name,new_process_name) over 30d WHERE creator!=parent
+      alert WHERE tuple_freq < 5
+- question: Does a logistic-regression / gradient-boosted model on one-hot Creator/Parent/Child plus command-line
+    features estimate a high spoofing probability (e.g., Office app creating PowerShell parented by explorer.exe)?
+  context: 'Train a logistic-regression / gradient-boosted model on one-hot encoded Creator/Parent/Child
+    images plus command-line features. The model learns benign UAC combinations versus malicious ones
+    such as an Office app creating PowerShell while forging explorer.exe as the parent. Output a spoofing
+    probability and the top-3 drivers (feature attribution) so analysts can quickly judge whether the
+    lineage was forged. In the context of the Stealth tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine
+    Learning): Train a logistic-regression / gradient-boosted model on one-hot encoded Creator/Parent/Child
+    processes plus command-line features to estimate spoofing probability; the model learns benign UAC
+    combinations versus malicious ones (Office app creating PowerShell parented by explorer.exe). Feature
+    attribution as in [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676) surfaces the top-3
+    drivers.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = onehot(creator,parent,child) + cmd_features
+      p = model.predict_proba(X)
+      alert WHERE p > threshold emit top3_drivers
+- question: Is a LOLBAS (powershell.exe, rundll32.exe, mshta.exe) executed where the Creator Process Name
+    is an Office app/browser but the Parent Process Name is explorer.exe, and does pivoting on its ProcessGUID
+    into Zeek conn.log reveal connections to uncategorized/known-malicious destinations?
+  context: 'Combine trusted-parent spoofing with first-party network corroboration. Flag a LOLBAS whose
+    creator is an Office app/browser but whose reported parent is explorer.exe, then use the ProcessGUID
+    to query Zeek conn.log for outbound connections to uncategorized or known-malicious destinations within
+    a short window. The combination of forged lineage plus suspicious egress strongly indicates a spearphishing
+    payload staging C2 while hiding its origin. In the context of the Stealth tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Symbolic Logic): Flag execution of a LOLBAS (powershell.exe, mshta.exe, rundll32.exe) where
+    4688 ''Creator Process Name'' is an Office app/browser but ''Parent Process Name'' is explorer.exe;
+    on match, use the ProcessGUID to query Zeek conn.log for connections to uncategorized/known-malicious
+    destinations within a short window. Combines trusted-parent spoofing ([Process Injection - Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/))
+    with first-party network corroboration.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE child_image IN ('powershell.exe','rundll32.exe','mshta.exe')
+        AND creator_process_name IN office_apps|browsers
+        AND parent_process_name = 'explorer.exe'
+      => pivot process_guid -> network within 5m
+  - technology: Zeek/pseudocode
+    query: |-
+      conn WHERE id.orig_h == host AND ts in [proc_ts, proc_ts+5m]
+        AND resp_destination IN uncategorized|known_malicious
+      => corroborate alert
+- question: For each LOLBAS, does a Chi-squared test comparing a host's/user's observed parent-creator
+    distribution against the enterprise baseline indicate an anomalous origin, and are blocked/failed
+    outbound connection counts elevated?
+  context: 'Baseline each LOLBAS''s legitimate parent/creator processes enterprise-wide, then use a Chi-squared
+    test to compare a host''s or user''s observed distribution against that baseline; a high chi-square
+    statistic indicates the LOLBAS is being launched from an anomalous (likely forged) origin. Also profile
+    failed/blocked outbound connection counts (NXDOMAIN/404/blocked) for the spawned LOLBAS as a distinct
+    failure-mode signal of C2 attempts. In the context of the Stealth tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Statistical Method): For each LOLBAS, baseline its legitimate parent/creator processes and
+    use a Chi-squared test comparing a host''s/user''s observed parent-creator distribution against the
+    enterprise baseline; a high chi-square indicates anomalous origin. Also profile failed/blocked outbound
+    connection counts (NXDOMAIN/404/blocked) for the spawned LOLBAS as a distinct failure-mode signal.
+    Rarity baseline per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      observed = parent_creator_dist(lolbas, host/user)
+      expected = enterprise_baseline(lolbas)
+      chi2 = chisquare(observed, expected)
+      alert WHERE chi2 > threshold
+      also track blocked_outbound_count (NXDOMAIN/404/blocked)
+- question: Does an Isolation Forest over LOLBAS process-creation events (user, host, parent image, creator
+    image, command-line parameters) isolate executions that differ from the benign majority?
+  context: 'Apply an Isolation Forest to LOLBAS creation events using user, host, parent image, creator
+    image, and command-line parameters; rare executions with forged or unusual parentage are isolated
+    quickly. Active-learning labeling keeps the model current against new LOLBin abuse. Surface the top-3
+    anomalous features so the analyst can confirm whether the LOLBAS origin was hidden. In the context
+    of the Stealth tactic, a positive result supports the information requirement: Has the adversary used
+    Parent PID Spoofing for privilege escalation? Method (Machine Learning): Apply an Isolation Forest
+    to LOLBAS process-creation events (user, host, parent image, creator image, command-line parameters)
+    to isolate executions differing from the benign majority, per [Isolation Forest](https://doi.org/10.1145/2133360.2133363);
+    active-learning labeling keeps the model current per [Living-Off-The-Land Command Detection Using
+    Active Learning](https://arxiv.org/abs/2111.15039). Surface the top-3 anomalous features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = [user,host,parent_image,creator_image,cmd_params] for lolbas events
+      score = IsolationForest().decision_function(X)
+      alert WHERE score anomalous emit top3_features
+- question: Does any process have explorer.exe as its reported parent while that parent's Subject User
+    Name is NT AUTHORITY\SYSTEM or its Session ID is 0?
+  context: 'Interactive explorer.exe always runs in a user context with a non-zero session. Alert on any
+    child whose reported parent is explorer.exe but whose parent context is NT AUTHORITY\SYSTEM or Session
+    0. This precisely catches a SYSTEM-parented spoof used to inherit a SYSTEM token while masquerading
+    as benign desktop activity - a hallmark of the ''becoming SYSTEM'' escalation technique. In the context
+    of the Stealth tactic, a positive result supports the information requirement: Has the adversary used
+    Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Alert on any process creation
+    where ''Parent Process Name'' is explorer.exe BUT the parent''s ''Subject User Name'' is NT AUTHORITY\SYSTEM
+    or ''Session ID'' is 0 - interactive explorer.exe runs in user context with a non-zero session. This
+    catches a SYSTEM-parented spoof per [Becoming SYSTEM via Parent Process Token Inheritance](https://blog.xpnsec.com/becoming-system/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE parent_process_name = 'explorer.exe'
+        AND (parent_subject_user = 'NT AUTHORITY\\SYSTEM' OR parent_session_id = 0)
+      => alert severity=high
+- question: For processes spawned by explorer.exe, which parent SubjectUserName / SessionID values are
+    statistical outliers (service accounts, session 0) versus the interactive baseline?
+  context: 'Profile the distribution of parent explorer.exe SubjectUserName and SessionID for every child
+    it spawns. Flag instances where the user is a service account or the session is 0, which are statistical
+    outliers against the normal interactive baseline. Such outliers indicate explorer.exe was spawned/spoofed
+    in an abnormal security context to host a privileged or hidden child process. In the context of the
+    Stealth tactic, a positive result supports the information requirement: Has the adversary used Parent
+    PID Spoofing for privilege escalation? Method (Statistical Method): For every process spawned by explorer.exe,
+    profile the distribution of parent SubjectUserName and SessionID; flag instances where the user or
+    session ID is a statistical outlier (service account, session 0) versus the interactive baseline,
+    per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline subject_user,session_id dist for explorer.exe children
+      alert WHERE subject_user IN service_accounts OR session_id = 0
+        (outlier vs interactive baseline)
+- question: Does a session-level sequence/time-series anomaly model flag an apparently normal chain (explorer.exe->cmd.exe)
+    that carries anomalous attributes such as a SYSTEM parent context, yielding high reconstruction error?
+  context: 'Apply a sequence/time-series anomaly model on per-session parent-child relationships. Even
+    a chain that looks normal by image names (explorer.exe->cmd.exe) produces high reconstruction error
+    when its attributes are anomalous - for example a SYSTEM parent context on what should be an interactive
+    session. Surface the top-3 deviating attributes so the analyst can see the hidden context driving
+    the anomaly. In the context of the Stealth tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Apply
+    a sequence/time-series anomaly model on per-session parent-child relationships; alert when an apparently
+    normal chain (explorer.exe->cmd.exe) occurs with anomalous attributes (SYSTEM parent context) producing
+    high reconstruction error, with top-3 deviating attributes surfaced. Provenance-graph rationale per
+    [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      seq = per-session parent-child relationships with attrs
+      recon_err = anomaly_model.reconstruct(seq)
+      alert WHERE recon_err high AND attrs anomalous (SYSTEM ctx)
+        emit top3_deviating_attrs
+- question: Does the kernel-observed true creating process for any new process differ from the parent
+    process ID reported by Sysmon/Security 4688 for the same new ProcessGuid, outside the documented UAC
+    elevation path?
+  context: 'This is the highest-fidelity, lowest-false-positive primitive for Parent PID Spoofing. The
+    Windows kernel (ETW Microsoft-Windows-Kernel-Process) records the TRUE caller of CreateProcess, while
+    an attacker using EXTENDED_STARTUPINFO_PRESENT + UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS)
+    forces a different reported PPID into Sysmon Event ID 1 / Security 4688. Join the two records on the
+    new ProcessGuid and deterministically alert when the kernel creator PID/image != the reported parent
+    PID/image. The only common benign source is the UAC path (consent.exe/svchost.exe assigning the PPID
+    after a SYSTEM-spawned elevation), which must be excluded. A positive result is near-certain evidence
+    of deliberate lineage forgery. In the context of the Privilege Escalation tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Symbolic Logic): Join each process-start from ETW Microsoft-Windows-Kernel-Process (which
+    records the true creating ProcessId) to the corresponding Sysmon Event ID 1 / Windows Event ID 4688
+    record (reported ParentProcessId). Alert deterministically whenever the kernel-observed creator PID/image
+    does not equal the reported parent PID/image for the same new ProcessGuid, excluding the documented
+    UAC path (consent.exe/svchost.exe assigning PPID after a SYSTEM-spawned elevation). This is the definitive
+    PPID-spoofing primitive per [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/)
+    and the original [SelectMyParent](https://blog.didierstevens.com/2009/11/22/quickpost-selectmyparent-or-playing-with-the-windows-process-tree/)
+    PoC.'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      JOIN etw_kernel_process AS k ON proc_start (true_creator_pid)
+        WITH (sysmon_id1 OR sec_4688) AS r ON new_process_guid
+      WHERE k.true_creator_pid != r.reported_parent_pid
+         OR lower(k.true_creator_image) != lower(r.reported_parent_image)
+      AND NOT (r.reported_parent_image IN ('consent.exe','svchost.exe') AND uac_elevation_context)
+      => alert severity=high
+- question: How many creator-not-equal-reported-parent mismatch events occur per host per day, and does
+    any host exceed its role baseline (mean + 3 sigma) or involve a non-UAC creator?
+  context: 'Rather than relying on a single observation, this models the RATE of PPID-spoofing API-path
+    events as a frequency metric. Legitimate UAC elevations are the dominant benign source, so a 30-day
+    per-host baseline lets you alert when daily mismatch counts exceed the host-role mean + 3 sigma, or
+    whenever any single mismatch involves a non-UAC creator (Office app, script host, LOLBin). A spike
+    in mismatches on a host that normally has none is a strong stealth signal that an adversary is repeatedly
+    forging lineage to evade process-monitoring defenses. In the context of the Privilege Escalation tactic,
+    a positive result supports the information requirement: Has the adversary used Parent PID Spoofing
+    for privilege escalation? Method (Statistical Method): Count creator!=reported-parent mismatch events
+    per host per day. Establish a 30-day baseline (legitimate UAC elevations are the dominant benign source);
+    alert when the per-host daily count exceeds the host-role mean + 3 sigma, or when any single mismatch
+    involves a non-UAC creator. Track the rate of such API-path events as a Frequency metric rather than
+    relying on a single observation, following the rarity-scoring approach of [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = stats count AS c BY host, day WHERE creator != reported_parent
+             eval mean=avg(c), sd=stdev(c) BY host_role over 30d
+      alert WHERE today.c > mean + 3*sd
+         OR (creator NOT IN uac_creators)
+- question: When per-host process provenance graphs are built from the kernel TRUE creator->child edge,
+    which causal paths score as rare outliers (e.g., an Office/script-host creator yielding a child whose
+    reported parent is explorer.exe or a SYSTEM process)?
+  context: 'This ML approach (ProvDetector-style: TF-IDF + doc2vec + Local Outlier Factor) builds provenance
+    graphs using the kernel-observed true creator edge, not the spoofed reported parent, then scores the
+    rarity of each causal path. A spoofed lineage shows up as a rare path because the true origin (Office
+    macro, mshta, wscript) is preserved in the graph even though the reported parent was forged to look
+    benign. Alerts must surface the top-3 contributing edges/features (true creator image, reported parent
+    image, child command-line token) so an analyst can validate the chain quickly. In the context of the
+    Privilege Escalation tactic, a positive result supports the information requirement: Has the adversary
+    used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Build per-host process
+    provenance graphs using the kernel TRUE creator->child edge, and score the rarity of each causal path
+    with TF-IDF + doc2vec + Local Outlier Factor as in [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).
+    A spoofed lineage produces a rare path (e.g., Office/script-host creator yielding a child whose reported
+    parent is explorer.exe or a SYSTEM process). Alert text must surface the top-3 contributing edges/features
+    (true creator image, reported parent image, child command-line token) driving the outlier score.'
+  answer_sources:
+  - etw:Microsoft-Windows-Kernel-Process
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers with ETW kernel-process
+    tracing and Sysmon enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      build graph edges = (true_creator_image -> child_image) per host
+      vectorize paths via TF-IDF + doc2vec
+      score = LocalOutlierFactor(path_vectors)
+      alert WHERE score in top rare percentile
+        emit top3_features(true_creator, reported_parent, child_cmdline_token)
+- question: Does the file hash of any NewProcessName in a 4688 event match an internal list of known-malicious
+    hashes tagged 'T1134.004'/'PPID Spoofing' (e.g., SelectMyParent and derivatives)?
+  context: 'For each 4688 event, hash the NewProcessName file and compare against a continuously updated
+    internal inventory of known-malicious hashes tagged for PPID spoofing tooling (SelectMyParent and
+    derivatives). Hashing first-party against an internal inventory avoids leaking IOCs; external lookups
+    are optional enrichment only. A match is a high-severity, high-confidence indicator that a known spoofing
+    tool executed. In the context of the Privilege Escalation tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Symbolic
+    Logic): For each 4688 event, hash the ''NewProcessName'' file and compare against a continuously updated
+    list of known-malicious hashes tagged ''T1134.004''/''PPID Spoofing'' (e.g., SelectMyParent and derivatives,
+    [SelectMyParent](https://blog.didierstevens.com/2009/11/22/quickpost-selectmyparent-or-playing-with-the-windows-process-tree/)).
+    Generate a high-severity alert on match. Treat hashing first-party against internal hash inventory;
+    external lookups are optional enrichment only.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for each 4688: h = hash(new_process_name)
+      if h IN internal_badhash_list[tag='T1134.004','PPID Spoofing']
+      => alert severity=high
+- question: Which executable hashes are present on fewer than 5 machines or below the 1st prevalence percentile
+    enterprise-wide and are not tied to a known deployment or patch?
+  context: 'Profile enterprise-wide prevalence of all executable hashes and flag those seen on fewer than
+    5 machines or below the 1st prevalence percentile that cannot be tied to a known deployment/patch.
+    Rare binaries are characteristic of bespoke PPID-spoofing tooling dropped onto a small number of targets.
+    This complements signature matching by catching novel/unknown spoofing utilities. In the context of
+    the Privilege Escalation tactic, a positive result supports the information requirement: Has the adversary
+    used Parent PID Spoofing for privilege escalation? Method (Statistical Method): Profile enterprise-wide
+    prevalence of all executable hashes; flag hashes seen on < 5 machines or below the 1st prevalence
+    percentile not tied to a known deployment/patch, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      prev = count_distinct(host) BY hash
+      alert WHERE prev < 5 OR prev < p1
+        AND hash NOT IN known_deploy/patch
+- question: Does a supervised classifier (Random Forest/Gradient Boosting) using hash prevalence, process
+    image, parent image, command-line, integrity, and user context score a process above the confidence
+    threshold, and what are the top-3 features?
+  context: 'Train a supervised classifier on hash prevalence, process image, parent image, command-line,
+    integrity, and user context to score the likelihood that a process creation is malicious PPID-spoofing
+    activity. Combining rare-hash signals with lineage and context features yields strong discrimination.
+    Alert above a confidence threshold and surface the top-3 contributing features for analyst triage.
+    In the context of the Privilege Escalation tactic, a positive result supports the information requirement:
+    Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Use
+    a supervised classifier (Random Forest/Gradient Boosting) on hash prevalence, process image, parent
+    image, command-line, integrity, and user context per [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676);
+    alert above a confidence threshold and surface the top-3 contributing features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, administrative workstations, and critical application servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features=[hash_prevalence,image,parent_image,cmdline,integrity,user_ctx]
+      score = rf_or_gbm.predict_proba(features)
+      alert WHERE score>threshold emit top3_features
+- question: Does a 4688/ETW record show a creator process that does not match the reported parent where
+    that reported parent is on a watchlist of privileged system processes (lsass.exe, services.exe, wininit.exe,
+    smss.exe), excluding the UAC consent path?
+  context: 'Deterministic rule: alert when creator != reported parent AND the reported parent is a high-privilege
+    system process that, by invariant, never legitimately spawns arbitrary children (lsass.exe never spawns;
+    services.exe spawns only svchost.exe and known services). Exclude documented Windows management paths
+    such as consent.exe spawning an elevated child. A match means an adversary forged a SYSTEM-level parent
+    to inherit its token or to hide the real origin of the new process. In the context of the Privilege
+    Escalation tactic, a positive result supports the information requirement: Has the adversary used
+    Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Trigger on every 4688/ETW where
+    ''Creator Process Name'' exists and != ''Parent Process Name'' AND ''Parent Process Name'' is a high-privilege
+    system process (lsass.exe, services.exe, wininit.exe, smss.exe). This is the privilege-escalation
+    spoof primitive ([Becoming SYSTEM](https://blog.xpnsec.com/becoming-system/), [Detecting Parent PID
+    (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/)); exclude documented
+    UAC paths.'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE creator_process_name != parent_process_name
+        AND parent_process_name IN ('lsass.exe','services.exe','wininit.exe','smss.exe')
+        AND NOT uac_consent_path
+      => alert severity=high
+- question: For each mismatched creator-parent tuple, which tuples fall below the 5th percentile of frequency
+    over a 30-day baseline or are first-seen on that host role, particularly tuples involving Office,
+    script hosts, or LOLBins?
+  context: 'For every creator!=parent mismatch, compute the frequency of the (creator,parent) tuple over
+    30 days and flag rare (sub-5th-percentile) or first-seen tuples. This separates rare malicious spoofs
+    from the common, repetitive benign UAC pattern. Newly observed tuples where the creator is an Office
+    app, script host, or LOLBin are especially suspicious because they represent an unusual binary forging
+    a privileged or trusted parent. In the context of the Privilege Escalation tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Statistical Method): For mismatched events compute frequency of each (''Creator Process Name'',''Parent
+    Process Name'') tuple over 30 days; flag tuples below the 5th percentile to distinguish from benign
+    UAC elevations, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      tuple_freq = count BY (creator_image,parent_image) over 30d WHERE creator!=parent
+      alert WHERE tuple_freq < p5 OR first_seen_on_host_role
+        flag if creator IN office|script_hosts|lolbins
+- question: When process-creation tuples (creator, spoofed parent, child, user context, integrity, logon
+    type) are clustered with an unsupervised model, which records land as noise or in tiny isolated clusters?
+  context: 'Train an unsupervised Isolation Forest / DBSCAN model on process-creation features. Benign
+    activity forms dense clusters; spoofed lineage tends to be isolated as noise or in tiny clusters because
+    its feature combination (rare creator, privileged/trusted reported parent, anomalous integrity) is
+    unlike the majority. Surface the top-3 features (creator image, reported parent, child command-line
+    token) for triage. This catches novel spoofing variants that signature rules miss. In the context
+    of the Privilege Escalation tactic, a positive result supports the information requirement: Has the
+    adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Cluster process-creation
+    features (creator, spoofed parent, child, user context, integrity) with DBSCAN/Isolation Forest per
+    [Isolation Forest](https://doi.org/10.1145/2133360.2133363); events classified as noise or in tiny
+    isolated clusters are likely malicious PPID spoofing - emit the top-3 features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - etw:Microsoft-Windows-Kernel-Process
+  - 'NAI: All Windows endpoints and servers with enhanced process creation logging enabled (including
+    command line and creator process).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = [creator,reported_parent,child,user_ctx,integrity,logon_type]
+      model = IsolationForest()/DBSCAN()
+      alert WHERE anomaly_score high OR cluster_size tiny/noise
+        emit top3_features
+- question: Does any 4688 parent-child relationship originate from a privileged system process that is
+    not on the allowlist of expected privileged chains (services.exe->svchost.exe, wininit.exe->services.exe,
+    smss.exe->csrss.exe), especially an interactive shell, script host, or LOLBin child?
+  context: 'Maintain a tight allowlist of legitimate privileged chains and alert on any privileged-parent
+    relationship outside it, weighting heavily when the child is an interactive shell, script host, or
+    LOLBin, or when child integrity is High/System. High-privilege system processes have an extremely
+    constrained legitimate child set, so a deviation strongly suggests an adversary forged the parent
+    to escalate privileges via token inheritance. In the context of the Privilege Escalation tactic, a
+    positive result supports the information requirement: Has the adversary used Parent PID Spoofing for
+    privilege escalation? Method (Symbolic Logic): Define known-good high-privilege parent-child relationships
+    (services.exe->svchost.exe, wininit.exe->services.exe); alert on any high-privilege parent-child relationship
+    not on the allowlist, especially when child integrity is High/System. Allowlist from [Unusual Parent-Child
+    Relationship](https://detection.fyi/elastic/detection-rules/windows/privilege_escalation_unusual_parentchild_relationship/)
+    and [Non services.exe Spawn of svchost.exe](https://research.splunk.com/endpoint/1d38e5e9-2ff8-4c47-872c-bf1657cefab5/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      allow = {services.exe->svchost.exe, wininit.exe->services.exe, smss.exe->csrss.exe}
+      WHERE parent_image IN privileged_sys_bins
+        AND (parent_image,child_image) NOT IN allow
+        AND (child IN shells|script_hosts|lolbins OR child_integrity IN High,System)
+      => alert
+- question: Over a 30-day baseline of parent-child pairs by host role, which new pairs or pairs with a
+    z-score above 3 (especially with a high-privilege parent) should be alerted?
+  context: 'Build a per-host-role baseline of parent-child pair frequencies and compute a z-score/rarity
+    score per pair, deriving thresholds from each server class''s own distribution. New pairs or those
+    with z>3 indicate statistically anomalous lineage. When the parent is a high-privilege binary and
+    the child is newly elevated, the anomaly is consistent with PPID spoofing for privilege escalation
+    on critical infrastructure. In the context of the Privilege Escalation tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Statistical Method): Build a 30-day baseline of parent-child frequencies; for new processes
+    with a high-privilege parent compute the z-score against the baseline and alert on z>3 or entirely
+    new pairs, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = freq BY (parent_image,child_image,host_role) over 30d
+      z = (obs - mean)/sd
+      alert WHERE z > 3 OR pair is new
+        prioritize parent_image IN privileged_sys_bins
+- question: Does an LSTM-autoencoder over per-host process-creation order produce high reconstruction
+    error for a tree where a privileged parent launches an unusual child, and what are the top-3 deviating
+    steps?
+  context: 'Train a sequence anomaly model (LSTM autoencoder) on per-host process-creation order to learn
+    expected boot/service/admin sequences. A spoofed lineage breaks the learned order (e.g., a SYSTEM-level
+    parent launching an unexpected child mid-session), yielding high reconstruction error. Surfacing the
+    top-3 deviating steps helps the analyst see exactly where the chain departs from normal, supporting
+    detection of stealthy escalation. In the context of the Privilege Escalation tactic, a positive result
+    supports the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Machine Learning): Train an LSTM-autoencoder on per-host process-creation sequences; a rare
+    high-privilege parent-child pair yielding high reconstruction error indicates deviation, with top-3
+    deviating steps surfaced. Graph rationale per [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Critical infrastructure servers (Domain Controllers, Certificate Authorities) and administrative
+    workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      seq = ordered process_creations per host
+      recon_err = LSTM_autoencoder.reconstruct(seq)
+      alert WHERE recon_err > threshold
+        emit top3_deviating_steps
+- question: Does an elevated 4688 process creation follow a 4624/4672 logon but originate from something
+    other than consent.exe (or carry Token Elevation Type 1/2 without consent.exe as parent), indicating
+    UAC bypass via PPID spoofing?
+  context: 'Legitimate interactive elevation flows through consent.exe (the UAC prompt). Alert when an
+    elevated process tied to an admin account follows a logon but does not originate from consent.exe
+    or an approved administrative workflow, or when Token Elevation Type is Type 1/Type 2 yet the parent
+    is not consent.exe. This catches the SYSTEM-token-inheritance escalation path where an adversary assigns
+    a SYSTEM parent to gain an elevated token while skipping the standard UAC prompt. In the context of
+    the Privilege Escalation tactic, a positive result supports the information requirement: Has the adversary
+    used Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Trigger on 4688 when ''Token
+    Elevation Type'' is Type 1 or Type 2 AND ''Parent Process Name'' is NOT consent.exe, targeting elevation
+    that skips the standard UAC prompt. Legitimate UAC PPID assignment and its abuse described in [Detecting
+    Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE 4688.elevated_token AND preceding 4624/4672 for acct
+        AND parent_process_name != 'consent.exe'
+        AND token_elevation_type IN (Type1,Type2)
+        AND NOT approved_admin_workflow
+      => alert
+- question: Does the distribution of reported parent processes for elevation-related launches per user/host
+    shift sharply (e.g., a new appearance of svchost.exe or lsass.exe as parent), and does the failure
+    rate of nearby elevation attempts change?
+  context: 'Baseline the per-user/host distribution of reported parents for elevation events (normally
+    consent.exe, explorer.exe). Compute entropy and flag sudden drops or the appearance of rare parents
+    like svchost.exe/lsass.exe for user-launched elevation. Also profile the failure/denied rate of nearby
+    4672 elevation attempts as a distinct State signal. A spike toward unusual parents indicates an adversary
+    forging lineage to obtain elevated tokens. In the context of the Privilege Escalation tactic, a positive
+    result supports the information requirement: Has the adversary used Parent PID Spoofing for privilege
+    escalation? Method (Statistical Method): Baseline common reported parents for elevation (consent.exe,
+    explorer.exe); compute entropy of the per-user parent distribution and flag sudden drops or rare parents
+    (svchost.exe). Also profile failed elevation/denied-UAC counts as a distinct State signal, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline parent_dist per (user,host) for elevation events
+      entropy_now vs entropy_base
+      alert WHERE entropy drop OR rare_parent IN ('svchost.exe','lsass.exe')
+      also track denied_4672_rate as state
+- question: Does a classifier trained on elevation events (creator image, reported parent, account type,
+    session/integrity, time-of-day) separate routine elevation from bypass, and what are the top-3 contributing
+    features?
+  context: 'Train a decision-tree/gradient-boosted classifier (ProblemChild-style) on elevation features
+    to distinguish routine UAC elevation from bypass. The model learns benign consent.exe-driven elevations
+    versus forged-parent escalations (e.g., svchost.exe/explorer.exe parented child with mismatched session/integrity).
+    Output the top-3 contributing features per alert so analysts can validate whether a real UAC bypass
+    occurred. In the context of the Privilege Escalation tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine
+    Learning): Train a decision-tree/gradient-boosted classifier on Creator/Parent/Child, session type
+    (interactive vs remote), integrity, and time-of-day to separate legitimate UAC elevations from bypasses
+    per [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676); output top-3 contributing features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly for users with administrative privileges.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features=[creator_img,reported_parent,acct_type,session,integrity,hour]
+      score = classifier.predict_proba(features)
+      alert WHERE score>threshold emit top3_features
+- question: Does the hash of a NewProcessName match internal known-bad/defense-evasion hash lists, especially
+    when the reported parent is explorer.exe or svchost.exe to masquerade origin?
+  context: 'Hash the NewProcessName for each 4688 event and correlate against internal known-bad/defense-evasion
+    hash lists, raising a high-severity alert on match. Pay special attention when the reported parent
+    is a trusted process (explorer.exe, svchost.exe), as this combines a malicious binary with a forged
+    trusted lineage to masquerade its origin - a clear stealth/defense-evasion pattern. In the context
+    of the Privilege Escalation tactic, a positive result supports the information requirement: Has the
+    adversary used Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Hash the ''NewProcessName''
+    for each 4688 event and correlate against internal known-bad/defense-evasion hash lists; alert high-severity
+    on match, especially when the reported parent is explorer.exe or svchost.exe (masquerading origin).
+    Trusted-parent abuse per [Process Injection - Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for each 4688: h = hash(new_process_name)
+      if h IN internal_known_bad/defense_evasion_list
+      => alert severity=high; escalate if parent_process_name IN ('explorer.exe','svchost.exe')
+- question: When a normally common parent (explorer.exe/svchost.exe) launches a process, is the child
+    command line above the 95th percentile of Shannon entropy/length for the host baseline, indicating
+    an obfuscated payload?
+  context: 'Compute Shannon entropy and length (Volume) of each command line and the rarity of each parent-child
+    pair (Frequency) over 30 days. Alert when a normally benign parent launches a child whose command
+    line exceeds the 95th-percentile entropy/length for the host baseline. High-entropy command lines
+    under a trusted, possibly spoofed parent indicate an encoded/obfuscated payload hiding behind a benign-looking
+    lineage. In the context of the Privilege Escalation tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Statistical
+    Method): Compute Shannon entropy/length (Volume) of each new process command line; flag values above
+    the 95th percentile combined with a common parent (explorer.exe, svchost.exe) indicating an obfuscated
+    payload, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline cmd_entropy,cmd_len per host over 30d
+      alert WHERE parent_image IN common_parents
+        AND (cmd_entropy > p95 OR cmd_len > p95)
+- question: Does a gradient-boosting model trained on process image, reported parent, command-line length/entropy,
+    account type, and session context score a creation as staged to masquerade as benign user activity?
+  context: 'Train a model on process image, reported parent, command-line length/entropy, account type,
+    session context, and name-collision-with-system-binary features, using LOLBin command-line methodology.
+    The model labels creations engineered to look like benign user activity (trusted parent + obfuscated
+    command line) as evasive. Emit the top-3 contributing tokens/features so the analyst can confirm the
+    masquerade. In the context of the Privilege Escalation tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine
+    Learning): Train a classifier on hash prevalence, parent image, command-line length/entropy, and name-collision-with-system-binary
+    features to label events benign vs evasive, using LOLBin feature methodology in [Living-Off-The-Land
+    Command Detection Using Active Learning](https://arxiv.org/abs/2111.15039); surface the top-3 evasive
+    features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: All Windows endpoints and servers, particularly those with user-interactive sessions (workstations,
+    terminal servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features=[image,reported_parent,cmd_len,cmd_entropy,acct_type,session,name_collision]
+      score = gbm.predict_proba(features)
+      alert WHERE score>threshold emit top3_tokens
+- question: Does a 4688 event show Creator Process Name (e.g., WINWORD.EXE/EXCEL.EXE/CHROME.EXE, an Office
+    app or browser) != Parent Process Name where the reported parent is a common trusted process (explorer.exe/svchost.exe)?
+  context: 'This is the canonical Office-to-explorer.exe spoof: a malicious document or browser exploit
+    spawns a child but forges explorer.exe as the parent to evade detections that block processes spawning
+    directly from Office. Trigger when the creator is an Office app or browser, the reported parent is
+    a common trusted process, and the two differ. A match strongly indicates spearphishing-driven execution
+    hiding its true origin. In the context of the Privilege Escalation tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Symbolic Logic): Trigger on 4688 where ''Creator Process Name'' != ''Parent Process Name'',
+    AND ''Creator Process Name'' is an Office app or browser, AND ''Parent Process Name'' is explorer.exe/svchost.exe
+    - the Office-to-explorer.exe spoof in [Detecting Parent PID (PPID) Spoofing](https://www.countercept.com/blog/detecting-parent-pid-spoofing/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE creator_process_name != parent_process_name
+        AND creator_process_name IN ('WINWORD.EXE','EXCEL.EXE','CHROME.EXE', office_apps, browsers)
+        AND parent_process_name IN ('explorer.exe','svchost.exe')
+      => alert
+- question: Among creator/parent mismatch events, which ('Creator Process Name','New Process Name') tuples
+    occur fewer than 5 times in 30 days enterprise-wide?
+  context: 'Build a frequency distribution of (creator, new-process) tuples for all mismatch events and
+    flag those occurring fewer than 5 times in 30 days enterprise-wide. A rare, unusual process being
+    spawned by Word (or another document/browser app) and then hiding its origin via a forged parent is
+    a high-confidence spoofing signal. Rarity scoring separates these from the small set of frequently-repeated
+    benign mismatches. In the context of the Privilege Escalation tactic, a positive result supports the
+    information requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method
+    (Statistical Method): Build a frequency distribution of (''Creator Process Name'',''New Process Name'')
+    tuples for mismatch events; flag tuples occurring < 5 times in 30 days, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      tuple_freq = count BY (creator_process_name,new_process_name) over 30d WHERE creator!=parent
+      alert WHERE tuple_freq < 5
+- question: Does a logistic-regression / gradient-boosted model on one-hot Creator/Parent/Child plus command-line
+    features estimate a high spoofing probability (e.g., Office app creating PowerShell parented by explorer.exe)?
+  context: 'Train a logistic-regression / gradient-boosted model on one-hot encoded Creator/Parent/Child
+    images plus command-line features. The model learns benign UAC combinations versus malicious ones
+    such as an Office app creating PowerShell while forging explorer.exe as the parent. Output a spoofing
+    probability and the top-3 drivers (feature attribution) so analysts can quickly judge whether the
+    lineage was forged. In the context of the Privilege Escalation tactic, a positive result supports
+    the information requirement: Has the adversary used Parent PID Spoofing for privilege escalation?
+    Method (Machine Learning): Train a logistic-regression model on one-hot Creator/Parent/Child plus
+    command-line features to estimate spoofing probability, learning benign UAC vs malicious combinations;
+    feature attribution per [ProblemChild](https://ar5iv.labs.arxiv.org/html/2008.04676) surfaces top-3
+    drivers.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, particularly those processing documents from external sources like email
+    or web downloads.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = onehot(creator,parent,child) + cmd_features
+      p = model.predict_proba(X)
+      alert WHERE p > threshold emit top3_drivers
+- question: Is a LOLBAS (powershell.exe, rundll32.exe, mshta.exe) executed where the Creator Process Name
+    is an Office app/browser but the Parent Process Name is explorer.exe, and does pivoting on its ProcessGUID
+    into Zeek conn.log reveal connections to uncategorized/known-malicious destinations?
+  context: 'Combine trusted-parent spoofing with first-party network corroboration. Flag a LOLBAS whose
+    creator is an Office app/browser but whose reported parent is explorer.exe, then use the ProcessGUID
+    to query Zeek conn.log for outbound connections to uncategorized or known-malicious destinations within
+    a short window. The combination of forged lineage plus suspicious egress strongly indicates a spearphishing
+    payload staging C2 while hiding its origin. In the context of the Privilege Escalation tactic, a positive
+    result supports the information requirement: Has the adversary used Parent PID Spoofing for privilege
+    escalation? Method (Symbolic Logic): Flag LOLBAS (powershell.exe, rundll32.exe, mshta.exe) where 4688
+    ''Creator Process Name'' is an Office app/browser but ''Parent Process Name'' is explorer.exe; pivot
+    on ProcessGUID into Zeek conn.log for connections to uncategorized/known-malicious destinations in
+    a short window. Trusted-parent abuse per [Process Injection - Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE child_image IN ('powershell.exe','rundll32.exe','mshta.exe')
+        AND creator_process_name IN office_apps|browsers
+        AND parent_process_name = 'explorer.exe'
+      => pivot process_guid -> network within 5m
+  - technology: Zeek/pseudocode
+    query: |-
+      conn WHERE id.orig_h == host AND ts in [proc_ts, proc_ts+5m]
+        AND resp_destination IN uncategorized|known_malicious
+      => corroborate alert
+- question: For each LOLBAS, does a Chi-squared test comparing a host's/user's observed parent-creator
+    distribution against the enterprise baseline indicate an anomalous origin, and are blocked/failed
+    outbound connection counts elevated?
+  context: 'Baseline each LOLBAS''s legitimate parent/creator processes enterprise-wide, then use a Chi-squared
+    test to compare a host''s or user''s observed distribution against that baseline; a high chi-square
+    statistic indicates the LOLBAS is being launched from an anomalous (likely forged) origin. Also profile
+    failed/blocked outbound connection counts (NXDOMAIN/404/blocked) for the spawned LOLBAS as a distinct
+    failure-mode signal of C2 attempts. In the context of the Privilege Escalation tactic, a positive
+    result supports the information requirement: Has the adversary used Parent PID Spoofing for privilege
+    escalation? Method (Statistical Method): Baseline each LOLBAS''s legitimate parents/creators and use
+    Chi-squared to compare a host''s/user''s observed distribution to the enterprise baseline; high chi-square
+    = anomalous origin. Also profile failed/blocked outbound connection counts (NXDOMAIN/404/blocked)
+    as a distinct failure-mode signal, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      observed = parent_creator_dist(lolbas, host/user)
+      expected = enterprise_baseline(lolbas)
+      chi2 = chisquare(observed, expected)
+      alert WHERE chi2 > threshold
+      also track blocked_outbound_count (NXDOMAIN/404/blocked)
+- question: Does an Isolation Forest over LOLBAS process-creation events (user, host, parent image, creator
+    image, command-line parameters) isolate executions that differ from the benign majority?
+  context: 'Apply an Isolation Forest to LOLBAS creation events using user, host, parent image, creator
+    image, and command-line parameters; rare executions with forged or unusual parentage are isolated
+    quickly. Active-learning labeling keeps the model current against new LOLBin abuse. Surface the top-3
+    anomalous features so the analyst can confirm whether the LOLBAS origin was hidden. In the context
+    of the Privilege Escalation tactic, a positive result supports the information requirement: Has the
+    adversary used Parent PID Spoofing for privilege escalation? Method (Machine Learning): Apply Isolation
+    Forest to LOLBAS events (user, host, parent image, creator image, command-line) to isolate rare executions
+    per [Isolation Forest](https://doi.org/10.1145/2133360.2133363); active-learning labeling keeps it
+    current per [Living-Off-The-Land Command Detection Using Active Learning](https://arxiv.org/abs/2111.15039).
+    Surface top-3 anomalous features.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All Windows systems, with a focus on internet-facing servers and standard user workstations
+    where LOLBAS abuse is common.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = [user,host,parent_image,creator_image,cmd_params] for lolbas events
+      score = IsolationForest().decision_function(X)
+      alert WHERE score anomalous emit top3_features
+- question: Does any process have explorer.exe as its reported parent while that parent's Subject User
+    Name is NT AUTHORITY\SYSTEM or its Session ID is 0?
+  context: 'Interactive explorer.exe always runs in a user context with a non-zero session. Alert on any
+    child whose reported parent is explorer.exe but whose parent context is NT AUTHORITY\SYSTEM or Session
+    0. This precisely catches a SYSTEM-parented spoof used to inherit a SYSTEM token while masquerading
+    as benign desktop activity - a hallmark of the ''becoming SYSTEM'' escalation technique. In the context
+    of the Privilege Escalation tactic, a positive result supports the information requirement: Has the
+    adversary used Parent PID Spoofing for privilege escalation? Method (Symbolic Logic): Alert when ''Parent
+    Process Name'' is explorer.exe BUT the parent''s ''Subject User Name'' is NT AUTHORITY\SYSTEM or ''Session
+    ID'' is 0; interactive explorer.exe runs in user context with non-zero session - the SYSTEM-parented
+    escalation in [Becoming SYSTEM](https://blog.xpnsec.com/becoming-system/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      WHERE parent_process_name = 'explorer.exe'
+        AND (parent_subject_user = 'NT AUTHORITY\\SYSTEM' OR parent_session_id = 0)
+      => alert severity=high
+- question: For processes spawned by explorer.exe, which parent SubjectUserName / SessionID values are
+    statistical outliers (service accounts, session 0) versus the interactive baseline?
+  context: 'Profile the distribution of parent explorer.exe SubjectUserName and SessionID for every child
+    it spawns. Flag instances where the user is a service account or the session is 0, which are statistical
+    outliers against the normal interactive baseline. Such outliers indicate explorer.exe was spawned/spoofed
+    in an abnormal security context to host a privileged or hidden child process. In the context of the
+    Privilege Escalation tactic, a positive result supports the information requirement: Has the adversary
+    used Parent PID Spoofing for privilege escalation? Method (Statistical Method): Profile the parent
+    explorer.exe SubjectUserName and SessionID distribution for each child; flag service-account names
+    or session 0 as statistical outliers versus the interactive baseline, per [CAR-2014-11-002](https://car.mitre.org/analytics/CAR-2014-11-002/).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline subject_user,session_id dist for explorer.exe children
+      alert WHERE subject_user IN service_accounts OR session_id = 0
+        (outlier vs interactive baseline)
+- question: Does a session-level sequence/time-series anomaly model flag an apparently normal chain (explorer.exe->cmd.exe)
+    that carries anomalous attributes such as a SYSTEM parent context, yielding high reconstruction error?
+  context: 'Apply a sequence/time-series anomaly model on per-session parent-child relationships. Even
+    a chain that looks normal by image names (explorer.exe->cmd.exe) produces high reconstruction error
+    when its attributes are anomalous - for example a SYSTEM parent context on what should be an interactive
+    session. Surface the top-3 deviating attributes so the analyst can see the hidden context driving
+    the anomaly. In the context of the Privilege Escalation tactic, a positive result supports the information
+    requirement: Has the adversary used Parent PID Spoofing for privilege escalation? Method (Machine
+    Learning): Apply a session-level sequence anomaly model; alert when a normal-looking chain (explorer.exe->cmd.exe)
+    carries anomalous attributes (SYSTEM parent context) yielding high reconstruction error, with top-3
+    deviating attributes surfaced. Provenance rationale per [Tactical Provenance-based Detection (ProvDetector)](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24046-paper.pdf).'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: Remote Desktop Session Hosts, Citrix servers, and other multi-user or remote access servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      seq = per-session parent-child relationships with attrs
+      recon_err = anomaly_model.reconstruct(seq)
+      alert WHERE recon_err high AND attrs anomalous (SYSTEM ctx)
+        emit top3_deviating_attrs
