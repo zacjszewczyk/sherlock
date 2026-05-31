@@ -1,0 +1,500 @@
+name: 'D3-UDTA: User Data Transfer Analysis'
+id: b2671d39-0344-432d-bb32-7fe7d2ffef7c
+description: >-
+  This playbook helps an analyst detect unauthorized data exfiltration by analyzing the volume, frequency,
+  and state of data a user transfers out of the enterprise. It begins with deterministic, rule-based controls
+  - static high-watermarks on single connections, per-user-day egress caps, encrypted/archive staging
+  detection, first-seen external destination flagging, and off-hours or removable-media bulk-copy detection
+  - that catch gross exfiltration regardless of model drift. It then layers statistical baselining: per-user
+  daily volume spikes, robust modified Z-score thresholds, peer-group outlier comparison, upload:download
+  byte-ratio inversion, external connection-frequency bursts, blocked/denied transfer-rate profiling,
+  DLP-hit correlation, and success-versus-failure state ratios. Finally it applies behavioral machine
+  learning - Isolation Forest on per-user feature vectors, autoencoder reconstruction error on egress
+  rate, deep sequence models, and volume forecasting - to surface the low-and-slow and novel transfer
+  patterns that evade static thresholds, with every model alert surfacing its top-3 contributing features.
+  Use it to distinguish routine business data movement from a sophisticated external actor staging and
+  exfiltrating sensitive data, a malicious insider copying files to removable media, or commodity malware
+  beaconing data out of your environment.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any single network connection move an unusually large volume of bytes - exceeding a static
+    high-watermark such as 1GB or the 99.9th percentile of historical connection sizes - and was that
+    connection dominated by outbound (orig_bytes) traffic leaving the enterprise?
+  context: For the Detect mission this deterministic rule catches gross bulk exfiltration in a single
+    session regardless of any baseline drift. Sum orig_bytes + resp_bytes for each connection in Zeek
+    conn.log and alert when it breaches a static high-watermark - start at 1GB and tune per-environment
+    from the 99.9th percentile of historical connection sizes. Prioritize connections where orig_bytes
+    (outbound) dominates, since an asymmetric, upload-heavy flow is the signature of data leaving rather
+    than entering. A positive result is a candidate bulk-transfer exfiltration event needing immediate
+    triage of the destination and the user; a negative result simply means no single connection breached
+    the floor, so pair this with the per-user-day and statistical checks to catch chunked transfers.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for conn in zeek_conn_log[last_90d]:
+          total = conn.orig_bytes + conn.resp_bytes
+          if total > high_watermark:   # start 1GB; tune to p99.9 of historical conn sizes
+            severity = 'HIGH' if conn.orig_bytes > conn.resp_bytes else 'MED'
+            alert('BULK_TRANSFER', conn.id_orig_h, conn.id_resp_h, total, conn.orig_bytes, severity)
+- question: Across an entire day, did any user's total outbound bytes to external IP addresses exceed
+    a hard ceiling (e.g., 5GB/user/day, or the 99.9th percentile of per-user-day egress)?
+  context: This deterministic per-user-day floor catches gross exfiltration that is spread across many
+    smaller connections and would slip under a single-connection watermark, and it keeps working even
+    when ML baselines drift. Sum each user's daily orig_bytes to external destinations from Zeek conn.log
+    and alert when the daily total breaches a hard cap derived from the 99.9th percentile of per-user-day
+    egress. For the Detect mission this provides an always-on, auditable backstop. A breach is a strong
+    exfiltration lead; review which destinations and connections contributed and whether the volume is
+    business-justified (backups, legitimate cloud uploads) before escalating.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days (evaluate per user-day)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for user, day in user_days[last_90d]:
+          daily_out = sum(conn.orig_bytes for conn in conns(user,day) if conn.id_resp_h is external)
+          if daily_out > 5GB:   # tune to p99.9 of per-user-day egress
+            alert('EGRESS_CAP_EXCEEDED', user, day, daily_out)
+- question: Did a user transfer large (>50MB), high-entropy files matching archive extensions (.zip, .rar,
+    .7z, .gz) to external or DMZ destinations, indicating compressed/encrypted data staging?
+  context: Attackers commonly compress and/or encrypt stolen data before exfiltration to shrink it and
+    evade content inspection, so a large high-entropy archive leaving the network is a classic staging-then-exfil
+    pattern. Inspect Zeek http.log and smb_files.log for transfers of files larger than 50MB whose entropy
+    is high (consistent with compression/encryption) and whose names match archive extensions, then alert
+    when the destination is external or in the DMZ. For the Detect mission a positive result points to
+    deliberate packaging of data for theft; correlate with the source user and the volume checks. A negative
+    result does not rule out exfiltration of unpackaged data, so keep the volume and ratio analytics running
+    alongside.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for f in zeek_http_log + zeek_smb_files_log:
+          if f.total_bytes > 50MB and f.entropy >= high and f.name ~ /\.(zip|rar|7z|gz)$/:
+            if f.dest in external or f.dest in DMZ:
+              alert('ENCRYPTED_STAGING', f.user, f.dest, f.name, f.total_bytes, f.entropy)
+- question: Did a user send a large outbound transfer (>100MB) to an external destination IP or domain
+    that has not appeared in that user's history during the prior 30 days?
+  context: 'Combining transfer volume with destination novelty sharply narrows false positives: routine
+    large uploads usually go to known, repeatedly-used services, whereas exfiltration often targets attacker-controlled
+    infrastructure the user has never contacted. Maintain a per-user rolling 30-day history of external
+    destination IPs/domains and alert when a >100MB outbound transfer targets a destination new to that
+    user. For the Detect mission a hit is a high-value lead - a large transfer to first-seen infrastructure
+    - that should be triaged against threat intel on the destination. A negative result means the destination
+    is familiar, lowering (but not eliminating) suspicion.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days (per-user 30-day destination history)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for conn in egress_conns[today]:
+          if conn.orig_bytes > 100MB:
+            hist = user_dest_history(conn.user, last_30d)
+            if conn.dest not in hist:
+              alert('LARGE_TRANSFER_NEW_DEST', conn.user, conn.dest, conn.orig_bytes)
+- question: Did a user copy large byte volumes to USB/removable media, or transfer more than 100MB outbound,
+    outside of their normal working hours?
+  context: Off-hours timing and removable-media use are strong insider-exfiltration indicators because
+    legitimate bulk work usually occurs during business hours over sanctioned channels. From Windows Security
+    Event ID 4663 (object access), Sysmon FileCreate, and removable-device events, alert when a user writes
+    large volumes to USB/removable media or moves >100MB outbound outside their established working hours.
+    For the Detect mission this maps to labeled insider exfiltration scenarios and catches both the disgruntled-insider
+    USB-copy case and an attacker operating during quiet hours. A positive result warrants reviewing what
+    files were copied and whether the device and timing are authorized; combine with the user's working-hours
+    baseline to reduce noise from shift workers.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for ev in win_4663 + sysmon_filecreate + removable_device_events:
+          if ev.target is removable_media and ev.bytes > large_threshold:
+            if outside_working_hours(ev.user, ev.time):
+              alert('OFFHOURS_USB_COPY', ev.user, ev.device, ev.bytes, ev.time)
+        for conn in egress_conns:
+          if conn.orig_bytes > 100MB and outside_working_hours(conn.user, conn.time):
+            alert('OFFHOURS_BULK_TRANSFER', conn.user, conn.dest, conn.orig_bytes)
+- question: For each user, does the total daily data transferred over a 30-day rolling window exceed the
+    99th percentile or 3 standard deviations above that user's own mean?
+  context: Per-user statistical baselining detects a user transferring far more than is normal for them,
+    even if the absolute volume is below organization-wide static caps. Compute each user's total daily
+    transferred bytes (sum of orig_bytes/resp_bytes from Zeek conn.log) over a rolling 30-day window and
+    alert when the day's total exceeds the user's 99th percentile or mean + 3 standard deviations. For
+    the Detect mission this catches a compromised account or insider whose activity suddenly spikes relative
+    to their own history. A positive result is a per-user anomaly to triage; be aware mean/SD thresholds
+    can be inflated by occasional backups, which is why the modified Z-score variant is run in parallel.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days (30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          series = daily_total_bytes(user, last_30d)
+          mu, sd = mean(series), stddev(series)
+          today = daily_total_bytes(user, today)
+          if today > percentile(series, 99) or today > mu + 3*sd:
+            alert('DAILY_VOLUME_SPIKE', user, today, mu, sd)
+- question: Using a robust baseline built from the median and median absolute deviation (MAD), does any
+    user's daily egress modified Z-score exceed 3.5?
+  context: Mean/standard-deviation baselines are easily distorted by occasional large but legitimate events
+    (scheduled backups, batch jobs), which inflate thresholds and hide real anomalies. Replacing them
+    with the median and MAD yields a robust modified Z-score that resists those outliers. Compute each
+    user's daily egress modified Z-score = 0.6745 * (value - median) / MAD and alert when it exceeds 3.5.
+    For the Detect mission this gives a more reliable per-user anomaly signal with fewer threshold-drift
+    false positives. A score above 3.5 marks a day that is genuinely anomalous relative to the user's
+    typical behavior and should be triaged for exfiltration.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days (30-day robust baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          series = daily_egress_bytes(user, last_30d)
+          med, mad = median(series), MAD(series)
+          today = daily_egress_bytes(user, today)
+          mz = 0.6745 * (today - med) / mad
+          if mz > 3.5:
+            alert('ROBUST_EGRESS_ANOMALY', user, today, mz)
+- question: When users are grouped by job role or department, is any user transferring significantly more
+    data than their peers - for example more than 2x the peer-group median or in the top 1% of their peer
+    rank?
+  context: Peer-group analytics catches a user whose volume looks normal against a global cap but is abnormal
+    for their role - a powerful insider and compromised-credential indicator. Group users by job role/department
+    and compare daily transfer volumes within each group, alerting when a user exceeds roughly 2x the
+    peer-group median or ranks in the top 1% of peers. For the Detect mission this contextualizes volume
+    against what is normal for similar employees, so an HR analyst suddenly transferring like a data engineer
+    stands out. A positive result is a contextual outlier to investigate; ensure peer groups are accurate,
+    since misassigned roles cause false positives.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for group in peer_groups(by=role_or_dept):
+          med = median(daily_volume(u) for u in group)
+          for u in group:
+            v = daily_volume(u)
+            if v > 2*med or rank(v, group) in top_1pct:
+              alert('PEER_GROUP_OUTLIER', u, group, v, med)
+- question: Has a user's outbound:inbound byte ratio (orig_bytes/resp_bytes) inverted and stayed high
+    - for example above 3:1 outbound - versus their normally download-heavy baseline?
+  context: Most users are download-heavy (they pull far more data than they push), so a sustained inversion
+    to upload-heavy traffic is a directionality signal that flags exfiltration even at moderate absolute
+    volume. Track each user's orig_bytes/resp_bytes ratio and alert when it inverts and stays high (e.g.,
+    >3:1 outbound) relative to that user's baseline. For the Detect mission this catches low-and-slow
+    exfiltration that never trips a raw-volume threshold but reverses the normal direction of data flow.
+    A positive result indicates the user is now pushing data out atypically; correlate with destinations
+    and content to confirm.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek smb_files.log
+  - Firewall logs
+  - Web Proxy logs
+  - 'NAI: Our organization''s internet egress points and DMZ boundaries'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          ratio_today = sum(orig_bytes)/max(sum(resp_bytes),1) for user today
+          base = baseline_ratio(user, last_30d)
+          if ratio_today > 3 and ratio_today > k*base and sustained_over(window):
+            alert('UPLOAD_RATIO_INVERSION', user, ratio_today, base)
+- question: Per user, does the number of external connections per minute/hour, or the count of distinct
+    external destinations per hour, show sustained bursts exceeding 3 standard deviations or 2x the peer-group
+    median?
+  context: Automated, chunked exfiltration tools open many short external connections rather than one
+    large transfer, so connection FREQUENCY is a distinct signal from raw volume. Baseline each user's
+    external connection count per minute/hour and distinct external destinations per hour from Zeek conn.log,
+    then alert on sustained bursts beyond 3 standard deviations or 2x the peer-group median. For the Detect
+    mission this catches beaconing and scripted upload loops that keep each transfer small to dodge volume
+    thresholds. A positive result is a frequency anomaly to triage against the destinations and timing;
+    legitimate causes include sync clients and CDNs, so combine with destination reputation.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - DLP logs
+  - 'NAI: Our organization''s internet egress points and DLP enforcement points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          conn_rate = count(external_conns(user))/interval
+          distinct_dst = count(distinct external_dst(user))/hour
+          base, sd = baseline(user); peer_med = peer_group_median()
+          if conn_rate > base + 3*sd or conn_rate > 2*peer_med:
+            alert('CONN_FREQ_BURST', user, conn_rate, distinct_dst)
+- question: For each user, what is the count and rate of blocked or denied egress events (firewall deny,
+    proxy 403, DLP block), and does it spike above the user's baseline failure-state rate?
+  context: A spike in failed/blocked transfers can indicate an actor probing for an open exfiltration
+    channel - trying port after port, service after service - and this failure-STATE rate is a separate
+    signal from successful-transfer volume. Track per-user counts and rate of blocked/denied egress (firewall
+    deny, proxy 403, DLP block) and baseline it independently, alerting when it spikes. For the Detect
+    mission a rising block rate is an early warning that an actor is attempting exfiltration before they
+    succeed. A positive result warrants reviewing what was blocked and whether the user later found an
+    allowed path; a low rate is normal background policy enforcement.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - DLP logs
+  - 'NAI: Our organization''s internet egress points and DLP enforcement points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          blocked = count(fw_deny) + count(proxy_403) + count(dlp_block) for user
+          rate = blocked / interval
+          base, sd = baseline_blocked(user, last_30d)
+          if rate > base + 3*sd:
+            alert('BLOCKED_TRANSFER_SPIKE', user, rate, base)
+- question: Did a user accumulate multiple DLP policy hits (sensitive-content matches) within a short
+    window AT THE SAME TIME as their outbound volume was elevated?
+  context: Combining content signals (DLP sensitive-content matches, state = blocked/allowed) with volume
+    context produces a high-confidence exfiltration alert that neither signal gives alone. Alert when
+    a user accumulates multiple DLP policy hits in a short window while their outbound volume is also
+    elevated. For the Detect mission this layered rule catches a user actively moving sensitive material
+    in bulk - the conjunction of 'this is sensitive data' and 'a lot of it is leaving' is far more specific
+    than either condition by itself. A positive result is a priority exfiltration lead; review the matched
+    content classifications, destinations, and whether the transfers were allowed or blocked.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - DLP logs
+  - 'NAI: Our organization''s internet egress points and DLP enforcement points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      for user in users:
+          hits = count(dlp_policy_hits(user) within short_window)
+          vol = outbound_volume(user, short_window)
+          if hits >= N and vol > elevated_threshold(user):
+            alert('DLP_PLUS_VOLUME', user, hits, vol)
+- question: For each user, what is the success-to-failure ratio of upload attempts (proxy 2xx vs 4xx/5xx,
+    firewall allow vs deny), and does the pattern show persistent high-volume successful uploads to non-business
+    destinations or a low-and-slow series of small successful uploads following earlier blocks?
+  context: 'The state of upload attempts - succeed versus fail - reveals exfiltration tradecraft: an actor
+    may probe (generating failures) and then succeed via an open channel, or quietly drip small successful
+    uploads to stay under thresholds. Compute each user''s success/failure ratio (proxy 2xx vs 4xx/5xx,
+    firewall allow vs deny) and flag persistent high-volume successful uploads to non-business destinations,
+    or a low-and-slow series of small successful uploads after earlier blocks, against the user''s baseline
+    ratio. For the Detect mission this catches insider exfiltration patterns that pure volume or pure
+    block-rate analysis misses. A positive result is a behavioral lead requiring destination and content
+    review.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - DLP logs
+  - 'NAI: Our organization''s internet egress points and DLP enforcement points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for user in users:
+          succ = count(proxy_2xx) + count(fw_allow); fail = count(proxy_4xx_5xx) + count(fw_deny)
+          ratio = succ/(fail+1); base = baseline_ratio(user)
+          if (ratio anomalous vs base) or (low_and_slow_small_uploads after prior blocks):
+            if dest in non_business: alert('UPLOAD_STATE_ANOMALY', user, succ, fail, ratio)
+- question: When per-user transfer feature vectors (daily outbound bytes, connection count, distinct destinations,
+    upload:download ratio, off-hours fraction, archive-file count) are scored with an Isolation Forest,
+    which users receive high anomaly scores, and what are the top-3 features driving each score?
+  context: Isolation Forest isolates anomalies efficiently in high-dimensional feature space and catches
+    multivariate exfiltration patterns that no single static threshold describes. Build per-user feature
+    vectors from daily outbound bytes, connection count, distinct destinations, upload:download ratio,
+    off-hours fraction, and archive-file count, then score with an Isolation Forest and alert on high
+    anomaly scores, emitting the top-3 contributing features so the analyst sees WHY (e.g., high off-hours
+    fraction + many archive files + ratio inversion). For the Detect mission this surfaces subtle combinations
+    indicative of insider or compromised-account exfiltration. Keep the deterministic byte-cap rules running
+    in parallel so model misses are still caught; a high score with explainable drivers is a strong triage
+    lead.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      X = per_user_features[daily_out_bytes, conn_count, distinct_dst, up_down_ratio, offhours_frac, archive_count]
+        model = IsolationForest().fit(X_baseline)
+        for user in users:
+          score = model.anomaly_score(X[user])
+          if score > threshold:
+            top3 = feature_attribution(model, X[user])[:3]
+            alert('ISOFOREST_ANOMALY', user, score, top3)
+        # keep deterministic byte-cap rules running in parallel
+- question: Using an online autoencoder trained on per-host packet/byte rate, magnitude, and variance
+    features across multiple time windows, which hosts show high reconstruction error (RMSE) indicating
+    abnormal egress volume or rate?
+  context: An autoencoder learns to reconstruct normal egress behavior; traffic it cannot reconstruct
+    well (high RMSE) is abnormal - and this works unsupervised on encrypted traffic without any decryption.
+    Train an online autoencoder over per-host packet/byte rate, magnitude, and variance features across
+    multiple time windows and flag high reconstruction error as anomalous egress volume/rate. For the
+    Detect mission this is well suited to encrypted exfiltration where payload inspection is impossible,
+    catching deviations in the shape and rate of traffic. A positive result (high RMSE host) is an egress-behavior
+    anomaly to correlate with the user and destination; the online/streaming nature limits drift-induced
+    false positives by continuously updating the model.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points'
+  range: Last 90 days (online/streaming model)
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      features = per_host[pkt_rate, byte_rate, magnitude, variance] over multi_window
+        ae = OnlineAutoencoder()   # Kitsune-style, unsupervised, no decryption needed
+        for host in hosts:
+          recon = ae.predict(features[host]); rmse = RMSE(features[host], recon)
+          ae.update(features[host])
+          if rmse > threshold:
+            alert('AUTOENCODER_EGRESS_ANOMALY', host, rmse)
+- question: When each user's daily aggregate activity (bytes, file, device, and http counts) is modeled
+    with a DNN/LSTM sequence model, which users show anomalous days, and what per-feature contributions
+    explain the anomaly score?
+  context: A deep sequence model (DNN/LSTM) learns the temporal pattern of each user's day-to-day activity
+    and flags days that break the learned sequence - capturing context that point-in-time thresholds miss.
+    Model each user's daily aggregate counts (bytes, file, device, http) and decompose the anomaly score
+    into per-feature contributions so analysts can triage WHY a day was flagged. For the Detect mission
+    this is validated against labeled insider-threat data and catches gradual behavioral shifts characteristic
+    of an insider ramping up exfiltration or a slowly-operating attacker. A positive result is an anomalous
+    user-day with explainable drivers; review the contributing features (e.g., spike in device or file
+    activity) against the user's role and known activity.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      for user in users:
+          seq = daily_aggregates(user)[bytes, file_count, device_count, http_count]
+          model = LSTM_or_DNN(); score = model.anomaly(seq[today] | seq.history)
+          if score > threshold:
+            contrib = per_feature_attribution(model, seq[today])
+            alert('SEQUENCE_MODEL_ANOMALY', user, score, top3=contrib[:3])
+- question: When each user's expected next-24h transfer volume is forecast from their history, did the
+    observed volume fall outside the predicted confidence interval?
+  context: Forecasting models predict what a user SHOULD transfer next and flag deviations from that prediction,
+    catching anomalies relative to a continuously-learned expectation rather than a fixed threshold. Forecast
+    each user's expected next-24h transfer volume from their history and alert when the observed volume
+    falls outside the predicted confidence interval; an online/streaming detector updates baselines continuously
+    to limit drift-induced false positives. For the Detect mission this catches both sudden spikes and
+    unexpected sustained increases. A positive result (observed outside the interval) is a per-user forecast
+    miss to triage. Retain the static high-watermark rule as a floor so a model that has 'learned' a creeping
+    baseline still cannot mask gross exfiltration.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      for user in users:
+          pred, lo, hi = forecast_next_24h(history(user))   # streaming/online update
+          observed = transfer_volume(user, next_24h)
+          if observed < lo or observed > hi:
+            alert('FORECAST_ANOMALY', user, observed, pred, lo, hi)
+        # retain static high-watermark rule as a floor
+- question: For every model-based detection, does each alert name the top-3 features (via SHAP/Shapley
+    attribution) that drove its anomaly score - for example outbound bytes, destination novelty, off-hours
+    fraction - rather than only a numeric score?
+  context: An anomaly score with no explanation is hard to triage and erodes analyst trust; SHAP (Shapley)
+    feature attribution makes every model alert actionable by naming the specific behaviors that drove
+    it. Attach SHAP attributions to all model-based detections so each alert surfaces its top-3 contributing
+    features (e.g., outbound bytes, destination novelty, off-hours fraction). For the Detect mission this
+    turns opaque scores into explainable leads, letting an analyst immediately judge whether the drivers
+    reflect genuine exfiltration or a benign cause, and dramatically speeds triage. The presence of clear
+    top-3 drivers is itself a quality gate - any model alert lacking them should be treated as incomplete.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall logs
+  - Web Proxy logs
+  - Windows Security logs
+  - 'NAI: Our organization''s internet egress points'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      for alert in model_alerts:
+          shap_vals = shap_explain(alert.model, alert.feature_vector)
+          alert.top3 = sort_by_abs(shap_vals)[:3]   # e.g., outbound_bytes, dest_novelty, offhours_frac
+          require(alert.top3 is not empty)  # quality gate
+          emit(alert)
