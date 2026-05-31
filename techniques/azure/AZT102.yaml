@@ -1,0 +1,505 @@
+name: 'AZT102: IP Discovery'
+id: 1111eccc-daaf-402d-b3f4-eb5c28f3a3eb
+description: This playbook helps an analyst investigate Azure IP Discovery (AZT102), in which a principal
+  views Azure resources such as public IP addresses, network interfaces (NICs), and virtual machine properties
+  to associate cloud resources with routable or internal IP addresses, determine which systems are externally
+  reachable, and map likely paths for initial access or lateral movement. It guides the analyst through
+  detecting control-plane read enumeration (e.g., Microsoft.Network/publicIPAddresses/read, Microsoft.Compute/virtualMachines/read
+  and equivalent CLI/PowerShell/REST calls), recognizing address-to-host linking chains (publicIP -> NIC
+  -> VM -> private IP/subnet), first-seen and outlier enumeration behavior, regional/resource-group sweeps,
+  permission-probing failure spikes, and the follow-on phase in which discovered addresses are organized
+  into actionable targets and selectively validated via connection attempts, HTTP probes, or management-protocol
+  tests at the perimeter. It combines deterministic (symbolic-logic) rules, statistical baselining, and
+  machine-learning approaches so the analyst can distinguish benign inventory review and automation from
+  adversary reconnaissance.
+type: technique
+related:
+- tactic_id: TA0043
+  tactic_name: Reconnaissance
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any principals issuing bursts of read operations against Azure network and virtual machine
+    objects (for example Microsoft.Network/publicIPAddresses/read or Microsoft.Compute/virtualMachines/read),
+    or running az network public-ip show, Get-AzPublicIpAddress, Get-AzNetworkInterface, Get-AzVM, or
+    equivalent REST GETs to management.azure.com, that look like systematic IP discovery?
+  context: Under Reconnaissance, an adversary views Azure resources to learn which public and private
+    IP addresses are assigned to cloud resources. Watch the Azure Activity Log / ARM operation logs for
+    principals issuing publicIPAddresses/read or virtualMachines/read operations, and host telemetry (PowerShell
+    4104, Sysmon 1, Windows 4688) for the corresponding CLI/PowerShell cmdlets. A concrete high-confidence
+    trigger is the same caller issuing >= 25 distinct network/VM read operations in 10 minutes, or reads
+    across >= 3 resource groups in 5 minutes; tune per tenant. Encode the logic as portable Sigma over
+    operationName/category/identity fields. A positive result is a single identity rapidly sweeping addressing
+    objects; a negative result is sparse, business-justified reads tied to known automation or admins.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source=azure_activity OR source=arm_operations
+        operationName IN ("Microsoft.Network/publicIPAddresses/read",
+          "Microsoft.Compute/virtualMachines/read",
+          "Microsoft.Network/networkInterfaces/read")
+        | bin _time span=10m
+        | stats dcount(operationName) as ops dcount(resourceGroup) as rgs by caller, _time
+        | where ops >= 25 OR rgs >= 3
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source IN (powershell_4104, sysmon_1, win_4688)
+        (CommandLine MATCHES "(?i)(Get-AzPublicIpAddress|Get-AzNetworkInterface|Get-AzVM|az network public-ip show)"
+         OR Image MATCHES "(?i)(az|pwsh|powershell)")
+        | stats count by host, user, CommandLine
+- question: Is any single session chaining read operations across public IP -> NIC -> VM -> private IP/subnet
+    objects for the same resource, indicating an attempt to resolve which routable addresses map to which
+    hosts?
+  context: 'Address-to-host linking is the heart of IP discovery: an adversary reads a public IP object,
+    then the NIC it is bound to, then the VM, then the private IP/subnet to build a full picture of which
+    routable address belongs to which host. Build this as an ordered-sequence rule that fires when >=
+    3 of the 4 object types are read for the same resource within 5 minutes, modeling the expected order
+    using first-party Azure logs only. A positive result is a tight, ordered chain on one resource (or
+    many); benign administration usually touches one object type for a known operational reason rather
+    than walking the whole chain.'
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days. Consider event-centered correlation within a 5-minute window per resource.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source=arm_operations
+        operationName IN (publicIPAddresses/read, networkInterfaces/read,
+          virtualMachines/read, subnets/read)
+        | transaction caller, targetResourceId maxspan=5m
+        | eval objtypes = dcount(operationType)
+        | where objtypes >= 3 AND ordered(publicIP, NIC, VM, subnet)
+- question: Has a principal performed publicIPAddresses/read or sweeping VM/NIC reads for the first time,
+    or against subscriptions or resource groups it has never previously touched?
+  context: First-seen enumeration is a high-fidelity signal even at low volume. Maintain a per-principal
+    history of operations over a 30-90 day lookback and alert when a principal performs an address/NIC/VM
+    read for the first time, or against a subscription or resource group it has never accessed. New-principal
+    x new-resource-provider pairs are especially telling under Reconnaissance because they reveal an identity
+    expanding into territory outside its normal job. A positive result is an established service account
+    or user suddenly reading network objects it never has; a negative result is activity consistent with
+    the principal's established history.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days (with 30-90 day historical baseline).
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source=arm_operations operationName IN (publicIPAddresses/read, networkInterfaces/read, virtualMachines/read)
+        | stats earliest(_time) as first_seen by caller, operationName, subscriptionId, resourceGroup
+        | where first_seen >= now() - 1d
+        AND NOT [ inputlookup principal_history WHERE caller=caller AND subscriptionId=subscriptionId ]
+- question: Does a principal's daily volume of network/VM read operations, distinct objects read, or distinct
+    resource groups and regions touched deviate sharply from its own baseline (modified Z-score |z| >
+    3.5)?
+  context: Statistical baselining catches enumeration that hides under bulk automation. For each principal,
+    baseline the daily count of network/VM read operations, the count of distinct public IP/NIC/VM objects
+    read, distinct resource groups and regions touched, and the share of reads against internet-facing
+    subscriptions. Use median + MAD (modified Z-score, alert when |z| > 3.5) so batch automation does
+    not distort the threshold, and optionally forecast the expected per-principal/per-subscription read
+    rate with trend+seasonality and alert when observed exceeds the prediction interval. Alerts must list
+    the top-3 contributing features (e.g., distinct VMs read, regions, internet-facing share). A positive
+    result is a principal whose breadth of reads spikes well above its norm.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source=arm_operations operationName IN (network/*, virtualMachines/read)
+        | bin _time span=1d
+        | stats count as reads dcount(targetResourceId) as objs dcount(resourceGroup) as rgs dcount(region) as regions by caller, _time
+        | eventstats median(reads) as med mad(reads) as mad by caller
+        | eval mzscore = 0.6745*(reads-med)/mad
+        | where abs(mzscore) > 3.5
+- question: In a single discovery session, does the breadth of regions, resource groups, and exposed services
+    covered exceed both the principal's own history and its peer group's typical behavior?
+  context: 'A regional sweep anomaly looks at coverage rather than raw counts: measure how many regions,
+    resource groups, and exposed services a principal touches in one discovery session and compare it
+    to both its own history and its peer group. Escalate sessions whose breadth exceeds both baselines,
+    and combine with impossible-travel / atypical-location and anonymous-IP signals on the same session
+    for higher confidence. Under Reconnaissance this distinguishes an operator methodically mapping the
+    tenant''s footprint from an admin working within a known scope. A positive result is wide cross-region/cross-RG
+    coverage by an identity that normally stays narrow.'
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days; evaluate per discovery session.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source=arm_operations
+        | transaction caller maxpause=15m
+        | stats dcount(region) as regions dcount(resourceGroup) as rgs dcount(service) as svcs by caller, session
+        | eventstats avg(regions) as peer_regions stdev(regions) as peer_sd by peer_group
+        | where regions > peer_regions + 3*peer_sd AND regions > self_baseline
+- question: Does a principal's ordered control-plane operation stream contain low-likelihood sequences
+    (e.g., rapid publicIP -> NIC -> VM -> subnet chains across many resources) that volume counters would
+    miss?
+  context: Sequence likelihood modeling scores the order of operations, not just their count. Model each
+    principal's ordered control-plane operation stream with a variable/multi-order Markov model and score
+    the likelihood of the observed sequence. Rapid publicIP->NIC->VM->subnet chains repeated across many
+    resources produce low-likelihood scores even when the total volume looks normal, exposing enumeration
+    that evades simple thresholds. A positive result is a sequence whose transition probabilities are
+    far below the principal's learned norm; a negative result is operations following habitual, high-probability
+    paths.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days (train on rolling history).
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      // train variable-order Markov model on per-principal operation sequences
+        model = markov_train(events WHERE caller=*, sequence=operationName, order<=3)
+        | score seq_loglik = markov_score(model, current_session_sequence)
+        | where seq_loglik < p01_threshold(caller)
+- question: Is there a spike in failed (AccessDenied / authorization-failed) network/VM read operations
+    or HTTP 403/404 ARM responses for a principal, indicating permission probing during enumeration?
+  context: Failure-rate profiling treats denied reads as a first-class signal. Track AccessDenied / authorization-failed
+    read operations and HTTP 403/404 ARM responses separately from successful reads. A spike in failed
+    network/VM reads (e.g., > 10 denials in 5 minutes, or a denial ratio > 30% of a principal's reads)
+    indicates a principal probing the limits of its permissions while enumerating. Baseline normal denial
+    rates per principal and alert on deviation. A positive result is a burst of authorization failures
+    concentrated on addressing/VM objects; a negative result is the occasional expected denial within
+    normal operation.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source=arm_operations operationName IN (network/*, virtualMachines/read)
+        | eval denied = if(resultType IN ("AccessDenied","Forbidden") OR httpStatus IN (403,404), 1, 0)
+        | bin _time span=5m
+        | stats sum(denied) as denials count as total by caller, _time
+        | eval ratio = denials/total
+        | where denials > 10 OR ratio > 0.30
+- question: Do unsupervised rare-function/population models over Azure Activity/ARM logs surface a principal
+    with rarely-seen operations, atypical caller IP/geo, or abnormally high distinct-operation counts
+    consistent with address harvesting?
+  context: An address-harvesting model applies unsupervised ML as a force multiplier over the deterministic
+    rules. Run rare-function/population jobs over Azure Activity/ARM logs to flag rarely-seen operations,
+    atypical caller IP/geo, and high distinct-operation counts per principal, and use isolation-forest
+    / UEBA scoring over features such as object diversity, subscription fan-out, repeated IP-specific
+    queries, source-host novelty, and denial ratio. Surface the top influencer fields in each alert for
+    explainability, and keep the deterministic rules running in parallel as the detection floor. A positive
+    result is a principal scored anomalous across multiple harvesting features.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = per_principal(object_diversity, subscription_fanout,
+          repeated_ip_queries, source_host_novelty, denial_ratio,
+          caller_ip_rarity, distinct_ops)
+        model = isolation_forest(features) // or UEBA population/rare-function job
+        | score anomaly = model.predict(features)
+        | where anomaly > threshold
+        | annotate top_influencers(features)
+- question: When principals, roles, resources, and read actions are modeled as a heterogeneous dynamic
+    graph, is any principal suddenly connecting to many network/VM resource nodes it never accessed before
+    (enumeration fan-out)?
+  context: An IAM graph anomaly model represents principals, roles, resources, and read actions as a heterogeneous
+    dynamic graph and detects a principal that suddenly forms edges to many network/VM resource nodes
+    it never touched before -- the graph signature of enumeration fan-out. Attention weights provide edge/feature
+    attribution so the alert explains which new connections drove the score, and the detector should be
+    validated against enterprise host/network baselines. Under Reconnaissance this catches lateral expansion
+    of an identity's access footprint that point-in-time rules miss. A positive result is rapid growth
+    in distinct resource edges from a single principal node.
+  answer_sources:
+  - Azure Activity Log (Administrative)
+  - Azure Resource Manager operation logs
+  - Defender for Cloud Apps
+  - Entra ID SignInLogs
+  - PowerShell Event ID 4104
+  - Proxy logs
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: Azure administration endpoints, egress to management.azure.com, identities querying network
+    objects for the first time, and subscriptions hosting internet-facing workloads'
+  range: Last 90 days (dynamic graph over rolling window).
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      graph = build_hetero_graph(nodes=[principal,role,resource], edges=read_actions, window=rolling)
+        model = dynamic_gnn(graph)
+        | score fanout_anomaly per principal
+        | where new_resource_edges >> historical_degree(principal)
+        | annotate attention_weights(edges)
+- question: After a principal reads public IP / VM / NIC objects in Azure, are there connection attempts,
+    HTTP requests, or management-protocol probes to those exact addresses in NSG Flow Logs, Azure Firewall,
+    or Zeek conn.log within a short window?
+  context: This discovery-to-validation pairing links control-plane reconnaissance to data-plane action.
+    Correlate recent publicIPAddresses/read or VM/NIC read activity with subsequent connection attempts,
+    HTTP requests, or management-protocol probes to those exact addresses in NSG Flow Logs / Azure Firewall
+    / Zeek conn.log within a short window (e.g., 30 minutes). Raise severity when the validated addresses
+    belong to identity, management, or data-bearing systems. A positive result is a tight discovery-then-touch
+    sequence on the same IPs; a negative result is enumeration with no follow-on connectivity, or connections
+    to addresses never enumerated.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days; correlate within a 30-minute window of the discovery event.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      disc = search source=arm_operations operationName IN (publicIPAddresses/read, virtualMachines/read, networkInterfaces/read)
+               | table _time caller discovered_ip
+        conn = search source IN (nsg_flow, azure_firewall, zeek_conn)
+        | join discovered_ip [ disc ]
+        | where conn._time - disc._time < 30m
+        | eval sev = if(dest_ip IN (identity_mgmt_data_ranges), "high", "medium")
+- question: Is endpoint tooling such as curl, Invoke-WebRequest, Test-NetConnection, ssh, mstsc, or nmap
+    being directed at the exact addresses just enumerated from Azure, especially within minutes of management-plane
+    discovery?
+  context: Selective endpoint testing detects the operator validating candidate targets by hand or with
+    tooling. Watch process/command-line telemetry (Sysmon 3, Windows 4688) and proxy logs for curl, Invoke-WebRequest,
+    Test-NetConnection, ssh, mstsc, or nmap aimed at the precise addresses just enumerated from Azure,
+    particularly within minutes of management-plane discovery. Baseline normal admin troubleshooting to
+    avoid false positives. A positive result is reconnaissance tooling targeting freshly discovered IPs
+    in close time proximity to the read operations; a negative result is routine, scheduled, or scoped
+    admin connectivity.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days; emphasize minutes-after-discovery correlation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      source IN (sysmon_3, win_4688, proxy)
+        (Image MATCHES "(?i)(curl|powershell|pwsh|ssh|mstsc|nmap)"
+         OR CommandLine MATCHES "(?i)(Invoke-WebRequest|Test-NetConnection)")
+        | join dest_ip [ search recently_enumerated_ips earliest=-30m ]
+        | stats count by host, user, dest_ip, CommandLine
+- question: How many newly discovered IPs receive first-time connection attempts within the same day,
+    and what fraction of enumerated addresses get validated (modified Z-score |z| > 3.5 over per-principal
+    history)?
+  context: New target spread quantifies how aggressively a principal converts discovery into validation.
+    Track how many newly discovered IPs receive first-time connection attempts within the same day and
+    the fraction of enumerated addresses that get validated, using median+MAD thresholds (|z| > 3.5) over
+    per-principal history. Flag sessions that validate an unusually high percentage of just-enumerated
+    addresses. Under target organization, a high conversion rate signals deliberate target selection rather
+    than incidental traffic. A positive result is a session validating far more of its enumerated IPs
+    than the principal historically does.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      | eval validated = ip IN (first_time_connections_today)
+        | bin _time span=1d
+        | stats count(eval(validated)) as new_targets dc(enumerated_ip) as enumerated by caller, _time
+        | eval validate_frac = new_targets / enumerated
+        | eventstats median(validate_frac) as med mad(validate_frac) as mad by caller
+        | eval mz = 0.6745*(validate_frac-med)/mad
+        | where abs(mz) > 3.5
+- question: Do a principal's follow-on connections disproportionately target production, identity, or
+    externally branded services relative to overall tenant exposure and compared to its peer group?
+  context: Priority host concentration scores the value of the validated targets, not just their number.
+    Determine whether follow-on connections disproportionately target production, identity, or externally
+    branded services relative to the tenant's exposure, comparing the principal to its peer group. Investigate
+    operators whose validations concentrate on high-value targets. Under target organization, an adversary
+    will preferentially probe the systems that yield access to credentials or sensitive data. A positive
+    result is validation traffic skewed toward crown-jewel systems beyond what peers exhibit; a negative
+    result is connectivity spread proportionally across ordinary workloads.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source IN (nsg_flow, azure_firewall, zeek_conn)
+        | eval hv = if(dest_ip IN (prod_identity_branded_ranges), 1, 0)
+        | stats sum(hv) as hv_hits count as total by caller
+        | eval hv_share = hv_hits/total
+        | eventstats avg(hv_share) as peer_avg stdev(hv_share) as peer_sd by peer_group
+        | where hv_share > peer_avg + 3*peer_sd
+- question: Is there a burst of blocked or denied connections (NSG deny, firewall deny, TCP RST, HTTP
+    403/404) to newly enumerated addresses, indicating active reachability testing?
+  context: Validation failure profiling makes blocked probes a distinct signal. Profile blocked/denied
+    connections and probe failures (NSG deny, firewall deny, TCP RST, HTTP 403/404) to discovered addresses;
+    a burst of failed first-time connections (e.g., > 20 blocked conns in 5 minutes to newly enumerated
+    IPs) indicates active reachability testing. Baseline normal block rates and alert on deviation. Under
+    target organization, a spike of denied first-touch connections reveals an operator probing which discovered
+    endpoints are actually reachable. A positive result is a concentrated burst of blocked attempts to
+    freshly enumerated IPs.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      source IN (nsg_flow, azure_firewall, zeek_conn)
+        | eval blocked = if(action IN ("Deny","Drop") OR tcp_flags="RST" OR http_status IN (403,404), 1, 0)
+        | where dest_ip IN (recently_enumerated_ips) AND blocked=1
+        | bin _time span=5m
+        | stats count as blocked_conns by src, _time
+        | where blocked_conns > 20
+- question: Does a sequence/graph model distinguish benign inventory review from target selection by weighting
+    timing compression between discovery and validation, first-time endpoint touches, repeated focus on
+    management/identity IPs, and cross-region behavior?
+  context: A target prioritization model uses ML to separate legitimate inventory review from adversary
+    target selection. Build a sequence/graph model that weights the timing compression between discovery
+    and validation, first-time endpoint touches, repeated focus on management/identity IPs, and cross-region
+    behavior, scoring sequence plausibility per principal. Surface the top-3 contributing features in
+    each alert. Under target organization this catches the pattern where discovery and validation are
+    tightly coupled and aimed at high-value systems. A positive result is a low-plausibility sequence
+    dominated by compressed timing and high-value targeting.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = per_principal(discovery_to_validation_gap, first_time_touch_rate,
+          mgmt_identity_focus, cross_region_spread)
+        model = sequence_or_graph_model(features)
+        | score plausibility = model.predict(features)
+        | where plausibility < threshold
+        | annotate top3_features(features)
+- question: When normal per-identity, per-resource access to addressing/metadata and management endpoints
+    is baselined, are there anomalous reconnaissance access patterns at runtime, including SSRF-driven
+    IP/metadata enumeration?
+  context: Runtime access baselining models normal per-identity, per-resource access to addressing/metadata
+    and management endpoints and flags anomalous reconnaissance patterns as they happen, including SSRF-driven
+    IP/metadata enumeration (e.g., abuse of the instance metadata service). Validate the detectors against
+    enterprise host/network baselines. Under target organization this catches enumeration that occurs
+    through compromised workloads or server-side request forgery rather than through interactive admin
+    sessions. A positive result is a workload or identity accessing metadata/management endpoints in a
+    pattern that deviates from its learned runtime baseline.
+  answer_sources:
+  - Azure Firewall Network Rule Logs
+  - NSG Flow Logs
+  - Proxy logs
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Public Azure endpoints, perimeter telemetry covering connection attempts to discovered addresses,
+    and analyst workstations or attacker infrastructure validating candidate targets'
+  range: Last 90 days (continuous runtime evaluation).
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      baseline = per_identity_per_resource_access(metadata_endpoints, mgmt_endpoints)
+        | score deviation = runtime_anomaly(current_access, baseline)
+        | where access_to_imds_or_mgmt AND deviation > threshold
+        | flag possible_ssrf if source=workload AND unexpected_metadata_query
