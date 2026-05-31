@@ -1,0 +1,535 @@
+name: 'T1098.005: Device Registration'
+id: 4c6b546b-81c2-4c66-8d6b-a665aff4bfd8
+description: Investigate adversary abuse of device registration (MITRE ATT&CK T1098.005), in which an
+  actor enrolls an attacker-controlled device into an identity provider's MFA or device-management system
+  (e.g., Entra ID/Intune, Okta, Duo) to gain persistent access and to bypass multifactor and conditional-access
+  controls. This playbook helps an analyst determine whether a successful device registration is malicious
+  by correlating IdP audit events (Entra `Add device`), Zeek registration traffic to IdP endpoints, authentication
+  telemetry, and post-registration behavior. It covers persistence-focused leads (registrations from threat-intel/anomalous
+  source IPs or known tooling such as AADInternals/BPRT, anomalous or high-entropy device names, registrations
+  preceded by failed logons or following password resets on dormant accounts, and bulk/burst registration
+  flooding) as well as privilege-escalation leads (newly registered devices beaconing to C2, rapid automated
+  access to crown-jewel assets, conditional-access bypass where previously denied resources become reachable,
+  and internal scanning/lateral-movement fan-out). Each question pairs symbolic-logic, statistical, and
+  machine-learning approaches with concrete pseudocode and the data sources and named areas of interest
+  needed to answer it.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a successful device registration originate from a source IP found on a threat-intelligence
+    feed, or did the HTTP User-Agent used to register match a known device-join tool such as AADInternals
+    or BPRT?
+  context: Persistence via device registration frequently begins with an actor driving the documented
+    Entra/IdP device-join flow against the exact registration endpoints (enterpriseregistration.windows.net,
+    device.login.microsoftonline.com). Correlating the Zeek conn.log source IP (id.orig_h) for those endpoints
+    against a known-malicious IP feed, and scanning Zeek http.log user_agent strings for tooling signatures
+    (AADInternals, BPRT, python-requests), surfaces attacker-driven enrollments that legitimate device
+    joins never produce. A deterministic high-fidelity variant is an Entra audit `Add device` / `Add registered
+    owner to device` operation on a privileged or dormant account. A positive hit (known-bad IP or tool
+    UA, especially on a sensitive account) is strong evidence of malicious persistence; a negative result
+    narrows the lead to behavioral analytics.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway (for Zeek logs), Cloud Identity Provider (IdP) consoles (e.g., Azure AD, Okta,
+    Duo), VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log where id.resp_h in IDP_REG_ENDPOINTS\n  | join threat_intel on id.orig_h\n\
+      \  | union (http.log where host in IDP_REG_ENDPOINTS and user_agent matches /AADInternals|BPRT|python-requests/i)\n\
+      \  | output src_ip, user_agent, ts"
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=azure:audit Operation IN (\"Add device\",\"Add registered owner to device\")\n\
+      \  | where target_account in (PRIVILEGED_ACCOUNTS) OR target_account in (DORMANT_ACCOUNTS)\n  |\
+      \ alert"
+- question: Is the ASN/country pair of a device-registration source IP statistically rare compared with
+    the organization's 90-day baseline of all registration traffic?
+  context: Even without a direct threat-intel hit, a registration arriving from an autonomous system or
+    country the organization almost never registers devices from is a meaningful anomaly for persistence
+    detection. For each registration source IP, resolve its ASN and country, then compare the frequency
+    of that ASN/country pair against a 90-day baseline of registration traffic and alert on pairs in the
+    bottom 5th percentile. Use median/MAD (modified Z-score, |Z|>3.5) instead of mean/std so legitimate
+    batch enrollments do not distort the cutoff. A rare pair suggests an actor enrolling a device from
+    infrastructure outside the organization's normal footprint.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway (for Zeek logs), Cloud Identity Provider (IdP) consoles (e.g., Azure AD, Okta,
+    Duo), VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline = registrations(last=90d) | enrich(asn,country) | freq by (asn,country)\n \
+      \ new_reg | enrich(asn,country) | lookup baseline\n  | modified_zscore(freq, baseline.freq)\n  |\
+      \ where pct(freq) < 5 OR abs(mz) > 3.5 | alert"
+- question: Did a successful device registration immediately follow a burst of failed or blocked authentication/registration
+    attempts from the same source IP?
+  context: Treating failure and challenge rates as a distinct signal exposes brute-force or credential-stuffing
+    that precedes a successful enrollment. Count HTTP non-200 responses (401/403), blocked Zeek conn.log
+    attempts, and Entra failed registration/sign-in results from each source IP in the window before a
+    successful `Add device`. A success that arrives right after a spike of failures or blocks — particularly
+    from an anonymous or anomalous IP — should be escalated, mirroring impossible-travel/anonymous-IP
+    correlation. This indicates the actor guessed or replayed credentials and then enrolled a device to
+    lock in persistent access.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway (for Zeek logs), Cloud Identity Provider (IdP) consoles (e.g., Azure AD, Okta,
+    Duo), VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  fails = events(401|403|conn_blocked|resultType=50126) by src_ip in [t-15m, t]\n  success\
+      \ = azure:audit Operation=\"Add device\" at t\n  | join success with fails on src_ip\n  | where\
+      \ fails.count >= 5 | alert"
+- question: Does a supervised classifier flag a new device registration as malicious based on IP geolocation,
+    ASN, timing, User-Agent rarity, and preceding failed attempts?
+  context: When labeled historical registration data exists, train a classification model (e.g., XGBoost)
+    on features including source IP geolocation, ASN, cyclical time-of-day, day-of-week, HTTP User-Agent
+    rarity, preceding failed-attempt count, and whether the IP is a TOR exit or public-cloud node, then
+    classify new registrations in real time. To make the alert actionable, surface the top-3 contributing
+    features (e.g., 'rare ASN', 'AADInternals UA', 'preceded by 6 failed logons') so analysts can triage
+    quickly. This catches persistence enrollments that combine several individually-weak signals into
+    a strong overall prediction.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Internet Gateway (for Zeek logs), Cloud Identity Provider (IdP) consoles (e.g., Azure AD, Okta,
+    Duo), VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model = xgboost.load('device_reg_clf')\n  feats = features(reg){geo, asn, tod_sin/cos,\
+      \ dow, ua_rarity, prior_fail_count, is_tor, is_cloud}\n  score = model.predict_proba(feats)\n  if\
+      \ score > THRESH: alert(top3_shap(feats))"
+- question: Was a device registered with a display name that violates the organization's naming convention
+    or matches a known tool's default device name?
+  context: The device displayName is attacker-chosen during the join flow, so a name that does not match
+    the organizational standard is a strong first-party persistence signal. In Entra audit logs where
+    OperationName is 'Add device' (or in decrypted Zeek http.log POST bodies), apply a regex that negates
+    the organizational naming convention (e.g., (?!^ORG-[A-Z]{3}-\d{7}$).*) and match known tool default
+    names; alert on any match. A non-conforming or tool-default name strongly suggests the device was
+    enrolled by an actor rather than by IT provisioning.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs (for Azure AD `OperationName: Add device`), Network
+    decryption points for SSL/TLS inspection (for Zeek http.log visibility)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=azure:audit OperationName=\"Add device\"\n  | eval name=targetResources[0].displayName\n\
+      \  | where NOT match(name, \"^ORG-[A-Z]{3}-\\\\d{7}$\") OR name in TOOL_DEFAULT_NAMES\n  | alert"
+- question: Does the Shannon entropy of a newly registered device's name exceed the organization's legitimate-name
+    distribution?
+  context: Randomly generated or scripted device names tend to have higher character entropy than human/IT-assigned
+    names. For each new device registration, calculate the Shannon entropy of targetResources[0].displayName
+    and compare it to the distribution of entropy scores for legitimate device names over the last 180
+    days; alert above the 95th percentile, deriving the cutoff robustly with median/MAD to resist outliers.
+    A high-entropy name registered against a user account is consistent with automated, adversary-driven
+    enrollment for persistence.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs (for Azure AD `OperationName: Add device`), Network
+    decryption points for SSL/TLS inspection (for Zeek http.log visibility)'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  baseline = entropy(legit_device_names, last=180d)\n  e = shannon_entropy(new_reg.displayName)\n\
+      \  | where e > p95(baseline) OR modified_zscore(e, baseline) > 3.5 | alert"
+- question: Do unsupervised clustering or outlier methods isolate a device name that does not belong to
+    any legitimate naming cluster?
+  context: Apply an unsupervised detector (DBSCAN or Extended Isolation Forest) to device-name feature
+    vectors built from string length, character entropy, numeric/alphabetic ratio, and special-character
+    presence, then review emergent clusters and outliers that do not match legitimate naming. Extended
+    Isolation Forest produces consistent, per-feature-explainable scores so the contributing name features
+    appear in the alert. Outlier names that fall outside established naming clusters point to enrollments
+    that were not produced by standard provisioning and warrant persistence investigation.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs (for Azure AD `OperationName: Add device`), Network
+    decryption points for SSL/TLS inspection (for Zeek http.log visibility)'
+  range: Last 180 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  X = vectorize(device_names){len, entropy, num_alpha_ratio, special_present}\n  model\
+      \ = ExtendedIsolationForest().fit(X_baseline)\n  scores = model.score(X_new)\n  | where score >\
+      \ THRESH | alert(per_feature_contrib)"
+- question: Was a device registration for a user preceded by five or more failed logons within 15 minutes,
+    or did it follow a password reset / account re-enable on a previously device-less account?
+  context: 'This captures two documented persistence patterns. First, create a stateful rule that triggers
+    when an Entra audit `Add device` for a user principal is preceded by more than 5 sign-in failures
+    (resultType 50126 / Windows 4625) for the same user within the prior 15 minutes — a credential-guess-then-enroll
+    sequence. Second, add the dormant-account variant: trigger when `Add device` or first MFA-method enrollment
+    follows a password reset or account re-enable for an account that previously had no registered device,
+    the exact APT29/Duo self-enrollment pattern. Either sequence indicates an actor converting compromised
+    credentials into durable, MFA-bypassing access.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - 'NAI: Authentication servers (Active Directory Domain Controllers for Windows Events), Cloud Identity
+    Provider (IdP) sign-in and audit logs, VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  add = azure:audit Operation=\"Add device\" by user at t\n  fails = signin(resultType=50126)\
+      \ OR WinEventID=4625 by user in [t-15m, t]\n  | join add, fails on user | where fails.count > 5\
+      \ | alert\n  ;\n  alert when Operation=\"Add device\" follows (password_reset OR account_enable)\n\
+      \        AND user.prior_registered_devices == 0"
+- question: Does a per-user deviation score (new country, new ASN, off-hours, impossible travel) for the
+    registration exceed the alerting threshold?
+  context: 'For each user, build a 180-day profile of typical registration attributes (source country,
+    ASN, time of day) and assign deviation points: +3 for a new country, +2 for a new ASN, +1 for a registration
+    between 10 PM and 6 AM local; alert when the score exceeds 4. Add a hard +5 when the registration
+    location is geographically infeasible versus the user''s prior authenticated session (implied velocity
+    above commercial-flight speed), per impossible-travel logic. A high cumulative score indicates the
+    enrollment deviates sharply from the user''s norm and likely reflects account compromise feeding persistence.'
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - 'NAI: Authentication servers (Active Directory Domain Controllers for Windows Events), Cloud Identity
+    Provider (IdP) sign-in and audit logs, VPN concentrators'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  p = profile(user, last=180d)\n  s = 0\n  s += 3 if reg.country not in p.countries\n\
+      \  s += 2 if reg.asn not in p.asns\n  s += 1 if reg.local_hour in [22..06]\n  s += 5 if impossible_travel(reg,\
+      \ last_authenticated_session(user))\n  | where s > 4 | alert"
+- question: Does a per-user one-class model flag the registration as an outlier against that user's historical
+    enrollment behavior?
+  context: For each user, train a one-class SVM (or Extended Isolation Forest) on feature vectors from
+    historical registration events (source geolocation, ASN, time of day, User-Agent, preceding failed-logon
+    count), classify each new registration in real time, and flag outliers as possible account compromise.
+    Emit the top-3 outlying features in the alert for explainable triage. Because the model is user-specific,
+    it catches enrollments that are unremarkable org-wide but anomalous for that particular identity —
+    a hallmark of credential-driven persistence.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - 'NAI: Authentication servers (Active Directory Domain Controllers for Windows Events), Cloud Identity
+    Provider (IdP) sign-in and audit logs, VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model[user] = OneClassSVM().fit(hist_registrations(user))\n  feats = features(new_reg){geo,\
+      \ asn, tod, ua, prior_fail_count}\n  if model[user].predict(feats) == OUTLIER: alert(top3_features)"
+- question: Did a single source IP register more than 5 devices in an hour, or did a single user register
+    more than 2 devices in an hour?
+  context: Bulk device flooding (e.g., BPRT abuse) produces many registrations from one source and is
+    a known persistence/impact technique. Using a SIEM, count Entra audit `Add device` events over a 1-hour
+    sliding window grouped by ipAddress and by targetResources[0].userPrincipalName; alert if the per-IP
+    count exceeds 5 or the per-user count exceeds 2. A spike of registrations from one origin or onto
+    one identity suggests automated mass enrollment rather than normal user behavior.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs, Internet gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source=azure:audit Operation=\"Add device\"\n  | sliding_window(1h)\n  | stats count\
+      \ by ipAddress, userPrincipalName\n  | where count_by_ip > 5 OR count_by_user > 2 | alert"
+- question: Does the org-wide hourly device-registration rate exceed its rolling baseline by more than
+    3 standard deviations, or show a sustained level shift?
+  context: Calculate a 30-day rolling average and standard deviation of org-wide device registrations
+    per hour and alert when an hour exceeds the mean by more than 3 standard deviations; prefer median/MAD
+    when batch enrollment events skew the series. Add change-point detection (CUSUM/PELT) to catch sustained
+    level-shifts in registration rate that a fixed threshold misses. A sudden spike or a sustained increase
+    in enrollment volume can indicate mass adversary registration for persistence or resource exhaustion.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs, Internet gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  series = hourly_count(Operation=\"Add device\")\n  roll = rolling(series, 30d)\n  |\
+      \ where value > roll.mean + 3*roll.std OR modified_zscore(value, roll) > 3.5\n  | union changepoint(series,\
+      \ method=PELT) | alert"
+- question: Does the actual hourly registration count exceed a seasonal time-series forecast's 99% upper
+    bound?
+  context: Implement a time-series forecasting model (e.g., Prophet) on historical hourly registration
+    counts with weekly and daily seasonality, and alert when the actual count exceeds the model's 99%
+    upper bound (yhat_upper). This approach, validated for cloud intrusion detection, accounts for normal
+    periodic patterns (business hours, onboarding days) so it flags genuine anomalies rather than expected
+    peaks — surfacing bursts of adversary enrollment that a static threshold would miss.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs, Internet gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model = Prophet(weekly_seasonality=True, daily_seasonality=True).fit(hourly_counts)\n\
+      \  fc = model.predict(now)\n  if actual_count(now) > fc.yhat_upper(0.99): alert"
+- question: Is this the first-ever device registration observed for a given (user, source-ASN) or (source-IP,
+    action) pairing over the lookback window?
+  context: Baseline first-seen registrations per identity and per source IP over a 90-day lookback and
+    alert on the first device registration ever observed for a given (user, source-ASN) or (source-IP,
+    action) pairing. This first-seen/rare-action detector catches novel enrollment behavior using only
+    internal audit logs, with no external lookups required. A brand-new pairing that has never appeared
+    before is a low-noise indicator of an actor enrolling from new infrastructure or onto a new identity
+    to establish persistence.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) audit logs, Internet gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  seen = set((user, asn) and (ip, action)) over last 90d\n  new_reg | key1=(user,asn)\
+      \ key2=(ip,action)\n  | where key1 not in seen OR key2 not in seen | alert(first_seen)"
+- question: Within 24 hours of registration, did a newly registered device connect to an IP or resolve
+    a domain on a C2 threat-intelligence feed?
+  context: After bypassing controls via registration, an actor's device often beacons to command-and-control.
+    Maintain a dynamic watchlist of internal IPs assigned to devices registered in the last 24 hours (sourced
+    from Entra `Add device` audit events) and correlate it against Zeek dns.log and conn.log; alert if
+    a watchlisted host resolves a domain or connects to an IP on a C2 threat-intelligence feed. A match
+    within the post-registration window strongly ties the new device to active adversary infrastructure
+    and confirms the registration was a foothold rather than benign onboarding.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: Internet gateway (for Zeek logs), DNS resolvers, Endpoint devices (for Windows Event Logs)'
+  range: Last 90 days (24h post-registration correlation window)
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  watchlist = internal_ips(devices_registered last 24h)\n  conn.log|dns.log where id.orig_h\
+      \ in watchlist\n  | join c2_intel on (id.resp_h OR query) | alert"
+- question: Do DNS queries from a newly registered device show an unusual share of low-reputation TLDs
+    or a burst of failed resolutions?
+  context: For DNS queries from newly registered devices, calculate per-TLD request frequency and compare
+    to the org baseline; flag devices whose distribution shows a high share of low-reputation TLDs (.xyz,
+    .top, .online). Profile the NXDOMAIN/failed-resolution rate separately — bursts of failed lookups
+    from a new device indicate DGA or C2 staging. Use change-point detection to flag the sudden onset
+    of such behavior. These patterns reveal a freshly registered device being used for adversary infrastructure
+    resolution shortly after gaining access.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: Internet gateway (for Zeek logs), DNS resolvers, Endpoint devices (for Windows Event Logs)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  q = dns.log where id.orig_h in new_device_ips\n  | tld_freq(q) vs org_baseline -> flag\
+      \ high low_rep_tld share\n  | nxdomain_rate(q) | changepoint(nxdomain_rate) | alert"
+- question: Does a pre-trained DGA model score any domain queried by a newly registered device above 0.85?
+  context: For all DNS queries from newly registered devices, score the query string with a pre-trained
+    DGA model (e.g., an LSTM that learns normal domain-name sequence structure) and alert on domains scoring
+    above 0.85. Sequence-language modeling of log strings underpins this approach. A high DGA score from
+    a newly registered device suggests the device is contacting algorithmically generated C2 domains,
+    indicating the registration enabled adversary command-and-control rather than legitimate use.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Windows Event ID 4688
+  - 'NAI: Internet gateway (for Zeek logs), DNS resolvers, Endpoint devices (for Windows Event Logs)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  model = lstm_dga.load()\n  for q in dns.log where id.orig_h in new_device_ips:\n   \
+      \ if model.score(q.query) > 0.85: alert(q)"
+- question: Did a newly registered device access more than 3 distinct crown-jewel assets within a 5-minute
+    window?
+  context: Newly Entra-registered devices obtain a Primary Refresh Token and may immediately reach internal
+    resources. Define a list of 'crown jewel' assets (URLs, server IPs, file-share UNC paths) and create
+    a stateful rule tracking access from IPs of newly registered devices; alert if such an IP successfully
+    accesses more than 3 distinct listed assets within a 5-minute window. Rapid touching of multiple high-value
+    targets right after registration indicates the device was registered specifically to reach sensitive
+    data, consistent with privilege escalation.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4663
+  - Windows Event ID 5145
+  - 'NAI: Web servers hosting sensitive applications, File servers hosting sensitive data, Internal network
+    segments monitored by network taps'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  src in new_device_ips AND target in CROWN_JEWELS AND result=success\n  | sliding_window(5m)\
+      \ | distinct_count(target) by src\n  | where distinct_count > 3 | alert"
+- question: Are the inter-access time deltas from a newly registered device below the 1st percentile of
+    the user's history, indicating automation?
+  context: For each user, establish a baseline distribution of time deltas between consecutive resource
+    accesses; after the user registers a new device, flag any session from it where the median inter-access
+    delta falls below the 1st percentile of that user's history, indicating automation or scripted access.
+    Derive the cutoff robustly with median/MAD. Sub-second, machine-paced access from a freshly registered
+    device suggests an attacker running tooling rather than a human operating normally, supporting a privilege-escalation
+    hypothesis.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4663
+  - Windows Event ID 5145
+  - 'NAI: Web servers hosting sensitive applications, File servers hosting sensitive data, Internal network
+    segments monitored by network taps'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  base = deltas_between_accesses(user, hist)\n  cur = deltas(session from new_device)\n\
+      \  | where median(cur) < p1(base) | alert(automation_suspected)"
+- question: Does a per-user Markov model assign an exceptionally low probability to the new device's application-access
+    sequence?
+  context: Model each user's application-access pattern as a first-order Markov chain (states = applications)
+    and compute the joint probability of a new device's access sequence; alert on exceptionally low-probability
+    sequences. Graph/embedding detectors over user-service activity similarly catch a new device touching
+    services outside the user's profile. A low-probability sequence means the new device is accessing
+    applications in an order the user never exhibits, which can reveal an adversary exploring resources
+    after escalating via registration.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4663
+  - Windows Event ID 5145
+  - 'NAI: Web servers hosting sensitive applications, File servers hosting sensitive data, Internal network
+    segments monitored by network taps'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  M[user] = first_order_markov(app_access_sequences(user))\n  p = joint_prob(M[user],\
+      \ new_device_sequence)\n  if p < THRESH: alert(low_prob_sequence)"
+- question: After registering a device, did a user successfully access an application that had previously
+    been blocked by Conditional Access for that same user?
+  context: 'Registering a device is a documented method to bypass conditional access. For any user who
+    registered a device in the last 24 hours, query their Entra sign-in logs for the prior 90 days and
+    alert if a successful login (conditionalAccessStatus: success) to an application from the new device
+    occurs where all previous attempts by that user to that app resulted in conditionalAccessStatus: failure.
+    A previously-denied resource suddenly becoming reachable from the new device is direct evidence of
+    policy bypass and privilege escalation.'
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) conditional access policy logs, Web Application Firewalls (WAFs),
+    Application-level authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  users = registered_device(last 24h)\n  for u in users, app:\n    prior = signin(u, app,\
+      \ last 90d)\n    if all(prior.conditionalAccessStatus == failure)\n       AND now.signin(u, app,\
+      \ device=new).status == success: alert"
+- question: Did a newly registered device successfully access a resource in the user's historical 'denied
+    set' (>99% prior failure rate)?
+  context: For each user, maintain a historical 'denied set' of resources where access fails more than
+    99% of the time; a successful access to any denied-set resource from a newly registered device is
+    statistically significant given the near-zero prior and should be flagged immediately. Treating failure/success
+    rates as a distinct state signal is core to conditional-access bypass detection. Because the prior
+    probability of success was essentially zero, a success from the new device is a high-confidence indicator
+    that the registration removed an access restriction.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) conditional access policy logs, Web Application Firewalls (WAFs),
+    Application-level authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  denied_set[user] = {res : fail_rate(user,res) > 0.99}\n  if access(user, res, device=new).status\
+      \ == success AND res in denied_set[user]:\n    alert(near_zero_prior_success)"
+- question: Does a per-user-resource classifier predict the access should fail, yet it succeeds from a
+    newly registered device?
+  context: For each user-resource pair, train a classifier (e.g., Naive Bayes) to predict access success
+    or failure from device compliance status, IP geolocation, and time of day; if a request from a newly
+    registered device is predicted to fail but succeeds, flag it as a high-confidence policy-bypass anomaly
+    and surface the deciding features. A predicted-fail-but-actually-succeeded outcome captures cases
+    where the new device's attributes should have triggered a conditional-access block, indicating the
+    registration enabled an unexpected privilege gain.
+  answer_sources:
+  - Zeek http.log
+  - 'NAI: Cloud Identity Provider (IdP) conditional access policy logs, Web Application Firewalls (WAFs),
+    Application-level authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  clf[user,res] = NaiveBayes().fit(hist){device_compliance, geo, tod -> outcome}\n  pred\
+      \ = clf[user,res].predict(new_request)\n  if pred == FAIL AND actual == SUCCESS: alert(deciding_features)"
+- question: Did a newly registered device connect to more than 10 unique internal hosts on administrative/recon
+    ports within 5 minutes?
+  context: From an IP tagged as a newly registered device, monitor Zeek conn.log for outbound connections
+    to internal ranges and count distinct destination hosts (id.resp_h) on ports 22, 135, 445, 3389, 5985,
+    5986; alert if the count exceeds 10 within a 5-minute sliding window. Also count failed/blocked connection
+    attempts (Zeek conn S0/REJ, Windows 5157) as a distinct scanning signal. Fan-out to many internal
+    hosts on admin ports right after registration indicates network reconnaissance or lateral movement
+    following the foothold.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Internal network segments (monitored by network taps for Zeek), Endpoint devices (for Windows
+    Event Logs), Core switches (for NetFlow/IPFIX data)'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log where id.orig_h in new_device_ips AND id.resp_p in {22,135,445,3389,5985,5986}\n\
+      \  | sliding_window(5m) | distinct_count(id.resp_h) by id.orig_h\n  | where distinct_count > 10\
+      \ | union count(conn_state in {S0,REJ}) | alert"
+- question: Does the Shannon entropy of destination IPs contacted by a newly registered device exceed
+    3 standard deviations above the workstation baseline?
+  context: For an IP tagged as a newly registered device, use a 1-minute sliding window to compute the
+    Shannon entropy of unique destination IPs it connects to; an entropy score exceeding 3 standard deviations
+    above the typical-workstation baseline indicates scanning. Use change-point detection to flag the
+    sudden onset of fan-out behavior. High destination-IP entropy reflects spraying connections across
+    many hosts — characteristic of automated scanning by a device that just gained access, supporting
+    a privilege-escalation/lateral-movement lead.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Internal network segments (monitored by network taps for Zeek), Endpoint devices (for Windows
+    Event Logs), Core switches (for NetFlow/IPFIX data)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  for ip in new_device_ips:\n    e = shannon_entropy(distinct dst_ip, window=1m)\n   \
+      \ if e > workstation_baseline.mean + 3*std: alert\n    | changepoint(e) | alert(onset)"
+- question: Does an unsupervised model flag a newly registered device's network behavior as non-endpoint-like
+    versus a standard workstation baseline?
+  context: Build a 'standard workstation' baseline from Zeek conn.log aggregated per host over 5-minute
+    intervals (protocol distribution, average/max connections, bytes sent/received, unique peers, failed-connection
+    ratio) and score newly registered devices with an unsupervised detector (Isolation Forest / Extended
+    Isolation Forest), surfacing the top contributing features; high scores indicate non-endpoint behavior.
+    A newly registered device that behaves like a scanner or server rather than a workstation suggests
+    it was registered to operate tooling, consistent with privilege escalation or lateral movement.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Internal network segments (monitored by network taps for Zeek), Endpoint devices (for Windows
+    Event Logs), Core switches (for NetFlow/IPFIX data)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  X = per_host_5m_features(conn.log){proto_dist, avg/max_conns, bytes, unique_peers, fail_ratio}\n\
+      \  model = ExtendedIsolationForest().fit(X_workstation_baseline)\n  if model.score(X_new_device)\
+      \ > THRESH: alert(top_features)"
+- question: Are there first-time authentication/connection edges from a newly registered device to hosts
+    its owning user never reaches?
+  context: Score new authentication/connection edges originating from a newly registered device against
+    a learned model of normal enterprise auth-graph structure; first-time (device, host) edges to systems
+    the owning user never reaches are flagged as anomalous lateral movement or privilege escalation. Graph-based
+    detectors over the enterprise auth graph capture this structure. New edges to never-before-touched
+    hosts indicate the registered device is moving laterally beyond the legitimate user's footprint, a
+    strong privilege-escalation signal.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Internal network segments (monitored by network taps for Zeek), Endpoint devices (for Windows
+    Event Logs), Core switches (for NetFlow/IPFIX data)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  G = enterprise_auth_graph(history)\n  for edge(device, host) from new_device:\n    if\
+      \ edge not in G AND host not in reachable(owning_user): alert(anomalous_edge)"
