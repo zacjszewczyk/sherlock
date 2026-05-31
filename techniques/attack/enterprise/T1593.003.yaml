@@ -1,0 +1,537 @@
+name: 'T1593.003: Code Repositories'
+id: 08794606-60f1-4acb-8cd9-d6d6838ec392
+description: 'Investigate evidence that an adversary is performing reconnaissance against the organization''s
+  public code repositories (e.g., GitHub, GitLab, SourceForge, BitBucket) and acting on what they find.
+  This playbook helps an analyst hunt for: secrets, API keys, and private-key material accidentally committed
+  to public-facing org repositories; suspicious clone/fork activity by brand-new or never-before-seen
+  accounts against sensitive repositories; repositories whose visibility has drifted to be more permissive
+  than intended; downstream abuse of leaked credentials such as external logins, credential stuffing,
+  and password spraying against corporate resources; and external probing of internal-only service endpoints
+  and hostnames discovered in leaked repository content. It combines symbolic-logic detections, statistical
+  baselining/anomaly methods, and machine learning models across Git provider audit logs, secret-scanning
+  services, endpoint authentication logs, and network telemetry to surface targeting before or during
+  initial access.'
+type: technique
+related:
+- tactic_id: TA0043
+  tactic_name: Reconnaissance
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has a secret-scanning service or first-party scanner identified a high-value credential type
+    (AWS key, private key, or API token) committed to a public-facing organizational code repository,
+    and is that secret still live?
+  context: During Reconnaissance an adversary harvests credentials and key material that developers accidentally
+    commit to public repositories. Ingest alerts from secret-scanning services (GitHub Advanced Security,
+    GitGuardian) and also run first-party scanners (Gitleaks regex+entropy ruleset; provider-specific
+    signatures for AWS/Google/Stripe keys and RSA/EC/PGP private-key headers) across all public org repos
+    AND their full git history. Escalate to high severity when a secret type from the predefined list
+    (AWS_KEY, PRIVATE_KEY, API_TOKEN) appears in a public commit. Auto-promote to CRITICAL when live provider-API
+    verification (e.g., TruffleHog verified=true) confirms the key is still active — a verified-live secret
+    is an immediate exposure that an adversary can weaponize for initial access, so it warrants rotation
+    and incident response now.
+  answer_sources:
+  - GitHub Advanced Security alert logs
+  - GitGuardian alert logs
+  - Third-party secret scanning service API logs
+  - 'NAI: Third-party secret scanning platforms and APIs'
+  range: Last 90 days
+  queries:
+  - technology: Secret-scanner/pseudocode
+    query: 'scan_repos(public_org_repos, include_history=true) with rules=[gitleaks_regex_entropy, aws_sig,
+      gcp_sig, stripe_sig, rsa_ec_pgp_headers]
+
+      | where secret_type in (AWS_KEY, PRIVATE_KEY, API_TOKEN)
+
+      | set severity = HIGH
+
+      | if trufflehog_verify(secret) == true then set severity = CRITICAL
+
+      | emit incident'
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (github_advanced_security, gitguardian, secret_scan_api)
+
+      | where repo_visibility == ''public'' AND secret_type IN (''AWS_KEY'',''PRIVATE_KEY'',''API_TOKEN'')
+
+      | eval severity = if(verified==''true'',''CRITICAL'',''HIGH'')
+
+      | alert'
+- question: Which developers are leaking secrets at an abnormally high rate compared to their own historical
+    baseline, suggesting account compromise or a need for targeted secdev training?
+  context: Beyond individual high-severity findings, a developer who suddenly leaks many more secrets
+    than normal may be compromised (an adversary pushing commits under their identity) or may simply need
+    training. Aggregate secret-leak alerts by author over rolling 30-day windows and trigger a medium-severity
+    alert when a developer's leak count exceeds the 95th percentile of their own history. Derive the percentile
+    from your own data and calibrate expected base rates against published prevalence figures (GitGuardian
+    State of Secrets Sprawl). A spike concentrated on one author is the signal; a broad uptick across
+    the org may indicate a tooling or process change instead.
+  answer_sources:
+  - GitHub Advanced Security alert logs
+  - GitGuardian alert logs
+  - Third-party secret scanning service API logs
+  - 'NAI: Third-party secret scanning platforms and APIs'
+  range: Last 90 days (30-day rolling windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=secret_scan_alerts earliest=-30d
+
+      | bin _time span=1d | stats count as leaks by author, _time
+
+      | eventstats perc95(leaks) as p95 by author
+
+      | where leaks > p95 | eval severity=''MEDIUM'' | alert'
+- question: Are candidate secret strings being filtered by Shannon entropy so that low-entropy false positives
+    are suppressed and only credential-like high-entropy strings are escalated?
+  context: Pure regex secret detection produces many false positives (placeholder values, example keys).
+    Compute the Shannon entropy of each candidate string and suppress candidates below a per-secret-type
+    threshold (e.g., ~3.7 bits/char for base64-like tokens), using labeled distributions (SecretBench)
+    to set type-specific cutoffs. This statistical filter sharply cuts noise so analysts focus on plausible
+    live secrets. A candidate above threshold should advance to verification; below threshold it is likely
+    a dummy/test value and can be deprioritized.
+  answer_sources:
+  - GitHub Advanced Security alert logs
+  - GitGuardian alert logs
+  - Third-party secret scanning service API logs
+  - 'NAI: Third-party secret scanning platforms and APIs'
+  range: Last 90 days
+  queries:
+  - technology: Secret-scanner/Stats pseudocode
+    query: "for candidate in scan_candidates:\n  H = shannon_entropy(candidate.value)\n  threshold = type_cutoff[candidate.secret_type]\
+      \   # e.g. base64 ~3.7 bits/char from SecretBench\n  if H >= threshold: keep(candidate) else suppress(candidate)"
+- question: When a new secret-leak alert fires, does a trained confidence-scoring model rate it above
+    0.85, and what features (entropy, file type, surrounding keywords) drive that score?
+  context: To further reduce the high false-positive rate of regex tools, train a classifier (logistic
+    regression or gradient boosting) on labeled features from SecretBench and historical alerts — repository
+    sensitivity, file extension, surrounding tokens/keywords, and secret entropy — to score each new alert
+    and automatically escalate those above 0.85. Surface the top-3 contributing features in the alert
+    text so the analyst can quickly judge validity. A high score with strong entropy + sensitive-repo
+    features is a confident true positive; a high score driven by weak features warrants manual review.
+  answer_sources:
+  - GitHub Advanced Security alert logs
+  - GitGuardian alert logs
+  - Third-party secret scanning service API logs
+  - 'NAI: Third-party secret scanning platforms and APIs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'model = load(''secret_confidence_gbm'')   # trained on SecretBench + historical alerts
+
+      feats = [repo_sensitivity, file_ext, surrounding_keywords, entropy]
+
+      score = model.predict_proba(feats)
+
+      if score > 0.85: escalate(alert, top3_features=explain(model, feats))'
+- question: Did a Git account created within the last 72 hours perform a clone or fork against a repository
+    tagged 'sensitive' or 'critical'?
+  context: Adversaries often spin up throwaway accounts to pull down sensitive code during reconnaissance.
+    Join git.clone/repo.fork audit events with user account metadata and alert when the acting user's
+    account age is under 72 hours AND the target repository is tagged 'sensitive' or 'critical'. A brand-new
+    account immediately reaching for your most sensitive repositories is a strong targeting signal — legitimate
+    new hires rarely fork critical repos within hours of account creation. Investigate the source IP/ASN
+    and any prior activity from the account.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider audit logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (github_audit, gitlab_audit) action IN (''git.clone'',''repo.fork'')
+
+      | lookup user_metadata actor OUTPUT account_created
+
+      | where (now() - account_created) < 72h AND repo_tag IN (''sensitive'',''critical'')
+
+      | alert severity=HIGH'
+- question: Is the daily clone volume on a critical repository spiking beyond three standard deviations
+    of its 30-day baseline, especially with new accounts contributing an outsized share, and are failed/denied
+    access events also rising?
+  context: Mass cloning of a critical repo can indicate bulk exfiltration of code during reconnaissance.
+    For each critical repository compute the 30-day moving average and standard deviation of daily clones,
+    and alert when a day's count exceeds the mean by 3σ. Escalate to high severity when new accounts (age
+    < 30 days) contribute more than the 90th percentile of their historical proportion of clones. Separately
+    profile and alert on failed/denied access events (403/permission-denied) as a distinct enumeration
+    signal — a burst of denials shows an actor probing what they cannot reach.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider audit logs'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (github_audit,gitlab_audit) action=''git.clone'' repo_tag=''critical''
+
+      | bin _time span=1d | stats count as clones, sum(eval(account_age<30d)) as new_acct_clones by repo,_time
+
+      | eventstats avg(clones) as mu, stdev(clones) as sd, perc90(new_acct_clones/clones) as p90 by repo
+
+      | where clones > mu+3*sd | eval severity=if((new_acct_clones/clones)>p90,''HIGH'',''MEDIUM'') |
+      alert'
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (github_audit,gitlab_audit) status IN (''403'',''permission_denied'')
+
+      | bin _time span=1d | stats count as denials by actor,repo,_time
+
+      | eventstats avg(denials) as mu, stdev(denials) as sd by repo
+
+      | where denials > mu+3*sd | alert label=''access_enumeration'''
+- question: Has a never-before-seen actor cloned or forked a sensitive repository, per a Bayesian new-edge
+    model over (actor, repository) pairs?
+  context: First-contact between an actor and a sensitive asset is inherently suspicious during reconnaissance.
+    Apply a Bayesian new-edge prediction model (Metelli and Heard) to (actor, repository) pairs and raise
+    an alert when a never-before-seen actor clones/forks a sensitive repo, weighting the alert by the
+    actor's overall rarity in your environment. A rare actor touching a sensitive repo for the first time
+    scores highest; a frequently-seen actor accessing a new repo is lower risk. This complements account-age
+    rules by catching established-but-unusual actors.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider audit logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/Stats pseudocode
+    query: "model = bayesian_new_edge(history=(actor,repo) edges)\nfor event in clone_fork_events where\
+      \ repo_tag in ('sensitive','critical'):\n   if edge(event.actor, event.repo) is new:\n      score\
+      \ = model.surprise(event.actor, event.repo) * actor_rarity(event.actor)\n      alert(event, score)"
+- question: Does the observed hourly/daily clone or fork volume for a critical repository fall outside
+    the 99% confidence interval predicted by a seasonal time-series (SARIMA) model?
+  context: Seasonal models capture normal weekday/weekend and business-hour rhythms of repo activity.
+    Train a SARIMA model on historical clone/fork counts for critical repositories and alert when hourly/daily
+    activity falls outside the 99% confidence interval. Report observed-vs-expected counts and the offending
+    repo/actor in the alert. Spikes far above the expected band — especially off-hours — suggest automated
+    or adversarial bulk access; troughs may indicate a logging gap. This catches volume anomalies that
+    static thresholds miss across seasonal patterns.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider audit logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "model = SARIMA.fit(history.clone_fork_counts[critical_repos], seasonal=daily/weekly)\npred,\
+      \ lo, hi = model.forecast(ci=0.99)\nif observed < lo OR observed > hi:\n   alert(repo, actor, observed=observed,\
+      \ expected=pred)"
+- question: Is any repository's actual visibility setting more permissive than its intended state (i.e.,
+    a repo marked internal/private is actually public)?
+  context: Misconfiguration that exposes an internal/private repo publicly is exactly the foothold an
+    adversary seeks during reconnaissance. Periodically query the Git provider API for repository visibility
+    settings, compare each to a master list of intended states, and alert when a repository's actual visibility
+    is more permissive than intended. A drift to 'public' on an internal-tagged repo is a configuration
+    exposure that should be remediated immediately and reviewed for any external clone/fork that occurred
+    while it was exposed.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider APIs and audit logs'
+  range: Last 90 days (continuous polling)
+  queries:
+  - technology: Git-API/pseudocode
+    query: "for repo in provider_api.list_repos():\n   intended = master_visibility_list[repo.name]\n\
+      \   if more_permissive(repo.visibility, intended):   # e.g. actual=public, intended=private\n  \
+      \    alert(repo, actual=repo.visibility, intended=intended, severity='HIGH')"
+- question: Has the Shannon entropy of accessed repository names dropped below the 10th percentile of
+    its 30-day history, indicating focused access to a small set of repos?
+  context: Targeted reconnaissance concentrates on a few high-value repositories, which lowers the diversity
+    (entropy) of accessed repo names compared to normal broad developer activity. Aggregate repo.access
+    events hourly and compute the Shannon entropy of accessed repository names, alerting when the entropy
+    drops below the 10th percentile of its 30-day history. A sharp entropy drop means activity has narrowed
+    onto a small set of repos — consistent with an actor zeroing in on a sensitive target rather than
+    routine wide-ranging development.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider APIs and audit logs'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (github_audit,gitlab_audit) action=''repo.access''
+
+      | bin _time span=1h | stats count by repo,_time
+
+      | per hour: H = shannon_entropy(distribution of repo access counts)
+
+      | eventstats perc10(H) as p10 over trailing 30d
+
+      | where H < p10 | alert label=''focused_access'''
+- question: Are per-actor or per-repo permission-denied/404 rates spiking beyond three standard deviations
+    of their 30-day baseline, distinguishing blind enumeration from authorized browsing?
+  context: An actor blindly enumerating private-intended repositories generates many permission-denied/404
+    responses, unlike an authorized user who knows what they can access. Baseline per-actor and per-repo
+    permission-denied/404 rates over 30 days and alert when denied-access counts spike beyond 3σ. A surge
+    of denials from a single actor or against a single repo indicates probing/enumeration; near-zero denials
+    is normal authorized browsing. This statistical signal helps separate reconnaissance from legitimate
+    access.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider APIs and audit logs'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (github_audit,gitlab_audit) status IN (''permission_denied'',''404'')
+
+      | bin _time span=1h | stats count as denied by actor,repo,_time
+
+      | eventstats avg(denied) as mu, stdev(denied) as sd by actor
+
+      | where denied > mu+3*sd | alert label=''enumeration'''
+- question: Does an Isolation Forest or One-Class SVM flag a Git audit session involving a private-intended
+    repository as a high-anomaly outlier, and what features drive the score?
+  context: Multivariate session anomalies catch reconnaissance that no single metric reveals. Train an
+    Isolation Forest or One-Class SVM on Git audit sessions using features such as clone/fork counts,
+    denied-access ratio, time of day, and account age, then flag high-anomaly-score sessions involving
+    private-intended repositories. Use LIME/feature attributions to surface the top-3 drivers in the alert
+    (e.g., high denied ratio + new account + off-hours). A high anomaly score on a private-intended repo
+    session is a strong targeting indicator worth manual triage.
+  answer_sources:
+  - GitHub audit stream
+  - GitLab audit events
+  - 'NAI: Cloud-based Git provider APIs and audit logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = session_features(clone_count, fork_count, denied_ratio, hour_of_day, account_age)\n\
+      model = IsolationForest.fit(historical_sessions)   # or OneClassSVM\nscore = model.anomaly_score(session)\n\
+      if score > threshold AND session.repo.intended in ('private','internal'):\n   alert(session, top3=lime_explain(model,\
+      \ feats))"
+- question: Is there a successful (4624) or failed (4625) authentication from a non-corporate IP for an
+    identity whose credentials were recently found in a public code repository?
+  context: Once an adversary harvests credentials from a public repo, the next step is using them. Maintain
+    a watchlist of usernames/credentials found in public repositories (populated by first-party scanning
+    and breach-matching, per Thomas et al.) and trigger a CRITICAL alert when Windows Event ID 4624 (success)
+    or 4625 (failure) shows authentication for those identities from non-corporate IPs. A watchlisted
+    account authenticating externally — successfully or not — directly links leaked-secret reconnaissance
+    to attempted initial access and demands immediate credential rotation and investigation.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Cloud Identity Provider Logs (e.g., Azure AD), Perimeter
+    Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(EventID=4624 OR EventID=4625)
+
+      | lookup leaked_cred_watchlist username OUTPUT match
+
+      | where match=true AND NOT cidr_match(src_ip, corporate_ranges)
+
+      | alert severity=''CRITICAL'''
+- question: For a watchlisted (leaked-credential) user, is the external authentication failure rate exceeding
+    its 30-day baseline by 3σ, or is there a failure-streak-then-success transition indicating successful
+    credential stuffing?
+  context: Credential stuffing against a known-leaked account produces a burst of external failures, sometimes
+    followed by a success. For each watchlisted user, baseline external authentication failure rates over
+    30 days and alert when the hourly failure rate exceeds the baseline by 3σ. Critically, treat the success-after-many-failures
+    transition (a 4625 streak followed by a 4624) as a distinct high-severity state change — that pattern
+    means the adversary likely guessed/confirmed the credential and gained access. Investigate the source
+    and session immediately on such a transition.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Cloud Identity Provider Logs (e.g., Azure AD), Perimeter
+    Firewalls'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EventID=4625 user IN watchlist NOT cidr_match(src_ip,corp)
+
+      | bin _time span=1h | stats count as fails by user,_time
+
+      | eventstats avg(fails) as mu, stdev(fails) as sd by user
+
+      | where fails > mu+3*sd | alert
+
+      -- separately: detect 4625-streak immediately followed by 4624 for same user/src -> severity HIGH'
+- question: Is a watchlisted account authenticating from a never-before-seen source ASN/geo per a Bayesian
+    new-edge model?
+  context: A leaked-credential account suddenly logging in from a source it has never used before is a
+    classic compromise signal. Use a Bayesian new-edge model (Metelli and Heard) over (user, source-ASN/geo)
+    pairs to flag a watchlisted account authenticating from a never-before-seen source. The model weights
+    by source rarity, so a watchlisted user appearing from an unusual ASN/geography scores high. This
+    catches successful use of leaked credentials even when volume-based failure detection does not fire.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Cloud Identity Provider Logs (e.g., Azure AD), Perimeter
+    Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: ML/Stats pseudocode
+    query: "model = bayesian_new_edge(history=(user, src_asn_geo))\nfor ev in auth_events where ev.user\
+      \ in watchlist:\n   if edge(ev.user, ev.src_asn_geo) is new:\n      alert(ev, score=model.surprise(ev.user,\
+      \ ev.src_asn_geo))"
+- question: Does a Random Forest authentication risk model score a login above 0.9, and which features
+    (watchlist status, ASN, geo rarity, time, result) contribute most?
+  context: Combine many weak signals into one risk score. Train a Random Forest (or apply structural-login
+    modeling per Siadati and Memon) on features such as watchlist status, source IP ASN, geolocation rarity,
+    time of day, and login result, alerting when predicted risk exceeds 0.9 and listing the top-3 contributing
+    features in the alert. A high-risk score driven by watchlist status + rare geo + off-hours is a confident
+    indicator that leaked credentials are being abused for initial access; surfacing the drivers lets
+    the analyst validate quickly.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Cloud Identity Provider Logs (e.g., Azure AD), Perimeter
+    Firewalls'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'feats = [watchlist_status, src_asn, geo_rarity, hour_of_day, logon_result]
+
+      model = RandomForest.load(''auth_risk'')
+
+      risk = model.predict_proba(feats)
+
+      if risk > 0.9: alert(event, top3=feature_importance(model, feats))'
+- question: Is a single source IP generating more than 10 failed logons (4625) against distinct user accounts
+    within a five-minute window, indicating password spraying?
+  context: After enumerating usernames (e.g., from leaked repo content), adversaries spray a few passwords
+    across many accounts. Alert when a single source IP triggers more than 10 Windows Event ID 4625 failures
+    for distinct user accounts within five minutes (Splunk Threat Research distinct-account thresholds;
+    tune to your environment). The defining feature is breadth — many distinct accounts from one source
+    in a short window — versus brute force which hammers one account. A positive hit warrants blocking
+    the source and reviewing whether any sprayed account subsequently succeeded.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Web Application Firewalls (WAFs)'
+  range: Last 90 days (5-minute windows)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EventID=4625
+
+      | bin _time span=5m | stats dc(target_user) as distinct_accts by src_ip,_time
+
+      | where distinct_accts > 10 | alert label=''password_spray'' severity=''HIGH'''
+- question: Per source IP within one hour, does the ratio of unique target accounts to failed attempts
+    exceed 0.9 with more than 10 distinct accounts, and is there a subsequent failure-to-success transition?
+  context: A high unique-accounts-to-attempts ratio is the statistical fingerprint of spraying (roughly
+    one attempt per account across many accounts), distinct from brute force (many attempts per account).
+    Calculate the ratio of unique target accounts to failed attempts per source IP and alert when the
+    ratio exceeds 0.9 AND the distinct account count surpasses 10 within one hour. Track the failure-to-success
+    transition as a distinct escalation state — if any sprayed account then succeeds, treat it as a likely
+    compromise and escalate immediately.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Web Application Firewalls (WAFs)'
+  range: Last 90 days (1-hour windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'EventID=4625
+
+      | bin _time span=1h | stats dc(target_user) as accts, count as attempts by src_ip,_time
+
+      | eval ratio = accts/attempts
+
+      | where ratio > 0.9 AND accts > 10 | alert
+
+      -- escalate if any of those accounts shows a later 4624 from same src'
+- question: Does clustering of authentication events (by ASN, user-agent, targeted accounts, timing) reveal
+    a low-and-slow password spray distributed across many source IPs that per-IP thresholds miss?
+  context: Sophisticated actors spread sprays across many IPs and slow the cadence to evade per-IP thresholds.
+    Cluster authentication events by behavioral features (source ASN, user-agent, targeted accounts, timing)
+    to surface low-and-slow sprays (Microsoft Sentinel approach). DBSCAN on 15-minute windows flags clusters
+    characterized by one source IP and many distinct accounts, and more importantly aggregates related
+    sources into a campaign. The alert should name the contributing accounts/IPs. A coherent cluster targeting
+    many accounts across IPs is a distributed spray that simple thresholds would never catch.
+  answer_sources:
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Web Application Firewalls (WAFs)'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = [src_asn, user_agent, set(target_accounts), timing]\nclusters = DBSCAN(window='15m').fit(auth_failure_events)\n\
+      for c in clusters:\n   if c.distinct_accounts large and shares ASN/UA pattern:\n      alert(campaign=c,\
+      \ accounts=c.accounts, ips=c.src_ips)"
+- question: Is an external resolver querying an internal-only hostname (e.g., *.internal.corp.com) discovered
+    in leaked repository content, and are NXDOMAIN responses for those names spiking?
+  context: Leaked configs and scripts in public repos frequently reveal internal hostnames and service
+    endpoints that adversaries then probe. Maintain a watchlist of internal-only hostnames discovered
+    in leaked repo content and alert when Zeek dns.log shows an external resolver querying any of them.
+    Also profile NXDOMAIN responses for these names as a distinct probing signal — repeated external lookups
+    (even failing ones) for internal-only names indicate an actor working from leaked intelligence to
+    map your attack surface.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Perimeter Firewalls, DNS Resolvers, Network TAPs providing data to Zeek sensors'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'source=dns.log
+
+      | where query in internal_hostname_watchlist AND is_external(orig_h)
+
+      | alert label=''internal_name_external_query''
+
+      -- separately: stats count by query where rcode_name=''NXDOMAIN'' -> probing signal'
+- question: Is a successful inbound connection (conn_state=SF) using a destination port in the bottom
+    1st percentile of the 30-day frequency table, and are rejected connections (S0/REJ) per source rising?
+  context: Adversaries probing internal services discovered via leaked repos often target unusual ports.
+    Build a 30-day frequency table of inbound destination ports and alert when a successful connection
+    (conn_state='SF') uses a port in the bottom 1st percentile. Separately count failed/rejected connections
+    (conn_state S0/REJ) per source as an enumeration signal — a source generating many rejects is scanning.
+    A successful connection on a rare port to an internal service is especially notable, as it suggests
+    the actor reached something not normally exposed.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Perimeter Firewalls, DNS Resolvers, Network TAPs providing data to Zeek sensors'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'source=conn.log
+
+      | stats count by id.resp_p over trailing 30d -> freq_table
+
+      | where conn_state=''SF'' AND percentile_rank(id.resp_p) < 1 | alert label=''rare_port_success''
+
+      -- separately: stats count by orig_h where conn_state in (''S0'',''REJ'') -> enumeration'
+- question: Does a Bayesian new-edge model flag a first-time inbound connection from an external source
+    to a non-public internal service whose name was sourced from a public repository?
+  context: First-contact between an external source and a non-public internal endpoint is highly suspicious,
+    especially when that endpoint's name came from a leaked repo. Apply a Bayesian new-edge model (Metelli
+    and Heard) over (external-source, internal-service) pairs to flag first-time inbound connections to
+    non-public endpoints whose names were sourced from a public repository. The model weights by source
+    rarity. A never-before-seen external source reaching a private endpoint named in leaked content tightly
+    couples reconnaissance to attempted access and merits immediate investigation.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Perimeter Firewalls, DNS Resolvers, Network TAPs providing data to Zeek sensors'
+  range: Last 90 days
+  queries:
+  - technology: ML/Stats pseudocode
+    query: "model = bayesian_new_edge(history=(ext_src, internal_service) edges)\nfor c in inbound_conns\
+      \ where c.service in leaked_endpoint_set:\n   if edge(c.ext_src, c.service) is new:\n      alert(c,\
+      \ score=model.surprise(c.ext_src, c.service))"
+- question: Does a One-Class SVM or Isolation Forest trained on Zeek conn.log features flag an inbound
+    connection as an outlier from normal profiles, with explainable drivers?
+  context: Multivariate modeling of inbound connections catches anomalous probing that single-feature
+    rules miss. Train a One-Class SVM or Isolation Forest on Zeek conn.log features (destination port,
+    protocol, duration, bytes, conn_state) to learn normal inbound connection profiles and alert on outliers,
+    using LIME-style feature attribution for explainability and robustness (Scientific Reports 2025).
+    An outlier inbound connection — unusual port + protocol + byte pattern — toward internal services
+    is consistent with reconnaissance acting on leaked endpoint intelligence; the feature attributions
+    let the analyst judge whether it is benign.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Perimeter Firewalls, DNS Resolvers, Network TAPs providing data to Zeek sensors'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feats = [id.resp_p, proto, duration, orig_bytes, resp_bytes, conn_state]\nmodel = OneClassSVM.fit(normal_inbound)\
+      \   # or IsolationForest\nif model.is_outlier(conn):\n   alert(conn, drivers=lime_explain(model,\
+      \ feats))"
