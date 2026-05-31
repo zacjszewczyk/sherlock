@@ -1,0 +1,509 @@
+name: 'T1036.001: Masquerading: Invalid Code Signature'
+id: d48b215d-463f-4157-90d7-147a24b34719
+description: 'Investigate the execution of binaries and loaded images that mimic valid code signatures
+  but fail digital-signature validation (MITRE T1036.001, Masquerading: Invalid Code Signature). Adversaries
+  copy certificate metadata and signature blocks from legitimately signed software onto tampered or unsigned
+  payloads so the files appear trustworthy to users, analysts, and security tooling while still failing
+  cryptographic validation. This playbook helps an analyst hunt for: processes and image loads matching
+  known-malicious hashes or stolen code-signing certificate thumbprints; signature-validation failures
+  (Sysmon SignatureStatus Invalid/Unavailable, Windows CodeIntegrity 3004/3033/3037/3077, macOS Gatekeeper/syspolicyd
+  failures); the tell-tale combination of a high-reputation signer subject with an invalid status; mismatched
+  Authenticode digests (''Bad Digest'' 0x80096010) from copied signatures; rare, typosquatted, self-signed,
+  or otherwise anomalous certificate attributes; downloaded files that execute with invalid signatures
+  shortly after retrieval; and structural/behavioral anomalies in claimed-signed binaries. It blends symbolic-logic
+  rules, statistical baselining and outlier detection, and machine-learning classification across endpoint
+  (Windows Sysmon/Security/CodeIntegrity, macOS EndpointSecurity/unified log) and network (Zeek) telemetry
+  to surface invalid-signature masquerading consistent with defense evasion by sophisticated actors, commodity
+  malware, and insiders.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any executed binaries or loaded images matching a known-malicious SHA256 hash or a compromised/stolen
+    code-signing certificate thumbprint or serial from a high-confidence threat-intelligence feed?
+  context: 'This is the highest-fidelity signal for invalid-code-signature masquerading tied to defense
+    evasion: adversaries frequently reuse stolen or compromised code-signing certificates across malware
+    families, so certificate thumbprints and serials are durable indicators that outlive a single hash.
+    Continuously extract the file SHA256 and the certificate thumbprint/serial from every process creation
+    (Sysmon EID 1, Windows 4688) and image load (Sysmon EID 7) event, and query both against a curated
+    high-confidence blocklist (for example the 72 compromised certificates and signed-malware hashes characterized
+    in Certified Malware, Kim et al., CCS 2017). Crucially, retain blocked certificate serials even after
+    the CA revokes them, because revocation does not stop adversaries from reusing the cert metadata.
+    A positive match is a high-priority alert worthy of immediate containment; a negative result still
+    leaves the other questions in this playbook to catch unknown-bad signing artifacts.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices (workstations, servers), Domain Controllers, Code repositories, Build servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "events = process_creation(Sysmon EID 1, Win 4688) UNION image_load(Sysmon EID 7);\nfor e in\
+      \ events: sha = e.sha256; thumb = e.cert_thumbprint; serial = e.cert_serial;\nif sha in TI.bad_hashes\
+      \ or thumb in TI.bad_certs or serial in TI.bad_cert_serials:\n  alert(priority=high, host=e.host,\
+      \ image=e.image, matched=sha|thumb|serial, parent=e.parent);"
+- question: Which individual endpoints show a statistically abnormal surge in unique threat-intel IOC
+    matches within 24 hours relative to their own 30-day baseline?
+  context: A single endpoint accumulating many distinct IOC hits in a short window suggests targeted intrusion
+    or active tooling deployment rather than opportunistic, scattered commodity malware. Compute the daily
+    frequency (count/min and count/day) of unique IOC hits per endpoint, then maintain a per-endpoint
+    rolling 30-day mean and standard deviation. Alert when a host's unique IOC hits in 24h exceed mean
+    + 3*sigma. Derive the sigma threshold from your own environment's 30-day distribution rather than
+    a fixed number. A positive result focuses the hunt on a concentrated host; a negative result across
+    the fleet argues against an active, IOC-heavy intrusion at this time.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices (workstations, servers), Domain Controllers, Code repositories, Build servers'
+  range: Last 90 days (per-host rolling 30-day baseline, 24h evaluation window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'hits = ioc_matches by host, day (count distinct ioc);
+
+      baseline = per_host mean, stddev over trailing 30d;
+
+      alert when hits_24h(host) > baseline.mean(host) + 3*baseline.stddev(host);
+
+      output host, hits_24h, baseline.mean, baseline.stddev, top_iocs;'
+- question: Is there an enterprise-wide, unforecasted spike in IOC-match counts for a specific indicator
+    type (hash or certificate thumbprint) that signals the start of a new campaign?
+  context: Stolen certificates are shared across malware families, so a sudden, sharp rise in matches
+    keyed to a single certificate thumbprint or hash often marks a new campaign before per-host thresholds
+    trip. Run time-series anomaly detection (SARIMA or Prophet) on the enterprise-wide IOC-match count,
+    segmented by IOC type. When the observed count deviates sharply from the forecast for one indicator,
+    raise an alert and surface the top-3 contributing indicators (indicator value, number of affected
+    hosts, first-seen time) so analysts can immediately scope the campaign. Certificate-keyed spikes are
+    especially high value. A positive detection should drive a broad hunt across the listed contributing
+    indicators.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: Endpoint devices (workstations, servers), Domain Controllers, Code repositories, Build servers'
+  range: Last 90 days (model trained on >=60 days of history, evaluated daily)
+  queries:
+  - technology: ML pipeline pseudocode
+    query: "series = daily_count(ioc_matches) segmented by ioc_type in {hash, cert_thumbprint};\nmodel\
+      \ = Prophet|SARIMA.fit(series[:-1]); forecast = model.predict(today);\nif observed(today) > forecast.upper:\n\
+      \  contributors = top3(indicator by host_count, first_seen);\n  alert(ioc_type, observed, forecast,\
+      \ contributors);"
+- question: Are any processes or loaded images executing with an Invalid or Unavailable signature status,
+    or triggering CodeIntegrity failed-validation / unsigned / policy-blocked events (or macOS Gatekeeper
+    verification failures)?
+  context: 'This is the core symbolic-logic detection for the technique: the OS itself reports that a
+    file claiming to be signed failed cryptographic validation. Trigger on Sysmon EID 7 where SignatureStatus
+    is ''Invalid'' or ''Unavailable'' while Signed=''true'', and on Windows CodeIntegrity events 3004/3033
+    (failed validation), 3037 (unsigned image loaded), and 3077 (blocked by signing policy). Correlate
+    each hit with the corresponding process creation (Sysmon EID 1) to capture parent process and command
+    line for context, following SigmaHQ code-integrity rules. On macOS, alert on syspolicyd/Gatekeeper
+    codesign verification failures. Maintain a curated allowlist of known-good but invalidly-signed software
+    (legacy/internal tools) to suppress benign noise. A positive result on a non-allowlisted path is a
+    strong masquerading indicator.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3004
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3033
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3037
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3077
+  - Sysmon Event ID 1
+  - macos:unifiedlog subsystem:syspolicyd
+  - 'NAI: All enterprise workstations, Application servers, Developer workstations, Systems with WDAC/App
+    Control or Gatekeeper policies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'sig = Sysmon EID 7 where Signed=''true'' and SignatureStatus in {Invalid, Unavailable};
+
+      ci = CodeIntegrity where EventID in {3004,3033,3037,3077};
+
+      mac = macos:unifiedlog subsystem=syspolicyd where verdict=''failed'';
+
+      join with Sysmon EID 1 on host,image to add parent, command_line;
+
+      alert when not allowlisted(path, signer); output host, image, signer, status, parent;'
+- question: Are there files presenting a high-reputation signer subject (e.g., 'Microsoft Corporation',
+    'Google LLC') while their signature status is Invalid?
+  context: A trusted, well-known signer subject paired with an Invalid signature status is an impossible
+    legitimate combination and is the precise artifact of copying a real signature/metadata block onto
+    a tampered payload (the MetaTwin technique). Flag any file whose signer subject matches a curated
+    list of high-reputation publishers but whose SignatureStatus is Invalid, and treat it as high severity
+    regardless of file path - location-based exclusions should not suppress this signal. A positive result
+    is among the most defensible indicators of deliberate masquerading; a clean result means no copied
+    high-reputation signatures were observed.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3004
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3033
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3037
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3077
+  - Sysmon Event ID 1
+  - macos:unifiedlog subsystem:syspolicyd
+  - 'NAI: All enterprise workstations, Application servers, Developer workstations, Systems with WDAC/App
+    Control or Gatekeeper policies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'sig = Sysmon EID 7 where SignatureStatus=''Invalid'';
+
+      reputable = {''Microsoft Corporation'',''Google LLC'',''Apple Inc.'',''Adobe Inc.'',...};
+
+      alert(severity=high) when sig.signer_subject in reputable;
+
+      output host, image, signer_subject, status, hash, parent;'
+- question: Which hosts or users exceed their own 30-day 99th-percentile rate of invalid-signature events
+    within a 24-hour window?
+  context: Beyond single-event rules, a host or user generating an unusual volume of invalid-signature
+    events may indicate active deployment of masqueraded tooling. For each host and user, build a rolling
+    30-day baseline of invalid-signature event counts (a State=fail metric), use the 99th percentile as
+    the alert threshold, and raise a medium-priority alert when a host/user exceeds it in 24h. Separately
+    track the per-host ratio of failed vs. successful validations to profile the failure mode (chronic
+    misconfiguration vs. sudden burst). Derive percentile thresholds from your own telemetry. A positive
+    result narrows the hunt to specific principals.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3004
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3033
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3037
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3077
+  - Sysmon Event ID 1
+  - macos:unifiedlog subsystem:syspolicyd
+  - 'NAI: All enterprise workstations, Application servers, Developer workstations, Systems with WDAC/App
+    Control or Gatekeeper policies'
+  range: Last 90 days (per-host/user rolling 30-day baseline, 24h evaluation window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'invalid = signature_events where status in {Invalid, Unavailable};
+
+      baseline = per host,user 30d distribution -> p99;
+
+      alert(priority=medium) when count_24h(host|user) > p99(host|user);
+
+      also compute fail_rate = failed/(failed+success) per host; output host, user, count_24h, p99, fail_rate;'
+- question: Can a supervised classifier rank invalid-signature events by maliciousness probability using
+    static file, path, signer, and command-line features, with explainable top features?
+  context: 'Single-event rules over-alert; an ML triage layer prioritizes the events most likely to be
+    true masquerading. Train a supervised classifier (XGBoost/Random Forest/LightGBM) on labeled invalid-signature
+    events using static features from the EMBER schema: file-path bucket (temp/download/system32), file-name
+    entropy, parent process, user type, command-line tokens, signer subject, and certificate-table size.
+    Output a probability score for triage and surface the top-3 SHAP-contributing features in the alert
+    so the analyst understands why the model flagged the event (explainability). A high-probability score
+    with intelligible drivers (e.g., temp path + reputable signer + invalid status) is strong corroboration
+    for escalation.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3004
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3033
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3037
+  - Microsoft-Windows-CodeIntegrity/Operational Event ID 3077
+  - Sysmon Event ID 1
+  - macos:unifiedlog subsystem:syspolicyd
+  - 'NAI: All enterprise workstations, Application servers, Developer workstations, Systems with WDAC/App
+    Control or Gatekeeper policies'
+  range: Last 90 days (model trained on labeled history)
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'X = features(path_bucket, fname_entropy, parent, user_type, cmdline_tokens, signer_subject,
+      cert_table_size);
+
+      model = XGBoost|RandomForest|LightGBM.fit(labeled_invalid_sig_events);
+
+      p = model.predict_proba(event); shap = explain(model, event);
+
+      alert when p > threshold; output host, image, p, top3_shap_features;'
+- question: Do any newly observed PE files have a recomputed Authenticode digest that does not match the
+    hash embedded in their WIN_CERTIFICATE signature block ('Bad Digest', 0x80096010)?
+  context: A digest mismatch is the dominant invalid-signature failure mode - roughly 74.3% of improperly
+    signed malware fails on bad digests from copied signatures (Certified Malware, Kim et al., CCS 2017)
+    - and is the exact MetaTwin artifact of pasting a legitimate signature onto a modified payload. On
+    process creation (Sysmon EID 1) for newly observed PE files, run a SOAR playbook that acquires the
+    binary, parses the WIN_CERTIFICATE structure to extract the embedded signed hash, recomputes the Authenticode
+    digest, and raises a high-priority alert on mismatch (WinVerifyTrust returning 0x80096010). A mismatch
+    means the file was modified after signing or had a signature copied onto it - high-confidence tampering
+    evidence.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: All enterprise workstations, Critical servers (Domain Controllers, Database Servers), Software
+    distribution points, File shares'
+  range: Last 90 days (triggered on first-seen PE execution)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on Sysmon EID 1 where image is newly_observed PE:\n  bin = acquire(image); embedded = parse_WIN_CERTIFICATE(bin).signed_hash;\n\
+      \  computed = authenticode_digest(bin);\n  if embedded != computed or WinVerifyTrust(bin)==0x80096010:\n\
+      \    alert(priority=high, host, image, embedded, computed);"
+- question: Which hosts are statistical outliers in the percentage of signed PE files in protected directories
+    whose recomputed Authenticode digest mismatches?
+  context: Tampering concentrated in protected system directories (e.g., C:\Windows\System32) is a strong
+    sign of an attempt to masquerade as core OS components. Weekly, hunt across endpoints scanning protected
+    directories and compute, per host, the percentage of signed PE files whose recomputed digest mismatches
+    (Volume + State metric). Establish a fleet-wide baseline and alert on hosts whose mismatch percentage
+    is a statistical outlier (Z-score > 3). Track the distinct error breakdown - bad digest vs. distrusted
+    root vs. unverified timestamp - as separate failure-mode signals so benign causes (expired timestamps)
+    are not conflated with deliberate digest tampering.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: All enterprise workstations, Critical servers (Domain Controllers, Database Servers), Software
+    distribution points, File shares'
+  range: Last 90 days (weekly fleet-wide hunt)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per host: scan signed PE in protected_dirs;
+
+      mismatch_pct(host) = count(bad_digest)/count(signed_pe);
+
+      fleet = distribution(mismatch_pct over hosts);
+
+      alert when zscore(mismatch_pct(host), fleet) > 3;
+
+      breakdown by {bad_digest, distrusted_root, unverified_timestamp};'
+- question: Among digest-mismatched files, which are the most anomalous by PE structure and signature
+    metadata according to an unsupervised outlier model?
+  context: Once digest mismatches are found, analysts need to prioritize the most suspicious. For each
+    digest-mismatched file extract a feature vector of PE metadata (compile time, section entropy, SizeOfImage
+    vs. on-disk size, overlay size) per PE-Probe (Shafiq et al., VB2009), plus signature metadata (signer,
+    timestamp) and context (path, host criticality). Score with Isolation Forest and surface the top-3
+    contributing features in the alert so analysts can prioritize the most anomalous tampering. A high
+    anomaly score with drivers like large overlay or SizeOfImage/on-disk discrepancy points to repacked
+    payloads carrying copied signatures.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: All enterprise workstations, Critical servers (Domain Controllers, Database Servers), Software
+    distribution points, File shares'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'X = features(compile_time, section_entropy, sizeofimage_vs_ondisk, overlay_size, signer, timestamp,
+      path, host_criticality);
+
+      model = IsolationForest.fit(X[mismatched_files]);
+
+      score = model.decision_function(file);
+
+      alert on low score; output file, host, anomaly_score, top3_features;'
+- question: Are any executables signed with certificates exhibiting suspicious attributes - known-bad
+    issuer/subject, typosquatted subjects (e.g., 'Microsof Corporation'), excessive validity (>10 years),
+    or self-signed certs masquerading as commercial CAs?
+  context: 'Adversaries abuse or fabricate certificates whose chains do not validate while crafting attributes
+    to look authoritative. Monitor Sysmon EID 7 against a watchlist of suspicious certificate attributes:
+    known-bad issuer/subject names, typosquatted subjects that closely imitate real publishers, unusually
+    long validity periods (>10 years), and self-signed certificates pretending to be commercial CAs. A
+    match indicates an intentional attempt to make a binary appear legitimately signed; combine with signature
+    status for severity. Typosquatted subjects in particular are difficult to explain benignly.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 1
+  - 'NAI: All enterprise workstations and servers, Certificate Authority servers, Developer workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "sig = Sysmon EID 7;\nalert when sig.issuer in known_bad or sig.subject in known_bad\n  or\
+      \ fuzzy_match(sig.subject, reputable_publishers) within edit_distance<=2 and not exact\n  or validity_days(sig.cert)\
+      \ > 3650\n  or (sig.self_signed and sig.subject ~ 'CA|Corporation|Inc');\noutput host, image, subject,\
+      \ issuer, validity_days, self_signed;"
+- question: Which executions are signed by certificate subjects/issuers in the top 1% of rarity relative
+    to the daily environment baseline, especially when combined with an invalid signature status?
+  context: 'Legitimate enterprise software is signed by a small, stable set of publishers; a never-before-seen
+    or extremely rare signer is inherently more suspect. Daily, ingest unique certificate subjects/issuers
+    from Sysmon EID 7 into a lookup with observation counts. For each new execution compute a rarity score
+    = inverse(observation count) for subject and issuer, and alert on executions in the top 1% (99th percentile)
+    of rarity scores that day. Combine with the State signal: a rare signer AND an Invalid status is high
+    severity. A positive result flags potential first-stage tooling or freshly minted attacker certificates.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 1
+  - 'NAI: All enterprise workstations and servers, Certificate Authority servers, Developer workstations'
+  range: Last 90 days (daily rarity scoring against a rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'lookup = counts(subject, issuer) over baseline;
+
+      for exec: rarity = 1/lookup[subject] + 1/lookup[issuer];
+
+      alert when rarity in top 1% of today''s distribution;
+
+      escalate when rarity_high AND signature_status=''Invalid'';
+
+      output host, image, subject, issuer, rarity, status;'
+- question: Do unsupervised clustering/outlier models identify certificates with anomalous signing practices
+    (rare combinations of validity, entropy, self-signed status, certificate-table size)?
+  context: Anomalous signing practices cluster differently from the bulk of legitimate enterprise certificates.
+    Weekly, run unsupervised clustering (DBSCAN) and/or Isolation Forest over certificate features - validity
+    duration (days), subject-string entropy, issuer-string entropy, self-signed boolean, and certificate-table
+    size - using a feature schema drawn from EMBER (Anderson & Roth). Flag noise points and tiny clusters
+    as anomalous signing practices and report the top-3 deviating features per flagged certificate. This
+    catches novel certificate abuse that static watchlists miss; positive results warrant deeper inspection
+    of the associated binaries and hosts.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 1
+  - 'NAI: All enterprise workstations and servers, Certificate Authority servers, Developer workstations'
+  range: Last 90 days (weekly clustering run)
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'X = cert_features(validity_days, subject_entropy, issuer_entropy, self_signed, cert_table_size);
+
+      labels = DBSCAN.fit_predict(X); iso = IsolationForest.fit(X);
+
+      flag = noise_points(labels) OR tiny_clusters(labels) OR iso.outliers;
+
+      output cert, associated_images, hosts, top3_deviating_features;'
+- question: Was a file downloaded from an external source and then executed on the same host within 10
+    minutes with an Invalid/Unavailable signature or a CodeIntegrity 3004/3037/3077 event?
+  context: Tying a network download to an immediate invalid-signature execution links delivery to evasion
+    and elevates confidence in malicious intent. Correlate a file hash from Zeek files.log observed in
+    a Sysmon EID 1 on the destination host within 10 minutes, joined to the corresponding Sysmon EID 7.
+    Generate a high-priority alert if SignatureStatus is Invalid/Unavailable or a CodeIntegrity 3004/3037/3077
+    event fires. Verify the downloaded artifact is truly a PE/Mach-O via content-type classification (Magika)
+    to catch extension/metadata masquerade where a non-executable wrapper hides an executable. A positive
+    result is a strong, time-correlated kill-chain link from delivery to execution.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: Network Egress/Internet Gateway, Proxy server logs, All enterprise workstations'
+  range: Last 90 days (10-minute download-to-execution correlation window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'dl = Zeek files.log (with conn.log src domain);
+
+      exec = Sysmon EID 1 where sha256==dl.sha256 and host==dl.dest and ts in [dl.ts, dl.ts+10m];
+
+      sig = Sysmon EID 7 for exec;
+
+      ci = CodeIntegrity {3004,3037,3077} for host;
+
+      alert(high) when sig.status in {Invalid,Unavailable} or ci fired;
+
+      verify Magika(dl.file) == PE|Mach-O; output host, domain, hash, status;'
+- question: Which source domains have the highest risk ratio of downloads that lead to invalid-signature
+    executions, and what download failure modes characterize staging infrastructure?
+  context: Domains whose downloads disproportionately result in invalid-signature executions are likely
+    malware staging infrastructure. Track the source domain for each download->invalid-execution chain
+    and, weekly, compute a risk ratio per domain = (downloads leading to invalid execution) / (total downloads).
+    Rank domains and investigate the top 5%. Separately profile download failure modes (HTTP 404, blocked/reset
+    connections, NXDOMAIN on the source FQDN) as distinct signals of ephemeral or rapidly rotated staging
+    infrastructure. High-risk-ratio domains become candidates for blocking and retrospective hunting across
+    all hosts that contacted them.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: Network Egress/Internet Gateway, Proxy server logs, All enterprise workstations'
+  range: Last 90 days (weekly domain risk-ratio computation)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'chains = download->invalid_exec joined by hash, host, 10m;
+
+      for domain: risk_ratio = count(invalid_exec_chains)/count(total_downloads);
+
+      rank domains; investigate top 5%;
+
+      profile failure_modes {http_404, rst/blocked, nxdomain} per domain;
+
+      output domain, risk_ratio, downloads, invalid_execs, failure_profile;'
+- question: Is there an anomalous hourly spike in download->invalid-execution events across the enterprise
+    indicating a coordinated delivery campaign?
+  context: A coordinated campaign produces a burst of download-then-invalid-execution chains that an hourly
+    anomaly detector can catch before per-domain ratios mature. Build an hourly time series of download->invalid-execution
+    event counts enterprise-wide and apply Seasonal Hybrid ESD (S-H-ESD) anomaly detection. On an anomalous
+    spike, raise an alert listing the top-3 contributing domains, hashes, and hosts to drive a broader
+    hunt. A positive detection focuses incident response on the contributing infrastructure and affected
+    hosts during the spike window.
+  answer_sources:
+  - Zeek files.log
+  - Zeek conn.log
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - 'NAI: Network Egress/Internet Gateway, Proxy server logs, All enterprise workstations'
+  range: Last 90 days (hourly time series, evaluated continuously)
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'series = hourly_count(download->invalid_exec chains);
+
+      anoms = SeasonalHybridESD(series);
+
+      on anomaly(hour): contributors = top3(domain, hash, host by count);
+
+      alert(hour, observed, expected, contributors);'
+- question: Does a file's true content type (per Magika classification) disagree with its declared extension
+    or version-info product type, indicating a precursor to copied-metadata masquerade?
+  context: Before applying any signature logic, you must establish what the file actually is - adversaries
+    manipulate extensions and version-info so a payload appears benign or differently typed. Classify
+    the file's true content type with Magika (Fratantonio et al., 2024) and alert when the declared extension
+    or version-info product type disagrees with the actual executable format. A mismatch (e.g., a file
+    claiming to be a document or DLL that is actually a PE/Mach-O executable) is a precursor to copied-metadata
+    masquerade and warrants treating downstream signature claims with suspicion. This guards the rest
+    of the pipeline against being fooled by forged metadata.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, EDR/sandbox detonation pipeline, Software distribution
+    points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for file in newly_observed:\n  true_type = Magika.classify(file);\n  declared = file.extension;\
+      \ product = file.versioninfo.product_type;\n  alert when true_type in {PE, Mach-O} and (declared\
+      \ not in exe_exts or product disagrees);\n  output host, file, true_type, declared, product;"
+- question: Do binaries that claim a valid signature exhibit structural PE anomalies - packing, abnormal
+    section entropy, SizeOfImage vs. on-disk discrepancy, or large overlay/certificate-table size?
+  context: Repacked payloads carrying copied signatures betray themselves structurally even when their
+    signature claim looks plausible. Compute structural PE statistics - packed/non-packed classification,
+    section entropy distribution, SizeOfImage vs. on-disk size, and overlay/certificate-table size - per
+    PE-Probe (Shafiq et al., VB2009). Score binaries that claim a valid signature but exhibit packing
+    or overlay anomalies; these structural deviations outperform raw entropy alone for catching repacked
+    payloads that carry copied signatures. A high structural-anomaly score on a claimed-signed binary
+    is strong corroboration to detonate or quarantine.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, EDR/sandbox detonation pipeline, Software distribution
+    points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for bin where claims_signed:\n  feats = {packed?, section_entropy_dist, sizeofimage_vs_ondisk,\
+      \ overlay_size, cert_table_size};\n  score = structural_anomaly(feats) vs fleet baseline;\n  alert\
+      \ when packed or overlay_anomaly or sizeofimage_mismatch;\n  output host, bin, score, anomalous_features;"
+- question: Does a supervised static classifier (and behavioral API-sequence model for detonated samples)
+    score a claimed-signed executable as likely malicious, with explainable top features?
+  context: A combined static+behavioral ML layer catches invalidly-signed masquerading binaries that evade
+    single-event rules. Score every claimed-signed executable with a LightGBM/XGBoost model trained on
+    the EMBER static feature schema (certificate-table, byte/entropy histograms, imports, signer), and
+    corroborate with behavioral API-sequence models trained on the Mal-API-2019 evaluation for detonated
+    samples. Emit the top-3 SHAP/gain features (e.g., 'signer=Microsoft but digest invalid', 'high section
+    entropy', 'imports VirtualAllocEx') in the alert text for analyst explainability. A high static score
+    reinforced by malicious API sequences from detonation is high-confidence evidence for escalation.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Windows Event ID 4688
+  - 'NAI: All enterprise workstations and servers, EDR/sandbox detonation pipeline, Software distribution
+    points'
+  range: Last 90 days (models retrained periodically; detonation as triggered)
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'static = LightGBM|XGBoost.fit(EMBER_features);
+
+      p_static = static.predict_proba(bin); shap = explain(static, bin);
+
+      if detonated: p_behav = APISeqModel(Mal-API-2019).predict(api_trace);
+
+      alert when p_static high or p_behav high;
+
+      output host, bin, p_static, p_behav, top3_features;'
