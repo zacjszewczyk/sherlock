@@ -1,0 +1,363 @@
+name: 'T1036.003: Masquerading: Rename Legitimate Utilities'
+id: 1308015e-f227-4d8f-9e77-1f6f7e67da31
+description: 'Investigate whether an adversary is renaming, copying, or relocating legitimate system utilities
+  and signed binaries (e.g., rundll32.exe, powershell.exe, PsExec, certutil.exe, wmic.exe, AutoHotKey,
+  IronPython) to evade name- or path-based security controls. This playbook helps an analyst hunt for
+  execution where the on-disk filename diverges from the binary''s true identity: hashes of known-good
+  utilities running under unexpected names, on-disk names that conflict with embedded PE metadata (OriginalFilename
+  / InternalName), command-line argument patterns characteristic of one utility executed under a different
+  process name, critical binaries launched from non-standard or world-writable directories, typosquatted
+  or homoglyph utility names, and renamed utilities that subsequently spawn shells or initiate suspicious
+  outbound network connections. It combines deterministic symbolic-logic rules, statistical baselining
+  (frequency, volume, entropy/KL divergence, failure-state profiling), and machine-learning classifiers/anomaly
+  models across Windows Sysmon, Windows Security auditing, Linux auditd/osquery, macOS Endpoint Security/unified
+  logs, and Zeek network telemetry.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there process executions where the binary's SHA256 matches a known-good legitimate utility
+    in our hash catalog, but the on-disk image filename does NOT match the expected name for that hash?
+  context: A renamed legitimate utility keeps its original bytes, so its hash is unchanged even though
+    its filename has been altered to evade name-based monitoring. This deterministic check maintains a
+    maintained {Hash, ExpectedFilename} table built from the LOLBAS abusable-binary catalog plus core
+    System32 binaries (powershell.exe, cmd.exe, rundll32.exe, psexec.exe, certutil.exe, wmic.exe). Query
+    Sysmon Event ID 1 / Windows 4688 process-creation events, look up the recorded SHA256, and alert whenever
+    the hash is in the known-good list but the Image filename differs from its expected name. A positive
+    result is high-confidence evidence of masquerading and supports the Stealth tactic hypothesis that
+    the adversary is blending malicious use of trusted tooling into normal activity. This is the deterministic
+    floor and these exact pairings must never be removed.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon deployed, particularly Domain Controllers, file
+    servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: process_events(EventID in [1,4688]) | lookup known_good[sha256] -> expected_name | where sha256
+      in known_good AND lower(image_filename) != lower(expected_name) | alert sha256, image, expected_name,
+      host, parent_image, command_line
+- question: For each known-good utility hash, is there a newly observed or statistically rare process
+    name (a low-frequency (hash,name) pairing) appearing in our environment, especially as a sudden burst?
+  context: Beyond exact mismatches, renamed utilities reveal themselves as outliers in the name distribution
+    attached to a given hash. Over a rolling 30-day baseline, for each known-good hash compute the frequency
+    distribution of associated process names plus Volume (executions/host/day) and Frequency (executions/min).
+    Flag a new (hash,name) pairing when the name falls below the 1st percentile of names seen for that
+    hash, or when a first-seen name for an established hash appears as a burst (>3 executions in 5 minutes).
+    Use KL divergence against the expected name-character distribution to score randomized/garbled rename
+    strings rather than raw Shannon entropy, and derive per-hash percentile cutoffs from your own telemetry.
+    A positive result indicates a stealthy rename that an exact-match list might miss; a negative result
+    means observed names align with the established baseline for that trusted binary.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon deployed, particularly Domain Controllers, file
+    servers, and developer workstations.'
+  range: Last 90 days, baselined over a rolling 30-day window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = process_events(last 30d) | stats count by sha256, image_name, host | compute name_freq_pctile
+      per sha256, kl_div(name_chars, expected_dist); current | where name_freq_pctile < 0.01 OR (first_seen_name
+      AND count_5min > 3) | alert sha256, image_name, kl_score, host
+- question: Does a supervised ML classifier score a process-creation event as likely masquerading based
+    on parent process, command-line length/entropy, hash-vs-name mismatch, and PE version-info features?
+  context: Some renames evade both exact lists and simple baselines, so a supervised classifier (Random
+    Forest / XGBoost / LightGBM) is trained on labeled process-creation events using features such as
+    parent process, command-line length and token entropy, the hash-vs-name match flag, and EMBER-style
+    static PE version-info features. Active-learning labeling of high-value command-line samples sharply
+    reduces labeling cost while keeping precision high. To remain triage-friendly and defensible, every
+    alert MUST surface the top-3 contributing features (e.g., 'name!=OriginalFileName', 'parent=winword.exe',
+    'cmdline contains -enc') alongside the model score. A high score with explanatory features lets an
+    analyst quickly confirm a stealthy renamed-utility execution; a low score with benign features helps
+    suppress noise.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon deployed, particularly Domain Controllers, file
+    servers, and developer workstations.'
+  range: Last 90 days for scoring; model trained on a stable historical period
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: features = extract(parent_image, cmdline_len, token_entropy, hash_name_mismatch, ember_pe_features);
+      score = clf.predict_proba(features); where score > threshold | alert score, top3_feature_contributions,
+      host, image, command_line
+- question: Are there process-creation events where the on-disk Image filename does not equal the OriginalFilename/InternalName
+    embedded in the binary's PE metadata, especially for watchlisted abused utilities?
+  context: PE binaries carry embedded version-info (OriginalFilename, InternalName) that survives renaming,
+    providing a direct way to unmask a renamed utility. Trigger on Sysmon Event ID 1 events where the
+    Image filename does not equal OriginalFileName, prioritizing OriginalFileName values on a watchlist
+    of abused utilities (PsExec.exe, certutil.exe, procdump.exe, rundll32.exe, wmic.exe, cmd.exe, powershell.exe),
+    per SigmaHQ renamed-binary rules and the LOLBAS project. Extend this to renamed script interpreters
+    where process.pe.original_file_name matches AutoIt/AutoHotkey/KIX32 but process.name does not. These
+    exact field-comparison rules are the deterministic floor and a match is strong evidence of intentional
+    concealment supporting the Stealth tactic.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon configured to capture and log PE header information.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: process_events(EventID=1) | where lower(image_filename) != lower(pe_original_filename) AND
+      pe_original_filename in watchlist[psexec,certutil,procdump,rundll32,wmic,cmd,powershell,autoit,autohotkey,kix32]
+      | alert image, pe_original_filename, host, parent_image, command_line
+- question: For each OriginalFilename, has a host introduced a new Image name or has the name distribution's
+    KL divergence from the expected single-name baseline exceeded enterprise norms?
+  context: A legitimate utility almost always runs under a single canonical filename, so the appearance
+    of additional Image names for one OriginalFilename signals possible renaming. For each unique OriginalFileName,
+    baseline the set of associated Image filenames and their counts. Alert when a host introduces a new
+    Image name for a watchlisted OriginalFileName, or when the per-OriginalFileName name distribution's
+    KL divergence from the expected (mostly single-name) distribution exceeds 2 standard deviations of
+    the enterprise baseline. Track Volume (distinct Image names per OriginalFileName per day) and State
+    (signed vs unsigned, hash known-good vs unknown) as separate features, and derive thresholds from
+    your environment. Positive results highlight stealthy aliasing of trusted binaries; negatives confirm
+    a stable single-name mapping.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon configured to capture and log PE header information.'
+  range: Last 90 days, baselined against the enterprise distribution
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = process_events | stats dc(image_name) as name_div, values(image_name) by pe_original_filename,
+      host; compute kl_div(name_dist, expected_single_name); where new_image_for_watchlisted_orig OR kl_div
+      > mean+2*stddev | alert pe_original_filename, image_name, kl_div, signed_state, host
+- question: Does a one-class anomaly model flag the (Image, OriginalFilename, signer, PE-section entropy)
+    tuple as deviating from known-good pairings, and does AMIDES-style adaptive detection attribute it
+    to an evaded rule?
+  context: To catch renamed/relocated invocations that evade exact string rules, train a one-class SVM
+    or autoencoder on known-good (Image, OriginalFileName, signer, PE-section entropy) tuples drawn from
+    a stable period using EMBER-style static PE features, then flag tuples with high reconstruction error.
+    Run AMIDES-style adaptive misuse detection in parallel so evasive invocations are caught and attributed
+    to the specific exact rule they evaded, giving the analyst explainability. Alerts must list the top-3
+    anomalous features. A high reconstruction error tied to an evaded rule is strong evidence of deliberate
+    masquerading; consistent low error confirms the binary's identity matches its metadata and signer.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with Sysmon configured to capture and log PE header information.'
+  range: Last 90 days for scoring; model trained on a stable historical baseline
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: tuples = (image, pe_original_filename, signer, pe_section_entropy, ember_features); recon_err
+      = ocsvm_or_autoencoder.score(tuples); amides = adaptive_misuse(events); where recon_err > threshold
+      OR amides.evaded_rule != null | alert recon_err, evaded_rule, top3_anomalous_features, host
+- question: Are there processes whose command-line arguments match a library of abused-utility regex patterns
+    (e.g., 'powershell -enc', 'certutil -urlcache', 'rundll32 javascript:') while the executing process
+    name/OriginalFilename is NOT the expected utility for that pattern?
+  context: Argument patterns betray the true tool being run even when the process name has been changed.
+    Match process command lines (Windows 4688 / Sysmon Event ID 1) against a library of regexes for abused
+    utilities drawn from LOLBAS and SigmaHQ (e.g., 'powershell -enc', 'certutil -urlcache', 'rundll32
+    javascript:', 'regsvr32 /i:http'), and alert when the executing process name/OriginalFilename does
+    not match the expected utility for that pattern. Augment exact matching with AMIDES adaptive misuse
+    detection to catch abbreviated or obfuscated variants of the same intent. A match where, say, audiodg.exe
+    runs PowerShell-style '-enc' arguments is a clear masquerade supporting the Stealth tactic; non-matches
+    reflect normal tool usage under expected names.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with command-line process auditing enabled.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: process_events(EventID in [1,4688]) | match command_line against regex_lib(powershell -enc,
+      certutil -urlcache, rundll32 javascript:, regsvr32 /i:http) -> expected_tool | where lower(image_name)
+      != expected_tool AND lower(pe_original_filename) != expected_tool | alert image, pe_original_filename,
+      matched_pattern, command_line, host
+- question: For each command-line pattern, is the executing process name a rare or first-seen outlier
+    relative to the historical set of names that ran that pattern, particularly in a burst?
+  context: The set of process names that legitimately execute a given command-line pattern is usually
+    small and stable. For each command-line pattern, build a frequency table of the process names that
+    historically executed it, with Volume (count/day) and Frequency (count/min) metrics. Flag executions
+    whose process name is outside the top 99% of names for that pattern or is first-seen, especially in
+    a burst. Use per-entity command profiling to score deviation, and derive percentile cutoffs from local
+    data. A rare or first-seen name attached to a known abused pattern strongly suggests a renamed utility
+    executing characteristic arguments; an expected name confirms benign usage.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with command-line process auditing enabled.'
+  range: Last 90 days, baselined over historical pattern-to-name frequencies
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = process_events | stats count by cmdline_pattern, image_name | compute name_pctile
+      per pattern; current | where name_pctile < 0.01 OR first_seen_name_for_pattern | where burst(count_5min)
+      | alert cmdline_pattern, image_name, name_pctile, host
+- question: Does an NLP/ML classifier or clustering of command-line strings separate malicious renamed-utility
+    invocations from benign ones, or flag clusters with high command similarity but high process-name
+    diversity?
+  context: Command lines can be modeled as text to learn benign-vs-malicious distinctions that resist
+    simple renaming. Encode command strings with regex tokenization/one-hot or TF-IDF and train supervised
+    classifiers to separate benign vs malicious utility invocations, using active learning to label efficiently.
+    Optionally DBSCAN-cluster command embeddings and flag clusters with high command similarity but high
+    process-name diversity, which is a hallmark of one tool being run under many renamed aliases. Alerts
+    must surface the top-3 tokens/features driving the score. A high-confidence malicious cluster or classification
+    with explanatory tokens supports the masquerading hypothesis; benign classification reduces analyst
+    noise.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: All Windows endpoints and servers with command-line process auditing enabled.'
+  range: Last 90 days for scoring; classifier trained on labeled historical commands
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: X = tfidf_or_tokenize(command_line); score = clf.predict_proba(X); clusters = dbscan(embed(command_line));
+      where score > threshold OR (cluster_cmd_similarity high AND dc(image_name) high) | alert score,
+      cluster_id, top3_tokens, image_name, host
+- question: Are critical system binaries (e.g., svchost.exe) executing from non-standard directories outside
+    their allowed paths, especially when a preceding file-creation for that file occurred in the same
+    non-standard path?
+  context: Adversaries copy or relocate system binaries to writable directories and run them from there
+    to evade path-based controls. Maintain a {executable -> legitimate directory} map (svchost.exe ->
+    C:\Windows\System32, etc.) and alert on Sysmon Event ID 1 process creation where a critical name runs
+    from a path outside its allowed set, per SigmaHQ. Also flag binaries executing from paths that imitate
+    but are not the real signed 'Program Files' directories. Raise severity when a preceding Sysmon Event
+    ID 11 file-creation for the same file occurred in that non-standard path within a short window. These
+    exact name/path pairings are the deterministic floor. A critical binary running from C:\Users\Public\
+    or C:\Temp is strong evidence of stealthy staging supporting the Stealth tactic.
+  answer_sources:
+  - Windows Event ID 11 (Sysmon)
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: User profile directories (e.g., AppData, Temp), shared temporary folders (e.g., C:\Temp, C:\ProgramData),
+    and world-writable directories.'
+  range: Last 90 days; correlate file-creation and execution within a short window (e.g., 10 minutes)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: exec = process_events(EventID=1) | lookup allowed_dir[image_name]; where image_path not in
+      allowed_dir[image_name] OR image_path like 'imitation Program Files' | join filecreate = file_events(EventID=11)
+      on same file_path within 10m | alert image_name, image_path, file_create_ts, host (raise severity
+      if join matched)
+- question: Are there process names that are fuzzy matches (edit-distance 1) or visual/unicode homoglyph
+    variants of protected system-utility names (e.g., 'svch0st.exe', 'rundlI32.exe') running from outside
+    System32/SysWOW64?
+  context: Typosquatted and homoglyph names visually impersonate trusted utilities to deceive analysts
+    and EDRs. Apply fuzzy matching (edit-distance fuzziness 1) of process names against protected utility
+    names to catch typosquats like 'svch0st.exe' or 'rundlI32.exe' not running from System32/SysWOW64.
+    For visually-confusable/unicode homoglyph substitutions that edit-distance misses, score name similarity
+    with a learned visual embedding (Siamese network). A near-miss name to a critical utility, especially
+    outside its legitimate directory, is strong evidence of deliberate deception supporting the Stealth
+    tactic; exact legitimate names from legitimate paths are benign.
+  answer_sources:
+  - Windows Event ID 11 (Sysmon)
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: User profile directories (e.g., AppData, Temp), shared temporary folders (e.g., C:\Temp, C:\ProgramData),
+    and world-writable directories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: process_events(EventID=1) | where edit_distance(image_name, protected_names) == 1 OR homoglyph_visual_sim(image_name,
+      protected_names) > threshold | where image_path not in [System32, SysWOW64] | alert image_name,
+      matched_protected_name, image_path, host
+- question: For each process name, is the execution path a statistical outlier (bottom 1%) relative to
+    its historical execution-path baseline, and are there blocked/failed launch attempts (AppLocker/WDAC
+    denials) preceding success?
+  context: 'Each binary has a stable set of legitimate execution paths; rare paths and failed launches
+    signal staging of renamed binaries. For each process name, build a historical baseline of execution
+    paths with counts and flag executions whose path is in the bottom 1% for that name. Explicitly profile
+    the State of these attempts: count blocked/failed executions (AppLocker/WDAC denials, access-denied)
+    per host as a distinct signal from successful ones, since renamed-binary staging often produces failed
+    launches before success. Derive percentile cutoffs from local telemetry. A rare path combined with
+    a burst of prior denials is strong evidence of an adversary iterating toward successful stealthy execution;
+    common paths with no failures are benign.'
+  answer_sources:
+  - Windows Event ID 11 (Sysmon)
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: User profile directories (e.g., AppData, Temp), shared temporary folders (e.g., C:\Temp, C:\ProgramData),
+    and world-writable directories.'
+  range: Last 90 days, baselined over historical path frequencies
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: baseline = process_events | stats count by image_name, image_path | compute path_pctile per
+      image_name; denials = applocker_wdac_events | stats count(blocked) by image_name, host; current
+      | where path_pctile < 0.01 | enrich with denials | alert image_name, image_path, path_pctile, blocked_count,
+      host
+- question: Does a per-host time-series anomaly model detect spikes in the daily count of critical utilities
+    executed from non-standard paths?
+  context: A surge in critical binaries launching from atypical paths can indicate active staging or lateral
+    spread. Build a per-host daily time series of the count of critical utilities executed from non-standard
+    paths and fit a seasonal anomaly model (SARIMA/Prophet); flag anomalous spikes. Feed the renamed-name
+    and command-line context into a command classifier and surface the top-3 contributing features (path,
+    name-vs-OriginalFileName, parent) in the alert. An anomalous spike with explanatory features points
+    to coordinated stealthy execution supporting the Stealth tactic; counts within seasonal norms are
+    benign.
+  answer_sources:
+  - Windows Event ID 11 (Sysmon)
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: User profile directories (e.g., AppData, Temp), shared temporary folders (e.g., C:\Temp, C:\ProgramData),
+    and world-writable directories.'
+  range: Last 90 days of daily counts for seasonal modeling
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: ts = per_host_daily_count(critical_util from non_standard_path); model = sarima_or_prophet.fit(ts);
+      anomaly = model.detect_spike(ts); where anomaly | enrich classifier(renamed_name, command_line)
+      | alert host, day, observed, expected, top3_features
+- question: Has a process previously tagged 'suspected_masquerade' (by any hash/PE/path/fuzzy-name rule)
+    subsequently spawned cmd.exe/powershell.exe or initiated a network connection to a threat-intel destination?
+  context: The most dangerous masquerades are those followed by hands-on-keyboard or C2 activity. Implement
+    a stateful rule that tags a process 'suspected_masquerade' if it fired any prior hash/PE/path/fuzzy-name
+    rule, then alert high-severity when that process (as parent) spawns cmd.exe/powershell.exe (Sysmon
+    Event ID 1) or initiates a network connection (Sysmon Event ID 3 / Zeek conn.log) to a threat-intel
+    destination. This chains stealth-tactic detections with follow-on behavior, sharply raising confidence.
+    A renamed utility that then opens a shell or beacons to known-bad infrastructure is a strong, actionable
+    incident; no follow-on activity lowers urgency but the masquerade flag still warrants review.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - Windows Event ID 3 (Sysmon)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, and all Windows endpoints/servers with Sysmon installed.'
+  range: Last 90 days; correlate follow-on activity within a short window of the masquerade tag
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: tag process as suspected_masquerade if matched(hash_rule OR pe_rule OR path_rule OR fuzzy_rule);
+      child = process_events(EventID=1) where parent in suspected_masquerade AND child in [cmd.exe,powershell.exe];
+      net = conn_events(Sysmon3 OR zeek_conn) where src_proc in suspected_masquerade AND dest in threat_intel;
+      alert high_severity proc, child_or_dest, host
+- question: For a 'suspected_masquerade' process, does its subsequent network behavior show rare destinations,
+    beacon-like regularity, DGA-like domains, or elevated failure rates (NXDOMAIN, connection-refused,
+    HTTP 4xx)?
+  context: 'C2 setup by a renamed tool leaves statistical fingerprints in network telemetry. For any ''suspected_masquerade''
+    process, score subsequent network behavior from Zeek conn.log/dns.log: Volume (bytes sent vs received
+    and their ratio), Frequency (connections/min, beacon regularity), and State (explicitly profile NXDOMAIN
+    responses, connection-refused/blocked attempts, and HTTP 4xx as distinct signals of C2 setup). Flag
+    domains in the bottom 1% of enterprise prevalence (top-1M list) or ports outside the top 95%, and
+    use KL divergence to flag randomized/DGA-like domains. Derive cutoffs from local baselines. Rare destinations,
+    regular beacons, or a cluster of failed resolutions following a masquerade strongly indicate active
+    C2; ordinary, prevalent destinations reduce concern.'
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - Windows Event ID 3 (Sysmon)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, and all Windows endpoints/servers with Sysmon installed.'
+  range: Last 90 days, baselined against enterprise network prevalence
+  queries:
+  - technology: Zeek/pseudocode
+    query: conn = zeek_conn join dns where src_proc in suspected_masquerade; score Volume(bytes_out/bytes_in),
+      Frequency(conn_per_min, beacon_regularity), State(count NXDOMAIN, conn_refused, http_4xx); where
+      domain_prevalence_pctile < 0.01 OR port_pctile > 0.95 OR kl_div(domain_chars) high | alert proc,
+      dest, beacon_score, failure_counts, host
+- question: Does a behavioral-chain ML model score the process-lineage/command sequence (renamed utility
+    -> shell/network) as malicious, with AMIDES attributing any rule-evasive variant to the evaded rule?
+  context: Whole-chain scoring captures the masquerade-to-impact progression that individual rules miss.
+    Build process-lineage/command sequences and score the chain (renamed utility -> shell/network) with
+    a classifier trained on benign vs malicious command/behavior sequences. Run AMIDES adaptive misuse
+    detection in parallel to flag rule-evasive variants and attribute the evaded rule. Alerts must surface
+    the top-3 features driving the score (e.g., 'renamed parent', 'rare destination', 'spawned powershell
+    -enc'). A high chain score with explanatory features is strong, defensible evidence of a stealthy
+    renamed-utility attack reaching command-and-control or execution; a low score indicates the lineage
+    resembles benign administration.
+  answer_sources:
+  - Windows Event ID 1 (Sysmon)
+  - Windows Event ID 3 (Sysmon)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, and all Windows endpoints/servers with Sysmon installed.'
+  range: Last 90 days for scoring; sequence model trained on labeled historical chains
+  queries:
+  - technology: ML/Pipeline pseudocode
+    query: seq = build_process_lineage(renamed_util -> child_proc -> network); score = chain_classifier.predict_proba(seq);
+      amides = adaptive_misuse(seq); where score > threshold OR amides.evaded_rule != null | alert score,
+      evaded_rule, top3_features, root_proc, host
