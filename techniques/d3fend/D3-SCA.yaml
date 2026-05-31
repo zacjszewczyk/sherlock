@@ -1,0 +1,462 @@
+name: 'D3-SCA: System Call Analysis'
+id: c1888a0a-2670-4b4c-b460-130d2ef61d3b
+description: 'Investigate whether a process is exhibiting unauthorized behavior by analyzing its system
+  calls and the host telemetry that proxies for them (Windows process-creation/Sysmon events, Linux auditd
+  SYSCALL records, and eBPF syscall events from Falco/Tracee). This playbook helps an analyst confirm
+  that detailed process/system-call telemetry is being collected and is of sufficient quality, then hunt
+  for malicious behavior across five complementary methods: deterministic argument-aware syscall signatures
+  (process injection, credential dumping, privilege escalation, sensitive-file access); statistical anomaly
+  detection over short syscall sequences (sliding-window n-grams, t-stide, and HMMs); volume/frequency/failure-rate
+  profiling that captures the physics of an attack (byte and call volume, calls-per-minute, and success/failure
+  state, including ransomware-style tight file loops); and machine-learning sequence and whole-system
+  provenance-graph models that surface novel, multi-stage intrusions with explainable feature attribution
+  for triage. Use it to find rare processes, anomalous parent-child relationships, conserved malicious
+  API/syscall chains, and deviations from a program''s normal execution path on critical servers, high-value
+  workstations, container hosts, and credential-bearing systems such as Domain Controllers and LSASS hosts.'
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Across every named area of interest, which hosts are reporting process and system-call telemetry
+    (Windows Event ID 4688, Sysmon Event ID 1, and Linux auditd SYSCALL records), and which hosts have
+    a collection gap?
+  context: 'This question establishes the detection floor: before any analytic can run, you must confirm
+    the raw telemetry exists and is flowing. Query the log management system for the presence of process
+    creation / syscall events across all NAIs and document the per-host volume over a representative 24-hour
+    window. Hosts that report zero or abnormally low volume relative to peers indicate a collection gap
+    (agent down, Sysmon not installed, auditd ruleset missing, or command-line auditing disabled). Also
+    verify that command-line auditing (ProcessCreationIncludeCmdLine_Enabled) and the Sysmon configuration
+    cover the events you depend on, since a 4688 without command line is far less useful for the downstream
+    methods in this playbook. A positive result (full coverage) confirms the detection floor can operate
+    first-party against the Detect tactic; a negative result is itself an actionable finding that must
+    be remediated before relying on the other questions.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Zeek conn.log
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), user workstations, and application
+    servers.'
+  range: Last 24 hours
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=process (EventCode=4688 OR (source=Sysmon EventID=1) OR (source=auditd type=SYSCALL))
+
+      | stats count AS events by host
+
+      | append [ inputlookup expected_hosts.csv | eval events=0 ]
+
+      | stats sum(events) AS events by host
+
+      | where events < min_expected_threshold  /* hosts with a collection gap */'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=process EventCode=4688 | stats dc(eval(if(isnotnull(CommandLine),1,null()))) AS cmdline_present,
+      count by host
+
+      | eval cmdline_coverage = round(cmdline_present/count*100,1)
+
+      | where cmdline_coverage < 95  /* command-line auditing not fully enabled */'
+- question: On each host, which processes execute so infrequently that they fall in the rare tail of that
+    host's 30-day process-execution baseline and therefore warrant investigation?
+  context: 'Rare processes are a classic signal of intrusion: attacker tools, living-off-the-land binaries
+    used out of context, and dropped payloads execute far less often than the routine software a host
+    runs every day. For each host, aggregate all process creation events over 30 days and compute the
+    execution frequency of each unique NewProcessName, then flag processes below the 5th percentile of
+    frequency for that specific host as rare. Tune the percentile by host class, because servers run a
+    narrower, more predictable process set than user workstations, so the same global threshold would
+    over-alert on workstations and under-alert on servers. This per-host statistical baseline, in the
+    spirit of frequency-weighted syscall profiling, surfaces outliers without needing a known-bad list.
+    A positive result is a rare process to triage against parentage, signing, and command line; a negative
+    result lowers (but does not eliminate) suspicion for that host.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Zeek conn.log
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), user workstations, and application
+    servers.'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=process (EventCode=4688 OR EventID=1) earliest=-30d
+
+      | stats count AS freq by host, NewProcessName
+
+      | eventstats perc5(freq) AS p5 by host
+
+      | where freq <= p5  /* rare processes for that host; tune percentile per host class */'
+- question: On critical servers, are there parent-child process relationships whose historical transition
+    probability is so low that the spawn looks anomalous (for example winlogon.exe spawning powershell.exe)?
+  context: Many attacks manifest as an unusual process lineage even when the individual binaries are legitimate.
+    Build a baseline model of parent-child process relationships on critical-server NAIs, and for each
+    new process event extract ParentProcessName and NewProcessName and compute the transition probability
+    of that pair from historical data using a Markov / HMM model. Pairs with very low probability are
+    flagged as anomalous sequences. HMM-based sequence models achieved the highest accuracy among syscall
+    data models, which is why this method is favored for lineage. The alert must list the offending parent,
+    the child, and the computed transition probability so the analyst can immediately judge plausibility.
+    A positive result (a near-zero-probability spawn such as a logon/UI process launching a scripting
+    engine) is a strong lead for injection, persistence, or hands-on-keyboard activity under the Detect
+    tactic; a high-probability pair is expected behavior.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Zeek conn.log
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), user workstations, and application
+    servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=process (EventCode=4688 OR EventID=1)
+
+      | `markov_transition_prob(ParentProcessName, NewProcessName)` AS p   /* trained on historical pairs
+      */
+
+      | where p < 0.001
+
+      | table _time host ParentProcessName NewProcessName p'
+- question: On Linux and container hosts, are there argument-aware syscall signatures of unauthorized
+    behavior, such as ptrace with PTRACE_POKETEXT/PTRACE_POKEDATA, a shell execve under a network daemon,
+    open/openat of /etc/shadow by a non-allowlisted process, or kernel-module loads?
+  context: 'These deterministic signatures are the non-negotiable detection floor and must run first-party
+    on the live syscall stream. The crucial point is that the discriminator is the syscall constant or
+    argument, not just the syscall name: ptrace becomes code injection only with the PTRACE_POKETEXT/POKEDATA
+    request writing into another process''s memory; execve of a shell is suspicious specifically when
+    its parent is a network daemon (web shell / exploited service); open/openat of /etc/shadow matters
+    when the caller is a non-root, non-allowlisted process; and init_module/finit_module signals a kernel
+    module load (rootkit). Maintain per-host allowlists rather than deleting these rules, and emit the
+    offending PID, target PID, request type, and command line. A match is a high-confidence lead; tuning
+    is done through the allowlist, never by removing the rule.'
+  answer_sources:
+  - eBPF syscall events (Falco/Tracee)
+  - Linux auditd SYSCALL records
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Windows Event ID 4688
+  - 'NAI: Application servers, container hosts, user workstations, and credential-bearing servers (Domain
+    Controllers, LSASS hosts).'
+  range: Last 90 days
+  queries:
+  - technology: Falco/Tracee pseudocode
+    query: 'syscall=ptrace AND request IN (PTRACE_POKETEXT, PTRACE_POKEDATA)
+
+      OR (syscall=execve AND proc.name IN (sh,bash,dash) AND proc.pparent IN (nginx,httpd,apache2,sshd))
+
+      OR (syscall IN (open,openat) AND fd.name=/etc/shadow AND NOT user.uid=0 AND NOT proc.name IN allowlist)
+
+      OR (syscall IN (init_module,finit_module))
+
+      => alert(pid, target_pid, request, cmdline)'
+- question: On Windows, are there deterministic credential-dumping or injection call patterns, such as
+    a process opening lsass.exe with dump-capable access and a call trace through dbghelp.dll/dbgcore.dll,
+    or a CreateRemoteThread whose entry point resolves to LoadLibraryA/W?
+  context: These two patterns cover the most common hands-on credential-access and injection techniques.
+    The MiniDump variant (CAR-2020-05-001) is detected when a process opens lsass.exe with GrantedAccess
+    implying read/dump and the call trace includes dbghelp.dll or dbgcore.dll, which export MiniDumpWriteDump.
+    The classic DLL injection (CAR-2013-10-002) is detected when a CreateRemoteThread into another process
+    resolves its entry point to LoadLibraryA or LoadLibraryW. Exclude known security/EDR source processes
+    via an allowlist, but do not delete the thresholds—tune the allowlist instead, because these are deterministic
+    floor rules for the Detect tactic. Watch for benign noise from werfault.exe and tasklist.exe on the
+    LSASS rule. A match against LSASS or a LoadLibrary remote thread from a non-allowlisted process is
+    a strong credential-access / injection indicator.
+  answer_sources:
+  - eBPF syscall events (Falco/Tracee)
+  - Linux auditd SYSCALL records
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Windows Event ID 4688
+  - 'NAI: Application servers, container hosts, user workstations, and credential-bearing servers (Domain
+    Controllers, LSASS hosts).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "(source=Sysmon EventID=10 TargetImage=*lsass.exe GrantedAccess IN (0x1010,0x1410,0x1438,0x143a,0x1fffff)\n\
+      \  CallTrace=*dbghelp.dll* OR CallTrace=*dbgcore.dll*)\nOR (source=Sysmon EventID=8 StartFunction\
+      \ IN (LoadLibraryA, LoadLibraryW))\n| where NOT SourceImage IN edr_allowlist\n| table _time host\
+      \ SourceImage TargetImage GrantedAccess CallTrace StartFunction"
+- question: Does any process's ordered API/syscall sequence align to a known malicious chain (for example
+    VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread) even when junk or no-op calls are inserted
+    to evade exact matching?
+  context: Adversaries pad their call sequences with extraneous or duplicative calls specifically to defeat
+    exact-match signatures. To counter this, score each process's ordered API/syscall sequence against
+    a library of conserved malicious chains using local sequence alignment (Smith-Waterman), which tolerates
+    inserted gaps so that interspersed junk does not break the match. Alert when the alignment score exceeds
+    a chain-specific threshold. This is robust where a naive contiguous-sequence rule would miss the behavior,
+    and it directly targets the injection/execution chains seen in real intrusions. A high-scoring alignment
+    to a chain like allocate-write-create-thread is a strong injection lead under the Detect tactic; low
+    alignment scores indicate the sequence does not resemble the cataloged chain.
+  answer_sources:
+  - eBPF syscall events (Falco/Tracee)
+  - Linux auditd SYSCALL records
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Windows Event ID 4688
+  - 'NAI: Application servers, container hosts, user workstations, and credential-bearing servers (Domain
+    Controllers, LSASS hosts).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for each process: seq = ordered_api_calls(process)\nfor chain in malicious_chain_library:\
+      \        /* e.g. VirtualAllocEx,WriteProcessMemory,CreateRemoteThread */\n    score = smith_waterman(seq,\
+      \ chain)        /* gap-tolerant local alignment */\n    if score > chain.threshold: alert(process,\
+      \ chain, score)"
+- question: For each long-running daemon or service, does the runtime stream of short syscall sequences
+    deviate from its clean-baseline n-gram database beyond the program's mismatch-ratio threshold?
+  context: A program under normal operation traverses a fairly stable set of short syscall sequences;
+    an exploited or hijacked process deviates from that path. Build a normal database of fixed-length
+    sliding-window syscall sequences (start with k=6) for each long-running program during a clean baseline
+    period. At runtime, compute the mismatch ratio (fraction of windows not present in the normal set)
+    and the locality-frame anomaly count, and alert when the mismatch ratio exceeds a per-program threshold
+    derived empirically (typically under 1% for stable daemons). Surface the specific anomalous n-grams
+    in the alert so the analyst can see exactly which call sequences are novel. This 'sense of self' approach
+    is especially effective for web/app servers, Domain Controllers, and database servers whose behavior
+    is consistent. A mismatch spike is a strong indicator of exploitation; a near-zero ratio is consistent
+    with normal execution.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Windows Event ID 4688
+  - 'NAI: Long-running daemons and services on critical servers (web/app servers, DCs, database servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'k=6
+
+      normal = set(sliding_windows(baseline_syscalls(program), k))   /* clean training period */
+
+      windows = sliding_windows(runtime_syscalls(program), k)
+
+      mismatch_ratio = count(w not in normal for w in windows) / len(windows)
+
+      if mismatch_ratio > program.threshold: alert(program, anomalous_ngrams)'
+- question: When syscall sequences are scored with frequency weighting (t-stide), are there rare-but-present
+    sequences that a presence-only n-gram model would miss?
+  context: A plain n-gram model only distinguishes present from absent sequences, but some malicious behavior
+    uses sequences that exist in normal operation yet occur far more rarely than baseline. Augment the
+    n-gram model with frequency weighting (t-stide) so that rare-but-present sequences are scored as anomalous
+    alongside truly absent ones. On the UNM benchmark, HMM and frequency-weighted models achieved 76-100%
+    detection with low false-alarm rates, so this materially improves sensitivity. Crucially, derive the
+    rarity threshold per program from that program's own baseline distribution rather than applying a
+    global constant, since each daemon has its own normal sequence frequencies. A positive result flags
+    a sequence whose observed frequency is far below its baseline; this complements the mismatch-ratio
+    method and reduces blind spots under the Detect tactic.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Windows Event ID 4688
+  - 'NAI: Long-running daemons and services on critical servers (web/app servers, DCs, database servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "model = tstide_train(baseline_syscalls(program), k=6)   /* stores per-sequence frequencies\
+      \ */\nfor w in runtime_windows(program):\n    score = tstide_rarity(model, w)\n    if score > program.baseline_rarity_threshold:\
+      \ alert(program, w, score)"
+- question: Where call-stack telemetry is available, does adding the return-address context to each syscall
+    before HMM scoring reveal injected invocations that look identical to legitimate ones by name alone?
+  context: The same syscall can be benign or malicious depending on where in the program it was invoked
+    from. By augmenting each syscall with its call-stack return-address context before scoring with an
+    HMM, legitimate and injected invocations of the same syscall are distinguished, which sharply reduces
+    false positives for buffer-overflow and code-injection exploits. This is most valuable on long-running
+    services where stack-walk telemetry can be collected. A positive result is a syscall issued from an
+    unexpected return address (e.g., from injected shellcode rather than the program's own code path),
+    a high-fidelity exploitation indicator; a negative result means the call originated from an expected
+    code location consistent with normal execution under the Detect tactic.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Windows Event ID 4688
+  - 'NAI: Long-running daemons and services on critical servers (web/app servers, DCs, database servers).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for each syscall s in process stream:\n    token = (s.name, s.callstack_return_address)\n\
+      hmm = hmm_train(baseline tokens(program))\nif hmm.sequence_loglik(runtime tokens) < program.threshold:\
+      \ alert(program, offending token)"
+- question: For each process, does an Isolation Forest over its volume, frequency, and success/failure
+    feature vector place it in the anomalous upper tail?
+  context: Style-based methods can miss the 'physics' of an attack, so this method profiles raw activity.
+    For each process build a feature vector of Volume (total syscalls, bytes read/written), Frequency
+    (syscalls/min, file opens/min, thread creations/min), and State (counts of successful vs failed calls),
+    then score it with an Isolation Forest and flag the upper tail (anomaly score above ~0.6, tuned per
+    host class). Isolation Forest isolates outliers efficiently without needing labeled malicious data,
+    which suits diverse host populations. Report the top-3 contributing features in the alert so the analyst
+    understands why the process is anomalous (e.g., extreme bytes written plus high file-open rate). A
+    high anomaly score points to ransomware, mass collection/exfiltration, or runaway tooling under the
+    Detect tactic; a low score is consistent with normal resource use.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: User workstations and file/application servers (ransomware and mass-file-access targets).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "features = per_process_vector(total_syscalls, bytes_rw, syscalls_per_min,\n              \
+      \                 file_opens_per_min, thread_creates_per_min, ok_calls, failed_calls)\nscore = isolation_forest.predict(features)\n\
+      if score > 0.6: alert(process, top3_contributing_features)   /* tune threshold per host class */"
+- question: Is any process executing tight, high-frequency loops of read -> encrypt/compute -> write-new-file
+    -> delete-original that indicate mass encryption (ransomware) or wiping?
+  context: Ransomware and wipers betray themselves through the relative frequency of event types inside
+    a tight loop rather than through any single call. Measure the relative frequency of event types within
+    a sliding window per process; a distribution dominated by paired file create/delete at a high rate
+    indicates mass encryption or wiping. Threshold on files-created-then-deleted per minute (for example
+    >50/min on a workstation), tuned per environment because backup and build tooling can legitimately
+    churn files. This loop-distribution approach catches the behavior even when file names and extensions
+    vary. A positive result on a user workstation or file server is a high-severity ransomware lead that
+    warrants immediate containment; tune the threshold to suppress known bulk-file utilities under the
+    Detect tactic.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: User workstations and file/application servers (ransomware and mass-file-access targets).'
+  range: Last 7 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=process (EventID=11 OR source=auditd type=SYSCALL) syscall IN (write,open,unlink) OR
+      EventID=11
+
+      | bin _time span=1m
+
+      | stats count(eval(action="create")) AS creates count(eval(action="delete")) AS deletes by host,
+      process, _time
+
+      | eval churn=min(creates,deletes)
+
+      | where churn > 50   /* tune per environment; high create+delete rate = mass encryption/wipe */'
+- question: Has any process's rate of failed system calls (failed open/openat, failed connect, failed
+    execve) spiked beyond its baseline mean plus three standard deviations, indicating privilege probing
+    or brute-forcing?
+  context: 'Failure state is a distinct and underused signal. Explicitly baseline and monitor error rates
+    as their own series: failed open/openat (ENOENT/EACCES/EPERM), failed connect (ECONNREFUSED), and
+    failed execve. A spike in EACCES/EPERM from a single process indicates privilege probing or enumeration,
+    while a spike in ENOENT indicates path or credential brute-forcing. Alert when a process''s failed-call
+    rate exceeds its baseline mean + 3 standard deviations. Because this watches the success/failure dimension
+    rather than the calls themselves, it catches reconnaissance and access attempts that successful-only
+    telemetry would miss. A positive result is a process aggressively touching resources it cannot access—often
+    the early, noisy phase of privilege escalation or discovery under the Detect tactic.'
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: User workstations and file/application servers (ransomware and mass-file-access targets).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=process (source=auditd type=SYSCALL exit<0) OR (EventID=1)
+
+      | eval err=case(exit=-13,"EACCES",exit=-1,"EPERM",exit=-2,"ENOENT",exit=-111,"ECONNREFUSED",true(),"OTHER")
+
+      | bin _time span=1m | stats count AS fails by host, process, _time
+
+      | eventstats avg(fails) AS mu stdev(fails) AS sd by host, process
+
+      | where fails > mu + 3*sd'
+- question: Does an LSTM language model trained on each process's normal syscall/event sequence flag a
+    runtime event that falls outside its top-g most-probable next events?
+  context: Sequence order is largely invariant to metamorphic obfuscation, so a learned model of normal
+    progression is a powerful detector of novel behavior. Train an LSTM (DeepLog-style) on sequences of
+    discrete syscall/event keys per process during normal operation, then at runtime flag any event that
+    is not within the model's top-g most-probable next events as anomalous. You can train on a small fraction
+    of normal data and update online from analyst feedback, which keeps the model current as the environment
+    changes. The alert must name the violated prediction set—the expected next events versus the observed
+    event—so analysts can validate it. A positive result is a process deviating from its learned execution
+    language, characteristic of exploitation or hijack; a negative result means the event was among the
+    expected continuations under the Detect tactic.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 3 (Network Connection)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: Critical servers and high-value workstations subject to APT/multi-stage intrusion.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = deeplog_lstm.train(normal_event_keys(process))   /* small fraction of normal data\
+      \ */\nfor event in runtime_stream(process):\n    topg = model.predict_next(history)\n    if event\
+      \ not in topg: alert(process, expected=topg, observed=event)"
+- question: When whole-system provenance graphs are built from syscall telemetry, which edges or nodes
+    have high reconstruction error under a temporal GNN, indicating a multi-stage intrusion?
+  context: Multi-stage intrusions span process, file, and socket relationships that no single event reveals.
+    Construct whole-system provenance graphs from syscall telemetry (process/file/socket nodes connected
+    by causal edges) and detect anomalies with a temporal GNN encoder-decoder that scores edges by reconstruction
+    error, then auto-reconstructs a compact attack-summary graph for investigation (KAIROS). For benign-only
+    training and node-level tracing, use an inductive GraphSAGE approach (ThreaTrace) or a self-supervised
+    masked graph auto-encoder with concept-drift handling (MAGIC). These models are designed for APT-style,
+    low-and-slow activity on critical servers and high-value workstations. A positive result is a set
+    of high-error edges/nodes that, when summarized, depicts an attack path (e.g., download -> write ->
+    execute -> connect); the reconstructed graph itself accelerates investigation under the Detect tactic.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 3 (Network Connection)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: Critical servers and high-value workstations subject to APT/multi-stage intrusion.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = build_provenance_graph(syscall_telemetry)   /* nodes: process/file/socket; edges: causal
+      */
+
+      err = temporal_gnn_autoencoder.reconstruction_error(G.edges)
+
+      anomalies = [e for e in G.edges if err[e] > threshold]
+
+      alert(summarize_attack_graph(anomalies))   /* or GraphSAGE / MAGIC for node-level tracing */'
+- question: For every machine-learning anomaly score raised by this playbook, are the top-3 contributing
+    features attached (via SHAP or equivalent) so an analyst can validate and triage rather than act on
+    an opaque score?
+  context: ML detections are only actionable if analysts can understand them. For every ML anomaly score,
+    attach feature-attribution output (e.g., SHAP) listing the top-3 contributing features—such as syscall
+    rate, a rare parent-child edge, or a failed-open count—in the alert text. This lets the analyst confirm
+    whether the model latched onto a meaningful signal or an artifact, dramatically improving triage speed
+    and trust, and providing a defensible rationale for escalation. This is not a separate detector but
+    a mandatory enrichment layered onto the LSTM and provenance-graph methods above. A well-attributed
+    alert shows a coherent story (e.g., extreme syscall rate + rare lineage + many failed opens) that
+    maps cleanly to a hypothesis under the Detect tactic; incoherent attributions flag likely false positives.
+  answer_sources:
+  - Linux auditd SYSCALL records
+  - eBPF syscall events (Falco/Tracee)
+  - Sysmon Event ID 1 (Process Create)
+  - Sysmon Event ID 3 (Network Connection)
+  - Sysmon Event ID 8 (CreateRemoteThread)
+  - Sysmon Event ID 11 (FileCreate)
+  - Windows Event ID 4688
+  - 'NAI: Critical servers and high-value workstations subject to APT/multi-stage intrusion.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "for each ml_alert:\n    shap_vals = shap_explain(model, ml_alert.features)\n    ml_alert.context\
+      \ = top_n(shap_vals, 3)   /* e.g. syscall_rate, rare_parent_child_edge, failed_open_count */\n \
+      \   emit(ml_alert)"
