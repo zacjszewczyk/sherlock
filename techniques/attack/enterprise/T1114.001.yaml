@@ -1,0 +1,385 @@
+name: 'T1114.001: Local Email Collection'
+id: d382f907-58b6-4be4-84b6-caca4c158c7b
+description: Investigate adversary attempts to collect sensitive data from user email stored locally on
+  Windows systems, primarily Microsoft Outlook offline (.ost) and personal storage (.pst) data files found
+  under C:\Users\<username>\Documents\Outlook Files and C:\Users\<username>\AppData\Local\Microsoft\Outlook.
+  This playbook helps an analyst hunt for malicious or non-allowlisted processes that locate, open, and
+  read these mail files; command-line interpreters and archive utilities (cmd.exe, powershell.exe, wscript.exe,
+  robocopy.exe, xcopy.exe, 7z.exe, esentutl.exe) that reference, copy, or compress .pst/.ost files; file-read
+  activity immediately followed by anomalous outbound network connections suggesting exfiltration; read-then-write
+  staging of similarly sized artifacts into common staging directories; and a single account or process
+  touching the mail files of many distinct user profiles within a short window. Each question pairs deterministic
+  symbolic-logic detections with statistical baselining and machine-learning approaches so renamed, obfuscated,
+  or novel collection behavior is still surfaced for triage, supporting the Collection tactic.
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process whose image hash or path matches a known-malicious indicator access a local
+    Outlook data file ending in .pst or .ost, or did any process not on the legitimate-accessor allowlist
+    read those files?
+  context: Local email collection begins when a process opens an Outlook .ost or .pst file under '\Documents\Outlook
+    Files' or '\AppData\Local\Microsoft\Outlook'. Continuously monitor Windows Event ID 4663 (and 4656
+    handle requests) for ObjectName ending in '.pst' or '.ost' in those paths, then join the ProcessId
+    to Event ID 4688 to recover the image hash and parent command line. Alert on any hash or path matching
+    a known-malicious indicator. Because attackers also use clean-but-unexpected tools, maintain an allowlist
+    of legitimate accessors (outlook.exe, searchindexer.exe, backup agents); per the 'normal self' baseline
+    concept, any non-allowlisted accessor is itself an alert. A hit on a malicious hash is high-confidence
+    Collection activity warranting host isolation; a clean result narrows the hunt to renamed or novel
+    tools covered by the rarity and ML methods here.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: User workstations, Executive laptops, Mail archive servers, Backup servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ACCESS = FROM Event4663,Event4656 WHERE ObjectName MATCHES '(?i)\\.(pst|ost)$'\n  AND (ObjectName\
+      \ CONTAINS 'Outlook Files' OR ObjectName CONTAINS 'AppData\\\\Local\\\\Microsoft\\\\Outlook')\n\
+      JOIN Event4688 ON ProcessId\nALERT WHERE sha256(Image) IN known_malicious_hashes\n   OR lower(Image)\
+      \ NOT IN allowlist[outlook.exe, searchindexer.exe, backup_agents]"
+- question: Among all processes that accessed .pst or .ost files over the last 30 days, which are statistically
+    rare across the environment or move anomalous byte volumes, indicating a previously unseen email-collection
+    tool?
+  context: Even when a tool is not on any blocklist, a malicious mail-file accessor is usually rare and
+    behaves differently from routine Outlook or backup activity. Aggregate every process that touched
+    .pst/.ost over 30 days, compute per-process prevalence (fraction of endpoints) and image-path entropy,
+    and flag processes present on fewer than 1% of endpoints. Score the combined feature vector with an
+    Isolation Forest, and derive byte-volume and access-frequency thresholds using robust median/MAD modified
+    Z-scores (alert at modified-Z > 3.5) so scheduled backup batch jobs do not inflate the baseline. Rare,
+    high-entropy processes reading large volumes from mail stores are strong Collection leads; widely
+    deployed, low-entropy accessors are likely benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: User workstations, Executive laptops, Mail archive servers, Backup servers'
+  range: Last 90 days (30-day baseline window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'BASE = FROM Event4663 WHERE ObjectName MATCHES ''(?i)\.(pst|ost)$'' EARLIEST=-30d
+
+      STATS prevalence=dc(host)/total_hosts, path_entropy=entropy(Image), bytes=sum(AccessBytes) BY Image
+
+      score = IsolationForest(prevalence, path_entropy, bytes, access_freq)
+
+      ALERT WHERE prevalence < 0.01 OR modified_z(bytes) > 3.5 OR score > threshold'
+- question: Is there a burst of ACCESS_DENIED outcomes on .pst/.ost files from a single process or account,
+    especially immediately preceding a successful read?
+  context: An adversary probing for accessible mail stores frequently generates failed reads before a
+    successful one. Track ACCESS_DENIED outcomes on Event ID 4663/4656 against mail files as a distinct
+    distribution per source process and account. A spike of denied reads followed by a successful read
+    is a strong recon-then-collect signal. Alert when the denied-read count per 10-minute window exceeds
+    3 standard deviations (or modified-Z > 3.5) above the host's baseline. A burst of denials with no
+    success may indicate blocked reconnaissance; denials followed by success indicate the actor found
+    a path around controls and likely collected data.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: User workstations, Executive laptops, Mail archive servers, Backup servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'DENY = FROM Event4663,Event4656 WHERE ObjectName MATCHES ''(?i)\.(pst|ost)$'' AND AccessResult=''ACCESS_DENIED''
+
+      STATS denied=count BY host, SubjectUser, ProcessId, bin(_time,10m)
+
+      ALERT WHERE denied > baseline_mean + 3*baseline_std OR modified_z(denied) > 3.5
+
+      ANNOTATE if followed_by successful_read(host,ProcessId) within 10m -> recon_then_collect'
+- question: Does a behavioral classifier trained on correlated process-and-file-access features flag a
+    mail-file access event as anomalous email collection?
+  context: 'Deterministic rules miss novel tradecraft, so train a classifier (random forest or Isolation
+    Forest) on correlated Event ID 4688/4663 features: process name, parent, command line, path entropy,
+    prevalence, bytes read, and a .pst/.ost flag. For label-free node-level scoring, use a provenance
+    GNN such as ThreaTrace; train and validate against labeled collection scenarios in the CERT Insider
+    Threat Test Dataset. Every alert must surface the top-3 contributing features (e.g., process prevalence,
+    path entropy, bytes read) so an analyst can judge it quickly. A high-scoring event with low prevalence
+    and high path entropy reading large byte volumes is a strong Collection indicator; well-explained
+    benign features lower priority.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - 'NAI: User workstations, Executive laptops, Mail archive servers, Backup servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = correlate(Event4688, Event4663) -> [proc_name, parent, cmdline, path_entropy,\n\
+      \   prevalence, bytes_read, is_pst_ost]\nmodel = RandomForest|IsolationForest|ThreaTrace_GNN (trained\
+      \ on CERT Insider Threat dataset)\nscore = model.predict(features)\nALERT WHERE score > threshold\
+      \ WITH top3_feature_contributions"
+- question: Was a command-line interpreter or archive utility executed with arguments that reference,
+    copy, or compress .pst or .ost files using copy, Compress-Archive, xcopy, Move-Item, or esentutl operations?
+  context: Hands-on-keyboard collection of email files leaves traces in process command lines. Scan Event
+    ID 4688 / Sysmon EID 1 for interpreters and utilities (cmd.exe, powershell.exe, pwsh.exe, robocopy.exe,
+    xcopy.exe, 7z.exe, esentutl.exe) whose command line matches '\.(ost|pst)\b' near copy / Compress-Archive
+    / xcopy / Move-Item tokens — for example 'copy *.pst', 'Compress-Archive -Path *.ost', or 'esentutl
+    /y *.ost'. These deterministic patterns are codified in the Splunk Security Content endpoint corpus.
+    A match is a direct, high-confidence indicator of email file collection or staging and should be triaged
+    against the executing user's role.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances, Administrative jump boxes,
+    Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "interp = [cmd.exe, powershell.exe, pwsh.exe, robocopy.exe, xcopy.exe, 7z.exe, esentutl.exe]\n\
+      ALERT FROM Event4688,Sysmon1\nWHERE lower(Image) IN interp\n  AND CommandLine MATCHES '(?i)\\.(ost|pst)\\\
+      b'\n  AND CommandLine MATCHES '(?i)(copy|Compress-Archive|xcopy|Move-Item|esentutl|/y)'"
+- question: Is a command line that references .pst or .ost files statistically rare or obfuscated compared
+    with the 30-day baseline, including day-over-day spikes in copy/archive command volume?
+  context: Attackers obfuscate or vary commands to evade literal patterns. Tokenize the process name and
+    arguments per event, compute a 30-day uniqueness score, and alert when a command referencing '.pst'/'.ost'
+    falls in the 99th percentile of rarity. Detect obfuscated variants that hide the extension using the
+    character/token/AST feature deviations described in Revoke-Obfuscation, and apply seasonality-aware
+    time-series decomposition to flag day-over-day spikes in copy/archive command counts. A rare or heavily
+    obfuscated mail-file command, or a sudden surge in archiving activity, suggests deliberate collection
+    rather than routine administration.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances, Administrative jump boxes,
+    Domain Controllers'
+  range: Last 90 days (30-day baseline window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "TOK = tokenize(Image + CommandLine) EARLIEST=-30d\nrarity = uniqueness_score(TOK)\nobf = revoke_obfuscation_features(CommandLine)\
+      \  # char/token/AST deviation\nALERT WHERE CommandLine MATCHES '(?i)\\.(ost|pst)' AND rarity >=\
+      \ p99\n   OR obf > threshold\n   OR timeseries_decompose(copy_archive_count) shows day_over_day\
+      \ spike"
+- question: Does an NLP/embedding-based command-line classifier separate benign administrative commands
+    from suspicious mail-file operations and cluster rare or novel obfuscated commands?
+  context: To catch variants that defeat regex and simple rarity, vectorize command lines (TF-IDF + logistic
+    regression as a baseline, or BERT-style embeddings as used by CrowdStrike for command-line anomaly
+    detection) to distinguish benign admin commands from suspicious mail-file operations and to cluster
+    rare or novel obfuscated commands. Surface the top-3 tokens/features driving the score in each alert.
+    A command embedding that clusters away from the analyst's known-benign administrative corpus while
+    referencing mail files is a strong Collection lead; commands that map to familiar admin clusters are
+    likely benign.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances, Administrative jump boxes,
+    Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = vectorize(CommandLine)  # TF-IDF+LogReg baseline OR BERT embeddings
+
+      label = classifier.predict(X)  # benign_admin vs suspicious_mailfile_op
+
+      clusters = cluster(rare_embeddings)
+
+      ALERT WHERE label=''suspicious'' OR cluster IN outlier_clusters WITH top3_tokens'
+- question: Did a non-allowlisted process read a .pst or .ost file and, within five minutes, initiate
+    an external network connection to a threat-intelligence-flagged destination or a rare ASN from the
+    same host/PID?
+  context: Collection is often immediately followed by exfiltration. Alert when a non-allowlisted process
+    (not outlook.exe / searchindexer.exe) accesses a .pst/.ost file (Event ID 4663) and within five minutes
+    the same host/PID initiates a Zeek conn.log connection to an external destination flagged by threat
+    intelligence or to a rare ASN. This file-to-network correlation ties the local Collection action to
+    an outbound channel, raising it from a single suspicious event to a credible exfil chain. A positive
+    result is high-confidence and should trigger containment; absence of an external connection keeps
+    the event in the local-collection category.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points (Firewalls, Proxies), DNS servers, Cloud storage gateways'
+  range: 'Last 90 days (event-centered: read +/- 5 min vs subsequent connection)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "READ = FROM Event4663 WHERE ObjectName MATCHES '(?i)\\.(pst|ost)$'\n  AND lower(Image) NOT\
+      \ IN allowlist[outlook.exe, searchindexer.exe]\nCONN = FROM zeek_conn WHERE is_external(resp_h)\n\
+      JOIN READ,CONN ON host,PID WHERE CONN._time BETWEEN READ._time AND READ._time+5m\nALERT WHERE resp_h\
+      \ IN threat_intel OR asn IN rare_asn"
+- question: After a .pst/.ost read, does the next outbound connection deviate from the host's baseline
+    byte volume, connection size, or destination-port distribution, or constitute a first-time host-to-destination
+    edge?
+  context: Exfiltration of mail stores often produces unusually large or unusual outbound flows. Baseline
+    per-process/host outbound byte volume, connection size, and destination-port distribution from historical
+    Zeek conn.log using byte-frequency profiling in the style of PAYL. After each .pst/.ost access, compare
+    the next connection's bytes_out and size to baseline and alert beyond 3 standard deviations. Additionally
+    score first-time host->external destination edges with Bayesian new-edge prediction. A large, unusually
+    shaped flow to a never-before-seen destination right after a mail-file read strongly indicates exfiltration
+    of collected email.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points (Firewalls, Proxies), DNS servers, Cloud storage gateways'
+  range: Last 90 days (post-access connection window)
+  queries:
+  - technology: Zeek/pseudocode
+    query: "baseline = profile(bytes_out, conn_size, dport_dist) BY host,proc  # PAYL byte-frequency\n\
+      POST = next_conn after pst_ost_read(host,PID)\nALERT WHERE POST.bytes_out > baseline.mean + 3*baseline.std\n\
+      \   OR new_edge_prob(host->resp_h) high  # Bayesian new-edge"
+- question: Are there bursts of blocked, failed, or reset outbound connections from a host shortly after
+    a .pst/.ost read, indicating exfiltration attempts hitting egress controls?
+  context: Failed exfiltration is still exfiltration intent. Profile blocked/failed/reset outbound connections
+    (firewall deny, Zeek conn_state S0/REJ) per host after mail-file access as a distinct signal. Repeated
+    blocked egress attempts following a .pst/.ost read indicate the actor is trying to move collected
+    data and being stopped by controls. Alert when the blocked-connection count per 10-minute window exceeds
+    the host's modified-Z 3.5 threshold. A spike of denied egress right after mail-file access is a strong,
+    actionable signal even though no data left the network.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points (Firewalls, Proxies), DNS servers, Cloud storage gateways'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FAIL = FROM zeek_conn WHERE conn_state IN [S0, REJ] OR firewall_action=''deny''
+
+      STATS blocked=count BY host, bin(_time,10m)
+
+      ALERT WHERE modified_z(blocked) > 3.5 AND preceded_by pst_ost_read(host) within 10m'
+- question: Does an anomaly model over per-host outbound traffic or whole-system provenance flag the file-read-to-external-connection
+    sequence following a mail-file access?
+  context: Subtle, low-and-slow exfiltration may not exceed simple thresholds. Train an LSTM autoencoder
+    on per-host bytes_out time series from Zeek conn.log and evaluate the post-access traffic window;
+    alternatively use whole-system provenance modeling (KAIROS) to flag the anomalous file-read -> external-connection
+    edge and reconstruct the chain. Report the top-3 anomaly contributors (bytes_out, destination rarity,
+    timing) in the alert. A high reconstruction error or a flagged provenance edge linking a mail-file
+    read to an external connection is a strong, explainable exfiltration indicator for the Collection-to-exfil
+    pivot.
+  answer_sources:
+  - Windows Event ID 4663
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points (Firewalls, Proxies), DNS servers, Cloud storage gateways'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'model = LSTM_autoencoder(per_host bytes_out timeseries)  # or KAIROS provenance graph
+
+      err = model.reconstruction_error(post_access_window)
+
+      ALERT WHERE err > threshold OR kairos_flags(read->external_conn edge)
+
+      WITH top3 contributors=[bytes_out, dest_rarity, timing]'
+- question: Did a process copy or archive a .pst/.ost file into a common staging directory (C:\Users\Public,
+    C:\Windows\Temp, C:\PerfLogs, %TEMP%) and create a similarly sized artifact there?
+  context: Before exfiltration, adversaries often stage collected mail in writable directories. Alert
+    when Event ID 4688 / Sysmon EID 1 shows cmd.exe/powershell.exe/robocopy.exe/7z.exe command lines copying
+    or archiving .pst/.ost files into staging directories such as C:\Users\Public, C:\Windows\Temp, C:\PerfLogs,
+    or %TEMP%, and corroborate with a Sysmon EID 11 file-create of a similarly sized artifact. The combination
+    of a mail-file copy/archive command and a matching new file in a staging path is a high-confidence
+    staging indicator that should be investigated alongside any subsequent outbound activity.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations, File servers, Publicly writable network shares, Temporary file directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "staging = [C:\\Users\\Public, C:\\Windows\\Temp, C:\\PerfLogs, %TEMP%]\nALERT FROM Event4688,Sysmon1\n\
+      WHERE lower(Image) IN [cmd.exe,powershell.exe,robocopy.exe,7z.exe]\n  AND CommandLine MATCHES '(?i)\\\
+      .(ost|pst)' AND CommandLine CONTAINS_ANY staging\nCORROBORATE Sysmon11 file_create IN staging WITH\
+      \ similar_size"
+- question: Within ten minutes of a .pst/.ost read, did the same process write an anomalous volume or
+    count of files to a staging directory, with written sizes comparable to the source mail file?
+  context: Staging can be detected statistically by correlating reads with subsequent writes. Correlate
+    file-read (Event ID 4663) bytes with subsequent writes to staging directories by the same PID; flag
+    when write volume or count within ten minutes of a mail-file read exceeds the 95th percentile / modified-Z
+    3.5 of the host baseline. Compare the written-file size to the source .ost/.pst size to catch full
+    or partial copies. A burst of writes whose total size mirrors the mail store indicates the actor duplicated
+    the email data for staging; small incidental writes are likely benign.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations, File servers, Publicly writable network shares, Temporary file directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "READ = Event4663 WHERE ObjectName MATCHES '(?i)\\.(pst|ost)$'\nWRITE = Event4663 WHERE AccessMask=WRITE\
+      \ AND ObjectName IN staging_dirs\nJOIN ON PID WHERE WRITE._time BETWEEN READ._time AND READ._time+10m\n\
+      ALERT WHERE write_vol > p95 OR modified_z(write_count) > 3.5\n   OR abs(write_size - read_size)/read_size\
+      \ < 0.1"
+- question: Does a provenance/sequence model detect the read-then-write subgraph where a non-approved
+    process reads a .pst/.ost node and immediately writes a temp-file node?
+  context: The read->write staging pattern forms a distinctive provenance subgraph. Build a provenance
+    graph linking processes and files and detect the subgraph where a non-approved process reads a .pst/.ost
+    node and immediately writes a temp-file node, using node-level GNN scoring (ThreaTrace) or whole-system
+    provenance autoencoding (KAIROS). Sequence-model the read->write event order with DeepLog and surface
+    the deviating step plus the top-3 features in the alert. A flagged read-then-stage subgraph from a
+    non-approved process is a strong Collection/staging indicator that explains the exact step that deviated
+    from normal behavior.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: User workstations, File servers, Publicly writable network shares, Temporary file directories'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = provenance_graph(processes, files)
+
+      detect subgraph: proc(non_approved) -READ-> (pst|ost) -WRITE-> temp_file
+
+      score = ThreaTrace_node_score(G) OR KAIROS_autoencode(G)
+
+      seq = DeepLog(read->write order)
+
+      ALERT WHERE anomalous WITH deviating_step + top3_features'
+- question: Did a single non-allowlisted account or process access .pst/.ost files belonging to multiple
+    distinct user profiles within a one-hour window?
+  context: Broad email collection often shows up as one identity touching many users' mailboxes. Alert
+    when Event ID 4663 shows a non-allowlisted account/process accessing .pst/.ost files across distinct
+    user profiles within one hour; legitimate accessors (backup service accounts, indexing) must be explicitly
+    allowlisted. On roaming-profile file servers and VDI hosts this pattern is a strong Collection signal
+    because a normal user only accesses their own mailbox. A non-allowlisted account fanning out across
+    many profiles in an hour is high-confidence and warrants rapid review of that account's recent activity.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: File servers hosting roaming profiles, Shared workstations, Citrix/VDI servers, Backup and archive
+    servers'
+  range: Last 90 days (rolling 1-hour windows)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ACCESS = FROM Event4663 WHERE ObjectName MATCHES '(?i)\\.(pst|ost)$'\n  AND lower(SubjectUser)\
+      \ NOT IN allowlist[backup_svc, index_svc]\nSTATS distinct_profiles=dc(profile_path) BY SubjectUser,\
+      \ ProcessId, bin(_time,1h)\nALERT WHERE distinct_profiles > 1"
+- question: Does the number of distinct user profiles accessed by an account exceed its own robust baseline,
+    or is the account-to-profile relationship seen for the first time relative to peers in the same role?
+  context: Thresholds should adapt per account and per role to avoid noise. Count unique target profiles
+    per source account over rolling 1-hour windows and alert when counts exceed the account's robust baseline
+    (modified-Z > 3.5, or 2-3 standard deviations). Score first-time account->profile relationships with
+    Bayesian new-edge prediction, and use peer-group baselining (UEBA) to compare an account against others
+    in the same role. An account suddenly touching far more profiles than its history or its peers, or
+    reaching profiles it has never accessed, is a strong anomalous-collection lead even below a fixed
+    count threshold.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: File servers hosting roaming profiles, Shared workstations, Citrix/VDI servers, Backup and archive
+    servers'
+  range: Last 90 days (rolling 1-hour windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "STATS profiles=dc(profile_path) BY SubjectUser, bin(_time,1h)\nALERT WHERE modified_z(profiles)\
+      \ > 3.5 OR profiles > peer_role_mean + 3*peer_role_std\n   OR new_edge_prob(SubjectUser->profile)\
+      \ high  # Bayesian new-edge"
+- question: Does clustering of mail-file access events isolate a small outlier cluster representing one
+    account touching many profiles, including off-hours access?
+  context: Unsupervised clustering can surface multi-profile collection without predefined thresholds.
+    Cluster file-access events with DBSCAN / Isolation Forest on features such as source user, process,
+    target profile count, bytes read, and hour-of-day to flag small or outlier clusters representing one
+    account touching many profiles. Validate against labeled multi-profile collection scenarios in the
+    CERT Insider Threat Test Dataset, and surface the top-3 features (distinct profile count, account
+    prevalence, off-hours flag) in the alert. A tiny outlier cluster of high-fan-out, off-hours mail access
+    is a strong insider-or-intruder Collection indicator.
+  answer_sources:
+  - Windows Event ID 4663
+  - 'NAI: File servers hosting roaming profiles, Shared workstations, Citrix/VDI servers, Backup and archive
+    servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features[source_user, process, target_profile_count, bytes_read, hour_of_day]
+
+      labels = DBSCAN(X)  # or IsolationForest(X)
+
+      ALERT WHERE cluster_size small OR point IN outlier
+
+      WITH top3=[distinct_profile_count, account_prevalence, off_hours_flag]'
