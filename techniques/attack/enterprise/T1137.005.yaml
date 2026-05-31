@@ -1,0 +1,525 @@
+name: 'T1137.005: Outlook Rules'
+id: bc52a2a9-346c-493c-aaba-bf50380a92a2
+description: 'Investigate whether an adversary has established or is leveraging malicious Microsoft Outlook
+  rules for persistence on a compromised mailbox or endpoint. Malicious Outlook rules (commonly created
+  with tooling such as Ruler or MFCMAPI, or via EWS/MAPI cmdlets like New-InboxRule and Set-InboxRule)
+  trigger code execution when an attacker sends a specially crafted email, typically launching a payload
+  from a WebDAV/UNC share or a user-writable path. This playbook guides the analyst across endpoint, network,
+  and cloud telemetry to: detect OUTLOOK.EXE spawning script interpreters or LOLBins, correlate child-process
+  hashes and outbound flows to threat-intel and low-reputation/newly registered destinations, surface
+  beaconing and egress anomalies, identify rule-creation tooling and EWS/MAPI rule-modification commands,
+  and hunt Microsoft 365 Unified Audit Log / mailbox audit events showing inbox rules with start-application
+  or external-forwarding actions created outside a user''s normal pattern. Because cloud-synced rules
+  survive endpoint reimaging, both host and mailbox vantage points are covered.'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any child process spawned by OUTLOOK.EXE have a binary hash that matches a threat-intelligence
+    indicator, and do that child's outbound Zeek conn.log/dns.log flows reach blocklisted or attacker-controlled
+    destinations?
+  context: Persistence via malicious Outlook rules classically launches a rule-triggered payload from
+    a remote WebDAV/UNC share when a crafted email arrives. By matching OUTLOOK.EXE child-process hashes
+    (Windows Event ID 4688 / Sysmon EID 1) against TI feeds and joining the corresponding network flows
+    (Zeek conn.log/dns.log) to known-bad destinations, the analyst confirms the foothold is live and identifies
+    the C2 or staging infrastructure. A positive correlation (known-bad hash plus known-bad destination)
+    is high-confidence evidence of an active persistence mechanism; a negative result narrows but does
+    not eliminate suspicion, since payloads may be novel.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr (EventCode=4688 OR sysmon_event=1) parent_image="*OUTLOOK.EXE"
+
+      | join child_hash [ lookup ti_hashes hash AS child_hash OUTPUT verdict ]
+
+      | join src_ip,child_pid [ search index=zeek (sourcetype=conn OR sourcetype=dns) | lookup ti_destinations
+      dest AS resolved_dest OUTPUT verdict ]
+
+      | where verdict="malicious"
+
+      | table _time host user parent_image child_image child_hash dest_ip query verdict'
+  - technology: Zeek/pseudocode
+    query: 'conn.log JOIN dns.log ON uid/orig_h
+
+      WHERE orig process == OUTLOOK.EXE child
+
+      AND (resp_h IN ti_blocklist OR query IN ti_domain_blocklist)
+
+      -> emit alert with child_hash, resp_h, service'
+- question: Did OUTLOOK.EXE spawn a script or LOLBin process that initiated an outbound connection within
+    10 minutes to a destination not on the approved Outlook add-in/update allowlist?
+  context: Outlook executes rule actions via ShellExecute with the 'open' verb, so any non-Office child
+    process is high signal. Tying the parent-child chain (OUTLOOK.EXE -> script/LOLBin) to a near-term
+    outbound connection that is not on the sanctioned Outlook add-in/update allowlist strongly indicates
+    rule-triggered code execution for persistence. The 10-minute window captures the typical fetch-and-execute
+    pattern. A positive result (suspicious child + unapproved egress) warrants immediate triage of the
+    mailbox's inbox rules.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days; correlate child-process and outbound connection within a 10-minute window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr EventCode=4688 parent_image="*OUTLOOK.EXE" child_image IN (scripts,lolbins)
+
+      | join host,child_pid [ search index=net EventCode=5156 OR sourcetype=zeek_conn ]
+
+      | eval dt=conn_time-proc_time | where dt>=0 AND dt<=600
+
+      | where NOT cidrmatch(approved_outlook_update_ranges, dest_ip)
+
+      | table _time host user child_image dest_ip dt'
+- question: For each OUTLOOK.EXE child process, does its outbound byte volume, bytes-out/bytes-in ratio,
+    or connection rate statistically exceed normal behavior (e.g., >3x the host median session bytes or
+    >6 connections/minute)?
+  context: 'Mail-client child processes rarely produce heavy or chatty egress. Profiling per-child outbound
+    byte volume, the bytes-out/bytes-in ratio, and connection count per minute lets the analyst flag exfiltration
+    or active C2: a child contacting an external host with more than 3x the host''s median session bytes,
+    or sustaining more than 6 connections per minute, is anomalous for an Outlook descendant. Elevated
+    ratios suggest data egress; high connection rates suggest tasking/beaconing. This statistical view
+    catches activity even when the destination is not yet known-bad.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=conn proc_chain="OUTLOOK.EXE>*"
+
+      | stats sum(orig_bytes) AS out sum(resp_bytes) AS inb count AS conns by host child_image dest_ip
+      span=1m
+
+      | eventstats median(out) AS host_median by host
+
+      | eval ratio=out/(inb+1)
+
+      | where out > 3*host_median OR conns > 6
+
+      | table host child_image dest_ip out inb ratio conns'
+- question: Do domains queried by Outlook-spawned children exhibit high Shannon entropy (above the 98th
+    percentile) or abnormally high NXDOMAIN/failed-connection rates (above the host 99th percentile) indicative
+    of DGA or C2 fallback?
+  context: 'Algorithmically generated domains and C2 fallback behavior produce two measurable signatures:
+    high-entropy domain names and elevated resolution/connection failure rates. Scoring domains queried
+    by Outlook-spawned children by Shannon entropy and flagging the top 2% surfaces likely DGA traffic;
+    separately profiling NXDOMAIN and blocked-connection ratios per child and flagging those exceeding
+    the host 99th percentile reveals malware cycling through dead C2 endpoints. Either signal from an
+    OUTLOOK.EXE descendant is strong evidence of malicious rule-triggered persistence.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=dns proc_chain="OUTLOOK.EXE>*"
+
+      | eval ent=shannon_entropy(query)
+
+      | eventstats perc98(ent) AS ent_thresh
+
+      | eval failed=if(rcode_name="NXDOMAIN",1,0)
+
+      | stats avg(failed) AS fail_rate max(ent) AS max_ent by host child_image
+
+      | eventstats perc99(fail_rate) AS fail_thresh by host
+
+      | where max_ent>ent_thresh OR fail_rate>fail_thresh'
+- question: Are there OUTLOOK.EXE child process names and destination domains that fall into the lowest
+    1% prevalence bucket fleet-wide relative to per-user/per-host baselines?
+  context: Rare-by-design tradecraft stands out against fleet baselines. Building per-user and per-host
+    baselines of OUTLOOK.EXE child process names and contacted destination domains, then alerting when
+    BOTH features land in the lowest 1% prevalence bucket across the fleet, isolates the unusual combination
+    of a never-before-seen Outlook child reaching a never-before-seen destination. This combined rarity
+    score is a robust persistence indicator that avoids the noise of single-feature rarity.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr parent_image="*OUTLOOK.EXE"
+
+      | stats count by child_image dest_domain
+
+      | eventstats sum(count) AS total
+
+      | eval prev=count/total
+
+      | where prev <= percentile(prev,1)
+
+      | table child_image dest_domain prev count'
+- question: Do Outlook-child outbound connections show periodic, low-jitter callback cadence consistent
+    with beaconing when analyzed with temporal-regularity methods (FFT/autocorrelation)?
+  context: Beaconing is a hallmark of C2 established via malicious Outlook rules. Forecasting the connection
+    cadence of Outlook-child flows and applying temporal-regularity analysis (FFT/autocorrelation) with
+    jitter thresholds detects periodic callbacks even when individual destinations rotate. Surfacing the
+    dominant period and a regularity score in the alert lets the analyst quickly judge whether the rhythm
+    is human (irregular) or automated (regular). A strong periodic signal from an OUTLOOK.EXE descendant
+    indicates an active implant and persistence.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days; analyze per-destination inter-arrival series over multi-week windows.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'series = inter_arrival_times(conn where proc_chain like ''OUTLOOK.EXE>*'' group by host,child,dest)
+
+      period, regularity = fft_autocorr(series)
+
+      jitter = stdev(series)/mean(series)
+
+      IF regularity > 0.8 AND jitter < 0.2: alert(host,child,dest,period,regularity)'
+- question: Does an online autoencoder ensemble flag per-host egress feature vectors (bandwidth, packet/connection
+    rate, jitter) with reconstruction error above the 99th percentile for hosts running OUTLOOK.EXE descendants?
+  context: Unsupervised autoencoder anomaly detection captures complex, multi-feature egress deviations
+    that simple thresholds miss. Scoring per-host egress feature vectors (bandwidth, packet/connection
+    rate, jitter) with an online autoencoder ensemble and alerting when reconstruction error exceeds the
+    99th percentile highlights hosts whose network behavior has drifted into abnormal territory, consistent
+    with rule-triggered payload C2/exfiltration. Listing the top-3 contributing features makes the alert
+    explainable and triageable.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: User workstations, Network egress points, DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = per_host_egress(bandwidth, pkt_rate, conn_rate, jitter)
+
+      err = autoencoder_ensemble.reconstruction_error(features)
+
+      IF err > percentile99(err): alert(host, top3_features(err))'
+- question: Was a known MAPI/rule-manipulation tool (MFCMapi.exe, Ruler.exe) executed, or did PowerShell
+    script-block logs contain inbox-rule cmdlets such as New-InboxRule, Set-InboxRule, New-MailboxRule,
+    or EWS rule/form indicators?
+  context: Ruler and MFCMAPI are the documented remote rule-creation primitives, and PowerShell cmdlets
+    (New-InboxRule/Set-InboxRule/New-MailboxRule) plus EWS rule/form calls are the scripted equivalents.
+    Alerting when Windows Event ID 4688 / Sysmon EID 1 launches these tools, or when PowerShell EID 4104
+    script blocks contain these keywords, directly catches the act of creating or modifying a malicious
+    Outlook rule. A positive hit—especially from a workstation, jump box, or Exchange server where rule
+    tooling is unexpected—is strong evidence of attempted persistence and should pivot to enumeration
+    of the affected mailbox's rules.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Microsoft 365 Unified Audit Log
+  - 'NAI: User workstations, Exchange Servers, Administrative jump boxes, Microsoft 365 / Exchange Online
+    audit logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(index=edr EventCode=4688 (child_image="*\\MFCMapi.exe" OR child_image="*\\Ruler.exe"))
+
+      OR (index=ps EventCode=4104 (ScriptBlockText="*New-InboxRule*" OR "*Set-InboxRule*" OR "*New-MailboxRule*"
+      OR "*EWS*" OR "*Ews.Service*"))
+
+      | table _time host user EventCode child_image ScriptBlockText'
+- question: Does any inbox rule have an action that launches an application/executable or forwards mail
+    to an external recipient, regardless of who created it?
+  context: 'The start-application and external-forwarding actions are the core abuse primitives of malicious
+    Outlook rules: the former gives code execution on email arrival, the latter silently exfiltrates mail.
+    Flagging any inbox rule whose action launches an application or forwards externally—independent of
+    the creator—catches both attacker-created and hijacked legitimate rules. This is a content/configuration
+    check (via audit logs, Get-InboxRule, or MFCMAPI), and any match should be validated against an approved
+    rule inventory.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Microsoft 365 Unified Audit Log
+  - 'NAI: User workstations, Exchange Servers, Administrative jump boxes, Microsoft 365 / Exchange Online
+    audit logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=m365 Operation IN ("New-InboxRule","Set-InboxRule","UpdateInboxRules")
+
+      | where match(RuleAction,"(?i)start-?application|run application|execute|forward|forwardto|redirectto")
+
+      | table _time mailbox actor RuleName RuleAction ClientIP'
+- question: Are Outlook-parent PowerShell events statistically rare, and do their script blocks rank high
+    by TF-IDF for uncommon rule/EWS terms, or does a user's daily rule-modification count exceed mean
+    + 3 sigma?
+  context: Legitimate rule changes are infrequent and follow stable per-user patterns. Flagging rare Outlook-parent
+    PowerShell events and ranking script blocks by TF-IDF for uncommon rule/EWS terms surfaces the unusual
+    command content associated with rule abuse, while baselining each user's rule-modification count and
+    alerting beyond mean + 3 sigma catches bursts of programmatic rule creation. Together these statistical
+    methods distinguish a one-off scripted attack from routine administration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Microsoft 365 Unified Audit Log
+  - 'NAI: User workstations, Exchange Servers, Administrative jump boxes, Microsoft 365 / Exchange Online
+    audit logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=ps EventCode=4104 parent_image="*OUTLOOK.EXE"
+
+      | eval score=tfidf(ScriptBlockText, corpus="rule_ews_terms")
+
+      | stats count AS daily by user date
+
+      | eventstats mean(daily) AS m stdev(daily) AS sd by user
+
+      | where daily > m+3*sd OR score > tfidf_threshold'
+- question: When rule-manipulation command lines are embedded with BERT-style representations and scored
+    with unsupervised outlier detectors (Isolation Forest/COPOD/PCA), do any score as outliers driven
+    by tokens like ews, mapi, start-application, or webdav paths?
+  context: Command-line obfuscation and uncommon parameter combinations evade keyword rules but stand
+    out in embedding space. Embedding rule-manipulation command lines with BERT-style representations
+    and scoring them with unsupervised outlier detectors (Isolation Forest, COPOD, PCA) catches novel
+    or disguised rule-creation commands. Reporting the top contributing tokens (e.g., ews, mapi, start-application,
+    a WebDAV path) gives the analyst an explainable reason for the alert and a direct pivot to the abuse
+    mechanism.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - Microsoft 365 Unified Audit Log
+  - 'NAI: User workstations, Exchange Servers, Administrative jump boxes, Microsoft 365 / Exchange Online
+    audit logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'emb = bert_embed(command_line for proc in [MFCMapi,Ruler,powershell rule cmdlets])
+
+      score = isolation_forest.decision_function(emb)  # or COPOD/PCA
+
+      IF score outlier: alert(host,user,command_line, top_tokens(emb))'
+- question: Is OUTLOOK.EXE the parent process of a command-line interpreter or scripting host (cmd.exe,
+    powershell.exe, wscript.exe, cscript.exe, mshta.exe, rundll32.exe, or regsvr32.exe)?
+  context: This parent-child relationship is rare and a primary signature of rule-triggered execution.
+    Alerting whenever OUTLOOK.EXE spawns cmd.exe, powershell.exe, wscript.exe, cscript.exe, mshta.exe,
+    rundll32.exe, or regsvr32.exe catches the moment a malicious rule fires and launches an interpreter
+    or LOLBin. Because legitimate Outlook almost never spawns these, a single match is high-confidence
+    and should trigger investigation of the mailbox's rules and the spawned process's downstream activity.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr EventCode=4688 parent_image="*\\OUTLOOK.EXE"
+
+      child_image IN ("*\\cmd.exe","*\\powershell.exe","*\\wscript.exe","*\\cscript.exe","*\\mshta.exe","*\\rundll32.exe","*\\regsvr32.exe")
+
+      | table _time host user child_image command_line'
+- question: Are there newly seen OUTLOOK.EXE parent-child tuples (absent from a 90-day baseline) or hosts
+    where the daily spawn count of a given child exceeds mean + 3 sigma?
+  context: First-seen and burst behaviors both indicate anomalous Outlook activity. Flagging OUTLOOK.EXE
+    parent-child tuples not present in a 90-day per-user/per-host baseline catches the introduction of
+    a new execution path, while alerting when a given child's daily spawn count exceeds the host's mean
+    + 3 sigma catches automated, repeated rule firing. These statistical signals add coverage for cases
+    where the child image alone is not inherently suspicious.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances'
+  range: Last 90 days; compare against a rolling 90-day baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr parent_image="*OUTLOOK.EXE"
+
+      | stats count AS daily earliest(_time) AS first_seen by host user child_image date
+
+      | eventstats mean(daily) AS m stdev(daily) AS sd by host child_image
+
+      | where first_seen > now()-90d OR daily > m+3*sd'
+- question: When OUTLOOK.EXE child events are clustered on (child image, path class, command-line embedding,
+    child success/exit state), do any fall out as noise/outliers?
+  context: Clustering captures multi-dimensional rarity that single rules miss. Grouping OUTLOOK.EXE child
+    events on child image, path classification, command-line embedding, and child success/exit state,
+    then flagging the noise points and outliers, isolates the unusual combinations characteristic of rule
+    abuse (e.g., an interpreter from a temp path with an obfuscated command line). Surfacing the top-3
+    features driving the outlier score makes the result explainable and gives the analyst a triage starting
+    point.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User workstations, Virtual Desktop Infrastructure (VDI) instances'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = features(child_image, path_class, bert(command_line), exit_state) for OUTLOOK children
+
+      labels = dbscan(X)
+
+      outliers = points labeled noise OR isolation_forest(X) high
+
+      alert(outliers with top3_features)'
+- question: Did an OUTLOOK.EXE child process run from a user-writable or remote path (%APPDATA%, %TEMP%,
+    C:\Users\Public, or a UNC/WebDAV \\host\share) and then connect to a threat-intel-blocked destination?
+  context: 'Rule-triggered payloads classically execute from a WebDAV share or other user-writable location
+    and then call out to attacker infrastructure. Correlating OUTLOOK.EXE children running from %APPDATA%,
+    %TEMP%, C:\Users\Public, or UNC/WebDAV paths with subsequent connections to TI-blocked destinations
+    confirms both the suspicious execution location and the malicious network objective. This combined
+    symbolic-logic check is high-precision: legitimate Outlook children rarely run from these paths or
+    reach blocked destinations.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr EventCode=4688 parent_image="*OUTLOOK.EXE"
+
+      child_path IN ("*\\AppData\\*","*\\Temp\\*","C:\\Users\\Public\\*","\\\\*\\*")
+
+      | join host,child_pid [ search index=zeek sourcetype=conn | lookup ti_destinations dest AS resp_h
+      OUTPUT verdict ]
+
+      | where verdict="malicious"
+
+      | table _time host user child_path resp_h'
+- question: Are there connections to newly registered domains (WHOIS age <30 days) or to destination ports
+    outside the host's 99.5% historical distribution, and do any Outlook children show elevated blocked-connection
+    or HTTP 404/NXDOMAIN failure ratios?
+  context: Newly registered domains, unusual destination ports, and high failure ratios are classic C2-staging
+    tells. Flagging Outlook-child connections to domains with WHOIS age under 30 days and to ports outside
+    the host's 99.5% historical distribution catches fresh attacker infrastructure and atypical channels,
+    while profiling blocked-connection and HTTP 404/NXDOMAIN rates per child treats elevated failure as
+    a distinct staging signal (malware probing dead or rotating endpoints). Together these statistical
+    thresholds extend detection to infrastructure not yet on any blocklist.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek proc_chain="OUTLOOK.EXE>*"
+
+      | lookup whois domain OUTPUT reg_age
+
+      | eventstats perc995(dest_port) AS port_hi by host
+
+      | eval failed=if(status_code=404 OR rcode="NXDOMAIN" OR conn_state="REJ",1,0)
+
+      | stats avg(failed) AS fail_rate by host child_image dest_domain dest_port reg_age
+
+      | where reg_age<30 OR dest_port>port_hi OR fail_rate>0.3'
+- question: Does an online autoencoder ensemble flag the host egress feature sequence (destination rarity,
+    byte ratio, jitter) with reconstruction error above the 99th percentile for hosts running suspicious
+    Outlook children?
+  context: Sequential egress modeling catches evolving network behavior that point-in-time rules miss.
+    Scoring the host egress feature sequence with an online autoencoder ensemble and flagging reconstruction
+    error above the 99th percentile detects when a host's outbound pattern—shaped by destination rarity,
+    byte ratio, and jitter—drifts into anomalous territory consistent with rule-triggered payload C2 or
+    exfiltration. Listing the top-3 contributing features keeps the alert explainable and ties it back
+    to the suspect Outlook child.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User Workstations, Network Egress Points, Web Proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = host_egress_sequence(dest_rarity, byte_ratio, jitter)
+
+      err = autoencoder_ensemble.reconstruction_error(seq)
+
+      IF err > percentile99(err): alert(host, top3_features(err))'
+- question: Does the Microsoft 365 Unified Audit Log or mailbox audit log contain a New-InboxRule/Set-InboxRule/UpdateInboxRules
+    event whose rule action launches an application, forwards mail externally, or creates a custom form/home
+    page?
+  context: Cloud-synced inbox rules survive endpoint reimaging, so the mailbox vantage point is essential
+    for persistence detection. Alerting on any Unified Audit Log New-InboxRule/Set-InboxRule/UpdateInboxRules
+    event whose action launches an application or forwards externally—or that creates a custom form or
+    home page—catches the configuration change at the source. Each hit should be enumerated and validated
+    against the known-good rule inventory (Get-InboxRule / MFCMAPI). A rule with a start-application or
+    external-forwarding action that is not on the approved list is strong evidence of malicious persistence.
+  answer_sources:
+  - Microsoft 365 Unified Audit Log
+  - Exchange mailbox audit log
+  - Exchange message trace
+  - 'NAI: Microsoft 365 / Exchange Online audit logs, Exchange Servers, Identity provider sign-in logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=m365 sourcetype=unified_audit Operation IN ("New-InboxRule","Set-InboxRule","UpdateInboxRules")
+
+      | where match(RuleAction,"(?i)start-?application|execute|forward|redirect|custom form|home ?page")
+
+      | lookup approved_rules mailbox RuleName OUTPUT is_known
+
+      | where is_known!="true"
+
+      | table _time mailbox actor RuleName RuleAction ClientIP'
+- question: Does a user's daily inbox-rule create/modify count exceed mean + 3 sigma, or do rule changes
+    originate from a first-seen ASN or country for that mailbox?
+  context: Routine users edit rules infrequently and from consistent locations. Baselining per-user inbox-rule
+    create/modify counts plus source-IP/client diversity, then alerting when the daily rule-change count
+    exceeds mean + 3 sigma or originates from a first-seen ASN/country, catches both bursty programmatic
+    rule creation and rules planted from anomalous geographies (e.g., after credential theft). These statistical
+    baselines turn the audit log into a behavioral sensor for mailbox persistence.
+  answer_sources:
+  - Microsoft 365 Unified Audit Log
+  - Exchange mailbox audit log
+  - Exchange message trace
+  - 'NAI: Microsoft 365 / Exchange Online audit logs, Exchange Servers, Identity provider sign-in logs'
+  range: Last 90 days; baseline per-user over the trailing 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=m365 Operation IN ("New-InboxRule","Set-InboxRule","UpdateInboxRules")
+
+      | iplocation ClientIP | stats count AS daily values(ASN) values(Country) AS countries by mailbox
+      date
+
+      | eventstats mean(daily) AS m stdev(daily) AS sd by mailbox
+
+      | where daily > m+3*sd OR new_value(countries) OR new_value(ASN)'
+- question: Does UEBA peer-group modeling flag inbox-rule creation/modification that deviates from the
+    user's peer group (rare actor, rare client, or anomalous rule action)?
+  context: Peer-group behavioral analytics contextualize rule changes against comparable users. Using
+    UEBA peer-group modeling to flag rule creation/modification that deviates from the user's peer group—such
+    as a rare actor performing the change, an unusual client/protocol, or an anomalous action—catches
+    malicious rules that individual thresholds would miss. Surfacing the contributing factors in the alert
+    lets the analyst quickly judge whether the deviation reflects compromise or benign change, supporting
+    efficient triage of mailbox persistence attempts.
+  answer_sources:
+  - Microsoft 365 Unified Audit Log
+  - Exchange mailbox audit log
+  - Exchange message trace
+  - 'NAI: Microsoft 365 / Exchange Online audit logs, Exchange Servers, Identity provider sign-in logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = ueba_peer_group(user, feature=[actor,client,rule_action,src_geo])
+
+      score = model.anomaly(rule_event)
+
+      IF score high: alert(mailbox, rule_event, contributing_factors)'
