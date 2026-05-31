@@ -1,0 +1,403 @@
+name: 'D3-PCSV: Process Code Segment Verification'
+id: 7700fff5-7a2c-4a85-a270-6a851cd7b291
+description: 'Investigate evidence that a running process''s in-memory executable code (its .text/code
+  segment) no longer matches its trusted on-disk image — the core of D3-PCSV: Process Code Segment Verification.
+  This playbook helps a SOC analyst hunt for code injection, process hollowing, herpaderping, and module
+  stomping by (1) alerting on deterministic process-tampering signals (Sysmon Event ID 25 image replacement/lock,
+  in-memory vs on-disk byte/hash mismatches, execution from unbacked private RX memory, and the ordered
+  allocate->write->execute injection primitives linked by a shared target address); (2) detecting impossible
+  process lineage and hollowing tells such as system binaries launched with empty command lines; and (3)
+  surfacing the behavioral and network consequences of tampering, where normally-silent system processes
+  begin new outbound communication or diverge from their learned system-call baseline. It blends deterministic
+  detection rules, statistical baselining of tampering and egress rates, coverage-health measurement,
+  and explainable machine-learning scoring so the analyst can both measure verification coverage gaps
+  and catch active in-memory tampering against high-value processes on critical servers, workstations,
+  and privileged-user endpoints.'
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which hosts have generated Sysmon Event ID 25 (ProcessTampering) events indicating an 'Image
+    is replaced' or 'Image is locked for access', and what is the full process lineage — initiating binary,
+    signer, and user context — behind each tampering event?
+  context: 'Sysmon Event ID 25 is the most direct, deterministic signal that a process''s on-disk image
+    was swapped out from underneath it at runtime, the classic footprint of process hollowing and herpaderping.
+    Within the Detect tactic this is a high-fidelity, low-volume primitive: each event should be raised
+    to high severity and immediately enriched with process-creation lineage from Windows Event ID 4688
+    to identify the initiating binary, its digital signer, the launching user, and the parent process.
+    Treat every ''image replaced'' as hollowing/herpaderping until proven benign — a true positive means
+    an attacker substituted malicious code into a trusted process image; a false positive is usually a
+    legitimate updater or self-modifying packer that can be allowlisted after verifying signer and path.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      from sysmon where event_id==25
+      | join process_creation (Windows EID 4688 OR Sysmon EID 1) on process_guid
+      | eval severity="high"
+      | where tamper_type in ("Image is replaced","Image is locked for access")
+      | table host, image, tamper_type, initiating_binary, signer, user, parent_image
+- question: For sensitive processes, does the in-memory code (.text) segment byte/hash-match the same
+    components of the binary on disk, or is there a mismatch that cannot be explained by known relocation
+    or rebasing offsets?
+  context: 'This is the literal definition of Process Code Segment Verification: compare the executable
+    memory of a live process against its source-of-truth on-disk image. For high-value processes, hash
+    or byte-compare the in-memory .text segment against the corresponding sections of the on-disk file,
+    normalizing for legitimate, expected modifications — ASLR relocations, rebasing, and import-address-table
+    fixups. Any remaining divergence is strong evidence of in-memory code modification (injection, stomping,
+    or hot-patching). A clean match supports integrity; an unexplained mismatch should be escalated and
+    the differing region carved for analysis. Beware false negatives if the verification logic or the
+    on-disk source of truth has itself been tampered with.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: EDR/Memory-scan pseudocode
+    query: |-
+      for proc in sensitive_processes:
+        on_disk = sections(read_file(proc.image_path)).text
+        in_mem  = read_memory(proc.pid, proc.text_base, proc.text_size)
+        normalized = apply_relocations(in_mem, proc.reloc_table, proc.image_base_delta)
+        if sha256(normalized) != sha256(on_disk):
+          alert(proc, region=diff(normalized, on_disk))
+- question: Are sensitive-API calls or new thread starts originating from private RX (read/execute) memory
+    that is not backed by any file on disk, or from a backing module whose in-memory bytes differ from
+    its disk image (module stomping)?
+  context: Mature injection avoids the on-disk file entirely, executing from privately allocated memory
+    or overwriting the body of an already-loaded legitimate module (module stomping). Using ETW Threat-Intelligence
+    call stacks and Sysmon Event ID 10 (ProcessAccess) call-trace analysis, walk the originating stack
+    frame for sensitive API calls and thread creations. Frames that resolve to private, non-file-backed
+    RX memory (shown as UNKNOWN/unbacked) or to a module whose mapped bytes no longer match disk indicate
+    code that exists only in memory — exactly what segment verification is designed to catch. A positive
+    result is execution from unbacked memory or a stomped module; a negative is a clean, disk-backed call
+    stack.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: EDR/ETW pseudocode
+    query: |-
+      from etw_ti_callstack OR sysmon EID 10 (ProcessAccess)
+      | for each frame in call_stack:
+          backing = map_region(frame.address)
+      | where backing.type=="PRIVATE" and backing.protect contains "X"  // unbacked RX
+         OR (backing.type=="IMAGE" and hash(backing.bytes)!=hash(disk_section(backing.module)))  // stomp
+      | table host, source_process, target_process, api, frame.address, backing
+- question: On a given host and target process, do the canonical injection primitives appear in the correct
+    order — memory allocation (VirtualAllocEx/NtAllocateVirtualMemory), then a write (WriteProcessMemory/NtWriteVirtualMemory),
+    then execution (CreateRemoteThread/NtCreateThreadEx/QueueUserAPC) — all referencing the same target
+    memory address?
+  context: Single injection-related API calls are noisy and generate many false positives in isolation.
+    The high-confidence pattern is the full, ordered chain — allocate, write, execute — operating on one
+    unified target address within a short window. Correlating these primitives (from Sysmon Event ID 8
+    CreateRemoteThread/WriteProcessMemory and ETW) by shared target address suppresses benign single-API
+    noise and still catches stealthy variants that split the steps. A positive result is a complete allocate->write->execute
+    sequence against the same address in a remote process; partial sequences or unrelated addresses should
+    be deprioritized. This directly evidences runtime code placement that segment verification would later
+    flag as a mismatch.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: |-
+      from api_telemetry (Sysmon EID 8 + ETW)
+      | where api in (alloc_apis, write_apis, exec_apis)
+      | sequence by host, target_pid, target_address within 60s
+        ordered: alloc_apis -> write_apis -> exec_apis
+      | eval confidence="high"
+      | table host, source_pid, target_pid, target_address, sequence
+- question: Are there elevated per-host rates of failed or blocked tampering signals — Sysmon EID 25 'Image
+    is locked for access', denied/failed ProcessAccess where the requested GrantedAccess was not granted,
+    or tampering attempts against protected processes — even when verification ultimately passes?
+  context: 'Attackers probe before they succeed, and protections (PPL, EDR self-protection, locked images)
+    frequently deny tampering attempts. These failure/state signals are valuable indicators in their own
+    right: a burst of denied ProcessAccess against lsass, repeated ''image locked'' events, or repeated
+    attempts on protected processes signal active reconnaissance or an in-progress attack that was merely
+    blocked, not absent. Track these distinct failure states per host and alert when their rate exceeds
+    the host''s baseline percentile. A positive result is an anomalous spike of blocked/failed tampering
+    activity on a host that should be quiet.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      from sysmon (EID 25 locked, EID 10 denied ProcessAccess, protected-process tamper)
+      | stats count as fails by host, signal_type, bin(1h)
+      | join baseline_p95 on host, signal_type
+      | where fails > baseline_p95
+      | alert host, signal_type, fails
+- question: What percentage of active hosts actually emit the telemetry required to detect process tampering
+    — specifically Sysmon Event ID 25-capable data and ETW Threat-Intelligence — and which business units
+    have coverage gaps that could be mistaken for clean hosts?
+  context: 'Detection is only as good as its coverage; a silent host may be clean or simply blind. To
+    make D3-PCSV defensible, quantify the share of active endpoints emitting the required Sysmon telemetry
+    (especially the EID 25 ProcessTampering event) and ETW Threat-Intelligence data, then break the result
+    down by business unit and host role. Low coverage in a critical-server segment is itself a finding:
+    it means tampering there would go undetected. A positive result is a coverage gap — hosts that are
+    active in inventory/EDR but absent from the tampering telemetry stream — which should be remediated
+    before clean-looking dashboards are trusted.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      let active = distinct host from heartbeat last 7d
+      | let covered = distinct host where sysmon_eid in (25) OR etw_ti_present
+      | eval coverage_pct = covered/active by business_unit
+      | where coverage_pct < target_threshold
+      | table business_unit, active, covered, coverage_pct
+- question: For each host and process family, does the observed daily count of tampering or unbacked-execution
+    events exceed its historical percentile threshold (e.g., >P99) or show an abrupt jump versus the trailing
+    30-day median?
+  context: Some environments legitimately generate occasional tampering-like telemetry (security tooling,
+    packers, JIT engines). Rather than alert on every event, build per-host and per-process-family baselines
+    of tampering and unbacked-execution frequency (counts per host per day) and flag statistical outliers
+    — counts above the historical P99 or sudden increases over the trailing 30-day median. This separates
+    a host's normal noise floor from a genuine spike of injection activity. A positive result is a host
+    whose tampering rate suddenly breaks from its own established baseline, which warrants triage even
+    if individual events look unremarkable.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      from tampering_events (Sysmon EID 25, unbacked-exec)
+      | stats count as c by host, process_family, day
+      | join hist (p99, median_30d) on host, process_family
+      | where c > p99 OR c > 3*median_30d
+      | sort -c | table host, process_family, c, p99, median_30d
+- question: When the deterministic rules fire, how does an explainable machine-learning model rank the
+    likelihood that a tampered process is malicious, and which top-three features (e.g., VirtualAllocEx,
+    WriteProcessMemory, CreateRemoteThread, unbacked-RX) drive that score?
+  context: 'Running in parallel with the deterministic rules, a supervised model can prioritize the alert
+    queue by combining tampered-process attributes, parent lineage, command-line features, signer trust,
+    host role, memory-region backing, and ordered-API features into a single malice ranking. Crucially,
+    it must be explainable: surface the top-3 contributing features (via SHAP/LIME) directly in the alert
+    text so the analyst sees why a process scored high — for example unbacked-RX execution plus the allocate/write/execute
+    trio plus an untrusted signer. The ML score complements, not replaces, the rules: a high score on
+    an otherwise borderline event accelerates triage, while feature attribution keeps the verdict defensible
+    and auditable.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - ETW Threat-Intelligence provider
+  - Windows Event ID 4688
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: ML/Inference pseudocode
+    query: |-
+      features = [alloc_api, write_api, exec_api, unbacked_rx, signer_trust, parent_lineage, cmdline_tokens, host_role]
+      score = model.predict_proba(features)
+      explain = shap_top_k(model, features, k=3)
+      if score > 0.8:
+          alert(process, score, top_features=explain)
+- question: Are there process-creation events showing lineage that should never occur — lsass.exe spawning
+    any child, svchost.exe whose parent is not services.exe, or system binaries spawned from user-writable
+    paths?
+  context: When a trusted system process is hollowed or injected and then used to spawn further activity,
+    the resulting parent-child relationship often violates Windows' well-known process tree. lsass.exe
+    spawning a child, an svchost.exe parented by something other than services.exe, or a system binary
+    executing from a user-writable directory are high-fidelity tells that a trusted image was replaced
+    or injected. Using Windows Event ID 4688 and Sysmon Event ID 1, encode these impossible lineages as
+    deterministic rules. A positive result is any match against the impossible-lineage list, which should
+    be treated as likely tampering and triaged with full command line and image-path context.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      from process_creation (Windows EID 4688 OR Sysmon EID 1)
+      | where (parent_image=="lsass.exe")
+         OR (image=="svchost.exe" AND parent_image!="services.exe")
+         OR (image in system_binaries AND image_path matches user_writable_path)
+      | table host, image, image_path, parent_image, user, command_line
+- question: Which known system processes (svchost.exe, explorer.exe, and similar) are running with zero-length
+    / empty command-line arguments, contrary to how the OS normally launches them with explicit parameters?
+  context: Process hollowing typically creates a legitimate system process in a suspended state, unmaps
+    its original image, and writes in malicious code — but the injected shellcode rarely reconstructs
+    the original command-line arguments the OS would normally supply (e.g., svchost.exe -k <servicegroup>).
+    The result is a well-known system binary running with an empty command line, a strong and cheap hollowing
+    indicator. Using Windows Event ID 4688 and Sysmon Event ID 1, flag system processes whose command
+    line is blank. A positive result is a system binary with no arguments where arguments are expected;
+    pair it with network and lineage checks to confirm hollowing versus a rare benign launch.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      from process_creation (Sysmon EID 1 OR Windows EID 4688)
+      | where image in ("svchost.exe","explorer.exe","services.exe","lsass.exe","dllhost.exe")
+      | where length(trim(command_line)) == 0 OR command_line == image_path
+      | table host, image, command_line, parent_image, user
+- question: Across the fleet, which parent->child image pairs are statistically rare (e.g., observed on
+    fewer than 0.1% of hosts) for processes that commonly host injected code, and which hosts exhibit
+    them?
+  context: Beyond hard-coded impossible lineages, prevalence analysis catches novel or stealthy hollowing/injection
+    chains that have not been explicitly enumerated. Compute the historical prevalence of every parent->child
+    image pair across the environment, then flag pairs that fall below a rarity threshold — for instance
+    seen on under 0.1% of hosts — particularly when the child or parent is a common injection host (svchost,
+    rundll32, regsvr32, wmiprvse). Rarity is not proof of malice, but a never-before-seen lineage on a
+    critical server is a strong lead. A positive result is a rare lineage that, combined with other tampering
+    signals, indicates a replaced or injected process image.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      from process_creation
+      | stats dc(host) as host_count by parent_image, child_image
+      | eval prevalence = host_count / total_hosts
+      | where prevalence < 0.001 AND (parent_image in inject_hosts OR child_image in inject_hosts)
+      | sort prevalence | table parent_image, child_image, prevalence, hosts
+- question: For each tampering or unbacked-execution event, is there a Zeek conn.log / Sysmon Event ID
+    3 network session from the same host and process within a tight time window — especially to new destinations,
+    with high outbound bytes, or to known suspicious infrastructure?
+  context: A tampered process usually exists to do something — most often command-and-control or data
+    exfiltration. Linking each tampering or unbacked-execution event to network sessions from the same
+    host and process within a narrow time window turns a host-only signal into a full attack narrative.
+    Prioritize correlated sessions that go to never-before-seen destinations, move large outbound volumes,
+    or hit threat-intel-flagged infrastructure. A positive result is a tampering event tightly followed
+    by anomalous egress from the same process, strongly indicating active C2 or exfiltration; the absence
+    of correlated traffic does not clear the event but lowers its immediate urgency.
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: |-
+      from tampering_events as t
+      | join network (Zeek conn.log OR Sysmon EID 3) as n
+         on t.host==n.host AND t.process==n.process
+         within [t.time, t.time+5m]
+      | eval priority = n.dest_is_new OR n.orig_bytes>p95 OR n.dest in threat_intel
+      | where priority
+      | table host, process, n.dest_ip, n.dest_port, n.orig_bytes, t.tamper_type
+- question: Does a normally-silent system or service process suddenly make outbound connections, contact
+    new destinations/ports, or exceed its historical outbound-byte percentile, in a way that deviates
+    from its learned egress baseline?
+  context: Many system and service processes have a stable, well-understood network profile — some essentially
+    never talk to the internet. Baseline each process's normal egress along volume (bytes/connections),
+    frequency (connections per minute), and state (success/blocked), then alert when a normally-silent
+    process begins making outbound connections, reaches new destinations or ports, or exceeds its outbound-byte
+    percentile. Fleet-wide prevalence helps suppress false positives (e.g., a legitimate but rare update
+    channel). A positive result is a quiet process that abruptly starts communicating externally — a classic
+    downstream symptom of injected code running inside a trusted host process.
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      from network (Zeek conn.log OR Sysmon EID 3)
+      | stats sum(orig_bytes) as bytes, count as conns, dc(dest) as dests by host, process, day
+      | join baseline (mean, p99, normal_silent_flag) on process
+      | where (normal_silent_flag AND conns>0) OR bytes>p99 OR dest_is_new
+      | table host, process, bytes, conns, dests
+- question: Do a process's runtime system-call (or sensitive-API) n-gram sequences deviate from the normal
+    behavioral profile learned for that process, suggesting its code was modified even when static segment
+    verification is inconclusive?
+  context: Static segment verification can be evaded (e.g., verifying a copy of bytes), so behavioral
+    modeling provides a complementary lens. Learn short system-call or sensitive-API n-gram sequences
+    per process as a 'sense of self' baseline, then flag a process whose live execution sequences diverge
+    from its learned normal — divergence implies the code path changed, consistent with injected or stomped
+    code now running inside the process. This catches tampering that static checks miss and corroborates
+    static findings when both fire. A positive result is a process exhibiting anomalous call sequences
+    against its own historical profile; tune n-gram length and thresholds to balance detection against
+    benign behavioral drift.
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Critical servers (e.g., Domain Controllers, database servers), User workstations, Endpoint devices
+    of privileged users'
+  range: Last 90 days
+  queries:
+  - technology: ML/Sequence-model pseudocode
+    query: |-
+      baseline = train_ngram_model(per_process syscall_sequences, n=6)
+      for proc in monitored_processes:
+        seq = recent_syscall_sequence(proc)
+        anomaly = fraction_of_ngrams_unseen(seq, baseline[proc.family])
+        if anomaly > threshold:
+          alert(proc, anomaly_score=anomaly)
