@@ -1,0 +1,333 @@
+name: 'D3-NTPM: Network Traffic Policy Mapping'
+id: e07ee031-c386-4a9e-96b3-9a1def7ba5f0
+description: Investigate whether network communications conform to the established, expected policy of
+  allowed pathways between internal and external assets, and surface flows that fall outside that learned
+  policy. This playbook builds a baseline model of distinct source/destination IP, destination port, and
+  protocol 4-tuples with per-pathway volume, frequency, and connection-state metrics; it layers deterministic
+  allowlist rules (observed-policy 4-tuples, deviations from mapped policy, connection-failure/state profiling,
+  unfingerprinted egress), statistical baselining (volume/frequency z-score and MAD exceedance, new listening-service
+  detection, per-host application fingerprints, probabilistic destination-novelty scoring), and explainable
+  machine learning (asset-role clustering, communication-graph edge scoring, and online flow-statistic
+  anomaly detection with SHAP/LIME feature attribution). It helps an analyst detect unauthorized connections,
+  backdoors and new services, horizontal scanning, beaconing, and out-of-policy egress while keeping success
+  and failure traffic as independent signals.
+type: technique
+related:
+- tactic_id: D3-M
+  tactic_name: Model
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: What is the complete set of observed network communication pathways, expressed as distinct
+    (source IP, destination IP, destination port, protocol) 4-tuples, and which of those pathways are
+    rare enough to be low-confidence members of the de facto allow-policy?
+  context: 'Under the Model tactic the analyst is constructing the baseline that every later detection
+    depends on: an enumerated allowlist of the communication pathways that actually occur on the network.
+    Generate a distinct list of all (id.orig_h, id.resp_h, id.resp_p, proto) 4-tuples from Zeek conn.log
+    (or equivalent firewall/NetFlow records) over a baseline window of at least 30 days. This observed
+    allowlist mirrors the explicit permit-by-exception rulebase model in NIST SP 800-41r1 and the permit/deny
+    ACE structure on enforcement devices such as Cisco ASR 9000 ACLs. Persist per-tuple connection counts
+    so that rare tuples seen below a tunable floor (for example fewer than 5 connections) are tagged low-confidence
+    rather than treated as fully sanctioned. A well-populated, stable baseline is the negative/expected
+    result; a sparse or volatile baseline indicates the window is too short or the segment is too dynamic
+    to model reliably yet.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - NetFlow
+  - 'NAI: Internal network segments, DMZ, Internet gateways, and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      FROM conn_log EARLIEST=-30d
+
+      | STATS connections=count() BY id.orig_h, id.resp_h, id.resp_p, proto
+
+      | EVAL confidence = IF(connections < 5, "low", "normal")
+
+      | OUTPUT observed_policy_allowlist'
+- question: Is any high-value asset initiating or receiving a connection on a (destination port, protocol)
+    combination that was never observed in the baseline window, indicating traffic outside the mapped
+    policy?
+  context: This is a deterministic policy-deviation rule for the Model/baseline-enforcement workflow.
+    Compare live traffic against the baselined 4-tuples and alert whenever a high-value asset participates
+    in a connection whose (port, proto) never appeared during the baseline period, applying the unauthorized-connection
+    logic formalized by Ghorbani et al. A sophisticated external actor establishing C2, a new admin channel,
+    or lateral movement will frequently use a port/protocol the asset has never spoken before. Triage
+    by confirming the asset's role, checking whether the port maps to a sanctioned service, and pivoting
+    on the initiating process via correlated host telemetry. A positive result is a strong candidate for
+    unauthorized access; a negative result confirms the connection conforms to mapped policy.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - NetFlow
+  - 'NAI: Internal network segments, DMZ, Internet gateways, and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      FROM conn_log (asset IN high_value_assets)
+
+      | LOOKUP observed_policy_allowlist BY id.resp_p, proto
+
+      | WHERE NOT matched
+
+      | ALERT severity=high, fields=(asset, id.resp_h, id.resp_p, proto, process)'
+- question: Which hosts exhibit abnormal volumes of rejected or half-open connections (REJ, S0, RSTO/RSTR)
+    relative to successful connections, suggesting horizontal scanning or failed-access probing?
+  context: Connection state and failure are treated as a first-class signal here rather than being collapsed
+    into success counts. Using Zeek conn.log conn_state/history fields, separately count REJ (rejected),
+    S0 (no reply), RSTO/RSTR (resets), and SF (normal establishment) per source over rolling 1-minute
+    and 1-hour windows. Alert when a host's rejected/half-open ratio exceeds a derived threshold (for
+    example more than 20 distinct destinations on REJ/S0 within 5 minutes, a classic horizontal-scan signature).
+    Keeping failure and success as independent metrics lets the analyst distinguish reconnaissance and
+    access failures from benign traffic. A positive result indicates scanning or probing consistent with
+    discovery/lateral-movement preparation; a negative result means failure rates are within normal operational
+    noise.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - NetFlow
+  - 'NAI: Internal network segments, DMZ, Internet gateways, and VPN concentrators.'
+  range: Last 90 days; evaluate over 1-minute and 1-hour rolling windows
+  queries:
+  - technology: Zeek/pseudocode
+    query: '>-
+
+      LOAD conn.log
+
+      | BUCKET 5min
+
+      | STATS distinct_dst=dcount(id.resp_h) BY id.orig_h, conn_state
+
+      | WHERE conn_state IN ("REJ","S0") AND distinct_dst > 20
+
+      | EMIT alert(id.orig_h, conn_state, distinct_dst, "possible horizontal scan")'
+- question: Does the byte volume or connection frequency on any mapped pathway deviate significantly from
+    its per-pathway statistical baseline, after accounting for benign periodic/automated cadence?
+  context: This is the statistical baselining layer of the Model tactic. For each 4-tuple compute Volume
+    (mean and 95th-percentile of orig_bytes+resp_bytes, plus the orig/resp byte ratio) and Frequency (connections
+    per minute and per hour); alert on robust z-score or MAD exceedance versus the per-pathway baseline.
+    Model periodic/automated cadence (per Mack et al.) so benign scheduled flows such as software updates,
+    NTP, and telemetry are not misclassified as beaconing. Derive thresholds per-dataset (for example
+    calibrated on the LANL Unified Host and Network data) rather than hard-coding them. A positive result
+    flags exfiltration-sized transfers, beaconing, or abnormal call frequency; a negative result confirms
+    the pathway is operating within its learned envelope. The byte ratio is especially useful for spotting
+    data staging/exfiltration where outbound greatly exceeds inbound.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - NetFlow
+  - 'NAI: Internal network segments, DMZ, Internet gateways, and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      FROM conn_log
+
+      | STATS bytes=p95(orig_bytes+resp_bytes), ratio=avg(orig_bytes/resp_bytes), freq=count()/window_min
+      BY tuple
+
+      | JOIN baseline BY tuple
+
+      | EVAL z=robust_z(bytes, baseline.bytes_med, baseline.bytes_mad)
+
+      | WHERE abs(z) > 3.5 AND NOT is_periodic(tuple)
+
+      | ALERT(tuple, bytes, ratio, freq, z)'
+- question: Has any stable internal host begun accepting connections as a server on a destination port
+    it was never observed listening on before, indicating a possible backdoor or unauthorized service?
+  context: This statistical first-seen detection watches the set of listening (server) ports per internal
+    IP, derived from Zeek conn.log direction/responder fields or Beehive-style host feature mining. Alert
+    when a host that has had a stable server-port profile begins accepting connections on a previously
+    unseen port. A new listening service on an otherwise stable server is a high-fidelity indicator of
+    a backdoor, a remote-access implant, or an unsanctioned service stood up by an insider or intruder.
+    Include the first-seen timestamp and the host's prior known port set in the alert so the analyst can
+    immediately assess whether the change is an approved deployment or an anomaly. A positive result warrants
+    host-level investigation of the listening process; a negative result confirms the service footprint
+    is unchanged.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - NetFlow
+  - 'NAI: Internal network segments, DMZ, Internet gateways, and VPN concentrators.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      FROM conn_log WHERE direction=responder
+
+      | STATS first_seen=min(ts), prior_ports=values(id.resp_p) BY id.resp_h
+
+      | LOOKUP server_port_baseline BY id.resp_h
+
+      | WHERE id.resp_p NOT IN baseline.ports
+
+      | ALERT(id.resp_h, id.resp_p, first_seen, baseline.ports)'
+- question: What is the expected per-host outbound application-layer fingerprint (User-Agent set, header
+    ordering, SNI/JA-style client traits, average request size and interval), and does it form a stable
+    allowlist of known-good egress behavior?
+  context: 'Under the Model tactic this builds the application-layer baseline that complements the network-layer
+    4-tuple model. During a training window, learn per-host outbound application fingerprints as in DECANTeR:
+    the set of User-Agents, HTTP header ordering, SNI/JA-style TLS client traits, and average request
+    size/interval the host normally exhibits. Store these as a per-host allowlist of expected egress behavior.
+    This fingerprint captures the ''how'' of a host''s communication, not just the ''where'', so malware
+    that reuses an approved destination but presents a different client fingerprint can still be caught.
+    A stable, well-clustered fingerprint per host is the expected result; high intra-host variance suggests
+    a shared/multi-user host that needs per-application rather than per-host profiling.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Proxy
+  - 'NAI: Internet gateways, web proxies, and DMZ egress points.'
+  range: Last 90 days; training window 14-30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      FROM http_log, ssl_log EARLIEST=-30d
+
+      | STATS user_agents=values(ua), header_order=values(hdr_seq), ja=values(ja3), avg_size=avg(req_len),
+      avg_interval=avg(delta_t) BY src_host
+
+      | OUTPUT per_host_app_fingerprint'
+- question: Is any outbound HTTP or TLS flow failing to match any learned application fingerprint for
+    its originating host, particularly flows directed to rare or newly observed destinations?
+  context: This deterministic rule operationalizes the DECANTeR fingerprint allowlist. Alert on any outbound
+    HTTP/TLS flow that matches no learned fingerprint for that host, and prioritize flows to rare or new
+    destinations. An unfingerprinted egress flow is exactly the footprint of a new tool, malware C2, or
+    a manual data-exfiltration attempt that does not reuse the host's normal browser/agent behavior. Triage
+    by correlating the initiating process on the host and assessing the destination's prevalence across
+    the fleet (a destination only this one host talks to is far more suspicious than a popular SaaS endpoint).
+    A positive result is a strong unauthorized-egress candidate; a negative result means the flow conforms
+    to the host's known application behavior.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Proxy
+  - 'NAI: Internet gateways, web proxies, and DMZ egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      FROM http_log, ssl_log (direction=outbound)
+
+      | LOOKUP per_host_app_fingerprint BY src_host
+
+      | WHERE flow_fingerprint NOT IN host.known_fingerprints
+
+      | ENRICH dest WITH fleet_prevalence
+
+      | ALERT severity=high WHEN dest.prevalence=rare, fields=(src_host, dest, ua, ja3, process)'
+- question: When a host communicates with a new external destination, how probable is it that this edge
+    is genuinely novel (versus expected organic growth), and should it therefore be escalated?
+  context: Rather than treating every first-seen external destination as equally suspicious, score new
+    (host -> external-domain/IP) edges by their modeled probability of being genuinely novel using the
+    Bayesian new-edge framework of Metelli & Heard, and learn per-host destination profiles with a Dirichlet-process
+    model (Heard et al.) to suppress expected growth. This statistical approach drastically cuts the false-positive
+    volume that naive first-seen alerting produces, because normal users constantly visit new benign sites.
+    A high novelty/anomaly score concentrates analyst attention on the new destinations least explainable
+    by a host's organic browsing history -- the ones most likely to be C2 or exfiltration endpoints. A
+    high score warrants triage of the destination and initiating process; a low score indicates expected
+    destination growth.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - Proxy
+  - 'NAI: Internet gateways, web proxies, and DMZ egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      FROM http_log, ssl_log (direction=outbound)
+
+      | EVAL is_new_edge = NOT seen_before(src_host, dest)
+
+      | WHERE is_new_edge
+
+      | SCORE novelty = bayesian_new_edge_prob(src_host, dest, dirichlet_profile[src_host])
+
+      | WHERE novelty > threshold
+
+      | ALERT(src_host, dest, novelty)'
+- question: Which implicit asset roles and network segments emerge when hosts are clustered by their communication
+    profiles, and is any host drifting away from the cluster (role) it was assigned to?
+  context: This machine-learning layer infers segmentation and roles that are not formally documented.
+    Cluster hosts by communication profile -- vectors of destination ports/protocols, peer sets, and Volume
+    -- using a k-means/PCA/MAD ensemble as in Bohara et al. The resulting clusters define implicit segmentation
+    and asset roles (for example domain controllers, web servers, workstations), and a host that drifts
+    from its cluster is flagged as behaving unlike its role peers. Crucially, the alert text must list
+    the top-3 features driving the assignment or deviation (per the SHAP-in-IDS review) so the analyst
+    triages an explanation, not an opaque score. A drifting host may have been repurposed, compromised,
+    or be carrying out activity inconsistent with its function. A positive result is a role-deviation
+    lead; a negative result confirms the host behaves like its peers.
+  answer_sources:
+  - Zeek conn.log
+  - NetFlow
+  - Firewall
+  - 'NAI: Enterprise-wide internal segments, server VLANs, and egress points.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\nfeatures = vectorize(host, [dst_ports, protocols, peer_set, volume])\nclusters = ensemble_kmeans_pca_mad(features)\n\
+      for host in hosts:\n    if distance(host, host.cluster_centroid) > drift_threshold:\n        top3\
+      \ = shap_top_features(host, k=3)\n        alert(host, host.role_cluster, top3)"
+- question: Which source-to-destination communication-graph edges have low modeled likelihood under a
+    learned graph embedding, marking them as out-of-policy relative to the network's normal connectivity
+    structure?
+  context: 'This ML detector learns unsupervised embeddings over the dynamic communication graph and scores
+    each edge''s likelihood, flagging low-probability src->dst edges as out-of-policy (per CyberGraph).
+    It acts as a learned allow-policy that complements the deterministic 4-tuple allowlist: where the
+    4-tuple list catches never-before-seen pairs, the graph model catches edges that are technically possible
+    but structurally improbable given who normally talks to whom (for example a workstation suddenly talking
+    to a database server it has no graph-neighborhood reason to reach). Validate the model on the LANL
+    Unified Host and Network dataset. A low-likelihood edge is a candidate for lateral movement or unauthorized
+    access; expected edges score high and are suppressed. Always pair the score with the contributing
+    endpoints for analyst triage.'
+  answer_sources:
+  - Zeek conn.log
+  - NetFlow
+  - Firewall
+  - 'NAI: Enterprise-wide internal segments, server VLANs, and egress points.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\ngraph = build_dynamic_comm_graph(conn_log, netflow)\nemb = unsupervised_graph_embedding(graph)\n\
+      for edge(src,dst) in live_edges:\n    p = edge_likelihood(emb, src, dst)\n    if p < low_prob_threshold:\n\
+      \        alert(src, dst, p, \"out-of-policy edge\")"
+- question: Do online per-host/per-flow statistics produce reconstruction or anomaly errors above auto-learned
+    thresholds across an ensemble of unsupervised models, and what top features explain each anomaly?
+  context: This is the streaming anomaly-detection layer that runs in parallel with -- and never replaces
+    -- the deterministic policy rules. Run an online autoencoder ensemble over incremental per-host/per-flow
+    statistics (Kitsune) and alert on reconstruction error above the auto-learned threshold; complement
+    it with a distribution-free Isolation Forest score and a poisoning-robust one-class model (iForest/OCSVM
+    with LIME). For every ML alert, surface the top-3 contributing features (for example dst_port, bytes_out,
+    conn_state) using SHAP/LIME so analysts triage explanations rather than bare scores. Using an ensemble
+    reduces blind spots and resistance to adversarial poisoning. A high reconstruction/anomaly error indicates
+    a flow that does not fit any learned normal pattern -- potential novel C2, exfiltration, or scanning;
+    a low error indicates normal traffic. Because these are unsupervised, the feature attributions are
+    essential to separate true anomalies from concept drift.
+  answer_sources:
+  - Zeek conn.log
+  - NetFlow
+  - Firewall
+  - 'NAI: Enterprise-wide internal segments, server VLANs, and egress points.'
+  range: Last 90 days; score continuously on streaming data
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\nfor flow in stream(per_host_flow_stats):\n    ae_err = kitsune_autoencoder_ensemble.reconstruction_error(flow)\n\
+      \    if_score = isolation_forest.score(flow)\n    oc_score = ocsvm_poison_robust.score(flow)\n \
+      \   if ae_err > auto_threshold OR if_score>t1 OR oc_score>t2:\n        top3 = shap_lime_top_features(flow,\
+      \ k=3)  # e.g. dst_port, bytes_out, conn_state\n        alert(flow.host, flow.id, ae_err, if_score,\
+      \ oc_score, top3)"
