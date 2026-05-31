@@ -1,0 +1,274 @@
+name: 'D3-CCSA: Credential Compromise Scope Analysis'
+id: 54d4dac1-fb3b-45d6-bd9b-d10f8477e504
+description: Investigate the full scope of a credential-compromise event on an affected host. This playbook
+  helps an analyst pinpoint the credential-theft event itself - direct reads of credential stores outside
+  normal authentication such as lsass memory, the SAM/SECURITY hive, ntds.dit, hiberfil.sys, /etc/shadow,
+  and /proc - which establishes the compromise time t0; enumerate every account that touched the system
+  since last boot and is therefore potentially compromised; correlate host and network authentication
+  timelines to surface abnormal host spread, byte/frequency volume, success/fail state shifts, first-time
+  credential edges, and follow-on account reuse consistent with lateral movement; and reconstruct the
+  host-resident process/file/network footprint to bound follow-on actions enabled by the stolen credentials.
+  It combines deterministic symbolic-logic rules (which are never suppressed) with statistical baselining
+  and machine-learning models that must surface their top contributing features.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which user accounts have logged on to the affected host since its last boot, and is each one
+    therefore in scope as a potentially compromised credential?
+  context: Per CAR-2015-07-001 (All Logins Since Last Boot), once a credential dumper like mimikatz reads
+    lsass memory, every account logged on since boot is potentially compromised because its credentials
+    were resident in memory. This deterministic enumeration is the floor of the scope analysis and is
+    NEVER suppressed by any score. Extract every interactive (type 2), network (type 3), and RemoteInteractive/RDP
+    (type 10) logon (Event 4624) on the host since the last boot marker (Event 6005/6009), join logoff
+    events (4634/4647) and Zeek conn.log sessions, and emit a deterministic unique-account list. Treat
+    every account with a session since boot as in-scope the moment lsass or any credential store is accessed.
+    A complete list tells the analyst exactly which credentials must be reset and monitored; missing an
+    account leaves an open foothold. This supports the Detect tactic by establishing the blast radius.
+  answer_sources: &id001
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4648
+  - Windows Event ID 6005/6009 (boot)
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Since last boot of the affected host (anchor to Event 6005/6009; typically Last 30 days)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      LET boot = latest(EventID IN (6005,6009)) WHERE Host=affected_host
+      FROM WindowsSecurity WHERE Host=affected_host AND EventID=4624
+        AND LogonType IN (2,3,10) AND _time >= boot
+      JOIN logoffs = EventID IN (4634,4647) ON TargetLogonId
+      STATS earliest(_time) AS first_seen, latest(_time) AS last_seen BY TargetUserName
+      OUTPUT unique account list  // hard floor: every account = in-scope
+  - technology: Zeek/pseudocode
+    query: |-
+      FROM conn.log WHERE id.resp_h = affected_host_ip AND ts >= boot_time
+      STATS count BY id.orig_h  // corroborate network sessions touching host since boot
+- question: After t0, did any in-scope account log on to a host it had never accessed in the prior 90
+    days, or did multiple accounts use explicit credentials toward multiple destinations in a short window?
+  context: Reuse of stolen credentials produces first-time account-to-host edges and explicit-credential
+    fan-out. Building per-account login paths (as in Hopper) lets the analyst hard-flag any post-t0 logon
+    to a host absent from that account's prior 90-day history. Additionally, per the Azure Sentinel Multiple
+    Explicit Credential Usage (Event 4648) query, flag any source host where >=3 distinct accounts used
+    explicit credentials (4648) toward >=3 distinct destinations within 10 minutes - a classic pass-the-hash
+    / credential-replay pattern. Counts are tuned to the environment but the deterministic rule remains.
+    A positive result strongly indicates lateral movement using the compromised credentials; a negative
+    result helps bound the scope. This serves the Detect tactic by tracing how far the stolen credentials
+    have spread.
+  answer_sources: *id001
+  range: Last 90 days for baseline; t0 to now for evaluation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      LET hist = SET(host) FROM 4624 WHERE account=A AND _time IN [t0-90d, t0)
+      FROM 4624 WHERE account=A AND _time >= t0
+      WHERE DestHost NOT IN hist -> FLAG first_time_host_access (hard)
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      FROM WindowsSecurity WHERE EventID=4648 AND _time >= t0
+      BIN _time SPAN=10m
+      STATS dc(SubjectUserName) AS accts, dc(TargetServerName) AS dests BY SourceHost, bin
+      WHERE accts >= 3 AND dests >= 3 -> FLAG explicit_cred_fanout
+- question: Does any in-scope account show a post-compromise spike in the number of unique hosts contacted,
+    off-hours activity, or network byte volume well above its own 30-day baseline?
+  context: Following host-graph feature approaches (Bohara et al.) and per-edge counting models (Heard
+    et al.), compute each account's 30-day baseline of daily unique hosts contacted, off-hours fraction,
+    and Zeek conn.log byte volume (orig_bytes + resp_bytes). Alert when post-compromise unique hosts exceed
+    baseline mean + 3*MAD (or exceed the account's personal p99), or when session byte volume deviates
+    more than 3 sigma from baseline. Thresholds are derived per dataset from the trailing 30-day distribution
+    rather than fixed globally. A sharp increase in host spread or data movement after t0 is a strong
+    statistical signal that the credential is being actively abused for lateral movement or collection.
+    This supports the Detect tactic by quantifying abnormal behavior that deterministic rules might miss.
+  answer_sources: *id001
+  range: Last 30 days for baseline; post-t0 window for evaluation
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      FROM 4624 WHERE _time IN [now-30d, t0)
+      STATS dc(DestHost) AS daily_hosts BY account, date
+      EVAL mean=avg(daily_hosts), mad=mad(daily_hosts) BY account
+      FROM 4624 WHERE _time >= t0 STATS dc(DestHost) AS cur BY account
+      WHERE cur > mean + 3*mad OR cur > p99(daily_hosts) -> ALERT
+  - technology: Zeek/pseudocode
+    query: |-
+      FROM conn.log GROUP BY account
+      EVAL bytes = orig_bytes + resp_bytes
+      compare post-t0 bytes vs baseline; ALERT if |z| > 3
+- question: Is there an abrupt change in the authentication failure-to-success ratio or attempt rate for
+    any in-scope account or host, including bursts of bad-password or lockout status codes?
+  context: Authentication failures are a distinct signal of credential testing/brute force or replay of
+    stale hashes. Per account/host, compute the 4625-failed / 4624-success ratio and attempts per minute
+    in 5-minute bins, then apply CUSUM and PELT change-point detection to find abrupt regime shifts. Alert
+    on a detected change point or a failed/success ratio above a tuned floor (e.g., > 0.3), and specifically
+    on bursts of Event 4625 with status 0xC000006A (bad password) or 0xC0000234 (account locked out),
+    plus Zeek failed/aborted connection spikes. A sudden surge in failures after t0 suggests the attacker
+    is testing stolen credentials or guessing related accounts; a steady ratio argues against active brute
+    forcing. This serves the Detect tactic by profiling the success/fail state of credential use.
+  answer_sources: *id001
+  range: Last 90 days for baseline; 5-minute bins around t0 and after
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      FROM WindowsSecurity WHERE EventID IN (4624,4625)
+      BIN _time SPAN=5m
+      STATS sum(EventID=4625) AS fail, sum(EventID=4624) AS ok BY account, host, bin
+      EVAL ratio = fail/(ok+1)
+      APPLY CUSUM/PELT on ratio time series
+      WHERE changepoint OR ratio > 0.3 -> ALERT
+      HIGHLIGHT 4625 Status IN (0xC000006A, 0xC0000234)
+  - technology: Zeek/pseudocode
+    query: |-
+      FROM conn.log WHERE conn_state IN ('REJ','RSTO','S0')
+      BIN ts SPAN=5m STATS count BY id.orig_h, bin; ALERT on burst
+- question: Which first-seen account-to-host authentication edges in the compromise window are most anomalous
+    given the surrounding network structure?
+  context: Not every new edge is equally suspicious; some reflect normal growth. Apply the Bayesian new-edge
+    model (Metelli & Heard, On Bayesian new edge prediction and anomaly detection in computer networks)
+    to score each first-seen account-to-host edge in the compromise window using shared-neighbour structure
+    - an edge between two nodes that share few common neighbours is far more surprising than one between
+    well-connected peers. Escalate edges in the top anomaly percentile as likely scope expansion. This
+    statistical method refines the deterministic first-time-host rule by ranking which new edges actually
+    warrant investigation, reducing analyst fatigue while preserving sensitivity. It supports the Detect
+    tactic by prioritizing the most probable lateral-movement paths.
+  answer_sources: *id001
+  range: Last 90 days for graph structure; compromise window for scoring
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      BUILD bipartite graph (account -> host) from 4624 over baseline
+      FOR each first-seen edge (a,h) in [t0, now]:
+        score = bayesian_new_edge(a, h, shared_neighbours)
+      RANK by score; ESCALATE top percentile as scope_expansion
+- question: Do machine-learning models of authentication sequences and host-graph dynamics flag post-t0
+    credential movements as anomalous, and what features drive each alert?
+  context: Run in parallel with - never replacing - the deterministic rules. Score post-t0 authentication
+    edges with temporal link prediction (Euler) and unsupervised graph embeddings (CyberGraph), or with
+    attention-RNN log models for sequence anomalies. These models capture subtle, multi-step movement
+    patterns that simple thresholds miss. Critically, every alert MUST surface the top-3 contributing
+    features (e.g., new edge, off-hours timing, rare authentication type or source host) drawn from attention
+    weights or embedding deltas - not just an opaque score - so the analyst can validate and act. A high
+    score with explainable features corroborates lateral movement; an unexplained score should be triaged
+    cautiously. This supports the Detect tactic by modeling anomalous credential-movement sequences with
+    interpretable output.
+  answer_sources: *id001
+  range: Last 90 days for training; post-t0 for scoring
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      model = TemporalLinkPredictor(Euler) | GraphEmbedding(CyberGraph) | AttnRNN(logs)
+      train on baseline auth graph/sequences
+      FOR edge in post_t0_edges: s = model.score(edge)
+        feats = top3(attention_weights | embedding_delta)
+      EMIT {edge, score, top3_features}  // run alongside deterministic rules
+- question: Has any process accessed a credential store - lsass memory, ntds.dit, the SAM/SECURITY hive,
+    /etc/shadow, or /proc maps - outside the normal authentication procedure, and does this define the
+    compromise time t0?
+  context: Per Symantec's Systems and methods for detecting credential theft, any access to a credential
+    store that occurs outside the authentication procedure is primary evidence of theft. Alert on Sysmon
+    Event 10 (ProcessAccess) to lsass.exe with GrantedAccess 0x1010/0x1410/0x143a from a non-system process;
+    Event 4663 reads of ntds.dit or the SAM/SECURITY hive; and auditd reads of /etc/shadow or /proc/*/maps
+    by a non-authentication process. This event sets t0, and per CAR-2015-07-001 it makes every since-boot
+    account on the host in-scope. Detecting it precisely is the anchor for the entire scope analysis -
+    the analyst pivots from this timestamp to enumerate exposed accounts and follow-on activity. This
+    is the core Detect-tactic trigger.
+  answer_sources: &id002
+  - Sysmon Event ID 10 (ProcessAccess)
+  - Windows Event ID 4663/4656 (object access)
+  - Windows Event ID 4672
+  - Linux auditd file access
+  - Sysmon Event ID 11 (FileCreate)
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      FROM Sysmon WHERE EventID=10 AND TargetImage='lsass.exe'
+        AND GrantedAccess IN (0x1010,0x1410,0x143A)
+        AND SourceImage NOT IN system_processes -> ALERT t0
+      OR EventID=4663 AND ObjectName IN ('*ntds.dit','*\\config\\SAM','*\\config\\SECURITY')
+  - technology: auditd/pseudocode
+    query: |-
+      FROM auditd WHERE name IN ('/etc/shadow') OR name MATCHES '/proc/*/maps'
+        AND syscall IN (open,openat,read) AND comm NOT IN auth_processes -> ALERT t0
+- question: Is there corroborating evidence - a known dumper image/hash, anomalous parent process, a handle
+    to HKLM\SECURITY\Cache, or a copied hiberfil/ntds file - that should escalate a credential-access
+    alert to high severity?
+  context: Primary evidence alone (a credential-store read) is medium severity; per the Symantec method,
+    require corroborating evidence before high severity. Corroboration includes a known dumper image name
+    or hash (mimikatz, procdump, gsecdump, etc.), an anomalous parent process, a handle to HKLM\SECURITY\Cache
+    (cached domain credentials), or a copy of hiberfil.sys or ntds.dit via Sysmon Event 11 (FileCreate).
+    Also record the count of failed vs. successful store-access attempts as a state signal. Combining
+    primary and corroborating evidence sharply reduces false positives (e.g., legitimate backup or AV
+    reading lsass) while ensuring genuine theft is escalated. This supports the Detect tactic by grading
+    the confidence of the t0 event before spinning up full scope analysis.
+  answer_sources: *id002
+  range: Last 90 days; correlate within minutes of the primary t0 event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      LET primary = credential_store_access_alert  // from prior question
+      corro = ANY(
+        Sysmon EID=1 Image/Hash IN known_dumpers,
+        Sysmon EID=1 ParentImage anomalous,
+        handle to HKLM\\SECURITY\\Cache,
+        Sysmon EID=11 TargetFilename MATCHES ('*hiberfil.sys','*ntds.dit'))
+      IF primary AND corro -> SEV=HIGH ELSE SEV=MEDIUM
+      STATS count(fail), count(success) AS access_state
+- question: What is the ranked set of anomalous processes, files, and network connections in the host's
+    whole-system provenance graph after t0, and what features make each anomalous?
+  context: After credential access, the analyst must bound the follow-on actions enabled by the stolen
+    credentials. Build a whole-system provenance graph from host telemetry (process creation, file creation,
+    network connections) and score post-t0 nodes/edges with a temporal graph autoencoder (KAIROS) or node-level
+    GraphSAGE (ThreaTrace). The output is a ranked list of anomalous processes, files, and connections
+    with their top contributing features, letting the analyst trace the attacker's footprint from t0 forward.
+    Deterministic process/parent rules are retained in parallel and are not overridden by the ML ranking.
+    A dense cluster of anomalous provenance around the in-scope accounts indicates active post-compromise
+    activity. This supports the Detect tactic by reconstructing the attack footprint to scope downstream
+    actions.
+  answer_sources: &id003
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 3 (NetworkConnect)
+  - Sysmon Event ID 11 (FileCreate)
+  - Linux auditd
+  - 'NAI: Domain Controllers, Member Servers, Critical Workstations'
+  range: t0 to now (default Last 90 days if t0 unknown)
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      g = build_provenance_graph(Sysmon EID 1/3/11, auditd) for host
+      model = KAIROS(temporal_graph_autoencoder) | ThreaTrace(GraphSAGE)
+      FOR node/edge in post_t0(g): s = model.anomaly(node)
+      RANK processes/files/connections by s WITH top_features
+      // keep deterministic process/parent rules in parallel
+- question: Did any in-scope account, after t0, install new services, register scheduled tasks, create
+    remote processes, or open outbound connections to never-before-seen destinations?
+  context: 'Enumerate concrete, high-fidelity post-t0 actions directly from first-party logs as hard rules:
+    new service installs (Event 7045), new scheduled tasks (Event 4698), remote process creation, and
+    outbound Sysmon Event 3 (NetworkConnect) connections to never-before-seen destinations by the in-scope
+    accounts. These deterministic triggers are maintained as a fixed inventory and the ML provenance score
+    must NOT suppress a fired deterministic rule. Each of these actions is a common persistence or lateral-movement
+    primitive an attacker uses once they hold valid credentials. Finding any of them after t0 by an in-scope
+    account confirms the credential is being weaponized and expands the investigation scope. This supports
+    the Detect tactic with a concrete follow-on trigger inventory that complements the ML footprint reconstruction.'
+  answer_sources: *id003
+  range: t0 to now (default Last 90 days if t0 unknown)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      FROM WindowsSystem/Security WHERE _time >= t0 AND account IN in_scope_accounts
+      MATCH ANY:
+        EventID=7045 (new service install)
+        EventID=4698 (scheduled task created)
+        remote process creation (4688/Sysmon 1 with remote parent)
+        Sysmon EID=3 DestIP NOT IN seen_destinations(account,90d)
+      -> FLAG follow_on_action (hard rule; never suppressed by ML)
