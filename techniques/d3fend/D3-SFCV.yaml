@@ -1,0 +1,373 @@
+name: 'D3-SFCV: Stack Frame Canary Validation'
+id: ecd5fd7d-da1d-4c06-982c-c55c4bacd8d7
+description: This playbook helps an analyst investigate whether stack frame canary protections are present,
+  effective, and actually firing across critical C/C++ applications, and whether attackers are attempting
+  or succeeding at memory-corruption attacks against them. Stack canaries produce high-fidelity, deterministic
+  crash artifacts when a contiguous stack overwrite is caught at a function epilogue - on Windows the
+  STATUS_STACK_BUFFER_OVERRUN exception (0xC0000409) via the /GS __fastfail path, and on Linux/macOS the
+  libc '*** stack smashing detected ***' message with SIGABRT from __stack_chk_fail. Because canaries
+  are routinely defeated by information leaks, write-what-where / direct overwrites that skip the canary,
+  and SEH abuse, this playbook layers deterministic crash-detection rules, build-time verification that
+  protections are compiled into shipped binaries, hardware shadow-stack (Intel CET) telemetry, statistical
+  crash bucketing and frequency baselining, anomalous inbound-payload detection, and machine-learning
+  analysis of control-flow traces, ROP gadget chains, and network flows. Use it to confirm canary coverage,
+  distinguish failed exploitation (a defended target) from successful bypass (an undefended or evaded
+  target), and surface zero-day attempts, fuzzing pressure, and hardening regressions against critical
+  and internet-facing software.
+type: technique
+related:
+- tactic_id: D3-H
+  tactic_name: Harden
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a Windows stack canary fire in any critical process, evidenced by a STATUS_STACK_BUFFER_OVERRUN
+    (0xC0000409) exception and the /GS __fastfail security-handler path?
+  context: 'This is the most direct, deterministic confirmation that a stack canary caught a contiguous
+    stack overwrite and terminated the process before control-flow hijack could occur. Query Windows Application/WER
+    logs (Event ID 1000/1001) and Sysmon process-terminate (Event ID 5) for exception code 0xC0000409,
+    which the MSVC /GS security cookie raises via __fastfail when the stack cookie does not match its
+    saved value at the function epilogue. For the Harden mission this is gold: a firing means the protection
+    you compiled in actually worked and a memory-corruption attempt was stopped. Alert on ANY occurrence
+    in a critical process - a single high-confidence firing should never be suppressed, because it indicates
+    either active exploitation attempts, fuzzing pressure, or a serious software defect. Investigate the
+    faulting module, offset, and call stack, and pivot to the network and host telemetry around the crash
+    window to determine whether the trigger was an external attacker.'
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1001
+  - Windows Event ID 1002
+  - Sysmon Event ID 5
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; pivot to a +/-5 minute window around each crash for correlation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (WinEventID:1000, WinEventID:1001, WinEventID:1002, SysmonEventID:5)\n| where exception_code\
+      \ == 0xC0000409  // STATUS_STACK_BUFFER_OVERRUN\n   OR fault_handler matches \"__fastfail\" OR signature\
+      \ contains \"/GS\"\n| where process_name in CRITICAL_APP_INVENTORY\n| alert severity=high \"Stack\
+      \ canary fired (Windows /GS) in critical process\""
+- question: On Linux or macOS, did a critical process abort with the libc '*** stack smashing detected
+    ***' message and SIGABRT (signal 6) originating from __stack_chk_fail?
+  context: This is the GCC/Clang Stack Smashing Protector (SSP) equivalent of the Windows /GS failfast.
+    When the SSP canary (the __stack_chk_guard value) is found corrupted at the epilogue, libc calls __stack_chk_fail,
+    prints '*** stack smashing detected ***', and raises SIGABRT (signal 6), terminating the process.
+    Query journald, coredumpctl, abrtd, and auditd for that message and for SIGABRT terminations of critical
+    services. For the Harden mission, this deterministically confirms your -fstack-protector build caught
+    and stopped an overwrite. Alert on any such abort in a critical process and examine the captured core
+    (faulting frame, backtrace) plus surrounding network and auditd activity to establish whether the
+    cause was an external overflow trigger versus an internal memory-safety bug.
+  answer_sources:
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; pivot to a +/-5 minute window around each abort for correlation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (linux_journald, coredumpctl, auditd)\n| where message contains \"*** stack smashing\
+      \ detected ***\"\n   OR (signal == 6 AND faulting_symbol == \"__stack_chk_fail\")\n| where comm\
+      \ in CRITICAL_APP_INVENTORY\n| alert severity=high \"Stack canary fired (SSP __stack_chk_fail) in\
+      \ critical process\""
+- question: Are all critical and internet-facing binaries actually compiled with stack-canary protection,
+    or are any being deployed WITHOUT /GS or -fstack-protector?
+  context: 'Canaries only protect what they are compiled into; an unprotected binary offers a silent control-flow
+    hijack on overflow with no crash artifact at all. This is the core build-time verification step of
+    the Harden mission. Scan build/CI logs and the shipped binaries themselves for stack-protection indicators:
+    on Windows confirm the /GS flag and the presence of __security_cookie / __security_check_cookie (e.g.,
+    via dumpbin); on Linux confirm -fstack-protector-strong and the __stack_chk_guard / __stack_chk_fail
+    symbols (e.g., via readelf or checksec). Alert on ANY critical binary deployed without these protections
+    - it is a hardening gap that an attacker can exploit deterministically. A negative result (all binaries
+    protected) validates your coverage; a positive result is an actionable remediation target for the
+    build pipeline (CWE-121, stack-based buffer overflow).'
+  answer_sources:
+  - Build System Logs
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Per build / release; re-scan deployed binaries at least every 90 days
+  queries:
+  - technology: Build/CI pseudocode
+    query: "for binary in deployed_artifacts(CRITICAL_APP_INVENTORY):\n  if binary.os == 'windows':\n\
+      \    ok = dumpbin_symbols(binary).contains('__security_cookie')\n         and build_flags(binary).contains('/GS')\n\
+      \  else:\n    ok = checksec(binary).stack_canary == 'yes'\n         and readelf_symbols(binary).contains('__stack_chk_fail')\n\
+      \  if not ok: alert(\"Critical binary shipped WITHOUT stack canary\", binary)"
+- question: Where Intel CET hardware-enforced stack protection is enabled, are there any control-protection
+    exceptions or ETW shadow-stack-mismatch events indicating return-address corruption?
+  context: Software canaries can be leaked or bypassed by non-contiguous writes, but a hardware shadow
+    stack catches return-address corruption independently. With Intel CET enabled, the CPU keeps a protected
+    shadow copy of return addresses and faults (control-protection exception) when the on-stack return
+    address does not match. Collect these control-protection exceptions / ETW shadow-stack-mismatch events
+    and alert on any violation. For the Harden mission this provides defense-in-depth telemetry that catches
+    exactly the bypass cases a software-only canary misses - return-address corruption via leaked canaries
+    or write-what-where primitives. A violation is a strong indicator of an in-progress code-reuse (ROP/JOP)
+    attack and warrants immediate escalation.
+  answer_sources:
+  - Intel PT / ETW Control-Protection Exceptions
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; pivot to a +/-5 minute window around each violation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source IN (ETW_ControlProtection, IntelPT_events)\n| where event_type == \"control_protection_exception\"\
+      \n   OR event_type == \"shadow_stack_mismatch\"\n| where process_name in CRITICAL_APP_INVENTORY\n\
+      | alert severity=high \"CET shadow-stack violation (return-address corruption)\""
+- question: Are there signs of documented canary-bypass conditions - an information leak preceding a crash,
+    a corrupted return address with an INTACT canary, or SEH abuse before the epilogue runs?
+  context: 'A canary that never fires is not proof of safety; sophisticated attackers defeat canaries
+    rather than trip them. Treat the known bypass paths as explicit hunt rules: (a) repeated info-disclosure
+    or format-string reads of the same module just before a crash, which suggests the attacker leaked
+    the canary value; (b) crashes showing a corrupted saved return address but an intact canary, the signature
+    of a write-what-where or direct overwrite that skips the canary; and (c) exceptions handled through
+    Windows Structured Exception Handling (SEH) before the function epilogue ever runs, performing the
+    malicious action before the canary check. For the Harden mission these are the cases where your canary
+    investment can be silently rendered ineffective, so each pattern must trigger escalation and deeper
+    forensic analysis rather than being dismissed as a benign crash.'
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1001
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - Intel PT / ETW Control-Protection Exceptions
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; correlate leak reads within minutes before the crash
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '// (a) info leak preceding crash
+
+      leaks = events where read_anomaly OR format_string_read grouped by module
+
+      crash = canary/security crash on same host+module
+
+      alert if leaks within 10m before crash
+
+      // (b) corrupted return addr but intact canary
+
+      alert if crash.return_addr_corrupted AND crash.canary_intact
+
+      // (c) SEH-handled exception before epilogue on Windows
+
+      alert if exception_dispatched_via_SEH in CRITICAL_APP_INVENTORY'
+- question: When canary firings occur, how do they group into equivalence buckets (faulting module + offset
+    + exception code + call-stack hash), and is any NEW security bucket or per-bucket volume spike appearing
+    across hosts or the fleet?
+  context: A single fuzzing run or repeated exploit attempt can generate thousands of near-identical crashes;
+    without deduplication the deterministic rules become unusable alert noise. Group canary-firing crashes
+    into equivalence buckets keyed on faulting module, offset, exception code, and a call-stack hash,
+    then count occurrences per bucket per host and per fleet - the Windows Error Reporting bucketing approach.
+    Track State by separating recovered/auto-restarted services from terminal aborts. For the Harden mission,
+    alert on any NEW security bucket (a never-before-seen crash signature in a hardened binary) and on
+    per-bucket volume spikes, while always retaining the underlying 'alert on any firing' rule beneath
+    this so single high-confidence events are never suppressed. A new bucket often marks a new vulnerability
+    or a new exploit being thrown at the target.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1001
+  - Sysmon Event ID 5
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'canary_crashes = all canary/security crash events
+
+      | eval bucket = hash(faulting_module, fault_offset, exception_code, callstack_hash)
+
+      | eval state = if(service_restarted, "recovered", "terminal")
+
+      | stats count by bucket, host, state
+
+      | alert if bucket not in known_buckets        // NEW security bucket
+
+      | alert if count > bucket_volume_threshold    // per-bucket spike'
+- question: For each critical application, does the per-hour and per-day count of canary/security crashes
+    exceed its rolling 95th-percentile baseline, indicating brute-force exploitation or fuzzing pressure?
+  context: Beyond single firings, a rising rate of security crashes is itself an attack signal. For each
+    critical application, compute a rolling baseline of canary/security-crash events per hour and per
+    day from at least four weeks of history, then alert when the count exceeds the rolling 95th percentile
+    (derive the threshold per dataset rather than hardcoding it). For the Harden mission this reveals
+    sustained exploitation or fuzzing campaigns that repeatedly trip a working canary - a defended target
+    under pressure. Keep the deterministic 'alert on any 0xC0000409 / __stack_chk_fail in a critical process'
+    rule active beneath this baseline so that single high-confidence firings are never lost in the statistics.
+    A spike with no corresponding successful intrusion is the hallmark of an attacker failing against
+    your hardening.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1001
+  - Sysmon Event ID 5
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; baseline over >=4 weeks of history
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per_app = canary_crashes | bin _time span=1h | stats count by app, _time
+
+      baseline = percentile(per_app.count, 95) over trailing 4w by app
+
+      alert if per_app.count > baseline
+
+      // retain deterministic single-firing rule beneath this baseline'
+- question: Within the crash window of an affected service, are failure-mode signals - process restart/abort
+    counts, blocked inbound connections, and elevated HTTP 4xx/5xx ratios - clustering together as the
+    signature of repeated FAILED exploitation?
+  context: 'Distinguishing a failed attack from a successful one is central to the Harden mission. Model
+    the failure-rate signals separately from success: count service restart/abort events from __stack_chk_fail
+    / 0xC0000409, count blocked inbound connections, and measure HTTP 4xx/5xx ratios on the affected service
+    inside the crash window. A burst of process aborts accompanied by elevated error and blocked rates
+    is the classic signature of an attacker repeatedly throwing an overflow at a canary-protected target
+    and being stopped each time. This pattern tells the analyst the protection is holding (good news)
+    but also that a determined adversary is actively probing the service and may eventually find a bypass
+    - so it should drive proactive patching and monitoring, not complacency.'
+  answer_sources:
+  - Windows Event ID 1000
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; aggregate within each crash window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "window = crash_time +/- 5m on affected_service\naborts = count(__stack_chk_fail OR 0xC0000409)\
+      \ in window\nblocked = count(firewall_blocked_inbound) in window\nerr_ratio = ratio(http_status\
+      \ >= 400) in window\nalert if aborts > 0 AND (blocked elevated OR err_ratio elevated)\n  label \"\
+      Repeated FAILED exploitation against canary-protected service\""
+- question: For internet-facing services, are there over-long, NOP-sled-like, or high-entropy inbound
+    request buffers that deviate from the per-service byte-length and byte-frequency profile, and do they
+    correlate with a same-host crash within one minute?
+  context: The overflow trigger usually arrives over the network before the canary fires. Baseline per-service
+    request byte-length distributions and byte-frequency histograms, then flag anomalous buffers using
+    Mahalanobis distance against the per-host/port/length profile - the PAYL anomalous-payload approach.
+    Over-long requests, NOP-sled-like padding, and high-entropy content are classic overflow trigger characteristics.
+    For the Harden mission, correlating a flagged payload with a same-host canary crash inside a one-minute
+    window confirms the inbound overflow trigger and ties the network evidence to the host crash artifact,
+    distinguishing a genuine remote attack from a local software fault. A correlated pair is high-confidence
+    evidence of an external memory-corruption attempt.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; correlate payloads to crashes within a 1-minute window
+  queries:
+  - technology: Zeek/pseudocode
+    query: "profile = per (host, port) baseline of request_length + byte_freq_histogram\nfor req in zeek_http_log[last_90d]:\n\
+      \  d = mahalanobis(features(req), profile[req.host, req.port])  // PAYL\n  if d > threshold: flag(req)\n\
+      alert if flagged_req correlates with canary_crash on same host within 60s"
+- question: Does a critical service's per-process system-call frequency or short-sequence profile deviate
+    significantly around or after a crash, surfacing exploited-process behavior even when no abort was
+    generated?
+  context: 'Not every successful exploit produces a clean abort; a bypassed canary may leave the process
+    running but behaving abnormally. Build per-process system-call frequency and short-sequence baselines
+    for critical services (the ''sense of self'' approach) and alert when a process''s syscall profile
+    deviates significantly around or after a crash window. For the Harden mission this provides a behavioral
+    safety net: if an attacker leaked the canary and achieved code execution without tripping it, the
+    resulting unusual syscall pattern (e.g., spawning a shell, opening new sockets, touching unexpected
+    files) can still expose the compromise. A significant deviation in a normally-stable service is a
+    strong indicator of post-exploitation activity that warrants forensic investigation.'
+  answer_sources:
+  - Sysmon Event ID 5
+  - Linux auditd
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; baseline normal syscall behavior over >=2 weeks
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_process syscall_freq + short_sequence_model over 2w (auditd)\nfor proc in CRITICAL_APP_INVENTORY:\n\
+      \  dev = profile_distance(current_syscall_profile(proc), baseline[proc])\n  alert if dev > threshold\
+      \ near/after a crash window"
+- question: Does a time-series forecast of each critical application's security-crash volume show observed
+    crashes falling outside the predicted band, signaling a new zero-day attempt or a hardening regression?
+  context: A learned forecast catches deviations that static thresholds miss. Train a time-series model
+    (e.g., ARIMA) on each critical application's security-crash volume and alert when observed crashes
+    fall outside the forecast band. For the Harden mission, a sudden excursion above the forecast can
+    mean a new zero-day is being attempted, while an unexpected change can also reveal a hardening regression
+    (for example, a build that silently shipped without /GS, changing the crash signature). Surface the
+    top-3 contributing factors - faulting module, deviation magnitude, and time-of-day - in the alert
+    text so an analyst can triage quickly. This turns crash telemetry into an early-warning signal rather
+    than a purely reactive record.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1001
+  - Linux journald/coredumpctl
+  - Linux auditd
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; train on >=8 weeks where available
+  queries:
+  - technology: ML/pseudocode
+    query: "model = ARIMA.fit(security_crash_volume[per app, hourly])\nforecast, band = model.predict(next_interval)\n\
+      if observed outside band:\n  alert(top3=[faulting_module, deviation_magnitude, time_of_day])"
+- question: Where hardware control-flow tracing is available, do Intel PT branch traces classify as ROP/JOP
+    control-flow hijacks that defeated the canary via a leak or direct overwrite?
+  context: 'When a canary is bypassed rather than tripped, the attack proceeds to code-reuse execution
+    that leaves no crash artifact - but it does leave an abnormal branch trace. Where Intel PT is captured,
+    classify branch traces with a hierarchical neural network (HeNet) to detect ROP/JOP control-flow hijacks,
+    which the literature reports detecting with near-perfect accuracy and low false positives. For the
+    Harden mission this directly addresses the canary''s blind spot: attacks that succeed by leaking or
+    skipping the canary still produce anomalous control flow. Alerts must list the top-3 anomalous trace
+    segments/branches so analysts can pinpoint the hijack. A positive classification on a critical process
+    is a high-severity indication of successful exploitation that bypassed your stack protection.'
+  answer_sources:
+  - Intel PT / ETW Control-Protection Exceptions
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; analyze traces around crash and anomaly windows
+  queries:
+  - technology: ML/pseudocode
+    query: "traces = IntelPT_branch_traces(CRITICAL_APP_INVENTORY)\nscore = HeNet.classify(traces)   //\
+      \ hierarchical NN for ROP/JOP\nif score == 'control_flow_hijack':\n  alert(top3_anomalous_branches=score.top_segments)"
+- question: Do disassembled candidate payloads contain ROP gadget chains distinguishable from benign instruction
+    sequences, indicating the post-canary-bypass code-reuse stage?
+  context: After a canary is defeated, attackers typically chain existing code gadgets (ROP) to achieve
+    execution under DEP/NX. Apply a deep neural network (ROPNN) to disassembled candidate payloads to
+    distinguish ROP gadget chains from benign instruction sequences, an approach reported at over 98%
+    accuracy with low overhead. For the Harden mission this catches the exploitation stage that occurs
+    specifically because the canary was bypassed rather than tripped - the gadget chain is the attacker's
+    substitute for the direct overwrite a canary would have caught. Surface the contributing gadget-chain
+    segments in the alert so analysts can confirm and reverse-engineer the payload. A positive result
+    on traffic or memory associated with a critical service is strong evidence of an active code-reuse
+    exploit.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Intel PT / ETW Control-Protection Exceptions
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; analyze captured payloads associated with crashes
+  queries:
+  - technology: ML/pseudocode
+    query: "for payload in candidate_payloads(critical_services):\n  insns = disassemble(payload)\n  if\
+      \ ROPNN.classify(insns) == 'rop_chain':\n    alert(gadget_segments=ROPNN.contributing_segments(insns))"
+- question: Do inbound and outbound network flows around a crash show abnormal pre-crash payloads or post-crash
+    C2 egress, as flagged by an unsupervised autoencoder ensemble correlated to the crash within one minute?
+  context: 'A complete picture of a canary event spans both the inbound trigger and any outbound consequence.
+    Run an unsupervised autoencoder ensemble (Kitsune/KitNET) over inbound and outbound flow features
+    from Zeek conn.log and http.log to flag abnormal pre-crash payloads and, critically, post-crash C2
+    egress. Correlate high reconstruction error with crash events on the same host within a one-minute
+    window and report the top-3 contributing flow features. For the Harden mission this ties the host
+    crash artifact to network behavior on both sides: an anomalous inbound flow just before the crash
+    corroborates an external overflow trigger, while anomalous outbound flow just after a crash (or a
+    bypassed-but-not-crashed process) is a red flag for successful compromise and command-and-control.
+    The combination sharply raises confidence that a memory-corruption attack was attempted and indicates
+    whether it succeeded.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - 'NAI: Critical application servers, internet-facing service hosts running custom or critical C/C++
+    software, endpoint devices running critical software, and build/CI servers producing those binaries.'
+  range: Last 90 days; correlate flows to crashes within a 1-minute window
+  queries:
+  - technology: Zeek/pseudocode
+    query: "features = flow_features(zeek_conn_log, zeek_http_log)  # inbound+outbound\nerr = KitNET.reconstruction_error(features)\
+      \   // Kitsune ensemble\nanomalies = features where err > threshold\nalert if anomaly correlates\
+      \ with crash on same host within 60s\n  report top3_contributing_flow_features"
