@@ -1,0 +1,388 @@
+name: 'AT1667.001: API Gateway & Lambda Persistence'
+id: 85460531-bcd0-4619-b8c7-9e3c1289840c
+description: Investigate whether an adversary has established persistence or staged initial access in
+  AWS by creating or modifying an Amazon API Gateway and Lambda path that yields an adversary-controlled
+  entry point into the account. This playbook helps an analyst determine if a compromised identity has
+  stitched together a control-plane chain (CreateRestApi/CreateApi or PutRestApi -> PutIntegration targeting
+  a Lambda -> lambda:AddPermission -> CreateDeployment) that exposes a new or altered externally reachable
+  endpoint backed by a Lambda function, and whether resource-policy or code changes expand who can invoke
+  that function. It also examines whether a newly published API Gateway stage then begins receiving external
+  invocations inconsistent with business traffic (low-and-slow validation calls, bursty probing from a
+  small set of cloud-hosted IPs) that activate a Lambda which performs follow-on administrative actions
+  such as RunInstances, CreateUser/CreateAccessKey, GetSecretValue, or Put*Policy. The playbook correlates
+  CloudTrail control-plane events with API Gateway access and execution logs, CloudWatch Logs, AWS Config
+  history, and VPC Flow Logs, and combines symbolic-logic detections, statistical baselining (MAD/modified
+  Z-score, AccessDenied precursor bursts, invocation-cadence profiling), and machine-learning sequence/graph
+  models to give the SOC granular, defensible coverage of serverless persistence in the Initial Access
+  tactic.
+type: technique
+related:
+- tactic_id: TA0001
+  tactic_name: Initial Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a single principal or session grant or broaden permission to invoke a Lambda function
+    in a way that creates a backdoor, for example a lambda:AddPermission that allows lambda:InvokeFunction
+    to an external or cross-account principal, a wildcard "*", or apigateway.amazonaws.com for a function
+    not previously fronted by that API, or an UpdateFunctionCode against a previously stable function?
+  context: In the Initial Access tactic, an adversary who already controls an AWS identity establishes
+    a durable, invokable entry point by loosening a Lambda function's resource policy or overwriting its
+    code. An AddPermission that opens lambda:InvokeFunction to an outside principal, a wildcard, or to
+    API Gateway for a function it never previously served is a direct backdoor primitive, and an UpdateFunctionCode
+    on a long-stable function can implant attacker logic. Look on CloudTrail for lambda:AddPermission
+    events whose policy statement expands the set of allowed invokers, and for UpdateFunctionCode against
+    functions with no recent legitimate deployment history; treat any resource-policy change that widens
+    who can invoke as high severity. A positive result indicates an attacker-controlled invocation path
+    or implanted code; a negative result shows invoke permissions remained scoped to known internal principals.
+  answer_sources: &id001
+  - CloudTrail
+  - API Gateway execution logs
+  - API Gateway access logs
+  - CloudWatch Logs
+  - AWS Config
+  - 'NAI: CloudTrail trails covering API Gateway and Lambda control-plane activity, API Gateway stages
+    exposed to the internet, Lambda log groups, and configuration history for serverless resources in
+    production accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource="lambda.amazonaws.com"
+
+      | where eventName in ("AddPermission","AddPermission20150331","UpdateFunctionCode")
+
+      | eval external_grant=if(match(requestParameters.principal,"^\*$|amazonaws\.com|\d{12}") AND requestParameters.action="lambda:InvokeFunction",1,0)
+
+      | eval code_overwrite=if(eventName="UpdateFunctionCode",1,0)
+
+      | lookup function_baseline functionName OUTPUT previously_fronted_by_api, last_legit_deploy
+
+      | where (external_grant=1 AND previously_fronted_by_api=0) OR code_overwrite=1
+
+      | eval severity="high" | alert'
+- question: Did a single principal or session perform the ordered API Gateway and Lambda control-plane
+    sequence CreateRestApi/CreateApi or PutRestApi -> PutIntegration (target = Lambda) -> lambda:AddPermission
+    -> CreateDeployment within a short window (for example under 30 minutes), especially against a newly
+    created, dormant, or over-privileged Lambda, outside approved change windows, or by a non-automation
+    principal?
+  context: 'Building an adversary-controlled entry point requires stitching several control-plane actions
+    into one chain: create or update the API, wire an integration to a Lambda, grant API Gateway permission
+    to invoke it, then deploy a stage so the endpoint is live. Seeing that full ordered sequence from
+    one principal in a tight window is a strong persistence signal, because legitimate deployments are
+    usually performed by CI/CD automation, not interactive identities, and rarely create a brand-new public
+    path end-to-end by hand. Detect the ordered sequence on CloudTrail and escalate when the target Lambda
+    is newly created, dormant, or bound to an unusual or over-privileged role, or when the work happens
+    outside approved change windows or by a human/non-automation principal. Validate rules against emulated
+    CloudTrail from Stratus Red Team and Pacu. A positive result indicates deliberate construction of
+    a serverless backdoor; a negative result reflects normal, segmented deployment activity.'
+  answer_sources: *id001
+  range: Last 90 days (correlate the ordered chain within a 30-minute sliding window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (eventSource="apigateway.amazonaws.com" OR eventSource="lambda.amazonaws.com")
+
+      | where eventName in ("CreateRestApi","CreateApi","PutRestApi","PutIntegration","AddPermission","CreateDeployment")
+
+      | transaction userIdentity.arn, session_id maxspan=30m
+
+      | eval ordered=match_sequence(eventName,["Create(RestApi|Api)|PutRestApi","PutIntegration","AddPermission","CreateDeployment"])
+
+      | eval integration_is_lambda=searchmatch("requestParameters.integrationUri=*function*")
+
+      | lookup lambda_inventory functionName OUTPUT created_recently, dormant, role_overprivileged
+
+      | eval escalate=if(created_recently OR dormant OR role_overprivileged OR NOT in_change_window OR
+      is_human_principal,1,0)
+
+      | where ordered=1 AND integration_is_lambda=1 | alert'
+- question: Is this the first time the (principal, eventName) or (assumed-role, API) pair has been observed
+    performing serverless control-plane actions such as CreateRestApi, CreateDeployment, PutIntegration,
+    AddPermission, or UpdateFunctionCode in a 30-90 day lookback?
+  context: First-seen analysis catches an adversary using a stolen or repurposed identity to perform serverless
+    administration it has never done before. Many compromised principals (for example an assumed role
+    normally used for read-only or unrelated tasks) suddenly create APIs, deploy stages, or alter Lambda
+    permissions. Build a first-seen baseline join on internal CloudTrail keyed on (principal, eventName)
+    and (assumed-role, API resource) over a 30-90 day lookback, and flag pairs never previously observed.
+    This is low-noise because established automation identities reuse a stable set of actions. A positive
+    result means the identity is exhibiting brand-new serverless-admin behavior consistent with persistence
+    setup; a negative result confirms the action matches the identity's historical pattern.
+  answer_sources: *id001
+  range: Last 90 days (first-seen lookback 30-90 days; evaluate per event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail (eventSource="apigateway.amazonaws.com" OR eventSource="lambda.amazonaws.com")
+      earliest=-90d
+
+      | where eventName in ("CreateRestApi","CreateDeployment","PutIntegration","AddPermission","UpdateFunctionCode")
+
+      | inputlookup append=t serverless_principal_baseline.csv
+
+      | eval first_seen_principal_action=if(NOT [userIdentity.arn,eventName] in baseline_pairs,1,0)
+
+      | eval first_seen_role_api=if(NOT [userIdentity.sessionContext.sessionIssuer.arn,requestParameters.restApiId]
+      in baseline_role_api,1,0)
+
+      | where first_seen_principal_action=1 OR first_seen_role_api=1 | alert'
+- question: Is the volume and cadence of a principal's, region's, or team's API Gateway and Lambda control-plane
+    activity a statistical outlier versus its own 30-90 day baseline, for example AddPermission, CreateDeployment,
+    or UpdateFunctionCode counts, or the ratio of newly-public stages to total changes, breaking the 95th-percentile
+    or MAD band?
+  context: Persistence setup often appears as a sudden burst of serverless control-plane changes that
+    diverge from an identity's normal deployment rhythm. Baseline per-principal, per-region, and per-team
+    daily counts of API Gateway and Lambda control-plane events and their inter-arrival cadence, then
+    use median-absolute-deviation / modified Z-score thresholds (flag |modified Z| > 3.5) so legitimate
+    deployment bursts from CI/CD do not distort the baseline. Alert when AddPermission/CreateDeployment/UpdateFunctionCode
+    counts, or the ratio of newly-public stages to total changes, exceed the 95th percentile or MAD band.
+    Report the metric, the baseline, and the observed value in the alert. A positive result shows the
+    identity is making serverless changes at a rate unlike itself and its peers; a negative result reflects
+    change volume consistent with expected operations.
+  answer_sources: *id001
+  range: Last 90 days (baseline 30-90 days; evaluate per principal/region/team per day)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail (eventSource="apigateway.amazonaws.com" OR eventSource="lambda.amazonaws.com")
+      earliest=-90d
+
+      | bin _time span=1d
+
+      | stats count as changes count(eval(eventName="AddPermission")) as addperm count(eval(eventName="CreateDeployment"))
+      as deploys count(eval(eventName="UpdateFunctionCode")) as codeupd count(eval(newly_public_stage=1))
+      as public_stages by userIdentity.arn, awsRegion, team, _time
+
+      | eval public_ratio=public_stages/changes
+
+      | eventstats median(addperm) as med p95(addperm) as p95 by userIdentity.arn
+
+      | eval mz=0.6745*(addperm-med)/`mad(addperm)`
+
+      | where abs(mz) > 3.5 OR addperm > p95 OR public_ratio > p95_ratio
+
+      | eval detail="metric=addperm baseline=".med." observed=".addperm | alert'
+- question: Did a principal generate a burst of AccessDenied or UnauthorizedOperation errors on Lambda
+    and API Gateway actions (for example more than five denials in five minutes or a MAD-band break) shortly
+    before a successful create/integrate/deploy chain?
+  context: Before standing up persistence, an actor with stolen or low-privilege credentials often probes
+    which serverless actions it is allowed to perform, producing clustered authorization failures. Profile
+    each principal's AccessDenied/UnauthorizedOperation rate on Lambda and API Gateway actions as a distinct
+    failure-mode signal, and alert when a principal exceeds its baseline denied-call rate (for example
+    >5 denials in 5 minutes or a MAD-band break) shortly before a successful create/integrate/deploy sequence.
+    That ordering - enumeration of permissions immediately followed by successful backdoor construction
+    - is highly indicative of an attacker finding and then using the access it needs. A positive result
+    suggests permission enumeration preceding persistence; a negative result indicates well-scoped access
+    without repeated denials.
+  answer_sources: *id001
+  range: Last 90 days (alert on a 5-minute sliding window; pivot forward to the chain)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail (eventSource="lambda.amazonaws.com" OR eventSource="apigateway.amazonaws.com")
+      (errorCode="AccessDenied" OR errorCode="*UnauthorizedOperation*")
+
+      | bin _time span=5m
+
+      | stats count as denials values(eventName) as denied_actions by userIdentity.arn, _time
+
+      | where denials > 5
+
+      | join type=left userIdentity.arn [ search source=cloudtrail eventName in ("PutIntegration","AddPermission","CreateDeployment")
+      errorCode="success" earliest=+0m latest=+30m ]
+
+      | eval escalate=if(isnotnull(successful_chain),1,0) | alert'
+- question: Does a sequence or graph model score the ordered CloudTrail control-plane activity (create
+    -> integrate -> AddPermission -> deploy) as an improbable serverless-persistence sequence for that
+    principal, weighting principal novelty, external invoke grants, dormant-function reuse, permission
+    breadth, and public exposure?
+  context: Sophisticated actors interleave benign calls and vary timing to evade simple ordered-rule and
+    threshold detections, so model the plausibility of the whole sequence and the relationships among
+    identities, roles, resources, and actions. Score ordered CloudTrail control-plane sequences with a
+    variable-order Markov or sequence model and/or a graph model over principal-role-resource-action edges.
+    Useful features include principal novelty, event ordering, whether an external invoke grant occurred,
+    reuse of a dormant function, permission breadth, and resulting public exposure; surface the top-3
+    contributing features in the alert text so analysts can validate the score against concrete evidence.
+    In the Initial Access tactic, a high score highlights a principal assembling a serverless entry point
+    in a way that is structurally unlike normal deployments and warrants triage.
+  answer_sources: *id001
+  range: Last 90 days (train on 30-90 days of sequences; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Per-principal control-plane sequence + identity-resource graph scoring
+
+      model vomc_sequence(sequence=ordered_eventName by userIdentity.arn, session_id)
+
+      | eval seq_anomaly=(plausibility(create->integrate->AddPermission->deploy) < threshold)
+
+      build_graph(nodes=[principal, role, resource, action], edges=performed, window=90d)
+
+      | score graph_anomaly(session) -> graph_score
+
+      | features [principal_novelty, event_ordering, external_invoke_grant, dormant_function_reuse, permission_breadth,
+      public_exposure]
+
+      | where seq_anomaly==1 OR graph_score > threshold
+
+      | emit userIdentity.arn, score, shap_top3'
+- question: Do unsupervised rare-action and population models over CloudTrail flag unusual serverless
+    API calls, source geographies/ASNs, or user-command pairs - prioritizing cases where the rare action
+    is an invoke-permission grant (AddPermission) or a function code change (UpdateFunctionCode)?
+  context: Rare-event and population analysis catches serverless persistence that evades thresholds and
+    ordered rules by surfacing actions that are simply unusual for the account. Run unsupervised rare-function/population
+    analysis over CloudTrail to flag uncommon serverless API calls, anomalous source geographies or ASNs,
+    and rare user-command pairs, and prioritize alerts where the rare action is an invoke-permission grant
+    or a function code change - the two most direct backdoor primitives. Complement with drift-resilient
+    graph anomaly detection, and require alerts to list the top contributing features (new principal,
+    rare eventName, new source). In the Initial Access tactic, a high score points to serverless backdoor
+    construction originating from an unusual identity, location, or command pattern that warrants correlation
+    with the rest of the session.
+  answer_sources: *id001
+  range: Last 90 days (train ML jobs on 30-90 days; score continuously)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Unsupervised rare-action + population + geo/ASN modeling over CloudTrail
+
+      ml rare_event(field=eventName, influencers=[userIdentity.arn, sourceIPAddress, awsRegion]) -> rare_score
+
+      ml population_analysis(by=userIdentity.arn, fields=[eventName, sourceIPAddress_asn, userAgent])
+      -> pop_score
+
+      | eval backdoor_priority=if(eventName in ("AddPermission","UpdateFunctionCode"),2,1)
+
+      | where (rare_score>thr OR pop_score>thr)
+
+      | sort -backdoor_priority, -rare_score
+
+      | emit top3=[new_principal, rare_eventName, new_source]'
+- question: Did an API Gateway stage created or modified within the prior 7 days receive external requests
+    from previously unseen source IPs/ASNs that successfully invoked (2xx, non-zero Lambda duration) a
+    Lambda function which then performed RunInstances, CreateUser/CreateAccessKey, GetSecretValue, or
+    Put*Policy in CloudTrail within the same trace?
+  context: Once a serverless backdoor exists, the adversary activates it by calling the fresh endpoint,
+    which triggers a Lambda that carries out follow-on administrative actions to expand access. The tell
+    is a brand-new or recently modified stage receiving external traffic from sources it has no prior
+    relationship with, successfully invoking a Lambda, and that invocation chaining into sensitive control-plane
+    actions. Correlate API Gateway access logs -> Lambda execution logs -> follow-on CloudTrail by trace/request
+    ID, and alert when a stage created/modified in the last 7 days is invoked from previously unseen IPs/ASNs
+    and the downstream Lambda performs RunInstances, CreateUser/CreateAccessKey, GetSecretValue, or Put*Policy.
+    A positive result strongly indicates an active serverless persistence path being used to provision
+    resources, mint credentials, or read secrets; a negative result shows the endpoint serving only expected,
+    non-privileged traffic.
+  answer_sources: &id002
+  - API Gateway access logs
+  - API Gateway execution logs
+  - CloudWatch Logs
+  - CloudTrail
+  - VPC Flow Logs
+  - 'NAI: Newly published API Gateway stages, Lambda functions that can trigger downstream administration,
+    and VPC-connected Lambda network telemetry for outbound control or follow-on actions'
+  range: Last 90 days (focus on stages aged <=7 days; correlate the invoke->admin chain within the same
+    trace)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=apigw_access_logs
+
+      | lookup apigw_stage_inventory stageId OUTPUT stage_created_time
+
+      | where (now()-stage_created_time) <= 7d AND status>=200 AND status<300
+
+      | eval new_source=if(NOT [sourceIp,asn] in known_sources_for_stage,1,0)
+
+      | join requestId [ search source=lambda_exec_logs duration>0 ]
+
+      | join trace_id [ search source=cloudtrail eventName in ("RunInstances","CreateUser","CreateAccessKey","GetSecretValue","Put*Policy")
+      ]
+
+      | where new_source=1 | alert'
+- question: For each new API Gateway endpoint, does its invocation profile - request cadence, source-IP/ASN
+    concentration, request/response byte volumes, user-agent diversity, and Lambda duration/error-rate
+    - diverge by a MAD band from legitimate application-rollout traffic and peer services, for example
+    being sparse-but-persistent or concentrated in a small set of cloud-hosted IPs?
+  context: 'Adversary use of a backdoor endpoint looks different from real customer traffic: it is often
+    low-and-slow validation, bursty probing from a handful of cloud-hosted IPs, narrow user-agent diversity,
+    and atypical byte and duration distributions. For each new endpoint, compute request cadence (req/min),
+    source-IP/ASN concentration, request/response byte volumes, user-agent diversity, and Lambda duration/error-rate,
+    and compare against a baseline of legitimate application-rollout traffic and peer services launched
+    by the same team. Flag endpoints whose profile is sparse-but-persistent, concentrated in a small set
+    of cloud-hosted IPs, or whose byte/cadence distribution diverges by a modified-Z MAD band from peers.
+    Set thresholds from your own access-log history. A positive result shows an endpoint behaving unlike
+    a genuine application rollout; a negative result reflects organic, distributed customer traffic.'
+  answer_sources: *id002
+  range: Last 90 days (baseline against peer rollouts; evaluate per new endpoint)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=apigw_access_logs earliest=-90d
+
+      | stats count as reqs dc(sourceIp) as distinct_ips dc(asn) as distinct_asns dc(userAgent) as ua_diversity
+      avg(req_bytes) as in_bytes avg(resp_bytes) as out_bytes avg(lambda_duration) as dur avg(eval(status>=400))
+      as err_rate by stageId
+
+      | eval ip_concentration=reqs/distinct_ips, cloud_hosted_ratio=cloud_ips/distinct_ips
+
+      | eventstats median(reqs) as med_reqs by team
+
+      | eval mz=0.6745*(reqs-med_reqs)/`mad(reqs)`
+
+      | where (ip_concentration > p95 AND cloud_hosted_ratio > 0.8) OR abs(mz) > 3.5
+
+      | table stageId reqs ip_concentration cloud_hosted_ratio ua_diversity | alert'
+- question: For each new endpoint, do the per-endpoint 4xx/5xx and Lambda error/throttle rates and downstream
+    403/AccessDenied counts show anomalous error-to-success transitions versus the endpoint's forecasted
+    band - for example high 4xx validation probing followed by a single successful 2xx invoke?
+  context: 'Low-and-slow validation of a backdoor endpoint commonly produces a distinctive failure signature:
+    many client errors as the actor probes the right path/method/payload, then a single clean 2xx invocation,
+    plus 403/AccessDenied on the downstream privileged actions the Lambda attempts. Track per-endpoint
+    4xx/5xx and Lambda error/throttle rates and downstream AccessDenied as a distinct failure signal,
+    and alert on anomalous error-to-success transitions versus the endpoint''s forecasted band. This profiling
+    separates an attacker tuning their request from organic traffic, which does not usually show a long
+    tail of failures collapsing into a single success. A positive result indicates probing that culminated
+    in a successful privileged invoke; a negative result shows error rates within the endpoint''s normal
+    forecast.'
+  answer_sources: *id002
+  range: Last 90 days (forecast per-endpoint error band; evaluate transitions per endpoint)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=apigw_access_logs earliest=-90d
+
+      | bin _time span=10m
+
+      | stats count as reqs count(eval(status>=400 AND status<500)) as c4xx count(eval(status>=500)) as
+      c5xx count(eval(status>=200 AND status<300)) as c2xx count(eval(downstream_error="AccessDenied"))
+      as denied by stageId, _time
+
+      | eval err_rate=(c4xx+c5xx)/reqs
+
+      | forecast err_rate -> expected_band
+
+      | eval transition=if(c4xx>5 AND c2xx>=1 AND lag(c2xx)=0,1,0)
+
+      | where err_rate > expected_band_upper OR transition=1 | alert'
+- question: Does an anomaly detector trained over new-endpoint telemetry - joining API access logs, Lambda
+    execution logs, VPC Flow egress, and follow-on CloudTrail - judge the invoke->admin-action chain implausible,
+    scoring endpoints on new-source concentration, unusual invoke-to-admin chaining, and the absence of
+    expected customer traffic?
+  context: 'The strongest evidence of an active serverless backdoor is the joined story across layers:
+    external invocation, Lambda execution, network egress, and subsequent administrative CloudTrail. Train
+    an anomaly detector over new-endpoint telemetry that joins API access logs, Lambda execution logs,
+    VPC Flow egress, and follow-on CloudTrail, using sequence/graph features so the model judges the plausibility
+    of invoke->admin-action chains rather than isolated events. Prioritize endpoints scored on new-source
+    concentration, unusual invoke-to-admin chaining, and the absence of expected customer traffic, and
+    output the top-3 contributing features per alert for explainable triage. In the Initial Access tactic,
+    a high score flags an endpoint whose purpose appears to be activating privileged actions rather than
+    serving an application; the explainable features tie the score back to concrete evidence.'
+  answer_sources: *id002
+  range: Last 90 days (train on 30-90 days of endpoint telemetry; score per new endpoint)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Join API access + Lambda exec + VPC Flow egress + follow-on CloudTrail per endpoint
+
+      join_telemetry(apigw_access, lambda_exec, vpc_flow, cloudtrail) by stageId, requestId, trace_id
+
+      | featurize endpoint: [new_source_concentration, invoke_to_admin_chaining, missing_expected_traffic,
+      egress_novelty, lambda_duration]
+
+      | model sequence_graph_anomaly(invoke->admin chain) -> anomaly_score, shap_top3
+
+      | where anomaly_score > threshold
+
+      | emit stageId, functionName, anomaly_score, shap_top3'
