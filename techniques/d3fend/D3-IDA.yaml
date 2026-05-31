@@ -1,0 +1,448 @@
+name: 'D3-IDA: Input Device Analysis'
+id: 4be248dc-bb09-4151-8c35-75e00424dd4c
+description: Investigate abusive input-device activity by correlating physical/HID-layer telemetry with
+  input-cadence (keystroke dynamics) and follow-on host behavior. This playbook helps an analyst detect
+  BadUSB-style keyboard masquerading, rogue HID/keystroke injection, counterfeit or substituted peripherals,
+  and unauthorized driver/service deployment that follows a suspicious device attach. It also covers automated
+  and impostor input detection by comparing dwell/hold times, inter-key flight latency, bigram latencies,
+  and throughput against per-user baselines and human-plausible ceilings. Deterministic device-authorization,
+  interface-class consistency, and human-timing-ceiling rules form the floor; statistical rarity, timing,
+  and deviation baselines plus ML device-fingerprint and sequence models run in parallel to surface attacker
+  peripherals and automated input.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any newly attached USB devices exposing an interface set inconsistent with their declared
+    function (e.g., a mass-storage or audio device that also presents an HID keyboard/pointer interface,
+    the BadUSB masquerade)?
+  context: This is the deterministic floor for input-device abuse. A legitimate flash drive exposes only
+    a mass-storage interface; a BadUSB device additionally registers an HID keyboard/pointer interface
+    so it can inject keystrokes. Enforce default-deny USB authorization and reject any device whose interface
+    set is inconsistent with its declared class, using USBGuard with-interface allow/block rules and USBFILTER
+    in-kernel URB rules that pin a device to one process/driver/direction. A positive result (one device
+    advertising both storage/audio and HID) is high-confidence evidence of a masquerading peripheral.
+    For the Detect mission this gives visibility of an attacker's initial-access hardware before any payload
+    runs. Alert text should name the device VID:PID/serial, the unexpected interface class, and the physical
+    port.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from usb_events where action="device_attach"
+
+      | where interface_classes contains "HID" AND (declared_class in ["MassStorage","Audio","Hub"])
+
+      | eval reason="interface-class inconsistency (BadUSB masquerade)"
+
+      | table host, vid, pid, serial, declared_class, interface_classes, usb_port'
+  - technology: USBGuard/pseudocode
+    query: '# default-deny; block multi-interface masquerade
+
+      allow with-interface equals { 08:*:* }      # storage only
+
+      block with-interface all-of { 08:*:* 03:*:* } # storage + HID = reject'
+- question: Did a new service installation (Windows Event ID 7045) containing known malicious HID tooling
+    strings occur close in time to a recent HID/PnP connection event (Event ID 400 or 6416) on the same
+    host, or did a fresh HID attach immediately precede process/script/OLE creation (Sysmon Event ID 1)?
+  context: 'Attackers chain a malicious HID attach to payload delivery: the keyboard injects commands
+    that install a service or spawn a process. Correlate new service installs (7045) carrying known HID
+    tooling strings with recent HID/PnP attach events (400/6416) on the same host within a short window
+    (default 60s, tune per environment). Extend with USBIPS-style behavior rules that bind a fresh HID
+    attach to subsequent process/script/OLE creation (Sysmon EID 1) so class-masquerading injection is
+    caught regardless of declared device class. A positive correlation indicates HID-driven execution
+    rather than benign peripheral use; absence of correlation lowers but does not eliminate suspicion.
+    Supports Detect by linking the device event to its execution consequence.'
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days; correlate attach and follow-on within 60s
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from win_events where EventID in (400,6416)
+
+      | join host, [from win_events where EventID=7045 OR (Sysmon EID=1)]
+
+      | where abs(t_attach - t_followon) <= 60s
+
+      | where service_name in HID_tool_strings OR cmdline matches HID_payload_patterns
+
+      | table host, vid, pid, service_name, image, cmdline, t_attach, t_followon'
+- question: On high-assurance hosts, does any peripheral's firmware or USB behavior deviate from its declared
+    device class (e.g., a flash drive that hides HID descriptors, or control transfers outside the class
+    spec)?
+  context: For high-assurance hosts, vet peripheral firmware/behavior against its declared USB class before
+    trust. FirmUSB applies domain-informed symbolic execution to detect hidden HID descriptors in flash-drive
+    firmware, and Cinch interposes a hypervisor-isolated gateway applying protocol-conformance, signature,
+    and rate-limit policy to the USB byte stream. Flag any device that emits descriptors or control transfers
+    outside its class spec. A positive result means the physical device is lying about what it is, the
+    strongest pre-execution indicator of a weaponized peripheral. This is most relevant where the cost
+    of HID injection is highest (privileged or air-gapped systems) and supports Detect by inspecting the
+    device itself rather than its downstream actions.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# enrich attach events with firmware/conformance verdicts from gateway
+
+      from usb_events where action="device_attach"
+
+      | lookup firmware_vetting by vid,pid,serial -> verdict, hidden_descriptors
+
+      | where verdict="nonconformant" OR hidden_descriptors=true
+
+      | table host, vid, pid, serial, declared_class, verdict, hidden_descriptors'
+- question: Were any newly attached HID devices outside the approved allowlist of vendor/product identifiers
+    and device classes for that host's role, especially when followed by network activity from the host?
+  context: Maintain per-host-role allowlists of approved HID vendor/product identifiers and device classes
+    as the deterministic floor; tune (do not delete) entries as hardware is approved. Flag newly attached
+    devices that are unapproved or inconsistent with the host role, and raise severity when the attach
+    is followed by outbound network activity in Zeek conn.log (a possible attach -> install -> beacon
+    chain). A positive result on a server or kiosk that should never see a new keyboard is strong evidence
+    of tampering. Supports Detect by enforcing what hardware is even permitted per system role and linking
+    unexpected devices to subsequent comms.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from usb_events where action="device_attach" AND interface_classes contains "HID"
+
+      | lookup hid_allowlist by host_role, vid, pid, device_class -> approved
+
+      | where approved!=true
+
+      | join host, [from zeek_conn where ts within 300s after attach]
+
+      | table host, host_role, vid, pid, device_class, dest_ip, dest_port'
+- question: Which attached USB devices are statistically rare across the enterprise (bottom 5th percentile
+    of VID/PID prevalence), and do those rare devices repeatedly appear on privileged endpoints?
+  context: Build 30-day baselines of VID/PID prevalence (Volume) and alert on devices in the bottom 5th
+    percentile of enterprise frequency, deriving the percentile cutoff per environment from the observed
+    distribution. Rarity is a proxy for non-standard, attacker-supplied, or counterfeit hardware. Escalate
+    severity when a rare device repeatedly appears across privileged endpoints, which suggests deliberate
+    targeting rather than a one-off personal accessory. A positive result is a ranked list of uncommon
+    devices for triage; common corporate peripherals fall out naturally. Supports Detect by surfacing
+    outliers a static allowlist might miss.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from usb_events where action="device_attach" earliest=-30d
+
+      | stats dc(host) as host_spread, count as attaches by vid, pid
+
+      | eventstats perc5(attaches) as p5
+
+      | where attaches <= p5
+
+      | eval severity=if(host_spread_privileged>0,"high","medium")
+
+      | sort attaches'
+- question: Are there bursts of HID attachments, off-hours connections, or repeated rejected/blocked device-authorization
+    events that exceed a user's or host's normal pattern?
+  context: 'Track timing, rate (Frequency: attach count/hour per user/host), and success/failure State
+    of HID attachments. Flag bursts or off-hours patterns above baseline (default >3 attaches/hour or
+    any attach outside the user''s historical active window) and explicitly profile rejected/blocked device-authorization
+    events (USBGuard audit log) as a distinct failure-mode signal of repeated unauthorized-device attempts.
+    A spike of blocked attaches can indicate an attacker repeatedly trying to get a peripheral accepted,
+    while off-hours attaches on an unattended host suggest physical tampering. Supports Detect by adding
+    behavioral and failure-mode context to raw device events.'
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from usb_events where interface_classes contains "HID"
+
+      | bin _time span=1h
+
+      | stats count as attaches, sum(eval(result="blocked")) as blocked by host, user, _time
+
+      | where attaches>3 OR _time not_in user_active_window OR blocked>=2
+
+      | table host, user, _time, attaches, blocked'
+- question: Does a connected peripheral's physical-layer hardware fingerprint fail to match the enrolled
+    device, indicating a substituted or counterfeit device that spoofs VID/PID/serial?
+  context: Where instrumentation allows, match a hardware fingerprint to the enrolled device to defeat
+    VID/PID/serial spoofing. MAGNETO machine-learns a device fingerprint from unintentional magnetic emissions
+    (>=98.2% brand/model accuracy), flagging substituted or counterfeit peripherals whose physical signature
+    deviates from enrollment. A positive result means the device claims to be a known-good peripheral
+    but is physically different, defeating identifier spoofing that fools allowlists and rarity scoring.
+    Surface the top contributing fingerprint features and the matched-vs-claimed device identity in the
+    alert. Supports Detect by anchoring trust to physics rather than software-declared identifiers.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "feat = magneto_fingerprint(device_emissions)\nclaimed = enrolled_template[vid,pid,serial]\n\
+      score = cosine(feat, claimed)\nif score < threshold: alert(host, vid, pid, serial,\n    claimed_model,\
+      \ predicted_model, top_features(feat))"
+- question: Does the sequence of device events on a host (attach -> driver/service install -> outbound
+    communications) match a learned HID-based attack workflow that warrants rapid containment?
+  context: Train sequence models on historical benign and malicious device-event chains (attach -> driver/service
+    install -> outbound comms), consistent with the cross-layer behavior analysis in USBIPS. Use model
+    scores to identify likely HID-based attack workflows requiring rapid containment, and emit the top-3
+    contributing events/features (e.g., new-HID-interface, 7045 service create, first-seen outbound peer)
+    alongside the score so analysts can triage without re-deriving the chain. A high score on a freshly
+    attached device followed by service creation and a never-before-seen outbound peer is a strong containment
+    trigger. Supports Detect by recognizing the full attack workflow rather than isolated events.
+  answer_sources:
+  - Windows PnP Event ID 400
+  - Windows Event ID 6416
+  - Windows Event ID 7045
+  - Sysmon Event ID 1 (process create)
+  - Linux udev / USBGuard audit log
+  - Zeek conn.log
+  - 'NAI: All managed endpoints (workstations and servers) with USB/HID ports enabled'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "seq = order_events(host, [hid_attach, driver_install, svc_7045, sysmon_1, zeek_conn])\nscore\
+      \ = seq_model.predict(seq)\nif score > threshold:\n  alert(host, score, top3_features(seq))  # e.g.\
+      \ new-HID-iface, 7045, first-seen-peer"
+- question: Is any host receiving sustained input whose cadence exceeds plausible human limits, such as
+    inter-key intervals consistently below ~30-50 ms with near-zero variance or throughput above ~800-1000
+    characters/minute?
+  context: 'This is the deterministic floor for automated input. Flag sustained input whose cadence exceeds
+    any plausible human ceiling: inter-key intervals consistently below ~30-50 ms with near-zero variance,
+    or sustained throughput above ~800-1000 characters/minute (Volume/Frequency). Derive human reference
+    ranges from measured dwell/flight distributions such as the CMU keystroke benchmark; constant-interval,
+    zero-jitter signatures are characteristic of macro/HID injection rather than human typing. Tune thresholds
+    per device class (physical vs touchscreen). A positive result indicates programmatic keystroke injection
+    regardless of the input device''s declared identity. Supports Detect by catching the behavior of injection
+    even when the device passes hardware checks.'
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; evaluate over sustained input windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from keystroke_timing
+
+      | stats median(flight_ms) as med, stdev(flight_ms) as jit, count as n by host, session
+
+      | eval cpm = (n / window_minutes)
+
+      | where (med < 50 AND jit < 5) OR cpm > 900
+
+      | table host, session, med, jit, cpm, n'
+- question: Does live keystroke timing deviate from a user's enrolled dwell/flight template beyond their
+    threshold, indicating an impostor or injected input?
+  context: Enroll a per-user template of hold (dwell) and inter-key (flight) times and score live input
+    with a scaled-Manhattan or Mahalanobis/nearest-neighbor detector, alerting when the distance exceeds
+    the user's threshold (start near the ~9.6-10.2% EER operating points reported by Killourhy & Maxion
+    and tune per population). A large distance means the live typist does not match the enrolled user,
+    signaling an impostor at the keyboard or automated input. Alert text must list the top-3 deviating
+    features (e.g., median dwell, a specific bigram latency, flight-time variance) so analysts can judge
+    plausibility. Supports Detect by tying input to identity, complementing the absolute human-ceiling
+    rule with per-user behavioral baselining.
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; continuous scoring
+  queries:
+  - technology: ML/pseudocode
+    query: "template = enroll[user]  # dwell + flight feature means/cov\nd = scaled_manhattan(live_features,\
+      \ template)\nif d > user_threshold:\n  alert(user, host, d, top3_deviating_features(live_features,\
+      \ template))"
+- question: Have a user's top-N bigram latencies shifted beyond their normal day-to-day drift envelope
+    (with sufficient sample volume to be reliable)?
+  context: Baseline the top-N bigram latencies per user and alert on shifts beyond the legitimate day-to-day
+    drift envelope. Smeaton et al. show top-200 bigram timings are highly stable for heavy typists, so
+    a large bigram-timing shift (with sufficient sample volume) is a strong impostor/injection signal.
+    Require a minimum keystroke count before scoring to avoid sparse-sample false positives. A positive
+    result is a statistically significant change in characteristic letter-pair timing, suggesting a different
+    typist or synthetic input. Supports Detect by exploiting one of the most stable individual typing
+    signatures, harder for an attacker to mimic than gross speed.
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; require minimum keystroke count
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from keystroke_timing where user=U
+
+      | where session_keystrokes >= min_count
+
+      | stats avg(latency) as cur by bigram | head 200
+
+      | lookup user_bigram_baseline by user,bigram -> base_mean, drift_sd
+
+      | where abs(cur-base_mean) > 3*drift_sd
+
+      | stats count as shifted_bigrams by user, session
+
+      | where shifted_bigrams >= N'
+- question: For free-text (non-password) input, does the user's digraph/n-graph latency profile diverge
+    from their enrolled profile when scored against population data?
+  context: For free-text (non-password) input, project digraph/n-graph latencies with linear discriminant
+    analysis and score against population data as in Šeděnka et al. (~5% EER), enabling continuous deviation
+    scoring without a fixed phrase. This extends impostor detection beyond logon to ordinary work activity,
+    so an attacker who captured a password but cannot reproduce the victim's free-typing rhythm is still
+    flagged. A positive result is a sustained low match score against the enrolled user during normal
+    typing. Supports Detect by providing always-on, phrase-independent verification of who is actually
+    at the keyboard.
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; continuous scoring
+  queries:
+  - technology: ML/pseudocode
+    query: "feat = lda_project(ngraph_latencies(free_text))\nscore = match_against_population(feat, enrolled[user],\
+      \ population_model)\nif score < threshold:\n  alert(user, host, score, \"free-text typing mismatch\"\
+      )"
+- question: Are there spikes in failed logons (4625), forced lock screens (4800), or rejected reauthentications
+    that coincide with keystroke scores diverging from a user's typing baseline?
+  context: 'Run keystroke scoring continuously and treat divergence as a trigger to lock/reauthenticate,
+    per the continuous-authentication loop formalized by Baig & Eskeland. Explicitly profile failure-mode
+    State signals: spikes in failed logons (Event ID 4625), forced lock screens (4800), and rejected reauthentication
+    as distinct indicators that an input source is failing the typing baseline. Correlating these auth
+    failures with low keystroke-match scores strengthens the case that an impostor or automated tool is
+    driving input. A positive result is a cluster of reauth failures aligned with typing-anomaly scores
+    on the same session. Supports Detect by linking behavioral biometrics to concrete authentication-state
+    outcomes.'
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; correlate within session
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from win_events where EventID in (4625,4800,4801)
+
+      | join host,user,session, [from keystroke_scores where match_score < threshold]
+
+      | bin _time span=10m
+
+      | stats count as auth_fail, min(match_score) as worst by host, user, session, _time
+
+      | where auth_fail >= 2'
+- question: Does a sequence model verifying an ongoing keystroke stream against the enrolled user report
+    a likelihood drop indicating the input no longer matches that user?
+  context: 'Verify an ongoing keystroke stream against the enrolled user with a sequence model: LSTM (TypeNet,
+    2.2% EER physical), Transformer self-attention (Momeni & BabaAli), or CNN+GRU (Chang, Li & Stamp)
+    over hold/flight sequences. Run in parallel with the deterministic human-ceiling rule and surface
+    the top-3 contributing features (e.g., sequence-likelihood drop, abnormal mean inter-key interval,
+    dwell variance) in the alert rather than only a score. A sustained likelihood drop mid-session is
+    strong evidence of an impostor takeover or injected input. Supports Detect by capturing temporal patterns
+    in typing that simple distance metrics miss, while staying explainable for triage.'
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; continuous verification
+  queries:
+  - technology: ML/pseudocode
+    query: "seq = hold_flight_sequence(live_stream)\nlikelihood = typenet.verify(seq, enrolled[user])\n\
+      if likelihood < threshold:\n  alert(user, host, likelihood, top3_features(seq))"
+- question: Does a signal-feature classifier over the keystroke-timing waveform (e.g., a Gabor filter
+    bank) classify the input as not matching the enrolled user or as machine-generated?
+  context: As an alternative learned representation, extract signal-processing features from the keystroke-timing
+    waveform (e.g., a Gabor filter bank) feeding a classifier, as in the BeiHang system, to complement
+    distance-based detectors for impostor/injected-input detection. Treating keystroke timing as a signal
+    can capture periodicity and texture that point-wise dwell/flight statistics miss, providing an independent
+    vote on whether input is human and matches the enrolled user. A positive result is a classifier verdict
+    of impostor or synthetic input that agrees with or adds to distance- and sequence-based detectors.
+    Supports Detect by diversifying the detection ensemble so an attacker must defeat multiple distinct
+    representations.
+  answer_sources:
+  - EDR raw input / keystroke timing telemetry
+  - Windows Event ID 4624 (logon success)
+  - Windows Event ID 4625 (logon failure)
+  - Windows Event ID 4800/4801 (workstation lock/unlock)
+  - RDP/VNC session input logs
+  - Web application input-timing logs
+  - 'NAI: Interactive endpoints, remote-session hosts, and authentication front-ends that can capture
+    input timing'
+  range: Last 90 days; continuous scoring
+  queries:
+  - technology: ML/pseudocode
+    query: "wave = timing_waveform(keystroke_stream)\nfeat = gabor_filterbank(wave)\nverdict = classifier.predict(feat)\
+      \  # {genuine, impostor, synthetic}\nif verdict != \"genuine\":\n  alert(user, host, verdict, top_features(feat))"
