@@ -1,0 +1,317 @@
+name: 'D3-ALLM: Active Logical Link Mapping'
+id: fccc3e7e-da5a-4650-866a-c3bddf1548c1
+description: Investigate the logical (data-link / flow) communication structure of the environment to
+  validate the expected network topology and surface anomalous, novel, or policy-violating logical links
+  between assets and trust zones. This playbook helps an analyst build and maintain a continuously updated
+  authoritative logical link map of source-destination-service tuples from first-party flow telemetry
+  (Zeek conn.log, Windows filtering events, NetFlow/IPFIX, firewall logs), then test that map for segmentation-policy
+  violations, newly originated destinations, structurally novel tuples, anomalous multi-hop credential-switching
+  paths, active-mapping/scan failure signatures, statistical change-points and outliers, and graph/ML-based
+  novel-edge and community-bridging anomalies. Each detection names the offending tuple, the policy or
+  baseline it violates, and the top contributing features, supporting the D3FEND Active Logical Link Mapping
+  defensive technique under the Model tactic.
+type: technique
+related:
+- tactic_id: D3-M
+  tactic_name: Model
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Can we produce a canonical, deduplicated inventory of every observed logical link (source
+    IP, destination IP, destination port, protocol, direction) across our network chokepoints and critical
+    hosts, suitable for use as a Zero Trust allow-list?
+  context: This establishes the authoritative substrate for the entire playbook. By aggregating Zeek conn.log
+    and Windows Event ID 5156 (permitted connection) records into normalized source/destination/port/protocol/direction
+    tuples and deduplicating by time window, the analyst builds the canonical map of what actually talks
+    to what. NIST SP 800-207 Zero Trust requires an explicit allow-list of resource-to-resource flows;
+    this inventory is that allow-list's evidence base. Supporting the Model tactic, a complete and current
+    link inventory lets the analyst reason about expected versus observed communication and is the precondition
+    for every anomaly comparison below. A missing or stale inventory means later policy and novelty checks
+    will be unreliable.
+  answer_sources: &id001
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - Firewall connection logs
+  - NetFlow/IPFIX
+  - 'NAI: Network chokepoints (internet gateway, core/distribution switches, inter-VLAN routers) and all
+    critical host endpoints (servers, domain controllers, management hosts, workstations).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5156, netflow, firewall_conn)\n  | eval tuple = src_ip\
+      \ + \"|\" + dst_ip + \"|\" + dst_port + \"|\" + proto + \"|\" + direction\n  | bin _time span=1h\n\
+      \  | dedup tuple, _time\n  | stats min(_time) as first_seen, max(_time) as last_seen, count by tuple\n\
+      \  | outputlookup logical_link_inventory"
+- question: Which observed logical links violate our network segmentation policy or expected trust-zone
+    flows — for example workstations directly reaching server management ports (TCP 22/3389/5985/5986/445/135),
+    unauthorized lateral SMB, or unexpected east-west administrative protocols?
+  context: Any link not on the policy allow-list is by definition anomalous under NIST SP 800-207. This
+    misuse-rule check compares each observed tuple against approved segmentation rules and expected trust-zone
+    flows, alerting on disallowed paths. The analyst is hunting for boundary violations that indicate
+    lateral movement, misconfiguration, or reconnaissance — a user workstation hitting WinRM/RDP/SMB/RPC
+    on a server is a high-fidelity signal of administrative misuse. Aligned to the Model tactic, these
+    deterministic rules encode the intended topology; thresholds are tuned by adjusting the permitted
+    set, never by deleting the rule. A positive result names the offending tuple and the policy it breaks;
+    a clean result confirms observed flows stay within segmentation boundaries.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5156, firewall_conn)\n  | lookup segmentation_allowlist\
+      \ src_zone dst_zone dst_port proto OUTPUT allowed\n  | where isnull(allowed) OR allowed=\"false\"\
+      \n  | where (src_zone=\"user\" AND dst_zone=\"server\" AND dst_port IN (22,3389,5985,5986,445,135))\n\
+      \      OR NOT match_policy(src_zone,dst_zone,dst_port,proto)\n  | table _time, src_ip, dst_ip, dst_port,\
+      \ proto, violated_policy"
+- question: Which hosts have begun originating connections to internal destinations or communities they
+    have never contacted before, and which of them exceed a baseline-derived threshold of distinct new
+    destinations within a rolling hour?
+  context: Maintaining a per-host set of historically contacted (destination, port) pairs lets the analyst
+    detect when a host suddenly reaches never-before-seen internal destinations — the new-destination
+    mining approach of Beehive (Yen et al.). A burst of distinct new destinations is a classic lateral-movement
+    or scanning signature. The analyst prioritizes hosts whose count of distinct new destinations in a
+    rolling hour exceeds a threshold (commonly 5–10 for workstations, but derived per-environment from
+    the 99th percentile). Supporting the Model tactic, this enriches the topology model with directional
+    novelty per node. A positive result is a host fanning out to fresh internal targets; a negative result
+    means the host stays within its historical destination set.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5156)\n  | eval destpair = dst_ip + \":\" + dst_port\n\
+      \  | lookup host_known_dests src_ip OUTPUT known_destpairs\n  | where NOT match(destpair, known_destpairs)\n\
+      \  | bin _time span=1h\n  | stats dc(destpair) as new_dests, values(destpair) as which by src_ip,\
+      \ _time\n  | where new_dests > baseline_p99(src_ip)\n  | table _time, src_ip, new_dests, which"
+- question: Using association-rule / market-basket mining of normal (source-class, destination-class,
+    service) structure, which structurally novel link tuples appear — new cross-community links that emerge
+    even when both endpoints are individually active?
+  context: Per-host novelty misses links where each endpoint is busy but the specific pairing is unprecedented.
+    Association-rule/market-basket mining learns the normal co-occurrence structure of (source-class,
+    destination-class, service) and deterministically flags tuples that violate learned rules, as in Siadati
+    and Memon. This surfaces new cross-community bridges — e.g. a finance workstation class suddenly speaking
+    a database service to an engineering server class — even though both classes are otherwise active.
+    Supporting the Model tactic, this models communities of communication rather than individual edges.
+    A positive result is a structurally improbable class-to-class-service combination; a negative result
+    means observed structure conforms to learned associations.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | lookup asset_class src_ip OUTPUT src_class | lookup\
+      \ asset_class dst_ip OUTPUT dst_class\n  | eval item = src_class + \"|\" + dst_class + \"|\" + service\n\
+      \  | apply assoc_rules(min_support=0.01, min_confidence=0.8)\n  | where rule_match=false\n  | table\
+      \ _time, src_class, dst_class, service, src_ip, dst_ip"
+- question: Are there causal multi-hop paths (chained logins/connections) that combine a credential or
+    account switch with a destination the originating source has no history of reaching?
+  context: Single-edge rules miss attacks expressed as a chain. By constructing causal multi-hop paths
+    from chained logins and connections and alerting when a path combines an account/credential switch
+    with a never-before-reached destination, the analyst detects the staged lateral movement pattern formalized
+    by Hopper (Ho et al.). This catches an attacker who hops host-to-host, switching credentials, to reach
+    a target the initial source never touches directly — while keeping alert volume low because only suspicious
+    causal chains fire. Supporting the Model tactic, it models paths through the graph, not just edges.
+    A positive result is a credential-switching path terminating at an anomalous destination; a negative
+    result means login chains follow historically normal routes.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (win_event=4624, win_event=4648, zeek_conn)\n  | build_login_chains(by=session,\
+      \ link_on=src_host->dst_host)\n  | eval cred_switch = (account[i] != account[i-1])\n  | lookup host_known_dests\
+      \ src_ip OUTPUT known_destpairs\n  | where cred_switch=true AND NOT match(final_dst, known_destpairs)\n\
+      \  | table chain_id, path, accounts, final_dst"
+- question: Which single sources are generating a high ratio of failed, blocked, or half-open connections
+    (Windows Event ID 5157, firewall denies, Zeek conn_state S0/REJ/RSTO) across many distinct destinations
+    and ports in a short window — the classic active-mapping / traceroute signature?
+  context: Failure state is a first-class signal. Active mapping, port scanning, and traceroute generate
+    characteristic failed-to-successful connection ratios as the tool probes destinations and ports that
+    do not answer. By counting blocked connections (Event ID 5157, firewall denies) and failed/RST/half-open
+    connections (Zeek conn_state S0/REJ/RSTO) per source, then alerting when one source produces a high
+    failure ratio across many distinct destinations/ports within a short window, the analyst catches reconnaissance
+    and active logical link mapping. Thresholds derive from the per-environment 99th percentile. Supporting
+    the Model tactic, this detects the very act of an adversary mapping the topology. A positive result
+    is a fan-out of failures from one source; a negative result reflects normal mostly-successful connectivity.
+  answer_sources: *id001
+  range: Last 24 hours
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5157, firewall_deny)\n  | eval failed = if(conn_state\
+      \ IN (\"S0\",\"REJ\",\"RSTO\") OR action=\"deny\", 1, 0)\n  | bin _time span=5m\n  | stats sum(failed)\
+      \ as fails, count as total, dc(dst_ip) as dsts, dc(dst_port) as ports by src_ip, _time\n  | eval\
+      \ fail_ratio = fails/total\n  | where fail_ratio > 0.7 AND dsts > p99_dsts AND ports > p99_ports\n\
+      \  | table _time, src_ip, fail_ratio, dsts, ports"
+- question: Over a 30-day baseline, how does each link rank by prevalence (frequency, byte volume, session
+    rate, success/fail ratio), and which rare links carry high byte transfer or long persistence?
+  context: Not every novel link is equally interesting; prevalence-based triage focuses attention. By
+    computing per-tuple frequency, byte volume (Volume), session rate (Frequency), and success/fail ratio
+    (State) distributions over a 30-day baseline and labeling each link common, uncommon, or rare via
+    percentile bands, the analyst can prioritize rare links that also move a lot of data or persist a
+    long time — the volume/frequency baselining of Ghorbani et al. A rare link with sustained high byte
+    transfer is a strong exfiltration or C2 candidate. Supporting the Model tactic, this stratifies the
+    topology by statistical normality. A positive result is a rare-yet-heavy link; a negative result is
+    a link consistent with common, low-risk patterns.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | eval tuple = src_ip + \"|\" + dst_ip + \"|\" + dst_port\
+      \ + \"|\" + proto\n  | stats count as freq, sum(bytes) as vol, avg(duration) as persist, \n    \
+      \  sum(eval(failed=1)) as fails, count as total by tuple\n  | eventstats perc95(freq) as p95_freq,\
+      \ perc05(freq) as p05_freq\n  | eval band = case(freq>=p95_freq,\"common\", freq<=p05_freq,\"rare\"\
+      , 1==1,\"uncommon\")\n  | where band=\"rare\" AND (vol > vol_p95 OR persist > persist_p95)\n  |\
+      \ table tuple, band, freq, vol, persist"
+- question: Applying a Bayesian first-time-edge model that controls for naturally active hubs, which previously
+    unseen (source, destination) links score as genuinely surprising rather than the expected churn of
+    busy servers and domain controllers?
+  context: Busy hubs (servers, DCs) constantly form new edges, drowning naive novelty alerts in false
+    positives. The Bayesian new-edge model of Metelli and Heard scores the surprise of a previously unseen
+    (source, destination) link while controlling for each node's natural activity level, so a new edge
+    to a high-degree hub is unsurprising but a new edge between two normally-quiet nodes is flagged. The
+    analyst uses this to keep sensitivity for genuinely novel links without alert fatigue from hub churn.
+    Supporting the Model tactic, it models per-node connectivity propensity. A positive result is a high-surprise
+    new edge between low-activity nodes; a negative result is a new edge well explained by hub behavior.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5156)\n  | eval edge = src_ip + \"->\" + dst_ip\n  |\
+      \ lookup seen_edges edge OUTPUT first_seen\n  | where isnull(first_seen)\n  | apply bayesian_new_edge(src_activity,\
+      \ dst_activity)  // Metelli & Heard\n  | eval surprise = -log(p_edge)\n  | where surprise > surprise_threshold\n\
+      \  | table _time, src_ip, dst_ip, surprise"
+- question: For each critical tuple and inter-subnet pair, where do seasonal baselines plus EWMA residuals
+    and change-point detection (CUSUM / Bayesian online / PELT) reveal sustained traffic increases, abrupt
+    regime changes, or unusual off-hours activity?
+  context: Adversary activity often manifests as a change in an existing link's behavior rather than a
+    brand-new link. By modeling hourly traffic with seasonal baselines and EWMA residuals and applying
+    change-point detection (CUSUM, Bayesian online change-point, or PELT) as surveyed by Aminikhanghahi
+    and Cook, the analyst flags sustained positive residuals, abrupt regime shifts (a quiet link suddenly
+    carrying steady traffic), and off-hours spikes beyond control limits. This catches staging, exfiltration
+    ramp-ups, and beaconing onset. Supporting the Model tactic, it models each link's temporal traffic
+    profile. A positive result is a statistically significant change-point on a monitored tuple; a negative
+    result is traffic within seasonal expectation.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | eval pair = src_subnet + \"->\" + dst_subnet\n \
+      \ | bin _time span=1h | stats sum(bytes) as vol by pair, _time\n  | apply seasonal_baseline(period=168h)\
+      \ | eval resid = vol - expected\n  | apply ewma(resid) | apply changepoint(method=\"PELT\")\n  |\
+      \ where changepoint=true OR resid > control_limit OR off_hours_anomaly=true\n  | table _time, pair,\
+      \ vol, expected, resid"
+- question: Extracting per-flow temporal features (byte/packet rates over time, burstiness, periodicity),
+    which logical links have a temporal signature that deviates from their own learned baseline?
+  context: Each logical link has a characteristic temporal fingerprint. Following the single-flow time-series
+    method of Koumar et al., the analyst extracts temporal Volume/Frequency features — byte and packet
+    rates over time, burstiness, and periodicity — to characterize each link, then flags links whose current
+    signature departs from their learned baseline. Periodic, low-jitter signatures can indicate automated
+    beaconing or C2; sudden bursty change can indicate exfiltration. Supporting the Model tactic, this
+    enriches the topology with per-edge temporal behavior. A positive result is a link whose timing fingerprint
+    no longer matches its history; a negative result is a link behaving in its usual temporal pattern.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | eval link = src_ip + \"->\" + dst_ip + \":\" + dst_port\n\
+      \  | timechart_per_link byte_rate, pkt_rate span=1m by link\n  | apply sfts_features(burstiness,\
+      \ periodicity, autocorr)  // Koumar et al.\n  | lookup link_temporal_baseline link OUTPUT baseline_sig\n\
+      \  | eval deviation = dist(current_sig, baseline_sig)\n  | where deviation > dev_threshold\n  |\
+      \ table link, deviation, periodicity, burstiness"
+- question: Scoring per-link feature vectors (bytes, packets, duration, destination-port entropy, fan-out,
+    failed-connection ratio) with Isolation Forest and PCA reconstruction error / MAD, which links are
+    multivariate outliers, and what are their top-3 contributing features?
+  context: Multivariate outliers escape single-metric thresholds. By assembling per-link feature vectors
+    — bytes, packets, duration, destination-port entropy, fan-out, failed-connection ratio — and scoring
+    them with Isolation Forest (Liu et al.) and PCA reconstruction error / median-absolute-deviation (Bohara
+    et al.), the analyst surfaces links that are jointly anomalous across features even when no single
+    feature is extreme. Critically, the analyst surfaces the top-3 contributing features in the alert
+    so triage is fast and defensible. Supporting the Model tactic, this provides a statistical anomaly
+    score per modeled edge. A positive result is a high anomaly score with named drivers (e.g. high port-entropy
+    + high fan-out); a negative result is a link near the center of the feature distribution.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | eval link = src_ip + \"->\" + dst_ip\n  | stats\
+      \ sum(bytes) as bytes, sum(pkts) as pkts, avg(duration) as dur,\n      entropy(dst_port) as port_entropy,\
+      \ dc(dst_ip) as fanout,\n      avg(eval(failed)) as fail_ratio by link\n  | apply isolation_forest(bytes,pkts,dur,port_entropy,fanout,fail_ratio)\
+      \ as iso_score\n  | apply pca_recon_error as pca_score\n  | where iso_score > 0.7 OR pca_score >\
+      \ mad_threshold\n  | eval top_features = top3_contributions()\n  | table link, iso_score, pca_score,\
+      \ top_features"
+- question: Building a directed communication graph and running community detection plus unsupervised
+    graph-embedding link prediction, which low-probability new cross-community edges appear, and which
+    two communities does each bridge?
+  context: Modeling communication as a graph reveals structure invisible to flat tuple lists. By constructing
+    a directed weighted communication graph, running community detection to infer normal service groupings,
+    and scoring candidate edges by link-prediction probability from unsupervised graph embeddings as in
+    CyberGraph (Bowman et al.), the analyst flags improbable new edges that bridge otherwise separate
+    communities — a hallmark of lateral movement crossing organizational or functional boundaries. Each
+    alert emits the new-edge probability and the two communities bridged for context. Supporting the Model
+    tactic, this is the graph-native model of expected topology. A positive result is a low-probability
+    cross-community edge; a negative result is an edge consistent with established community structure.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=5156)\n  | build_graph(nodes=ip, edges=tuple, weight=count)\n\
+      \  | apply community_detection() as community\n  | apply graph_embedding_link_pred() as edge_prob\
+      \  // CyberGraph\n  | where is_new_edge=true AND edge_prob < 0.05 AND src_community != dst_community\n\
+      \  | table src_ip, dst_ip, edge_prob, src_community, dst_community"
+- question: Applying scalable temporal link prediction (GNN encoder + recurrent temporal model) over the
+    time-evolving communication/authentication graph, which edges appear at times the model assigns low
+    probability?
+  context: The communication graph evolves over time, and edges that are normal at one moment may be anomalous
+    at another. The Euler approach (King and Huang) combines a GNN encoder with a recurrent temporal model
+    to predict, for each time step, the probability of each edge; edges that appear when the model predicts
+    low probability are flagged. This captures temporally-aware novelty — a link that would be normal
+    during business hours but is improbable at 3 a.m., or that appears in an unprecedented sequence. It
+    runs in parallel with the deterministic segmentation floor and never replaces it. Supporting the Model
+    tactic, it models how topology should evolve. A positive result is a temporally improbable edge; a
+    negative result is an edge consistent with the predicted evolving graph.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=4624)\n  | build_temporal_graph(snapshot=1h)\n  | apply\
+      \ euler_link_pred(gnn_encoder, recurrent_temporal) as edge_prob\n  | where observed_edge=true AND\
+      \ edge_prob < low_prob_threshold\n  | // run alongside, never instead of, segmentation_allowlist\
+      \ rules\n  | table _time, src_ip, dst_ip, edge_prob"
+- question: Building a heterogeneous graph of sequential, temporal, logical, and spatial relationships
+    among hosts, users, and operations and clustering the learned node embeddings, which subtle anomalous
+    link patterns emerge that per-edge statistics miss?
+  context: Some malicious behavior is only visible when multiple relationship types are considered together.
+    Following Log2vec (Liu et al.), the analyst builds a heterogeneous graph capturing sequential, temporal,
+    logical, and spatial relationships among hosts, users, and operations, learns node embeddings, and
+    clusters them to detect subtle anomalous link patterns that evade per-edge statistics. This catches
+    stealthy, multi-stage activity whose individual edges look benign but whose combined relational context
+    is anomalous. Supporting the Model tactic, it provides a rich relational model of the environment.
+    A positive result is an embedding-cluster outlier representing an unusual relational pattern; a negative
+    result is activity that embeds near normal clusters.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, win_event=4624, win_event=5156)\n  | build_hetero_graph(rels=[sequential,temporal,logical,spatial],\
+      \ nodes=[host,user,op])\n  | apply log2vec_embeddings() as emb\n  | apply cluster(emb) as cluster_id\n\
+      \  | where cluster_outlier_score > threshold\n  | table _time, node, cluster_id, cluster_outlier_score"
+- question: Reconciling complementary unsupervised detectors (PCA reconstruction error, k-means distance,
+    MAD) over Host Communication Graph features, which links are flagged by multiple detectors concurrently,
+    and which detectors and features drove each score?
+  context: Single detectors trade precision for recall; an ensemble that requires concurrence raises precision
+    on stealthy links. Following Bohara et al., the analyst computes Host Communication Graph features
+    and runs complementary unsupervised detectors — PCA reconstruction error, k-means distance to nearest
+    centroid, and median-absolute-deviation — alerting only when multiple detectors agree, while reporting
+    which detectors and features drove the score for triage. This reduces false positives versus any single
+    method and yields defensible, explainable alerts. Supporting the Model tactic, it is the ensemble
+    verdict over the graph model. A positive result is a link flagged by two or more detectors with named
+    drivers; a negative result is a link no detector flags or only one weakly flags.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (zeek_conn, netflow)\n  | build_host_comm_graph_features by link\n  | apply\
+      \ pca_recon_error as d1 | apply kmeans_distance as d2 | apply mad_score as d3\n  | eval votes =\
+      \ (d1>t1) + (d2>t2) + (d3>t3)\n  | where votes >= 2\n  | eval drivers = which_detectors_and_features()\n\
+      \  | table link, votes, d1, d2, d3, drivers"
