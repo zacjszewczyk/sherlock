@@ -1,0 +1,302 @@
+name: 'D3-UBA: User Behavior Analysis'
+id: 92041209-b3b1-4ce5-a386-b050ef671bd0
+description: 'This playbook helps an analyst investigate whether a user account should be locked to evict
+  a suspected adversary, in support of the information requirement: under what conditions should an account
+  be locked to effectively evict a suspected adversary? It applies User Behavior Analysis (D3-UBA) to
+  two evidentiary patterns. First, it examines accounts that exhibit a combination of anomalous authentication
+  and host behaviors that, aggregated, exceed a per-user risk threshold and indicate probable compromise:
+  watchlisted source logins, impossible travel, explicit-credential fan-out, concurrent sessions, multi-factor
+  behavioral anomalies, robust per-metric outliers, authentication time-series change-points, rare authentication
+  graph edges, and combined one-class behavioral risk scoring. Second, it examines accounts or sources
+  that generate an abnormal volume or rate of authentication failures (password spraying, brute force,
+  or credential stuffing), optionally followed by a success, that justify a temporary lock and forced
+  credential reset. Each question maps a concrete detection method to the data sources and named areas
+  of interest where the analyst should hunt, so the lock-or-not decision is defensible and grounded in
+  evidence.'
+type: technique
+related:
+- tactic_id: D3-E
+  tactic_name: Evict
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any user account successfully authenticate from a source IP, ASN, or Tor exit node that
+    appears on a curated watchlist of known-malicious infrastructure, and is that account high-centrality
+    (admin/service) in the authentication graph?
+  context: 'Evict tactic: a successful logon (Windows Event ID 4624 or Azure AD Sign-in) from a watchlisted
+    source is strong grounds to lock the account pending review, because legitimate users should not be
+    authenticating from known-malicious IPs/ASNs/Tor exits. Correlate every success against the watchlist,
+    and use PageRank centrality over the authentication graph (as in LogonTracer) to prioritize admin/service
+    accounts whose compromise would let an adversary pivot widely. A positive hit on a high-centrality
+    account is a high-confidence eviction trigger; a hit on a low-privilege account still warrants review
+    but lower urgency.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "logins = events(EventID in [4624] OR source=='AzureAD Sign-in' AND result=='success')\n  hits\
+      \ = logins where src_ip in watchlist_ips OR src_asn in watchlist_asns OR is_tor_exit(src_ip)\n \
+      \ rank = pagerank(auth_graph(user,host))\n  emit hits sorted by rank[user] desc -> action: lock(user)\
+      \ pending review"
+- question: For consecutive logins by the same user, does the geodesic distance between the resolved source
+    geolocations divided by the elapsed time imply a travel velocity that is physically impossible (e.g.,
+    exceeding ~900 km/h)?
+  context: 'Evict tactic: impossible travel indicates the same credential is in use from two locations
+    that one person could not traverse in the elapsed time, suggesting credential theft or session hijacking.
+    Compute the great-circle distance between consecutive login source geolocations and divide by the
+    time delta; if required velocity exceeds a tuned cutoff (start ~900 km/h), lock the account. Allowlist
+    corporate VPN/proxy egress ASNs and recently-used datacenter ranges to suppress false positives, and
+    record both IPs, the distance, and the delta in the alert so an analyst can validate. A confirmed
+    impossible-travel pair is a strong eviction trigger.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; correlate consecutive login pairs per user
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n    for (a,b) in consecutive_logins(user):\n      if asn(a) in vpn_allowlist\
+      \ or asn(b) in vpn_allowlist: continue\n      v = geodist(geo(a.ip), geo(b.ip)) / hours(b.time -\
+      \ a.time)\n      if v > 900: alert(user, a.ip, b.ip, dist=geodist, delta=b.time-a.time) -> lock(user)"
+- question: Is a single source account or host using explicit credentials (Windows Event ID 4648) to connect
+    to an unusually large number of distinct target accounts or destination hosts within a short sliding
+    window?
+  context: 'Evict tactic: explicit-credential fan-out is a hallmark of lateral movement and credential
+    reuse, where an adversary on one host uses harvested credentials to authenticate outward to many systems.
+    Count distinct (target account, destination host) tuples per source within a sliding window (e.g.,
+    1 hour) and lock the source when it exceeds a deterministic floor (start: >5 distinct target accounts
+    OR >10 distinct destinations), per the Azure Sentinel 4648 hunting query. A high fan-out from one
+    source strongly indicates active compromise and justifies eviction; normal admin tooling should be
+    baselined and allowlisted.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; 1-hour sliding window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "e = events(EventID==4648)\n  group by src_account, src_host over window(1h):\n    distinct_targets\
+      \ = countdistinct(target_account)\n    distinct_dests = countdistinct(dest_host)\n    if distinct_targets\
+      \ > 5 or distinct_dests > 10: lock(src_account)"
+- question: Does a single user have two or more simultaneous interactive logons (Event ID 4624 logon type
+    2 or 10) from different source hosts, or active concurrent sessions exceeding their historical 99th
+    percentile?
+  context: 'Evict tactic: concurrent interactive sessions for one user from different hosts indicate credential
+    sharing or an active adversary using the account in parallel with the legitimate user. Deterministically
+    flag two or more simultaneous interactive logons (logon type 2/10) from different sources per MITRE
+    CAR-2013-02-008, and in parallel track concurrent active sessions per user across source IPs (Zeek
+    conn.log), alerting when a user exceeds their historical 99th percentile. Either condition is a credible
+    eviction trigger; confirm the second session is not a known jump host or remote-support tool before
+    locking.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "logons = events(EventID==4624 AND logon_type in [2,10])\n  for user, t in logons:\n    active\
+      \ = sessions_overlapping(user, t)\n    if countdistinct(active.src_host) >= 2: alert(user)\n  //\
+      \ statistical arm\n  if concurrent_sessions(user) > p99(user.history): alert(user)"
+- question: When compared to their own baseline and to role-based peer groups, is a user simultaneously
+    logging in outside normal hours AND from a country/ASN that is among the rarest 5% for that user and
+    uncommon for peers?
+  context: 'Evict tactic: multi-factor behavioral anomalies catch compromise that no single signal would.
+    Baseline each user''s typical login hours, common source geolocation/ASN (Zeek conn.log), and process-execution
+    frequency (Event ID 4688), then compare against role-based peer groups as in Microsoft Sentinel UEBA.
+    Raise risk when an account logs in both off-hours and from a top-5% rarest country/ASN for that user
+    that peers also rarely use, summing per-activity rarity weights into an investigation-priority score.
+    A high combined rarity score signals likely account takeover; peer comparison reduces false positives
+    from legitimately unusual but role-appropriate behavior.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; baseline over trailing 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n    base = baseline(user, hours, asn, proc_freq, window=30d)\n    peer\
+      \ = peer_group_baseline(role_of(user))\n    score = w1*offhours(login,base) + w2*rare_asn(login.asn,\
+      \ base, peer, pct=0.05)\n    if offhours and rare_asn: emit priority_score=score for review/lock"
+- question: Using an outlier-resistant modified Z-score, do any per-user counts (failed logons, bytes
+    out, distinct destinations, concurrent sessions) exceed |0.6745*(x-median)/MAD| > 3.5 over a trailing
+    30-day window?
+  context: 'Evict tactic: robust per-metric thresholding flags statistically extreme behavior without
+    being distorted by batch jobs or scheduled tasks. Convert raw per-user counts into median-absolute-deviation
+    modified Z-scores and flag values where |0.6745*(x-median)/MAD| > 3.5, deriving median and MAD per
+    user over a trailing 30-day window. Because MAD is resistant to the heavy-tailed activity of automation,
+    an exceedance is a meaningful anomaly worth investigating for eviction; multiple simultaneous metric
+    exceedances strengthen the case to lock the account.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; trailing 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n    for metric in [failed_logons, bytes_out, distinct_dests, concurrent_sessions]:\n\
+      \      med = median(metric[user], 30d); mad = MAD(metric[user], 30d)\n      mz = 0.6745*(metric.today\
+      \ - med)/mad\n      if abs(mz) > 3.5: alert(user, metric, mz)"
+- question: Does change-point detection on a user's authentication time series (login frequency, distinct
+    destinations, bytes out) reveal an abrupt regime shift, especially one coinciding with a rare source
+    ASN or a newly-accessed destination?
+  context: 'Evict tactic: compromise often manifests as a sudden, sustained change in a user''s behavior
+    rather than a single spike. Run change-point detection (CUSUM, PELT, or Bayesian online) on per-user
+    time series of login frequency, distinct destinations, and bytes out to flag abrupt regime shifts
+    that precede or accompany compromise, per Aminikhanghahi & Cook and the change-finder approach in
+    LogonTracer. Alert when a detected change-point coincides with a rare source ASN or new destination,
+    as that conjunction is a strong eviction indicator; an isolated change-point may simply reflect a
+    role change.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days time series per user
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n    series = daily(login_freq, distinct_dests, bytes_out)[user]\n    cps\
+      \ = changepoint_detect(series, method='PELT')\n    for cp in cps:\n      if rare_asn_near(user,\
+      \ cp) or new_dest_near(user, cp): alert(user, cp)"
+- question: Across the per-user/host authentication graph, are there new or low-probability authentication
+    edges (entities that do not normally communicate, or credential-switch paths reaching never-accessed
+    servers)?
+  context: 'Evict tactic: lateral movement creates authentication edges that did not previously exist
+    in the environment. Build a per-user/host authentication graph and score new or low-probability edges
+    using unsupervised graph embeddings (CyberGraph), temporal link prediction (Euler), or credential-switch
+    path inference reaching never-accessed servers (Hopper). Tune the alert budget to roughly 10/day and
+    include the specific anomalous edge (source, destination, credential) in the alert; train and validate
+    on the LANL auth dataset. A rare edge into a sensitive server via a switched credential is a high-fidelity
+    eviction trigger.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; model trained on trailing history
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "G = auth_graph(events([4624,4648]))\n  emb = graph_embeddings(G)  // CyberGraph / Euler temporal\
+      \ link prediction\n  for edge in new_edges(G):\n    p = link_probability(emb, edge)\n    if p <\
+      \ threshold: alert(src=edge.src, dst=edge.dst, cred=edge.cred)\n  enforce alert_budget(~10/day)"
+- question: When the behavioral features above are aggregated into a one-class anomaly model (Isolation
+    Forest / One-Class SVM trained on normal per-user behavior), does any account's anomaly score exceed
+    the dynamically tuned threshold, and what are the top contributing features?
+  context: 'Evict tactic: a combined one-class model unifies disparate weak signals into a single defensible
+    risk score for the lock decision. Train an Isolation Forest or One-Class SVM on normal per-user behavior
+    and lock when the anomaly score exceeds a dynamically tuned threshold. Use LIME or attention to surface
+    the top-3 contributing features (e.g., rare ASN, new destination edge, off-hours logon) in the alert
+    text rather than only a score, per the cited interpretable models; validate on the CERT insider threat
+    dataset. The interpretability is essential so an analyst can justify eviction and rule out benign
+    explanations.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4648
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Azure AD Sign-in Logs
+  - 'NAI: Authentication servers, critical asset servers, user workstations, and network gateways.'
+  range: Last 90 days; model trained on normal baseline
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "X = per_user_features(failed_logons, bytes_out, rare_asn, new_edges, offhours, concurrent)\n\
+      \  model = IsolationForest().fit(X_normal)\n  for user in users:\n    s = model.anomaly_score(X[user])\n\
+      \    if s > tuned_threshold:\n      top = explain(model, X[user], k=3)  // LIME/attention\n    \
+      \  alert(user, score=s, drivers=top) -> lock(user)"
+- question: Within a short window, does any single source IP or host generate failed logons (Windows Event
+    ID 4625 or Azure AD sign-in failures) against an unusually large number of distinct target accounts,
+    indicating a password spray?
+  context: 'Evict tactic: password spraying tries a few common passwords against many accounts from one
+    source to stay under per-account lockout thresholds. Per source IP/host per window, count distinct
+    target accounts with failed logons and lock or throttle the source when distinct failed users exceeds
+    a deterministic floor (start: >10 distinct accounts in 5 minutes, each with few attempts), escalating
+    severity when failures exceed mean + 3*stddev of the source''s baseline, per Splunk Threat Research.
+    A confirmed spray justifies blocking the source and forcing credential resets on any subsequently-successful
+    targets.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - Azure AD Sign-in Logs
+  - Zeek conn.log
+  - 'NAI: Authentication servers, identity providers, VPN/remote-access gateways, and internet-facing
+    applications.'
+  range: Last 90 days; 5-minute window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "f = events(EventID==4625 OR azuread_signin_failure)\n  group by src_ip over window(5m):\n\
+      \    distinct_users = countdistinct(target_account)\n    if distinct_users > 10 and attempts_per_user\
+      \ is low: throttle(src_ip)\n    if fail_count > mean(src.baseline) + 3*std(src.baseline): escalate(src_ip)"
+- question: Across many source IPs over long time windows, does time-series decomposition of the count
+    of distinct failed accounts and the failure/success ratio reveal anomalous failure bursts indicative
+    of a low-and-slow password spray?
+  context: 'Evict tactic: sophisticated adversaries distribute sprays across many IPs over long windows
+    to evade per-IP thresholds. Apply time-series decomposition (e.g., series_decompose_anomalies) to
+    the count of distinct failed accounts and the failed/success ratio, flagging anomalous failure bursts
+    that per-IP rules would miss, per the Microsoft Sentinel low-and-slow ML hunting guidance. A detected
+    aggregate anomaly should prompt investigation of all participating sources and any accounts that subsequently
+    authenticated successfully, which may warrant temporary locks and resets.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - Azure AD Sign-in Logs
+  - Zeek conn.log
+  - 'NAI: Authentication servers, identity providers, VPN/remote-access gateways, and internet-facing
+    applications.'
+  range: Last 90 days; aggregate time series
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ts = timechart(span=1h, distinct_failed_accounts, fail_success_ratio)\n  anomalies = series_decompose_anomalies(ts)\n\
+      \  for a in anomalies where a.is_anomaly:\n    investigate(sources_in(a.bucket), successes_after(a.bucket))"
+- question: Did any single account exceed a failed-logon floor (e.g., >5 Event ID 4625 in 10 minutes)
+    immediately followed by a successful logon (Event ID 4624) from a new IP/ASN, or did an already-disabled/blocked
+    account attempt to authenticate?
+  context: 'Evict tactic: failure-then-success from a new source is the classic signature of a successful
+    brute force or credential-stuffing attack, and authentication attempts by disabled accounts indicate
+    either misconfiguration or adversary probing. Treat failure rate as a first-class signal: lock when
+    an account exceeds a failed-logon floor (start: >5 4625 in 10 minutes) immediately followed by a 4624
+    success from a new IP/ASN, or when a disabled/blocked account attempts to authenticate, per Defender
+    for Cloud Apps anomaly policies. Profile per-account baseline failure rate so normal fat-finger users
+    are not locked; a genuine failure-then-success from new infrastructure is a high-confidence eviction
+    trigger.'
+  answer_sources:
+  - Windows Event ID 4625
+  - Windows Event ID 4624
+  - Azure AD Sign-in Logs
+  - Zeek conn.log
+  - 'NAI: Authentication servers, identity providers, VPN/remote-access gateways, and internet-facing
+    applications.'
+  range: Last 90 days; 10-minute correlation window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for user in users over window(10m):\n    fails = count(EventID==4625)\n    if fails > 5:\n\
+      \      s = first(EventID==4624 after last_fail)\n      if s and s.src_ip not in user.known_ips:\
+      \ lock(user); reset_creds(user)\n  if EventID in [4625,4624] and account.is_disabled: alert(account)"
