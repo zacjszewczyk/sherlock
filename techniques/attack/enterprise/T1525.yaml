@@ -1,0 +1,924 @@
+name: 'T1525: Implant Internal Image'
+id: 0fec6d83-d846-448f-b5ed-eb20b0db3f6f
+description: 'This playbook helps an analyst investigate whether an adversary is establishing persistence
+  by implanting malicious code into internal cloud or container images (AWS AMIs/custom images, GCP/Azure
+  images, or Docker images) so that infrastructure provisioning repeatedly redeploys the backdoor as part
+  of the Persistence tactic. It guides the hunt across several behavioral angles spanning container hosts
+  (Windows and Linux), cloud instances, image registries, and the cloud control plane: network egress
+  from freshly deployed image versions to C2 indicators or to anomalous/failing destinations (Zeek conn/dns/ssl,
+  JA3/JA3S baselining, per-image traffic forecasting); malicious process execution inside containers and
+  instances (reverse shells, download cradles, cryptominers via Windows EID 4688, auditd/Sysmon-for-Linux
+  execve, novel/entropy-heavy commands, and ML command-line classifiers); registry and control-plane image
+  pushes/registrations from unauthorized IPs, principals, or off-hours (Zeek http.log, Windows EID 4624,
+  AWS CloudTrail RegisterImage/CreateImage/CopyImage/ModifyImageAttribute/ecr:PutImage, allowlist and
+  signed-provenance gating, behavioral risk scoring, Isolation Forest); post-update behavioral drift in
+  a deployed container/instance including unexpected IMDS access and new IAM role assumption; high-volume
+  discovery/enumeration against the registry or image catalog preceding an implant; and image-content
+  diffing for embedded persistence (SSH authorized_keys, baked-in credentials, new users/cron/services)
+  followed by RunInstances launches. Detection methods combine symbolic-logic rules, statistical baselining/forecasting,
+  and machine-learning models so the analyst can corroborate a suspected internal image implant across
+  image provenance, runtime behavior, identity context, and network egress.'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: '[Persistence] Match container traffic to C2 indicators: Can you determine whether a container
+    or cloud instance, deployed from a recently created or modified internal image, initiates a network
+    connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence feed, or generates
+    abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after first deployment of
+    the new image version. -- specifically, using the ''Match container traffic to C2 indicators'' (Symbolic
+    Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a container or cloud instance, deployed from a recently created or modified
+    internal image, initiates a network connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence
+    feed, or generates abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after
+    first deployment of the new image version. This Symbolic Logic approach looks for the following signal:
+    Filter Zeek conn.log/dns.log traffic from hosts running the new image version and alert when destination
+    IPs/domains appear on high-confidence C2 feeds, including source container/image name+tag; corroborate
+    with runtime egress rules (''Unexpected outbound connection'' from a container) per [Falco Default
+    Runtime Security Rules](https://falco.org/docs/reference/rules/default-rules/). Reverse-shell/dropper
+    egress from freshly deployed artifacts is the dominant implant payload behavior in [Backstabber''s
+    Knife Collection](https://arxiv.org/abs/2005.09535). A positive result -- a rule match, statistical
+    outlier, or model alert -- suggests that an internal image has been backdoored or that a container/instance
+    deployed from a recently changed image is behaving maliciously; pivot to the responsible image name+tag/AMI
+    ID and its registration/push event, the principal and source IP that created or pushed it, the deploying
+    provisioning pipeline, the running container/instance, and any resulting C2 or lateral-movement activity.
+    A negative result helps rule out this implant vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, slow, or living-off-the-land image-implant
+    persistence.'
+  answer_sources: &id001
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Container host nodes, cloud instances, network egress points, internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Match container traffic to C2 indicators
+
+      source IN [Zeek conn.log, Zeek dns.log, Zeek ssl.log]
+
+      | WHERE matches_action_criteria("Match container traffic to C2 indicators")
+
+      // Filter Zeek conn.log/dns.log traffic from hosts running the new image version and alert when
+      destination IPs/domains app
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Detect unknown TLS fingerprints per image: Can you determine whether a container
+    or cloud instance, deployed from a recently created or modified internal image, initiates a network
+    connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence feed, or generates
+    abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after first deployment of
+    the new image version. -- specifically, using the ''Detect unknown TLS fingerprints per image'' (Statistical
+    Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a container or cloud instance, deployed from a recently created or modified
+    internal image, initiates a network connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence
+    feed, or generates abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after
+    first deployment of the new image version. This Statistical Method approach looks for the following
+    signal: Baseline JA3/JA3S hashes per image name/version using Zeek ssl.log and alert on any hash absent
+    from the image-specific roster, per [JA3 TLS Client Fingerprinting](https://github.com/salesforce/ja3);
+    separately profile failure state (blocked connections, NXDOMAIN, TLS handshake failures per minute)
+    as a distinct beacon/exfil signal. A positive result -- a rule match, statistical outlier, or model
+    alert -- suggests that an internal image has been backdoored or that a container/instance deployed
+    from a recently changed image is behaving maliciously; pivot to the responsible image name+tag/AMI
+    ID and its registration/push event, the principal and source IP that created or pushed it, the deploying
+    provisioning pipeline, the running container/instance, and any resulting C2 or lateral-movement activity.
+    A negative result helps rule out this implant vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, slow, or living-off-the-land image-implant
+    persistence.'
+  answer_sources: *id001
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "# Detect unknown TLS fingerprints per image\nsource IN [Zeek conn.log, Zeek dns.log, Zeek\
+      \ ssl.log]\n| STATS baseline over 30d per (image, container/instance, principal)\n| COMPUTE deviation\
+      \ (z-score / percentile / change-point)\n// Baseline JA3/JA3S hashes per image name/version using\
+      \ Zeek ssl.log and alert on any hash absent from the image-specific \n| WHERE deviation > threshold\
+      \ | ALERT enrich(host, principal, image, container, dest)"
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Forecast anomalous container traffic: Can you determine whether a container
+    or cloud instance, deployed from a recently created or modified internal image, initiates a network
+    connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence feed, or generates
+    abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after first deployment of
+    the new image version. -- specifically, using the ''Forecast anomalous container traffic'' (Machine
+    Learning) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a container or cloud instance, deployed from a recently created or modified
+    internal image, initiates a network connection to a destination IP/FQDN on a high-confidence C2 threat-intelligence
+    feed, or generates abnormal egress (high blocked-connection/NXDOMAIN failure rates) shortly after
+    first deployment of the new image version. This Machine Learning approach looks for the following
+    signal: Train per-image/per-container time-series models on aggregated bytes + connection counts/min
+    and alert when observed values exceed the forecast interval for >5 minutes; learn the broader implant→deploy→C2
+    chain as a rare provenance subgraph via [KAIROS](https://tfjmp.org/publications/2024-sp.pdf) and surface
+    the top-3 contributing features (destination, byte volume, time-of-day) in the alert per [SHAP IDS
+    review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id001
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Forecast anomalous container traffic
+
+      source IN [Zeek conn.log, Zeek dns.log, Zeek ssl.log]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Train per-image/per-container time-series models on aggregated bytes + connection counts/min
+      and alert when observed val
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Regex detection for malicious command lines: Can you determine whether a process
+    is created within a container or on an instance launched from the changed image that executes a command
+    line containing syntax associated with reverse shells, remote file download/execution, or known cryptomining
+    tools (e.g., the reverse-shell CMD overwrite that CCAT injects). -- specifically, using the ''Regex
+    detection for malicious command lines'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a process is created within a container or on an instance launched from the
+    changed image that executes a command line containing syntax associated with reverse shells, remote
+    file download/execution, or known cryptomining tools (e.g., the reverse-shell CMD overwrite that CCAT
+    injects). This Symbolic Logic approach looks for the following signal: Scan process-creation command
+    lines (Windows EID 4688, auditd/Sysmon-for-Linux execve) for container processes using regexes for
+    reverse shells, certutil/curl/wget download cradles, and cryptominer names, and alert on matches;
+    layer container-runtime rules (''Terminal shell in container'', exec from /dev/shm or /tmp, write
+    below binary dirs) from [Falco Default Runtime Security Rules](https://falco.org/docs/reference/rules/default-rules/).
+    The implanted reverse-shell CMD is exactly the [CCAT](https://rhinosecuritylabs.com/cloud-security/cloud-container-attack-tool/)
+    Docker Backdoor payload. A positive result -- a rule match, statistical outlier, or model alert --
+    suggests that an internal image has been backdoored or that a container/instance deployed from a recently
+    changed image is behaving maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push
+    event, the principal and source IP that created or pushed it, the deploying provisioning pipeline,
+    the running container/instance, and any resulting C2 or lateral-movement activity. A negative result
+    helps rule out this implant vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: &id002
+  - Windows Event ID 4688
+  - Linux auditd execve
+  - Sysmon for Linux EID 1
+  - 'NAI: Container host nodes (Windows and Linux), cloud instances'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Regex detection for malicious command lines
+
+      source IN [Windows Event ID 4688, Linux auditd execve, Sysmon for Linux EID 1]
+
+      | WHERE matches_action_criteria("Regex detection for malicious command lines")
+
+      // Scan process-creation command lines (Windows EID 4688, auditd/Sysmon-for-Linux execve) for container
+      processes using reg
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+- question: '[Persistence] Flag novel/entropy-heavy process executions: Can you determine whether a process
+    is created within a container or on an instance launched from the changed image that executes a command
+    line containing syntax associated with reverse shells, remote file download/execution, or known cryptomining
+    tools (e.g., the reverse-shell CMD overwrite that CCAT injects). -- specifically, using the ''Flag
+    novel/entropy-heavy process executions'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a process is created within a container or on an instance launched from the
+    changed image that executes a command line containing syntax associated with reverse shells, remote
+    file download/execution, or known cryptomining tools (e.g., the reverse-shell CMD overwrite that CCAT
+    injects). This Statistical Method approach looks for the following signal: Baseline command names
+    and parent-child relationships per image; alert on ''first seen'' processes for an image version or
+    command-line entropy above the 99th percentile, since implant payloads are typically obfuscated and
+    execute at first run per [Backstabber''s Knife Collection](https://arxiv.org/abs/2005.09535). A positive
+    result -- a rule match, statistical outlier, or model alert -- suggests that an internal image has
+    been backdoored or that a container/instance deployed from a recently changed image is behaving maliciously;
+    pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal and
+    source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id002
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Flag novel/entropy-heavy process executions
+
+      source IN [Windows Event ID 4688, Linux auditd execve, Sysmon for Linux EID 1]
+
+      | STATS baseline over 30d per (image, container/instance, principal)
+
+      | COMPUTE deviation (z-score / percentile / change-point)
+
+      // Baseline command names and parent-child relationships per image; alert on ''first seen'' processes
+      for an image version or
+
+      | WHERE deviation > threshold | ALERT enrich(host, principal, image, container, dest)'
+- question: '[Persistence] Model command lines with an ML classifier: Can you determine whether a process
+    is created within a container or on an instance launched from the changed image that executes a command
+    line containing syntax associated with reverse shells, remote file download/execution, or known cryptomining
+    tools (e.g., the reverse-shell CMD overwrite that CCAT injects). -- specifically, using the ''Model
+    command lines with an ML classifier'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a process is created within a container or on an instance launched from the
+    changed image that executes a command line containing syntax associated with reverse shells, remote
+    file download/execution, or known cryptomining tools (e.g., the reverse-shell CMD overwrite that CCAT
+    injects). This Machine Learning approach looks for the following signal: Train an embedding-based
+    classifier on labeled container command lines and alert on malicious classifications with confidence
+    >0.90, reporting the top-3 token/feature contributors per [SHAP IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full);
+    generate labeled training/validation events with [Stratus Red Team](https://github.com/DataDog/stratus-red-team).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id002
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Model command lines with an ML classifier
+
+      source IN [Windows Event ID 4688, Linux auditd execve, Sysmon for Linux EID 1]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Train an embedding-based classifier on labeled container command lines and alert on malicious
+      classifications with confi
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
+- question: '[Persistence] Correlate image events to allowlists: Can you determine whether an image is
+    pushed to the internal container registry, OR a cloud image is registered/copied/shared, from a source
+    IP not associated with CI/CD systems, by a principal outside the authorized developer/admin group,
+    or outside standard deployment hours — the registry/control-plane pivot that establishes T1525 persistence.
+    -- specifically, using the ''Correlate image events to allowlists'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an image is pushed to the internal container registry, OR a cloud image is registered/copied/shared,
+    from a source IP not associated with CI/CD systems, by a principal outside the authorized developer/admin
+    group, or outside standard deployment hours — the registry/control-plane pivot that establishes T1525
+    persistence. This Symbolic Logic approach looks for the following signal: Alert when container image
+    pushes (Zeek http.log POST /v2/.../blobs, ecr:PutImage) or cloud image RegisterImage/CreateImage/CopyImage/ModifyImageAttribute
+    (launchPermission sharing) originate from IPs/principals not on CI/CD or admin allowlists, using Windows
+    EID 4624 / CloudTrail userIdentity for account context, per [Elastic Detection Rules for AWS](https://github.com/elastic/detection-rules/tree/main/rules/integrations/aws);
+    this is the persistence pivot in the [CCAT](https://rhinosecuritylabs.com/cloud-security/cloud-container-attack-tool/)
+    workflow. A positive result -- a rule match, statistical outlier, or model alert -- suggests that
+    an internal image has been backdoored or that a container/instance deployed from a recently changed
+    image is behaving maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push
+    event, the principal and source IP that created or pushed it, the deploying provisioning pipeline,
+    the running container/instance, and any resulting C2 or lateral-movement activity. A negative result
+    helps rule out this implant vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: &id003
+  - Zeek http.log
+  - Windows Event ID 4624
+  - AWS CloudTrail (RegisterImage, CreateImage, CopyImage, ModifyImageAttribute, ecr:PutImage)
+  - 'NAI: Internal container image registry (e.g., ECR), CI/CD pipeline servers, cloud control plane,
+    authentication servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Correlate image events to allowlists
+
+      source IN [Zeek http.log, Windows Event ID 4624, AWS CloudTrail (RegisterImage, CreateImage, CopyImage,
+      ModifyImageAttribute, ecr:PutImage)]
+
+      | WHERE matches_action_criteria("Correlate image events to allowlists")
+
+      // Alert when container image pushes (Zeek http.log POST /v2/.../blobs, ecr:PutImage) or cloud image
+      RegisterImage/CreateIm
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Enforce signed-provenance gating: Can you determine whether an image is pushed
+    to the internal container registry, OR a cloud image is registered/copied/shared, from a source IP
+    not associated with CI/CD systems, by a principal outside the authorized developer/admin group, or
+    outside standard deployment hours — the registry/control-plane pivot that establishes T1525 persistence.
+    -- specifically, using the ''Enforce signed-provenance gating'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an image is pushed to the internal container registry, OR a cloud image is registered/copied/shared,
+    from a source IP not associated with CI/CD systems, by a principal outside the authorized developer/admin
+    group, or outside standard deployment hours — the registry/control-plane pivot that establishes T1525
+    persistence. This Symbolic Logic approach looks for the following signal: Block deploy/admission of
+    any image whose digest lacks a valid in-policy supply-chain attestation or signature, per [in-toto](https://www.usenix.org/conference/usenixsecurity19/presentation/torres-arias)
+    and [TUF](https://theupdateframework.io/papers/survivable-key-compromise-ccs2010.pdf) (Notary/Docker
+    Content Trust, cosign); an out-of-band implanted image fails verification deterministically. A positive
+    result -- a rule match, statistical outlier, or model alert -- suggests that an internal image has
+    been backdoored or that a container/instance deployed from a recently changed image is behaving maliciously;
+    pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal and
+    source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Enforce signed-provenance gating
+
+      source IN [Zeek http.log, Windows Event ID 4624, AWS CloudTrail (RegisterImage, CreateImage, CopyImage,
+      ModifyImageAttribute, ecr:PutImage)]
+
+      | WHERE matches_action_criteria("Enforce signed-provenance gating")
+
+      // Block deploy/admission of any image whose digest lacks a valid in-policy supply-chain attestation
+      or signature, per [in-
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Score pushes by behavioral baselines: Can you determine whether an image is
+    pushed to the internal container registry, OR a cloud image is registered/copied/shared, from a source
+    IP not associated with CI/CD systems, by a principal outside the authorized developer/admin group,
+    or outside standard deployment hours — the registry/control-plane pivot that establishes T1525 persistence.
+    -- specifically, using the ''Score pushes by behavioral baselines'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an image is pushed to the internal container registry, OR a cloud image is registered/copied/shared,
+    from a source IP not associated with CI/CD systems, by a principal outside the authorized developer/admin
+    group, or outside standard deployment hours — the registry/control-plane pivot that establishes T1525
+    persistence. This Statistical Method approach looks for the following signal: Compute risk scores
+    combining source IP/principal first-seen rarity (via [Bayesian new-edge prediction](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286.pdf)),
+    off-hour pushes, image size anomalies (>2σ), and preceding AccessDenied/401/403 failure bursts as
+    a distinct enumeration-then-push signal; alert above threshold. A positive result -- a rule match,
+    statistical outlier, or model alert -- suggests that an internal image has been backdoored or that
+    a container/instance deployed from a recently changed image is behaving maliciously; pivot to the
+    responsible image name+tag/AMI ID and its registration/push event, the principal and source IP that
+    created or pushed it, the deploying provisioning pipeline, the running container/instance, and any
+    resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector but
+    should be corroborated with the other questions in this playbook, since a single method can miss stealthy,
+    slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id003
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Score pushes by behavioral baselines
+
+      source IN [Zeek http.log, Windows Event ID 4624, AWS CloudTrail (RegisterImage, CreateImage, CopyImage,
+      ModifyImageAttribute, ecr:PutImage)]
+
+      | STATS baseline over 30d per (image, container/instance, principal)
+
+      | COMPUTE deviation (z-score / percentile / change-point)
+
+      // Compute risk scores combining source IP/principal first-seen rarity (via [Bayesian new-edge prediction](https://projecte
+
+      | WHERE deviation > threshold | ALERT enrich(host, principal, image, container, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Isolation Forest for image-event anomalies: Can you determine whether an image
+    is pushed to the internal container registry, OR a cloud image is registered/copied/shared, from a
+    source IP not associated with CI/CD systems, by a principal outside the authorized developer/admin
+    group, or outside standard deployment hours — the registry/control-plane pivot that establishes T1525
+    persistence. -- specifically, using the ''Isolation Forest for image-event anomalies'' (Machine Learning)
+    approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an image is pushed to the internal container registry, OR a cloud image is registered/copied/shared,
+    from a source IP not associated with CI/CD systems, by a principal outside the authorized developer/admin
+    group, or outside standard deployment hours — the registry/control-plane pivot that establishes T1525
+    persistence. This Machine Learning approach looks for the following signal: Train an [Isolation Forest](https://doi.org/10.1145/2133360.2133363)
+    on features (geolocation, user agent, time/day, image size, discovery:push ratio, principal) and flag
+    outliers, surfacing the top-3 contributing features in the alert per [SHAP IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id003
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Isolation Forest for image-event anomalies
+
+      source IN [Zeek http.log, Windows Event ID 4624, AWS CloudTrail (RegisterImage, CreateImage, CopyImage,
+      ModifyImageAttribute, ecr:PutImage)]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Train an [Isolation Forest](https://doi.org/10.1145/2133360.2133363) on features (geolocation,
+      user agent, time/day, ima
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Profile allowed network/process/IMDS behavior: Can you determine whether a
+    newly deployed container or instance, after an image update, exhibits significant deviation in network/process/identity
+    behavior versus its own historical baseline — e.g., novel connections, unexpected processes, or reaching
+    cloud instance metadata (IMDS) and assuming new roles it never used before. -- specifically, using
+    the ''Profile allowed network/process/IMDS behavior'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a newly deployed container or instance, after an image update, exhibits significant
+    deviation in network/process/identity behavior versus its own historical baseline — e.g., novel connections,
+    unexpected processes, or reaching cloud instance metadata (IMDS) and assuming new roles it never used
+    before. This Symbolic Logic approach looks for the following signal: Enforce per-image connection/process
+    profiles and alert on violations after image updates, including unexpected contact to the instance-metadata
+    service or new IAM role assumption, per [Falco Default Runtime Security Rules](https://falco.org/docs/reference/rules/default-rules/)
+    and the metadata-access baselining in [Wiz IMDS Anomaly Hunting](https://www.wiz.io/blog/imds-anomaly-hunting-zero-day).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: &id004
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - AWS CloudTrail
+  - Linux auditd execve
+  - 'NAI: Container host nodes, cloud instances, internal network segments, network egress points, cloud
+    control plane'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "# Profile allowed network/process/IMDS behavior\nsource IN [Windows Event ID 4688, Zeek conn.log,\
+      \ AWS CloudTrail, Linux auditd execve]\n| WHERE matches_action_criteria(\"Profile allowed network/process/IMDS\
+      \ behavior\")\n// Enforce per-image connection/process profiles and alert on violations after image\
+      \ updates, including unexpected contact \n| ALERT enrich(host, principal, image, container, src_ip,\
+      \ dest)"
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Baseline post-update behavior changes: Can you determine whether a newly deployed
+    container or instance, after an image update, exhibits significant deviation in network/process/identity
+    behavior versus its own historical baseline — e.g., novel connections, unexpected processes, or reaching
+    cloud instance metadata (IMDS) and assuming new roles it never used before. -- specifically, using
+    the ''Baseline post-update behavior changes'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a newly deployed container or instance, after an image update, exhibits significant
+    deviation in network/process/identity behavior versus its own historical baseline — e.g., novel connections,
+    unexpected processes, or reaching cloud instance metadata (IMDS) and assuming new roles it never used
+    before. This Statistical Method approach looks for the following signal: Compare rolling 24-hour baselines
+    (ports, subnets, byte counts, connection counts/min, distinct APIs/roles, entropy) before/after the
+    image update and alert on >2σ deviations; large-scale per-workload telemetry baselining follows [Lin
+    et al.](https://doi.org/10.1109/CLOUD53861.2021.00063). A positive result -- a rule match, statistical
+    outlier, or model alert -- suggests that an internal image has been backdoored or that a container/instance
+    deployed from a recently changed image is behaving maliciously; pivot to the responsible image name+tag/AMI
+    ID and its registration/push event, the principal and source IP that created or pushed it, the deploying
+    provisioning pipeline, the running container/instance, and any resulting C2 or lateral-movement activity.
+    A negative result helps rule out this implant vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, slow, or living-off-the-land image-implant
+    persistence.'
+  answer_sources: *id004
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline post-update behavior changes
+
+      source IN [Windows Event ID 4688, Zeek conn.log, AWS CloudTrail, Linux auditd execve]
+
+      | STATS baseline over 30d per (image, container/instance, principal)
+
+      | COMPUTE deviation (z-score / percentile / change-point)
+
+      // Compare rolling 24-hour baselines (ports, subnets, byte counts, connection counts/min, distinct
+      APIs/roles, entropy) bef
+
+      | WHERE deviation > threshold | ALERT enrich(host, principal, image, container, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Cluster behavioral shifts: Can you determine whether a newly deployed container
+    or instance, after an image update, exhibits significant deviation in network/process/identity behavior
+    versus its own historical baseline — e.g., novel connections, unexpected processes, or reaching cloud
+    instance metadata (IMDS) and assuming new roles it never used before. -- specifically, using the ''Cluster
+    behavioral shifts'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a newly deployed container or instance, after an image update, exhibits significant
+    deviation in network/process/identity behavior versus its own historical baseline — e.g., novel connections,
+    unexpected processes, or reaching cloud instance metadata (IMDS) and assuming new roles it never used
+    before. This Machine Learning approach looks for the following signal: Use K-Means (or similar) on
+    per-image runtime profiles and flag images/containers moving to a new or sparse cluster after an update,
+    reporting the top-3 features driving the shift per [SHAP IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id004
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Cluster behavioral shifts
+
+      source IN [Windows Event ID 4688, Zeek conn.log, AWS CloudTrail, Linux auditd execve]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Use K-Means (or similar) on per-image runtime profiles and flag images/containers moving to a
+      new or sparse cluster afte
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Alert on high-volume discovery calls: Can you determine whether an entity performs
+    a high volume of discovery-related calls against the image registry or cloud image catalog (listing
+    repositories/tags, DescribeImages) — frequently with elevated AccessDenied/403/404 failure rates —
+    without subsequently pulling/pushing or launching, indicative of reconnaissance preceding an implant.
+    -- specifically, using the ''Alert on high-volume discovery calls'' (Symbolic Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an entity performs a high volume of discovery-related calls against the image
+    registry or cloud image catalog (listing repositories/tags, DescribeImages) — frequently with elevated
+    AccessDenied/403/404 failure rates — without subsequently pulling/pushing or launching, indicative
+    of reconnaissance preceding an implant. This Symbolic Logic approach looks for the following signal:
+    Monitor Zeek http.log / CloudTrail for >50 discovery calls (GET /v2/_catalog, /tags/list, DescribeImages,
+    ListImages) in 10 minutes from one IP/principal without follow-up pulls/pushes and alert; this enumeration
+    is step 1 of the [CCAT](https://rhinosecuritylabs.com/cloud-security/cloud-container-attack-tool/)
+    workflow. A positive result -- a rule match, statistical outlier, or model alert -- suggests that
+    an internal image has been backdoored or that a container/instance deployed from a recently changed
+    image is behaving maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push
+    event, the principal and source IP that created or pushed it, the deploying provisioning pipeline,
+    the running container/instance, and any resulting C2 or lateral-movement activity. A negative result
+    helps rule out this implant vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: &id005
+  - Zeek http.log
+  - AWS CloudTrail (ecr:DescribeRepositories, ecr:ListImages, ec2:DescribeImages)
+  - 'NAI: Internal container image registry, cloud control plane, user workstation network segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Alert on high-volume discovery calls
+
+      source IN [Zeek http.log, AWS CloudTrail (ecr:DescribeRepositories, ecr:ListImages, ec2:DescribeImages)]
+
+      | WHERE matches_action_criteria("Alert on high-volume discovery calls")
+
+      // Monitor Zeek http.log / CloudTrail for >50 discovery calls (GET /v2/_catalog, /tags/list, DescribeImages,
+      ListImages) in
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Flag anomalous discovery ratios and failures: Can you determine whether an
+    entity performs a high volume of discovery-related calls against the image registry or cloud image
+    catalog (listing repositories/tags, DescribeImages) — frequently with elevated AccessDenied/403/404
+    failure rates — without subsequently pulling/pushing or launching, indicative of reconnaissance preceding
+    an implant. -- specifically, using the ''Flag anomalous discovery ratios and failures'' (Statistical
+    Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an entity performs a high volume of discovery-related calls against the image
+    registry or cloud image catalog (listing repositories/tags, DescribeImages) — frequently with elevated
+    AccessDenied/403/404 failure rates — without subsequently pulling/pushing or launching, indicative
+    of reconnaissance preceding an implant. This Statistical Method approach looks for the following signal:
+    Baseline discovery:pull/push ratios and AccessDenied/403/404 rates per IP/principal and alert when
+    a host exceeds the 99th percentile, treating the failure burst as a distinct reconnaissance signal
+    (cloud-telemetry baselining per [Lin et al.](https://doi.org/10.1109/CLOUD53861.2021.00063)). A positive
+    result -- a rule match, statistical outlier, or model alert -- suggests that an internal image has
+    been backdoored or that a container/instance deployed from a recently changed image is behaving maliciously;
+    pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal and
+    source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id005
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Flag anomalous discovery ratios and failures
+
+      source IN [Zeek http.log, AWS CloudTrail (ecr:DescribeRepositories, ecr:ListImages, ec2:DescribeImages)]
+
+      | STATS baseline over 30d per (image, container/instance, principal)
+
+      | COMPUTE deviation (z-score / percentile / change-point)
+
+      // Baseline discovery:pull/push ratios and AccessDenied/403/404 rates per IP/principal and alert
+      when a host exceeds the 99
+
+      | WHERE deviation > threshold | ALERT enrich(host, principal, image, container, dest)'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Sequence-model registry workflows: Can you determine whether an entity performs
+    a high volume of discovery-related calls against the image registry or cloud image catalog (listing
+    repositories/tags, DescribeImages) — frequently with elevated AccessDenied/403/404 failure rates —
+    without subsequently pulling/pushing or launching, indicative of reconnaissance preceding an implant.
+    -- specifically, using the ''Sequence-model registry workflows'' (Machine Learning) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that an entity performs a high volume of discovery-related calls against the image
+    registry or cloud image catalog (listing repositories/tags, DescribeImages) — frequently with elevated
+    AccessDenied/403/404 failure rates — without subsequently pulling/pushing or launching, indicative
+    of reconnaissance preceding an implant. This Machine Learning approach looks for the following signal:
+    Train an [HMM](https://ieeexplore.ieee.org/document/766910) on registry/control-plane call sequences
+    and alert on low-probability sessions (e.g., repeated list-tags/DescribeImages without pull), surfacing
+    the top contributing transitions per [SHAP IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id005
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Sequence-model registry workflows
+
+      source IN [Zeek http.log, AWS CloudTrail (ecr:DescribeRepositories, ecr:ListImages, ec2:DescribeImages)]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Train an [HMM](https://ieeexplore.ieee.org/document/766910) on registry/control-plane call sequences
+      and alert on low-pr
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
+  - technology: Zeek/pseudocode
+    query: '# Image-implant network correlation
+
+      conn.log, dns.log, ssl.log, http.log
+
+      | JOIN deployed-image host/container to outbound flows on (id.orig_h, image, time-window)
+
+      | AGG dest rarity, C2-feed match, JA3/JA3S, bytes, NXDOMAIN/blocked per (id.orig_h, image)
+
+      | flag C2/anomalous egress from freshly deployed image versions per action criteria'
+- question: '[Persistence] Diff image content for implanted persistence: Can you determine whether a cloud
+    virtual-machine image (AMI/custom image) is registered, copied, or modified with embedded persistence
+    (new SSH authorized_keys/host keys, baked-in credentials, added users/cron/services), then used by
+    infrastructure provisioning to launch instances — durable image-publisher persistence as demonstrated
+    for public AMIs. -- specifically, using the ''Diff image content for implanted persistence'' (Symbolic
+    Logic) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a cloud virtual-machine image (AMI/custom image) is registered, copied, or modified
+    with embedded persistence (new SSH authorized_keys/host keys, baked-in credentials, added users/cron/services),
+    then used by infrastructure provisioning to launch instances — durable image-publisher persistence
+    as demonstrated for public AMIs. This Symbolic Logic approach looks for the following signal: On RegisterImage/CreateImage,
+    scan image content and alert on first-seen SSH authorized_keys/host keys, embedded credentials/API
+    keys, new local users, cron entries, or services versus the prior approved image, and correlate RunInstances
+    that launch from a non-curated/unexpected image ID — the exact backdoor classes found across public
+    AMIs by [Balduzzi et al.](https://www.s3.eurecom.fr/docs/sac12_balduzzi.pdf), and adaptable from [Elastic
+    Detection Rules for AWS](https://github.com/elastic/detection-rules/tree/main/rules/integrations/aws).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: &id006
+  - AWS CloudTrail (RegisterImage, CreateImage, CopyImage, ModifyImageAttribute, RunInstances)
+  - Image content/manifest scan
+  - 'NAI: Cloud control plane, image build pipeline, instance launch events'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '# Diff image content for implanted persistence
+
+      source IN [AWS CloudTrail (RegisterImage, CreateImage, CopyImage, ModifyImageAttribute, RunInstances),
+      Image content/manifest scan]
+
+      | WHERE matches_action_criteria("Diff image content for implanted persistence")
+
+      // On RegisterImage/CreateImage, scan image content and alert on first-seen SSH authorized_keys/host
+      keys, embedded credent
+
+      | ALERT enrich(host, principal, image, container, src_ip, dest)'
+- question: '[Persistence] Baseline image-registration cadence: Can you determine whether a cloud virtual-machine
+    image (AMI/custom image) is registered, copied, or modified with embedded persistence (new SSH authorized_keys/host
+    keys, baked-in credentials, added users/cron/services), then used by infrastructure provisioning to
+    launch instances — durable image-publisher persistence as demonstrated for public AMIs. -- specifically,
+    using the ''Baseline image-registration cadence'' (Statistical Method) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a cloud virtual-machine image (AMI/custom image) is registered, copied, or modified
+    with embedded persistence (new SSH authorized_keys/host keys, baked-in credentials, added users/cron/services),
+    then used by infrastructure provisioning to launch instances — durable image-publisher persistence
+    as demonstrated for public AMIs. This Statistical Method approach looks for the following signal:
+    Baseline per-account image-registration/sharing volume and inter-event timing; alert on bursts >2σ,
+    off-hours registrations, or ModifyImageAttribute that shares an image to external/unexpected accounts,
+    and flag first-time (principal,image) edges via [Bayesian new-edge prediction](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-13/issue-4/On-Bayesian-new-edge-prediction-and-anomaly-detection-in-computer/10.1214/19-AOAS1286.pdf).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id006
+  range: Last 90 days (baseline 30+ days; evaluate per-hour/day windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '# Baseline image-registration cadence
+
+      source IN [AWS CloudTrail (RegisterImage, CreateImage, CopyImage, ModifyImageAttribute, RunInstances),
+      Image content/manifest scan]
+
+      | STATS baseline over 30d per (image, container/instance, principal)
+
+      | COMPUTE deviation (z-score / percentile / change-point)
+
+      // Baseline per-account image-registration/sharing volume and inter-event timing; alert on bursts
+      >2σ, off-hours registrati
+
+      | WHERE deviation > threshold | ALERT enrich(host, principal, image, container, dest)'
+- question: '[Persistence] Isolation Forest on image-registration events: Can you determine whether a
+    cloud virtual-machine image (AMI/custom image) is registered, copied, or modified with embedded persistence
+    (new SSH authorized_keys/host keys, baked-in credentials, added users/cron/services), then used by
+    infrastructure provisioning to launch instances — durable image-publisher persistence as demonstrated
+    for public AMIs. -- specifically, using the ''Isolation Forest on image-registration events'' (Machine
+    Learning) approach?'
+  context: 'Why this matters: Under the Persistence tactic (TA0003), an adversary implants malicious code
+    into an internal cloud or container image so that automated provisioning keeps redeploying the backdoor,
+    granting durable, hard-to-evict access; the implant leaves traces in image-build/registry events,
+    control-plane API calls, container/instance runtime behavior, and network egress. This evidence focuses
+    on the condition that a cloud virtual-machine image (AMI/custom image) is registered, copied, or modified
+    with embedded persistence (new SSH authorized_keys/host keys, baked-in credentials, added users/cron/services),
+    then used by infrastructure provisioning to launch instances — durable image-publisher persistence
+    as demonstrated for public AMIs. This Machine Learning approach looks for the following signal: Train
+    an [Isolation Forest](https://doi.org/10.1145/2133360.2133363) on RegisterImage/ModifyImageAttribute
+    features (principal, source IP/geo, time-of-day, target sharing scope, image size delta) and flag
+    outliers with top-3 feature attribution per [SHAP IDS review](https://www.frontiersin.org/journals/artificial-intelligence/articles/10.3389/frai.2025.1526221/full);
+    validate thresholds with labeled events from [Stratus Red Team](https://github.com/DataDog/stratus-red-team).
+    A positive result -- a rule match, statistical outlier, or model alert -- suggests that an internal
+    image has been backdoored or that a container/instance deployed from a recently changed image is behaving
+    maliciously; pivot to the responsible image name+tag/AMI ID and its registration/push event, the principal
+    and source IP that created or pushed it, the deploying provisioning pipeline, the running container/instance,
+    and any resulting C2 or lateral-movement activity. A negative result helps rule out this implant vector
+    but should be corroborated with the other questions in this playbook, since a single method can miss
+    stealthy, slow, or living-off-the-land image-implant persistence.'
+  answer_sources: *id006
+  range: Last 90 days (train on 30-90 day history; score rolling windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '# Isolation Forest on image-registration events
+
+      source IN [AWS CloudTrail (RegisterImage, CreateImage, CopyImage, ModifyImageAttribute, RunInstances),
+      Image content/manifest scan]
+
+      | FEATURIZE events (image/registry/process/flow/identity features)
+
+      | SCORE model.predict(features)
+
+      // Train an [Isolation Forest](https://doi.org/10.1145/2133360.2133363) on RegisterImage/ModifyImageAttribute
+      features (pri
+
+      | WHERE score > threshold | ALERT with top-3 feature attribution'
