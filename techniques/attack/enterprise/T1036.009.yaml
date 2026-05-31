@@ -1,0 +1,412 @@
+name: 'T1036.009: Masquerading: Break Process Trees'
+id: d8a6b145-1e5b-4e35-8f85-c196c33449c2
+description: 'Investigate whether an adversary is evading defenses by breaking process-tree ancestry on
+  Linux and macOS hosts (MITRE ATT&CK T1036.009, Masquerading: Break Process Trees). Malware can sever
+  its parent-child lineage by double-forking (fork -> fork -> setsid -> parent exit), calling daemon(),
+  or using nohup/disown/shell backgrounding, so the payload is re-parented to init (PID 1) or launchd
+  and is no longer associated with the activity that launched it. This playbook helps an analyst hunt
+  for: processes re-parented to PID 1/launchd within seconds of creation whose original parent exited
+  cleanly (exit code 0) rather than crashing; detachment primitives (daemon(), setsid(), nohup, disown,
+  ''&'') paired with immediate parent exit; quick parent-termination time deltas that separate deliberate
+  orphaning from genuine faults; detached processes that go on to spawn shells, write to startup/persistence
+  locations (~/.bashrc, /etc/cron*, systemd units, LaunchAgents/LaunchDaemons), or beacon outbound; and
+  detached payloads reconstructed by correlating auditd/eBPF kernel provenance with Zeek conn/dns/ssl
+  telemetry, including raw-socket/BPF magic-packet C2 and rare-JA3 beaconing. Each evidence area pairs
+  symbolic-logic, statistical, and machine-learning approaches so the analyst can recover true lineage
+  even after the live PPID has been destroyed and can detect both commodity Linux implants (e.g., BPFDoor,
+  XorDdos) and sophisticated, signature-evading actors.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did an execve'd process get re-parented to PID 1 (init/launchd) within about 5 seconds of
+    creation while its original parent exited cleanly (exit code 0) and the new parent is not an allowlisted
+    supervisor (systemd, init, launchd, dockerd, containerd, cron, sshd, upstart)?
+  context: In the Stealth tactic an adversary double-forks or daemonizes so the payload's lineage is severed
+    and process-tree-based detection cannot link it to the activity that launched it. Reconstruct causal
+    lineage from kernel clone/fork/setsid/execve/exit_group records (auditd, eBPF, or macOS ESF) rather
+    than trusting the live PPID, which has already been destroyed. Alert when a freshly execve'd process
+    is adopted by PID 1 within ~5 seconds AND the recorded original parent exited cleanly (code 0, not
+    a signal/crash) AND the adopting parent is not a known supervisor. Whole-system provenance (KAIROS)
+    recovers true lineage post-detachment. Add high-fidelity sub-rules for re-parented processes whose
+    image is under /dev/shm or /tmp, whose binary was deleted after launch, or whose argv[0] differs from
+    /proc/pid/exe (BPFDoor hallmark). A positive result is a strong orphaning signal; clean (intentional,
+    code 0) orphaning distinguishes evasion from genuine crashes.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux servers, macOS endpoints, and any host where daemon-style execution is expected.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "lineage = RECONSTRUCT(auditd.fork, auditd.clone, auditd.setsid, auditd.execve, auditd.exit_group)\n\
+      ALERT WHERE child.event=execve\n  AND child.new_ppid==1\n  AND (child.reparent_time - child.create_time)\
+      \ <= 5s\n  AND orig_parent.exit_code==0 AND orig_parent.exit_signal==NONE\n  AND new_parent.comm\
+      \ NOT IN [systemd,init,launchd,dockerd,containerd,cron,sshd,upstart]\nRAISE_FIDELITY WHERE child.exe\
+      \ LIKE '/dev/shm/%' OR child.exe LIKE '/tmp/%'\n  OR child.binary_deleted==true OR child.argv0 !=\
+      \ readlink('/proc/'+child.pid+'/exe')"
+  - technology: macOS Unified Log/pseudocode
+    query: "ALERT WHERE proc.responsible_pid==1 /*launchd*/\n  AND (proc.adopt_time - proc.exec_time)\
+      \ <= 5s\n  AND orig_parent.exit_status==0\n  AND new_parent NOT IN [launchd]\n  AND proc.path NOT\
+      \ IN approved_daemons"
+- question: Which hosts or service accounts show orphaned/re-parented process rates above their 30-day
+    99th-percentile baseline, or exhibit first-seen orphaning behavior for that host class?
+  context: Statistical baselining catches evasive orphaning that any single event would not. In the Stealth
+    tactic, an actor who repeatedly breaks process trees will raise the per-host or per-account rate of
+    re-parented processes above normal. Track orphan/re-parent counts per host and per service account
+    as count/min and per-day totals over a 30-day baseline, then flag hosts above the 99th percentile
+    or any first-seen orphaning path for that host class. Weight by event rarity (ProvDetector) so re-parent
+    paths uncommon for that host type score higher, and apply isolation-based outlier scoring (Isolation
+    Forest) to surface low-volume anomalies that percentiles alone miss. A spike or novel orphaning pattern
+    is a lead; stable, expected daemon behavior is benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux servers, macOS endpoints, and any host where daemon-style execution is expected.'
+  range: Last 90 days (30-day baseline, evaluate trailing window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "orphans = COUNT(events WHERE new_ppid==1) BY host, account, bin(1m)\nbaseline = PERCENTILE(orphans.per_day,\
+      \ 99) OVER last_30d BY host_class\nALERT WHERE orphans.per_day > baseline\n  OR FIRST_SEEN(host,\
+      \ reparent_path) WITHIN last_24h\nSCORE = rarity_weight(reparent_path) * count"
+  - technology: ML/pseudocode
+    query: 'features = [orphans_per_min, orphans_per_day, distinct_reparent_paths, account]
+
+      model = IsolationForest(contamination=auto)
+
+      ALERT WHERE model.anomaly_score(features) > threshold'
+- question: Does the per-binary syscall order match a learned double-fork (fork -> fork -> setsid -> parent
+    exit) or daemon()-style launch sequence that breaks process ancestry?
+  context: 'Sequence modeling detects detachment patterns even when individual syscalls look benign. In
+    the Stealth tactic the diagnostic signal is the ORDER of operations: fork, fork again, setsid, then
+    the parent exits, or a daemon() call. Train a sequence model (HMM with call-stack context, or an LSTM
+    log model such as DeepLog) on the per-binary syscall order and score launches that deviate toward
+    double-fork/daemon detachment that severs ancestry. Emit the top-3 contributing features (the re-parent-to-PID1
+    edge, sub-second parent exit, image path) via SHAP in the alert so an analyst can adjudicate quickly.
+    A high anomaly score on a known-benign service binary is likely a tuning miss; a high score on an
+    unusual binary writing to /tmp is a strong lead.'
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux servers, macOS endpoints, and any host where daemon-style execution is expected.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ORDERED_SYSCALLS(per_binary)  # e.g. [fork, fork, setsid, exit_group]
+
+      model = HMM_with_callstack() OR LSTM_DeepLog()
+
+      score = model.anomaly(seq)
+
+      ALERT WHERE score > threshold AND seq CONTAINS detachment_pattern
+
+      EXPLAIN top3 = SHAP(features=[reparent_to_pid1, subsec_parent_exit, image_path])'
+- question: Was a process started with detachment primitives such as daemon()/setsid(), nohup, disown,
+    or explicit '&' background execution where the child persists after its parent exits?
+  context: In the Stealth tactic these primitives are the mechanism for breaking the process tree so a
+    payload outlives and disowns its launching context. Alert on auditd/eBPF syscall or command traces
+    that include daemonization (daemon()/setsid()), nohup, disown, or '&' backgrounding when the child
+    survives the parent's exit. Falco's default ruleset offers ready declarative detections for detached/daemonized
+    execution, programs run from /dev/shm or /tmp, unexpected setuid/setgid, and shell spawns, all emitting
+    explainable rule fields; pair with auditd/eBPF rule construction for stealthy Linux execution primitives.
+    Legitimate admins also background jobs, so combine with image path, account, and timing context; a
+    detached binary in /tmp or with unexpected setuid is far more suspicious than a known admin tool under
+    nohup.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux endpoints, macOS endpoints, and administrative jump hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE (syscall IN [setsid] OR cmdline MATCH /(daemon|nohup|disown)/ OR cmdline ENDSWITH\
+      \ '&')\n  AND child.alive_after(parent.exit)==true\nENRICH WITH falco_fields(detached, run_from_tmp_or_shm,\
+      \ unexpected_setuid_setgid, shell_spawn)"
+  - technology: Falco/rule
+    query: 'USE Falco default rules: ''Run shell untrusted'', ''Launch Privileged Container'', detached/daemonized
+      exec, ''Read sensitive file''; alert on programs from /dev/shm or /tmp and unexpected setuid/setgid'
+- question: For each host role, are there parent-to-child survival time deltas below the 1st percentile
+    (sub-second parent death) or bursty spikes in detached launches above the 99th percentile?
+  context: In the Stealth tactic, deliberate double-fork detachment shows up statistically as the parent
+    dying almost immediately after spawning the child. Baseline, per host role over 30 days, the time
+    delta between parent exit and child survival and flag deltas below the 1st percentile (sub-second
+    parent death signals intentional orphaning), plus bursty spikes (count/min above the 99th percentile)
+    in detached launches. Apply rare-path frequency weighting (ProvDetector) so uncommon detachment sequences
+    are prioritized. Sub-second clean parent death paired with a surviving child is a strong evasion signal;
+    gradual or expected service start-up timing is benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux endpoints, macOS endpoints, and administrative jump hosts.'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'delta = parent.exit_time - child.create_time BY host_role
+
+      p1 = PERCENTILE(delta, 1) OVER last_30d BY host_role
+
+      rate = COUNT(detached_launch) BY host, bin(1m)
+
+      p99 = PERCENTILE(rate, 99) OVER last_30d BY host_role
+
+      ALERT WHERE delta < p1 OR rate > p99
+
+      SCORE = rare_path_weight(detachment_sequence)'
+- question: Can a classifier distinguish normal service start-up from deliberate process-tree breakage
+    using lineage, syscall order, image/CWD metadata, exit-code state, and session context?
+  context: Signatures miss novel detachment variants, so in the Stealth tactic a learned model generalizes
+    across techniques. Train a classifier on lineage, syscall order, image/CWD metadata, exit-code state,
+    and session context to separate benign service start-up from intentional tree breakage, using node-level
+    provenance role learning (ThreaTrace) to generalize without signatures. Surface the top-3 features
+    driving each score (SHAP) in the alert. A high score on a process with a deleted binary, /tmp CWD,
+    clean parent exit, and no TTY session is a strong lead; a high score on a known systemd-managed service
+    warrants retuning.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux endpoints, macOS endpoints, and administrative jump hosts.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [lineage_path, syscall_order, image_path, cwd, exit_code, session_ctx]
+
+      model = ThreaTrace_node_role() OR GradientBoosting()
+
+      ALERT WHERE model.predict(features)==''tree_breakage'' AND score>threshold
+
+      EXPLAIN top3 = SHAP(features)'
+- question: After a process's tree was broken, did that orphaned/re-parented process spawn a shell, write
+    to a startup/persistence location (~/.bashrc, /etc/cron*, systemd units, LaunchAgents/LaunchDaemons),
+    or initiate an outbound connection?
+  context: In the Stealth tactic, breaking the tree is a means to an end; the payload's real intent appears
+    in the follow-on actions an analyst can still attribute via reconstructed lineage. Link orphaned/re-parented
+    processes to subsequent shell launches, writes to startup/persistence locations, or outbound connections,
+    and alert when those behaviors occur after the tree was broken. Watch specifically for raw-socket/BPF-filter
+    creation by non-system orphaned processes, a hallmark of detached Linux implants like BPFDoor. A detached
+    process that promptly establishes persistence or beacons out is high-confidence malicious; a detached
+    daemon doing only its expected work is benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Linux servers, macOS endpoints, and network egress points that receive traffic from detached
+    processes.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "detached = SET(processes WHERE new_ppid==1 AND orig_parent.exit_code==0)\nALERT WHERE proc\
+      \ IN detached AND (\n   spawns_shell(proc)\n   OR writes_path(proc, [~/.bashrc, /etc/cron*, /etc/systemd/*,\
+      \ ~/Library/LaunchAgents/*, /Library/LaunchDaemons/*])\n   OR opens_outbound(proc) )\nHIGH_FIDELITY\
+      \ WHERE proc.creates_raw_socket OR proc.attaches_bpf_filter AND proc NOT system_owned"
+  - technology: Zeek/pseudocode
+    query: 'JOIN auditd.detached_proc TO conn.log BY (host, pid, src/dst, ts)
+
+      ALERT WHERE detached_proc -> conn.log outbound connection within window'
+- question: Are the follow-on actions of a detached process (shell, file-write, network) rare for that
+    process class, including volume features (bytes out, out/in ratio) and failure-rate features (NXDOMAIN
+    bursts, blocked/failed connects)?
+  context: In the Stealth tactic, rarity quantifies how far a detached process's behavior departs from
+    its peers. Compare follow-on actions of detached processes against host baselines and flag rare shell,
+    file-write, or network behaviors below the 1st percentile for that process class. Include volume features
+    (bytes out, out/in ratio) and failure-rate features (NXDOMAIN bursts, blocked/failed connects) as
+    distinct signals, and score the rarest causal paths highest (ProvDetector). A detached process producing
+    behavior almost never seen for its class, with high out/in ratio or NXDOMAIN bursts, is a strong beaconing/exfil
+    lead; common behavior is benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Linux servers, macOS endpoints, and network egress points that receive traffic from detached
+    processes.'
+  range: Last 90 days (per-class baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for proc in detached:\n  rarity = PERCENTILE_RANK(proc.followon_action) BY process_class\n\
+      \  vol = [bytes_out, out_in_ratio]\n  fail = [nxdomain_rate, blocked_connect_rate, failed_connect_rate]\n\
+      \  ALERT WHERE rarity < 1pct OR vol/fail anomalous\n  SCORE = rare_causal_path_weight(proc)"
+- question: Do provenance lineage graphs of detached execution chains (auditd correlated with Zeek conn/dns)
+    reveal follow-on actions that deviate from learned benign service/user roles?
+  context: In the Stealth tactic, graph anomaly detection captures relationships that sequence models
+    miss after the live tree is destroyed. Build provenance lineage graphs for detached execution chains
+    by correlating auditd with Zeek conn/dns, then use graph anomaly detection (KAIROS) to surface detached
+    processes whose follow-on actions deviate from learned benign service/user roles. Heterogeneous log
+    embeddings (Log2vec) capture rare temporal/spatial relations missed by sequence models. Validate against
+    DARPA TC and OpTC datasets. A detached subgraph that does not match any learned benign role is a strong
+    lead; subgraphs matching known service roles are benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Linux servers, macOS endpoints, and network egress points that receive traffic from detached
+    processes.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = BUILD_PROVENANCE_GRAPH(auditd JOIN zeek.conn JOIN zeek.dns)
+
+      emb = Log2vec(G) ; det = KAIROS_graph_anomaly(G)
+
+      ALERT WHERE node/subgraph deviates from learned benign service_role
+
+      VALIDATE against DARPA_TC_E3, OpTC'
+- question: Did a parent process terminate within 2 seconds of creating a child, with the child continuing
+    under init/launchd lineage and the parent's exit clean (exit code 0, not a signal-induced crash)?
+  context: In the Stealth tactic, the precise signature of intentional orphaning is a parent that exits
+    cleanly almost immediately after spawning a surviving child adopted by init/launchd. Alert when a
+    parent terminates within 2 seconds of child creation, the child continues under init/launchd lineage,
+    AND the parent's exit was clean (code 0, no signal). Reconstruct the severed lineage from kernel fork/exec/exit
+    records (KAIROS) rather than the live tree. The clean-exit condition is what separates deliberate
+    exit(0) orphaning from a genuine crash (non-zero/SIGSEGV); a clean quick exit with a surviving init-adopted
+    child is a strong evasion lead.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux and macOS hosts running custom scripts, daemons, or user-launched background jobs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "lineage = RECONSTRUCT(auditd.fork, auditd.execve, auditd.exit_group)\nALERT WHERE (parent.exit_time\
+      \ - child.create_time) <= 2s\n  AND child.current_ppid==1  /* init or launchd */\n  AND parent.exit_code==0\
+      \ AND parent.exit_signal==NONE"
+- question: Which parent-child pairs have parent-termination-to-child-survival deltas below the 1st percentile
+    of a 30-day baseline, and how does the crash-vs-clean exit ratio distinguish deliberate exit(0) orphaning
+    from genuine faults?
+  context: In the Stealth tactic, statistical profiling separates rare deliberate orphaning from the long
+    tail of normal short-lived processes. Flag parent-child pairs whose parent-termination-to-child-survival
+    deltas fall below the 1st percentile across a 30-day baseline, and profile the crash-vs-clean exit
+    ratio so deliberate exit(0) orphaning stands out from genuine faults. Isolation-based scoring (Isolation
+    Forest) isolates these low-frequency outliers, and system-call frequency baselines further characterize
+    abnormal startup behavior. A sub-1st-percentile delta with a clean exit(0) is a strong lead; sub-second
+    deltas dominated by SIGSEGV/non-zero exits are likely real crashes.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux and macOS hosts running custom scripts, daemons, or user-launched background jobs.'
+  range: Last 90 days (30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'delta = parent.exit_time - child.create_time
+
+      p1 = PERCENTILE(delta, 1) OVER last_30d BY host_class
+
+      clean_ratio = COUNT(exit_code==0)/COUNT(all_exits) BY host
+
+      ALERT WHERE delta < p1 AND clean_ratio HIGH (deliberate) NOT signal_crash'
+  - technology: ML/pseudocode
+    query: 'features = [exit_delta, exit_code, exit_signal, syscall_freq_profile]
+
+      model = IsolationForest()
+
+      ALERT WHERE model.anomaly_score(features) > threshold AND exit_code==0'
+- question: Are there significant time-series spikes in per-host quick-exit/orphaning event counts indicating
+    repeated process-tree breaking?
+  context: In the Stealth tactic, an adversary who repeatedly breaks process trees (e.g., a noisy implant
+    or repeated tool runs) produces detectable temporal spikes. Model per-host counts of quick-exit/orphaning
+    events as a time series (SARIMA or seasonal-ESD) and alert on significant spikes indicating repeated
+    tree breaking. Streaming provenance graph-sketch drift detection (UNICORN) catches gradual increases
+    independent of the live tree. Report the top-3 contributing windows/features (SHAP) in the alert.
+    A sustained or sharp spike above expected seasonality is a lead; counts within forecast bounds are
+    benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - macOS Unified Log
+  - 'NAI: Linux and macOS hosts running custom scripts, daemons, or user-launched background jobs.'
+  range: Last 90 days (seasonal model)
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = COUNT(quick_exit_orphan_events) BY host, bin(1h)
+
+      forecast = SARIMA(ts) OR seasonal_ESD(ts)
+
+      ALERT WHERE ts > forecast.upper_bound
+
+      DRIFT = UNICORN_graph_sketch(provenance_stream)
+
+      EXPLAIN top3 windows/features = SHAP'
+- question: Do network connections from detached processes (traced via auditd + Zeek) reach destinations
+    matching threat intelligence, newly registered/rare domains, or exhibit magic-packet/raw-socket C2
+    patterns?
+  context: In the Stealth tactic, a detached payload is often the first userland component visible before
+    it beacons, so the analyst must reconstruct origin by correlating kernel telemetry with network logs.
+    Track detached processes to their network connections using auditd and Zeek, then alert on destinations
+    matching threat intelligence or newly registered/rare domains. For Linux implants also flag magic-packet/raw-socket
+    C2 patterns triggered by orphaned processes (BPFDoor), and reconstruct the payload origin from kernel
+    provenance (KAIROS). A detached process beaconing to a TI-flagged or newly registered domain, or using
+    raw-socket magic-packet C2, is high-confidence malicious; connections to established, expected destinations
+    are benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points and Linux or macOS endpoints where detached payloads may beacon outward.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "detached = SET(proc WHERE new_ppid==1 AND orig_parent.exit_code==0)\nconns = JOIN detached\
+      \ TO (zeek.conn, zeek.dns, zeek.ssl) BY (host,pid,ts)\nALERT WHERE conns.dst IN ti_indicators OR\
+      \ conns.domain IN (newly_registered OR rare)\n  OR proc.uses_raw_socket OR proc.magic_packet_trigger"
+  - technology: Zeek/pseudocode
+    query: 'ALERT dns.log WHERE query newly_registered OR low_prevalence
+
+      ALERT conn.log WHERE resp_h IN ti_list AND originating_proc IN detached'
+- question: Are TLS sessions from detached processes using JA3/JA3S hashes below the 1st percentile of
+    enterprise prevalence (and not allowlisted), combined with anomalous volume, duration, and failure-rate
+    features?
+  context: In the Stealth tactic, rare TLS fingerprints betray custom C2 clients used by detached implants.
+    Flag TLS sessions from detached processes whose JA3/JA3S hashes are below the 1st percentile of enterprise
+    prevalence and not on allowlists, combined with volume features (bytes out, out/in ratio), connection
+    duration, and failure-rate signals (NXDOMAIN, failed/blocked connects) that distinguish beaconing
+    orphans from benign daemons. Rare-path frequency weighting (ProvDetector) prioritizes the least-common
+    behaviors. A detached process with a rare unlisted JA3, high out/in byte ratio, and failed-connection
+    bursts is a strong beaconing lead; common JA3s from expected daemons are benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points and Linux or macOS endpoints where detached payloads may beacon outward.'
+  range: Last 90 days (enterprise-wide JA3 prevalence)
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "ja3_prev = PREVALENCE(ssl.ja3) OVER enterprise\nALERT WHERE originating_proc IN detached\n\
+      \  AND ja3_prev < 1pct AND ja3 NOT IN allowlist\n  AND (bytes_out high OR out_in_ratio high OR nxdomain_burst\
+      \ OR failed_connects high)\nSCORE = rare_path_weight"
+- question: When scored by a Random Forest/XGBoost model on destination port, JA3 rarity, domain entropy,
+    connection duration, byte volume/ratio, and failed-connection counts, which detached-process beacons
+    are high risk?
+  context: In the Stealth tactic, a supervised model fuses many weak network signals into a high-confidence
+    beacon score for detached payloads. Score feature sets such as destination port, JA3 rarity, domain
+    entropy, connection duration, byte volume/ratio, and failed-connection counts with a Random Forest
+    or XGBoost model and escalate high-risk detached beacons. Surface the top-3 contributing features
+    (e.g., rare JA3, high out/in byte ratio, parent re-parented to PID1) via SHAP in the alert, and correlate
+    with node-level provenance scoring (ThreaTrace) for the originating process. A high model score corroborated
+    by a re-parented-to-PID1 origin is a strong lead; low scores on established daemon traffic are benign.
+  answer_sources:
+  - auditd:SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points and Linux or macOS endpoints where detached payloads may beacon outward.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [dst_port, ja3_rarity, domain_entropy, conn_duration, bytes_out, out_in_ratio,
+      failed_connects]
+
+      model = RandomForest() OR XGBoost()
+
+      risk = model.predict_proba(features)
+
+      ALERT WHERE risk > threshold AND originating_proc IN detached
+
+      EXPLAIN top3 = SHAP([rare_ja3, out_in_ratio, parent_reparented_pid1])
+
+      CORRELATE ThreaTrace node_score(originating_proc)'
