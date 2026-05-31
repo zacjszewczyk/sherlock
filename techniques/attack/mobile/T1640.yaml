@@ -1,0 +1,443 @@
+name: 'T1640: Account Access Removal'
+id: 002c0db6-df88-4d67-bb39-57814a277e5a
+description: Investigate whether an adversary is removing or denying legitimate users access to corporate
+  accounts (Account Access Removal) by abusing compromised mobile devices, mobile-network egress, and
+  account-management interfaces. This playbook helps an analyst hunt for accounts that are deleted, locked,
+  or manipulated (credentials reset, MFA revoked) to lock legitimate users out. It correlates Windows
+  account-lockout (Event ID 4740) and password-reset (Event ID 4724) activity with source IPs belonging
+  to mobile-carrier ASNs (via Zeek conn.log), device user-agents that do not match the user's enrolled
+  profile in the Mobile Device Management (MDM) platform, and Cloud Identity Provider events. It examines
+  abusive bursts of HTTP POST/DELETE requests against critical account-management API endpoints (password
+  reset, account deletion, MFA revocation) observed at WAF and API Gateway tiers, and ties anomalous authentication
+  abuse back to managed mobile devices that granted Device Administrator permission to non-standard, newly
+  installed, or sideloaded apps - the privilege that enables resetPassword/lockNow/wipeData abuse. Detection
+  methods span symbolic logic (deterministic correlation rules and watchlists), statistical baselining
+  (modified Z-score outliers, sequential hypothesis testing of failure ratios, URI path entropy, rate-of-change),
+  and machine learning (seasonal time-series anomaly detection, isolation forest/one-class SVM, permission-based
+  app classifiers, device clustering, and graph link-prediction) so analysts can determine whether legitimate
+  user access is being deliberately stripped away.
+type: technique
+related:
+- tactic_id: TA0034
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a single account experience a password reset (Windows Event ID 4724) immediately followed
+    by an account lockout (Windows Event ID 4740) for the same target user from the same source IP within
+    a 60-second window, where that source IP belongs to a mobile-carrier ASN and the device is unregistered
+    or non-compliant in MDM?
+  context: 'Account Access Removal under the Impact tactic frequently manifests as an adversary forcing
+    a password reset and then triggering a lockout (or repeated lockouts) so the legitimate user cannot
+    regain access. This symbolic-logic rule mirrors the excessive-lockout/account-takeover detections
+    from Splunk Security Content: it correlates a 4724 with a subsequent 4740 for the same TargetUserName
+    from the same Source Network Address inside a tight 60-second window. Enrich the source IP with its
+    ASN from Zeek conn.log; if the ASN is on a mobile-network-provider watchlist, raise high severity
+    because the threat model is a compromised mobile device performing the abuse. Then query the MDM platform
+    to verify device identity: if the device is unregistered or non-compliant for that user, escalate
+    to critical. A positive result is a strong, near-real-time indicator of deliberate lockout abuse;
+    a negative result does not clear the user since the actor may pace activity outside the window.'
+  answer_sources:
+  - Windows Event ID 4740
+  - Windows Event ID 4724
+  - Zeek conn.log
+  - Zeek http.log
+  - MDM Device Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: Active Directory Domain Controllers, VPN Concentrators, Internet Gateway, Mobile Device Management
+    (MDM) Platform, Cloud Identity Provider (e.g., Azure AD, Okta)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "reset = auth_events(EventID=4724);\nlock  = auth_events(EventID=4740);\njoin reset, lock on\
+      \ TargetUserName, SourceNetworkAddress\n  where lock.time - reset.time <= 60s;\nasn = zeek_conn.lookup(SourceNetworkAddress).asn;\n\
+      dev = mdm.lookup(user=TargetUserName, ip=SourceNetworkAddress);\nseverity = high if asn in mobile_carrier_watchlist\
+      \ else medium;\nif dev == null or dev.compliant == false: severity = critical;\nalert user, SourceNetworkAddress,\
+      \ asn, dev.id, severity"
+- question: Was an account lockout or password reset tied to a device that transitioned to non-compliant
+    or unenrolled status in MDM within the previous 24 hours, with corroborating egress from a mobile-carrier
+    ASN?
+  context: 'Per NIST SP 800-124r2, a device that recently fell out of MDM compliance or was unenrolled
+    is a heightened risk surface: an adversary who compromised it may use it to strip a user''s account
+    access. This rule alerts when a lockout (4740) or password reset (4724) is associated with a device
+    whose MDM compliance state flipped to non-compliant or unenrolled in the prior 24 hours. To suppress
+    false positives from routine compliance churn, require corroborating mobile egress - the source IP''s
+    ASN (from Zeek conn.log) must be a mobile network provider. A positive result suggests the lock/reset
+    originated from a device that just left managed control, a classic Impact precursor; a negative result
+    indicates the action came from a still-compliant or non-mobile source and warrants different handling.'
+  answer_sources:
+  - Windows Event ID 4740
+  - Windows Event ID 4724
+  - Zeek conn.log
+  - Zeek http.log
+  - MDM Device Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: Active Directory Domain Controllers, VPN Concentrators, Internet Gateway, Mobile Device Management
+    (MDM) Platform, Cloud Identity Provider (e.g., Azure AD, Okta)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "evt = auth_events(EventID in [4724,4740]);\ndev = mdm.device_for(user=evt.TargetUserName);\n\
+      noncompliant_recent = dev.status in ['non-compliant','unenrolled']\n  and now - dev.status_change_time\
+      \ <= 24h;\nasn = zeek_conn.lookup(evt.SourceNetworkAddress).asn;\nalert when noncompliant_recent\
+      \ and asn in mobile_carrier_watchlist\n  output evt.TargetUserName, dev.id, dev.status, asn"
+- question: Is a user accumulating an abnormally high ratio of failed password resets, denied MFA challenges,
+    and consecutive bad-password attempts (Event IDs 4771/4625) such that a sequential hypothesis test
+    crosses the abuse threshold after only a handful of failures?
+  context: 'Rather than watching raw volume, this statistical method tracks failure-mode state separately
+    because lockout abuse produces an abnormally high failure ratio. For each user maintain counts of
+    failed password resets, failed/denied MFA challenges, and consecutive bad-password attempts (Event
+    ID 4771 Kerberos pre-auth failures and 4625 logon failures) from Cloud Identity Provider and Domain
+    Controller logs. Model each attempt as a Bernoulli success/fail trial and apply Wald''s Sequential
+    Probability Ratio Test (as used in Fast Portscan Detection): accumulate the failed-to-successful log-likelihood
+    ratio and raise an alert once it crosses the configured threshold, typically after roughly 4-5 failed
+    operations. This catches deliberate lockout/credential-removal abuse early while tolerating isolated
+    user error. A crossing is a strong signal of intentional access denial; staying below threshold reflects
+    normal failure noise.'
+  answer_sources:
+  - Windows Event ID 4740
+  - Windows Event ID 4724
+  - Zeek conn.log
+  - Zeek http.log
+  - MDM Device Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: Active Directory Domain Controllers, VPN Concentrators, Internet Gateway, Mobile Device Management
+    (MDM) Platform, Cloud Identity Provider (e.g., Azure AD, Okta)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n  stream = auth_events(user, types=[failed_reset, mfa_denied, 4771, 4625]);\n\
+      \  L = 0  // log-likelihood ratio\n  for attempt in stream:\n    L += log(P_fail_given_attack /\
+      \ P_fail_given_benign) if attempt.failed\n         else log(P_succ_given_attack / P_succ_given_benign);\n\
+      \    if L >= threshold_upper: alert user, L, attempt.count; reset L\n    if L <= threshold_lower:\
+      \ reset L"
+- question: Did a user's count of password resets (4724) and lockouts (4740) per interval exceed their
+    own 30-day robust baseline (modified Z-score > 3.5), with the exceedance sourced from a mobile-carrier
+    ASN and a user-agent not matching the MDM device profile?
+  context: This statistical method builds a per-user, 30-day rolling baseline of reset/lockout counts
+    per fixed interval from authentication logs (Event IDs 4724, 4740, and Cloud Identity Provider logs).
+    It uses the robust median/MAD modified Z-score (alert when 0.6745*(x-median)/MAD > 3.5) instead of
+    mean/standard deviation so that legitimate bursts do not inflate the threshold and mask later abuse.
+    Exceedances are enriched with the source ASN (Zeek conn.log) and user-agent (Zeek http.log); escalate
+    when the ASN is a mobile carrier and the user-agent does not match the device profile recorded in
+    MDM. A positive result indicates this user is suddenly experiencing far more reset/lockout activity
+    than is normal for them - a hallmark of targeted Account Access Removal; a negative result keeps them
+    within personal norms.
+  answer_sources:
+  - Windows Event ID 4740
+  - Windows Event ID 4724
+  - Zeek conn.log
+  - Zeek http.log
+  - MDM Device Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: Active Directory Domain Controllers, VPN Concentrators, Internet Gateway, Mobile Device Management
+    (MDM) Platform, Cloud Identity Provider (e.g., Azure AD, Okta)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for user in users:\n  series = counts(auth_events(user, EventID in [4724,4740]), bin=interval,\
+      \ window=30d);\n  med = median(series); mad = MAD(series);\n  for x in current_bins:\n    mz = 0.6745*(x\
+      \ - med)/mad;\n    if mz > 3.5:\n      asn = zeek_conn.asn(x.src_ip); ua = zeek_http.ua(x.src_ip);\n\
+      \      escalate if asn in mobile_carrier_watchlist and ua != mdm.profile(user).ua;\n      alert\
+      \ user, x, mz, asn, ua"
+- question: Do a user's password-reset/lockout counts in 5-minute bins show a seasonal anomaly (Seasonal
+    Hybrid ESD) or an improbable reset->change->lockout ordering (DeepLog), and does the combined risk
+    score implicate a mobile ASN, rare geolocation, or non-MDM device?
+  context: This machine-learning method applies a seasonal time-series anomaly detector (Twitter's Seasonal
+    Hybrid ESD) to per-user 4724/4740 counts in 5-minute bins, STL-decomposing daily and weekly seasonality
+    so routine business-hours peaks are tolerated rather than flagged. Sequence anomalies - an improbable
+    reset->credential-change->lockout ordering that signals scripted access removal - can be cross-checked
+    with an LSTM log-key model (DeepLog). On anomaly, compute a final risk score combining the anomaly
+    score with flags for mobile ASN, rare geolocation, and non-MDM device, then surface the top-3 contributing
+    features (for example 'mobile carrier ASN', 'reset count 8x baseline', 'unknown user-agent') in the
+    alert text so the analyst can triage quickly. A high explainable score with mobile-device indicators
+    strongly suggests deliberate, automated Account Access Removal.
+  answer_sources:
+  - Windows Event ID 4740
+  - Windows Event ID 4724
+  - Zeek conn.log
+  - Zeek http.log
+  - MDM Device Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: Active Directory Domain Controllers, VPN Concentrators, Internet Gateway, Mobile Device Management
+    (MDM) Platform, Cloud Identity Provider (e.g., Azure AD, Okta)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "series = counts(auth_events(user, EventID in [4724,4740]), bin=5m);\nanom = SeasonalHybridESD(series,\
+      \ period=daily+weekly);\nseq_anom = DeepLog.score(logkey_sequence(user));  // reset->change->lockout\n\
+      if anom or seq_anom > tau:\n  risk = w1*anom + w2*seq_anom + w3*mobile_asn(user) +\n         w4*rare_geo(user)\
+      \ + w5*non_mdm_device(user);\n  alert user, risk, top3_features(risk)"
+- question: Did a source IP on a mobile-carrier ASN send an HTTP POST or DELETE to a watchlisted account-management
+    API endpoint (such as /api/v1/user/delete, /auth/reset-password, /mfa/revoke), and did the request's
+    JWT lack a recent successful-MFA claim?
+  context: 'Account Access Removal is often executed directly against account-management APIs. Maintain
+    a watchlist of critical endpoints (account deletion, password reset, MFA revocation) and ingest Zeek
+    http.log and API Gateway logs. Trigger high severity for any POST/DELETE to a watched URI where the
+    source IP ASN (from Zeek conn.log) is on a mobile-provider watchlist, applying the account-lifecycle
+    deterministic patterns from Splunk Security Content. Parse the Authorization header: if the JWT lacks
+    a recent successful-MFA claim, increase priority, because privileged account changes should normally
+    require fresh strong authentication. A positive result indicates a mobile-sourced attempt to delete
+    or take over an account through its management interface; a negative result means no mobile-sourced
+    critical-endpoint writes were seen in range.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - WAF Logs
+  - API Gateway Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: API Gateway Servers, Web Application Firewalls (WAFs), Internet-facing application servers,
+    Cloud Identity Provider Logs, Microservice infrastructure hosting account management functions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "req = http_events(method in ['POST','DELETE']);\nwatch = feed['critical_account_endpoints'];\
+      \  // /api/v1/user/delete, /auth/reset-password, /mfa/revoke\nasn = zeek_conn.asn(req.src_ip);\n\
+      if req.uri in watch and asn in mobile_carrier_watchlist:\n  sev = high;\n  jwt = parse_jwt(req.headers.Authorization);\n\
+      \  if not jwt.amr_recent_mfa: sev = critical;\n  alert req.src_ip, asn, req.uri, req.method, sev"
+- question: Did a mobile-ASN source IP exceed the 30-day robust baseline of requests to a critical account
+    endpoint in a 5-minute window while also exhibiting low Shannon entropy of URI paths, indicating repetitive
+    programmatic abuse?
+  context: 'This statistical method builds, for each critical endpoint, a 30-day baseline of request counts
+    per source IP in 5-minute windows and uses the robust modified Z-score (rather than mean/stdev) to
+    set the alerting threshold. Alert when a mobile-ASN source exceeds it. Concurrently compute the Shannon
+    entropy of URI paths per source IP and escalate when a high request rate (volume/frequency) couples
+    with low path entropy (for example below 1.0): high volume against a narrow set of paths is the signature
+    of an automated tool hammering account-removal endpoints rather than a human browsing. A positive
+    result strongly implies scripted Account Access Removal from a compromised mobile device; a negative
+    result indicates the source''s request pattern is diverse and within normal volume.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - WAF Logs
+  - API Gateway Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: API Gateway Servers, Web Application Firewalls (WAFs), Internet-facing application servers,
+    Cloud Identity Provider Logs, Microservice infrastructure hosting account management functions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for endpoint in critical_endpoints:\n  base = counts(http_events(endpoint) by src_ip, bin=5m,\
+      \ window=30d);\n  med=median(base); mad=MAD(base);\n  for ip in current:\n    mz = 0.6745*(rate(ip,endpoint)-med)/mad;\n\
+      \    H = shannon_entropy(uri_paths(ip));\n    if mz>3.5 and zeek_conn.asn(ip) in mobile_carrier_watchlist:\n\
+      \      sev = escalate if H < 1.0 else high;\n      alert ip, endpoint, mz, H, sev"
+- question: Is a mobile-ASN source IP producing a high ratio of 4xx/401/403 to 2xx responses and failed-then-succeeded
+    reset/delete sequences on account endpoints, crossing a sequential-hypothesis-test threshold after
+    ~4-5 failures?
+  context: This statistical method tracks failure state separately from volume because credential-spray
+    and enumeration that precede a successful account removal produce a high error ratio. Per source IP,
+    compute the ratio of 4xx/401/403 to 2xx responses and the count of failed-then-succeeded reset/delete
+    sequences from WAF and API Gateway logs. Apply the sequential-hypothesis-testing failure model (Fast
+    Portscan Detection) so that a mobile-ASN source generating a high failed-to-successful ratio on account
+    endpoints is flagged after roughly 4-5 failures. A crossing indicates an adversary probing and then
+    succeeding at account removal; staying below threshold reflects ordinary client error rates.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - WAF Logs
+  - API Gateway Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: API Gateway Servers, Web Application Firewalls (WAFs), Internet-facing application servers,
+    Cloud Identity Provider Logs, Microservice infrastructure hosting account management functions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for ip in source_ips where zeek_conn.asn(ip) in mobile_carrier_watchlist:\n  stream = waf_api_events(ip,\
+      \ account_endpoints) ordered by time;\n  L = 0;\n  for r in stream:\n    fail = r.status in [4xx,401,403];\n\
+      \    L += log(P_fail_attack/P_fail_benign) if fail else log(P_succ_attack/P_succ_benign);\n    if\
+      \ L >= threshold: alert ip, error_ratio(ip), fail_then_succeed(ip); reset L"
+- question: Did a single mobile-ASN source IP's request rate exceed its prior-week median/MAD baseline
+    by more than the modified-Z threshold across two or more account-management endpoints within a 15-minute
+    span?
+  context: This statistical method computes a 7-day rolling median and MAD for request rates to each account-management
+    endpoint and watches for sudden acceleration. Alert when a single mobile-ASN source's rate exceeds
+    its prior-week baseline by more than the modified-Z threshold across two or more endpoints within
+    15 minutes. Spreading elevated activity across multiple account-management functions (reset, delete,
+    MFA revoke) in a short window is characteristic of an actor systematically removing access rather
+    than a user performing one legitimate action. A positive result points to coordinated multi-endpoint
+    abuse from one mobile source; a negative result means no source showed correlated cross-endpoint acceleration.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - WAF Logs
+  - API Gateway Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: API Gateway Servers, Web Application Firewalls (WAFs), Internet-facing application servers,
+    Cloud Identity Provider Logs, Microservice infrastructure hosting account management functions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for ip, endpoint:\n  med = rolling_median(rate(ip,endpoint), 7d); mad = rolling_MAD(rate(ip,endpoint),7d);\n\
+      \  mz[ip][endpoint] = 0.6745*(rate_now(ip,endpoint)-med)/mad;\nfor ip where zeek_conn.asn(ip) in\
+      \ mobile_carrier_watchlist:\n  hot = {e for e in endpoints if mz[ip][e] > 3.5 within 15m};\n  if\
+      \ count(hot) >= 2: alert ip, hot, mz[ip]"
+- question: Does an unsupervised model (Isolation Forest / One-Class SVM) trained on known-good API traffic
+    flag a POST/DELETE request from a mobile ASN as an outlier, and do LIME feature attributions implicate
+    the URI, method, body length, user-agent, request timing, or error ratio?
+  context: This machine-learning method trains an unsupervised detector on known-good traffic only (Isolation
+    Forest / One-Class SVM, as validated for IoT security). Feature vectors include hashed URI path, HTTP
+    method, request body length (volume), hashed user-agent, time since last request from the same source
+    IP, 4xx-to-2xx ratio (state), and source IP ASN (Zeek conn.log). Flag outliers, prioritize POST/DELETE
+    from mobile ASNs by anomaly score, and use LIME/feature attribution to surface the top-3 contributing
+    features in the alert. This catches novel abuse patterns that fixed rules miss while keeping results
+    explainable for triage. A high anomaly score on a mobile-sourced account-write request is a strong
+    Account Access Removal indicator; an in-distribution score suggests routine API use.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - WAF Logs
+  - API Gateway Logs
+  - Cloud Identity Provider Logs
+  - 'NAI: API Gateway Servers, Web Application Firewalls (WAFs), Internet-facing application servers,
+    Cloud Identity Provider Logs, Microservice infrastructure hosting account management functions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = IsolationForest().fit(known_good_api_traffic);\nfor req in api_events:\n  fv = [hash(req.uri),\
+      \ req.method, req.body_len, hash(req.ua),\n        req.time_since_last(src_ip), err_ratio(src_ip),\
+      \ zeek_conn.asn(src_ip)];\n  score = model.anomaly_score(fv);\n  if score > tau:\n    prio = high\
+      \ if req.method in ['POST','DELETE'] and asn in mobile_carrier_watchlist else med;\n    alert req,\
+      \ score, prio, lime_top3(model, fv)"
+- question: Did a managed device grant Device Administrator permission to a non-standard app (not on the
+    approved list) and then, within 60 minutes, see a 4740 lockout or a failed Cloud Identity Provider
+    reset for that device's user?
+  context: 'Device Administrator is the Android privilege that enables resetPassword/lockNow/wipeData
+    - the exact capabilities behind Account Access Removal and the basis of ATT&CK detection DET0605/AN1655.
+    This rule triggers when an MDM log shows a non-standard app (not on the approved list per NIST SP
+    800-163r1) being granted Device Administrator permission, then correlates by device ID/user with authentication
+    logs: if within 60 minutes a Windows Event ID 4740 lockout or a failed Cloud Identity Provider reset
+    occurs for that user, escalate to high and consider quarantining the device. A positive correlation
+    links a freshly empowered suspicious app to real account-access damage; a negative result means the
+    grant has not yet produced observable auth abuse but the device still warrants review.'
+  answer_sources:
+  - MDM Device Logs
+  - MDM Application Logs
+  - Windows Event ID 4724
+  - Windows Event ID 4740
+  - Zeek conn.log
+  - Cloud Identity Provider Logs
+  - 'NAI: Mobile Device Management (MDM) Platform, Managed Mobile Devices, Active Directory Domain Controllers,
+    Cloud Identity Provider (e.g., Azure AD, Okta), VPN Concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "grant = mdm_events(type='device_admin_granted');\nif grant.app not in approved_app_list:\n\
+      \  user = mdm.user_for(grant.device_id);\n  abuse = auth_events(user, EventID=4740 or cloud_idp_reset_failed)\n\
+      \          where time - grant.time <= 60m;\n  if abuse: severity=high; recommend quarantine(grant.device_id);\n\
+      \  alert grant.device_id, grant.app, user, abuse"
+- question: Did a newly installed or sideloaded app request or receive Device Administrator privileges
+    within the last 24 hours, especially where the app signer is not in the enterprise allowlist?
+  context: Per NIST SP 800-163r1 app-vetting criteria, a brand-new or sideloaded app acquiring Device
+    Administrator rights is a high-risk event because that privilege underpins account lock/reset/wipe
+    abuse. This rule alerts when a recently installed or sideloaded app requests or receives Device Administrator
+    privileges, with priority raised when the app signer is not in the enterprise allowlist. Enrich with
+    the MDM app inventory to confirm the install occurred within the last 24 hours, distinguishing opportunistic
+    post-compromise installs from long-standing managed apps. A positive result flags a likely malicious
+    tool positioning itself to remove account access; a negative result means no recent unsanctioned Device
+    Admin grants were observed.
+  answer_sources:
+  - MDM Device Logs
+  - MDM Application Logs
+  - Windows Event ID 4724
+  - Windows Event ID 4740
+  - Zeek conn.log
+  - Cloud Identity Provider Logs
+  - 'NAI: Mobile Device Management (MDM) Platform, Managed Mobile Devices, Active Directory Domain Controllers,
+    Cloud Identity Provider (e.g., Azure AD, Okta), VPN Concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "grant = mdm_events(type='device_admin_granted');\napp = mdm.app_inventory(grant.device_id,\
+      \ grant.app);\nrecent_install = now - app.install_time <= 24h;\nsideloaded = app.install_source\
+      \ not in ['managed_store','enterprise_store'];\nalert when (recent_install or sideloaded)\n  output\
+      \ grant.device_id, grant.app, app.signer, app.install_source\n  priority = high if app.signer not\
+      \ in enterprise_allowlist else medium"
+- question: Did a managed device's Device Administrator grant frequency exceed its 90-day robust baseline
+    (modified Z-score) within 24 hours, accompanied by anomalous authentication-related connections (ports
+    88/389/445/3389) above the user's daily baseline?
+  context: This statistical method builds, for each managed device, a 90-day baseline of permission changes
+    from MDM logs and applies a robust median/MAD modified Z-score to Device Administrator grant frequency,
+    alerting on exceedance within 24 hours. It then enriches with the device IP (from MDM/VPN) and Zeek
+    conn.log to flag authentication-related connections (ports 88 Kerberos, 389 LDAP, 445 SMB, 3389 RDP)
+    and escalates when their volume exceeds the user's daily baseline by the modified-Z threshold. The
+    combination of an unusual surge in Device Admin grants and a surge in auth-protocol traffic from the
+    same device suggests the device is being weaponized to manipulate accounts. A positive result points
+    to active privilege abuse; a negative result keeps the device within its normal permission-change
+    rhythm.
+  answer_sources:
+  - MDM Device Logs
+  - MDM Application Logs
+  - Windows Event ID 4724
+  - Windows Event ID 4740
+  - Zeek conn.log
+  - Cloud Identity Provider Logs
+  - 'NAI: Mobile Device Management (MDM) Platform, Managed Mobile Devices, Active Directory Domain Controllers,
+    Cloud Identity Provider (e.g., Azure AD, Okta), VPN Concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for device in managed_devices:\n  base = counts(mdm_events(device, type='device_admin_granted'),\
+      \ window=90d);\n  mz = 0.6745*(grants_24h(device)-median(base))/MAD(base);\n  if mz > 3.5:\n   \
+      \ conns = zeek_conn(device.ip, dport in [88,389,445,3389]);\n    user_base = daily_baseline(mdm.user_for(device));\n\
+      \    if volume(conns) > user_base * mz_threshold: escalate;\n    alert device, mz, volume(conns)"
+- question: Does a permission-based classifier (Random Forest/SVM over SigPID's significant permissions)
+    score an installed app as high-risk for rarely-needed high-privilege permissions such as Device Admin
+    and Accessibility Services, corroborated by on-device behavioral anomalies?
+  context: This machine-learning method scores installed apps with a compact permission-based classifier
+    (Random Forest/SVM over the ~22 significant permissions from SigPID), weighting rarely-needed high-privilege
+    permissions such as Device Administrator and Accessibility Services that enable account manipulation.
+    It corroborates the static score with on-device behavioral baselining (Andromaly) over CPU, process,
+    and network features so that a risky permission set plus anomalous runtime behavior raises confidence.
+    The alert surfaces the top-3 risk-driving permissions for explainability. A high score on an app holding
+    Device Admin/Accessibility is a leading indicator that the app could perform Account Access Removal;
+    a low score reflects a benign permission profile.
+  answer_sources:
+  - MDM Device Logs
+  - MDM Application Logs
+  - Windows Event ID 4724
+  - Windows Event ID 4740
+  - Zeek conn.log
+  - Cloud Identity Provider Logs
+  - 'NAI: Mobile Device Management (MDM) Platform, Managed Mobile Devices, Active Directory Domain Controllers,
+    Cloud Identity Provider (e.g., Azure AD, Okta), VPN Concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "clf = RandomForest().fit(sigpid_permission_features, labels);\nfor app in installed_apps:\n\
+      \  pv = permission_vector(app);  // ~22 SigPID significant permissions\n  risk = clf.predict_proba(pv);\n\
+      \  behav = andromaly_anomaly(app.device, app, features=[cpu,proc,net]);\n  if risk > tau or (risk\
+      \ > tau_low and behav):\n    alert app, app.device, risk, top3_permissions(pv)  // e.g. DEVICE_ADMIN,\
+      \ ACCESSIBILITY"
+- question: When a managed device enters a high-risk cluster (by app count, high-risk permissions, compliance,
+    enrollment age), do graph link-prediction and causal credential-switch rules surface an improbable
+    new identity edge from that device that coincides with a lockout or failed MFA?
+  context: This machine-learning method clusters all managed devices (K-Means/DBSCAN) on installed-app
+    count, count of high-risk permissions (Device Admin, Accessibility), compliance status, and enrollment
+    age. When a device enters a high-risk cluster, lower the alert thresholds for subsequent anomalous
+    behavior so that even a single 4740 lockout or failed MFA from it triggers review. In parallel, rank
+    improbable new identity edges originating from that device using unsupervised graph link-prediction
+    (CyberGraph) and apply causal credential-switch plus first-time-access rules (Hopper) to surface the
+    rare access path for triage. A flagged rare edge from a high-risk device tied to a lockout/MFA failure
+    is a strong Account Access Removal signal; absence of such edges lowers concern even for clustered
+    devices.
+  answer_sources:
+  - MDM Device Logs
+  - MDM Application Logs
+  - Windows Event ID 4724
+  - Windows Event ID 4740
+  - Zeek conn.log
+  - Cloud Identity Provider Logs
+  - 'NAI: Mobile Device Management (MDM) Platform, Managed Mobile Devices, Active Directory Domain Controllers,
+    Cloud Identity Provider (e.g., Azure AD, Okta), VPN Concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "clusters = DBSCAN(devices, features=[app_count, high_risk_perm_count, compliance, enroll_age]);\n\
+      high_risk = clusters.label(device) in risky_clusters;\nif high_risk: lower_threshold(device);  //\
+      \ single 4740 or failed MFA alerts\nedges = identity_graph.new_edges(device);\nfor e in edges:\n\
+      \  p = CyberGraph.link_score(e);  // improbability\n  if p > tau and Hopper.credential_switch_or_first_access(e):\n\
+      \    alert device, e, p, related_lockout_or_mfa_fail(device)"
