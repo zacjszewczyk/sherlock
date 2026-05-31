@@ -1,0 +1,538 @@
+name: 'T1578: Modify Cloud Compute Infrastructure'
+id: 62e62ff0-5d9d-4d1c-8661-e40de40fe1ad
+description: 'Investigate adversary attempts to modify a cloud account''s compute service infrastructure
+  (creating, deleting, or modifying compute instances, virtual machines, volumes, and snapshots) in order
+  to evade defenses, bypass access restrictions, and remove evidence of their presence. This playbook
+  helps an analyst hunt for: malicious offensive tooling executed on admin/CI/developer endpoints that
+  drives cloud control-plane changes; anomalous or denylisted User-Agent/TLS clients talking to cloud
+  provider API endpoints; ordered API sequences indicative of snapshot abuse (create -> share publicly/externally
+  -> copy); risky misconfigurations such as public snapshots and wide-open security group rules (0.0.0.0/0);
+  infrastructure changes made in anomalous user contexts (off-hours, new geolocation/ASN, missing MFA);
+  statistically significant bursts of resource creation/deletion calls; and large outbound data transfers
+  correlated with access-enabling modifications. It combines symbolic-logic correlation rules, robust
+  statistical baselining, and machine-learning approaches across endpoint, network, and cloud audit telemetry.'
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process matching a known cloud-offensive tool or script (by name, command line, or file
+    hash) execute on an administrator, developer, CI/CD, or bastion host, and was it corroborated by a
+    successful cloud control-plane API call within ~10 minutes?
+  context: Adversaries frequently stage cloud infrastructure modification from a compromised admin workstation,
+    developer endpoint, CI/CD runner, or bastion host using offensive frameworks like Pacu or Stratus
+    Red Team, or ad-hoc credential-harvesting scripts (e.g., get_creds.ps1). Monitoring Windows Event
+    ID 4688 and Sysmon Event ID 1 for process creation and matching process name, command line, and SHA256
+    against IOCs for these tools reveals the local launch point. Requiring corroboration with a matching
+    CloudTrail/Azure/GCP control-plane event within 10 minutes (and confirming the API succeeded vs. AccessDenied)
+    suppresses benign local tooling and ties the host activity to an actual defense-evasion change in
+    the cloud, supporting the Defense Impairment tactic.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Administrator workstations, Developer endpoints, CI/CD pipeline servers, Bastion hosts'
+  range: Last 90 days (correlate process events with cloud API calls in a 10-minute window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '  proc = events(EventID in [4688] OR Sysmon=1) where host in [admin,dev,cicd,bastion]
+
+      hit = proc where (proc.name in IOC_tools OR proc.cmdline ~ IOC_regex OR proc.sha256 in IOC_hashes)
+
+      api = cloud_events(CloudTrail|Azure|GCP) where eventName in [RunInstances,CreateSnapshot,ModifySnapshotAttribute,...]
+
+      alert when hit AND exists(api where api.identity~hit.user AND |api.time-hit.time|<=10m AND api.outcome=Success)'
+- question: Are cloud CLI binaries (aws.exe, az.cmd, gcloud) being invoked on these hosts with rare command-line
+    argument combinations relative to a 30-day enterprise baseline, especially runs that produced AccessDenied?
+  context: Even without a known IOC, adversaries reveal themselves through unusual cloud CLI usage. Building
+    a 30-day enterprise baseline of command-line argument combinations for aws/az/gcloud and flagging
+    the 99th-percentile-rare combinations surfaces novel tradecraft. Because per-user command distributions
+    are heavily skewed, threshold with a robust median/MAD modified z-score (|score|>3.5) and per-identity
+    rarity scoring rather than mean/stddev to avoid false positives from power users. Counting invocations
+    per minute per host detects scripted activity, and separately tracking CLI runs that returned AccessDenied
+    surfaces scripted reconnaissance probing for permissions before a defense-evasion change.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Administrator workstations, Developer endpoints, CI/CD pipeline servers, Bastion hosts'
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '  cli = proc where name in [''aws.exe'',''az.cmd'',''gcloud'']
+
+      argkey = normalize(cli.cmdline -> sorted flags/subcommands)
+
+      baseline = freq(argkey) per identity over 30d
+
+      score = modified_zscore(argkey_rarity)  # median/MAD
+
+      alert when |score|>3.5 OR argkey in bottom_1pct
+
+      also: count(cli)/min per host; count(cli where outcome=AccessDenied) per identity'
+- question: Does a Random Forest classifier trained on command-line features flag a cloud-tool invocation
+    as malicious, and is that high-risk prediction correlated with anomalous outbound network volume in
+    Zeek conn.log?
+  context: A supervised Random Forest trained on command-line features (length, character entropy, keyword
+    count, presence of credential/region/profile indicators) generalizes beyond static IOCs to distinguish
+    benign from malicious cloud tool usage. Correlating high-risk predictions with anomalous outbound
+    conn.log volume from the same host raises confidence that the tool is actively driving exfiltration-enabling
+    infrastructure changes. Emitting the top-3 contributing features (entropy, '--profile' churn, IAM
+    keyword count) in the alert text gives analysts explainable triage. Validate the model against Stratus
+    detonations and Elastic CloudTrail ML telemetry to limit drift and false positives.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Administrator workstations, Developer endpoints, CI/CD pipeline servers, Bastion hosts'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  features = [len,entropy,keyword_count,has_cred,has_region,has_profile] from cmdline
+
+      pred = RandomForest.predict_proba(features)
+
+      egress = zeek_conn bytes_out per host (anomalous vs baseline)
+
+      alert when pred.malicious>0.8 AND egress.anomalous
+
+      emit top3 feature_importances in alert'
+- question: Is there network traffic to cloud provider API endpoints whose HTTP User-Agent or TLS client
+    fingerprint matches signatures for offensive tooling (Pacu, Stratus) or generic scripted clients (python-requests,
+    Boto3) operating outside approved automation ranges?
+  context: Cloud API abuse generates network traffic that often carries telltale client fingerprints.
+    In Zeek http.log/ssl.log, filtering to cloud provider API IP ranges/hostnames and matching the user_agent
+    or TLS client against known offensive-tooling signatures (Pacu default boto/user-agent strings, Stratus
+    clients) or generic scripted clients like python-requests/Boto3 originating outside approved automation
+    source ranges identifies likely attacker-driven control-plane manipulation. A positive match from
+    an unexpected source is a strong indicator of unauthorized infrastructure modification supporting
+    defense evasion.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points, Internet gateways, Forward proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "  traffic = http.log UNION ssl.log where dest in CLOUD_API_RANGES/hostnames\nalert when traffic.user_agent\
+      \ in IOC_user_agents\n       OR traffic.ja3/tls_client in IOC_tls_clients\n       OR (user_agent\
+      \ ~ /python-requests|Boto3/ AND src NOT in APPROVED_AUTOMATION_RANGES)"
+- question: Which User-Agent strings or TLS client versions seen reaching cloud APIs fall below a 1% frequency
+    floor over a 30-day baseline, and do any rare clients exhibit a high ratio of HTTP 4xx/403 responses
+    indicative of scripted probing?
+  context: 'Rare clients are suspicious clients. Counting User-Agent strings and TLS client versions over
+    a 30-day rolling baseline and alerting on values below the 1% frequency floor surfaces previously-unseen
+    automation that may be attacker tooling. Per-identity rarity scoring and robust modified z-score thresholds
+    reduce false positives from legitimate but uncommon admin clients. Tracking the ratio of HTTP 4xx/403
+    responses per User-Agent is decisive: a high error ratio on a rare UA indicates scripted probing/permission
+    enumeration that often precedes a successful defense-evasion modification.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points, Internet gateways, Forward proxy servers'
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: '  ua_freq = count(user_agent) / total over 30d to CLOUD_API
+
+      rare = ua where ua_freq < 0.01 (also modified_zscore robust)
+
+      err_ratio = count(status in 4xx/403)/count(*) per ua
+
+      alert when rare AND err_ratio high; volume distinct_sources per ua'
+- question: Does DBSCAN clustering of User-Agent fingerprints reveal outlier clusters of previously-unseen
+    or custom clients communicating with cloud APIs?
+  context: Unsupervised clustering catches novel tooling that signature and simple-frequency methods miss.
+    Vectorizing User-Agent strings and applying DBSCAN groups normal clients into dense clusters and isolates
+    outliers — previously-unseen or custom clients that warrant review. This mirrors rare-client population
+    analysis in Elastic CloudTrail ML. Including the top-3 distinguishing tokens/features of each outlier
+    cluster in the alert provides explainability so analysts can quickly judge whether a custom client
+    is sanctioned automation or adversary-controlled infrastructure-modification tooling.
+  answer_sources:
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Network egress points, Internet gateways, Forward proxy servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  X = vectorize(user_agent tokens / char n-grams)
+
+      labels = DBSCAN(eps,min_samples).fit(X)
+
+      outliers = points where label==-1 or in tiny clusters
+
+      review outliers; emit top3 distinguishing tokens per cluster'
+- question: Did a single identity execute the ordered snapshot-abuse sequence CreateSnapshot -> ModifySnapshotAttribute
+    (shared to an external/unknown account or made public) -> CopySnapshot within ~30 minutes?
+  context: Snapshot exfiltration follows a recognizable choreography. A SIEM correlation rule for the
+    ordered sequence CreateSnapshot -> ModifySnapshotAttribute (createVolumePermission shared to an external/unknown
+    account-id or made public) -> CopySnapshot by the same identity within 30 minutes — exactly as defined
+    by Stratus Red Team's share-EBS-snapshot technique — produces a high-fidelity alert. Enriching with
+    the destination account-id and noting whether the share was public vs. to a specific account tells
+    the analyst whether data was exposed broadly or staged to an attacker-controlled account, a hallmark
+    of defense evasion via infrastructure modification.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services (e.g., AWS CloudTrail S3 bucket, Azure Monitor),
+    Administrator workstations, CI/CD servers'
+  range: Last 90 days (correlate sequence within a 30-minute window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  seq by identity within 30m:\n  e1 = CreateSnapshot\n  e2 = ModifySnapshotAttribute where\
+      \ createVolumePermission shared_to(external_account|all)\n  e3 = CopySnapshot\nalert when e1->e2->e3\
+      \ ordered AND same identity\nenrich destination account-id; state=shared-public|shared-to-account"
+- question: Do the transition probabilities between a single identity's cloud API call types (Create/Modify/Copy/Delete/Share)
+    form a sequence whose joint probability falls below a dynamic threshold under a Markov model of normal
+    admin behavior?
+  context: Attackers chain API calls in orders that legitimate admins rarely use. Modeling transition
+    probabilities between cloud API call types with a first-order (or variable-order) Markov chain trained
+    on normal admin behavior lets you score full sequences and flag those whose joint probability falls
+    below a dynamic threshold. Variable-order chains capture longer contexts, as in Cloudflare's API-abuse
+    work. Reporting the single lowest-probability transition that drove the score focuses analyst triage
+    on the exact anomalous step in the infrastructure-modification chain.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services (e.g., AWS CloudTrail S3 bucket, Azure Monitor),
+    Administrator workstations, CI/CD servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '  build Markov(P(api_t | api_{t-1})) from benign admin sequences
+
+      for each identity sequence: joint = product(P transitions)
+
+      alert when joint < dynamic_threshold
+
+      report argmin transition (lowest-prob step)'
+- question: Does an LSTM autoencoder trained on benign cloud API call sequences produce a high reconstruction
+    error for a given identity's recent sequence of infrastructure-modification calls?
+  context: Sequence anomalies that simple rules miss can be learned. An LSTM autoencoder trained on benign
+    cloud API call sequences (baselined from the flaws.cloud CloudTrail dataset plus internal logs) reconstructs
+    normal behavior well but yields high reconstruction error on unusual sequences such as snapshot-abuse
+    chains. Surfacing the top-3 API events contributing most to reconstruction error gives explainable
+    triage, and cross-checking against Markov sequence-probability scoring raises confidence that the
+    flagged sequence represents adversary infrastructure manipulation rather than rare-but-benign automation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services (e.g., AWS CloudTrail S3 bucket, Azure Monitor),
+    Administrator workstations, CI/CD servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  model = LSTM_autoencoder.train(benign_api_sequences)
+
+      err = reconstruction_error(model, identity_recent_sequence)
+
+      alert when err > threshold
+
+      emit top3 events by per-step error; cross-check Markov score'
+- question: Was a cloud API call or CLI command executed with parameters that create an overly permissive
+    setting or disable a security control — e.g., CidrIp 0.0.0.0/0, public snapshot/'public', wildcard
+    principal '*', or DisableEbsEncryptionByDefault — and did the change succeed?
+  context: Defense evasion via infrastructure modification often means deliberately weakening controls.
+    Scanning cloud audit event parameters and Event ID 4688 command lines for high-risk patterns (CidrIp
+    0.0.0.0/0, '"public"', wildcard principals '*', DisableEbsEncryptionByDefault) and alerting catches
+    the moment a control is loosened. Basing the rule corpus on SigmaHQ cloud rules and Stratus Red Team
+    misconfigurations ensures coverage. Distinguishing a successful change from a denied attempt tells
+    the analyst whether the weakened posture is now live and exploitable.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services, Configuration Management Databases (CMDB), Administrator
+    workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  events = cloud_audit UNION proc(EventID 4688).cmdline\nrisky = events matching any:\n  /0\\\
+      .0\\.0\\.0\\/0/, /\"public\"/, principal=='*',\n  eventName=='DisableEbsEncryptionByDefault'\nalert\
+      \ when risky; state = Success vs AccessDenied/Failed"
+- question: Does an individual identity's rate of risky-API calls exceed the 24-hour average baseline
+    for its role, and is the 403/AccessDenied rate per role abnormally high?
+  context: What is risky for one role is routine for another, so baselining must be role-aware. Building
+    a baseline of risky-API call rates per user role and alerting when an individual exceeds the role's
+    24-hour average — using CloudWatch-style expected min/max anomaly bands and a robust modified z-score
+    (|score|>3.5) instead of plain 2-sigma — resists skew from naturally bursty roles. Counting risky
+    calls per 15 minutes detects scripted spikes, and tracking the 403/AccessDenied rate per role surfaces
+    scripted reconnaissance probing for the permissions needed to weaken defenses.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services, Configuration Management Databases (CMDB), Administrator
+    workstations'
+  range: Last 90 days (24-hour role baselines)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '  baseline = avg/MAD(risky_api_rate) per role over 24h
+
+      score = modified_zscore(identity.risky_rate vs role baseline)
+
+      alert when |score|>3.5 OR rate outside CloudWatch anomaly_band
+
+      freq: count(risky)/15min; state: AccessDenied_rate per role'
+- question: Does a Logistic Regression risk classifier label a cloud API call as high-risk based on its
+    parameters (wildcards, 'public'/'all' keywords, resource type, CIDR breadth)?
+  context: A lightweight, interpretable Logistic Regression classifier trained on call parameters (presence
+    of wildcards, keywords 'public'/'all', resource type, CIDR breadth) labels each infrastructure-modification
+    call's risk and generalizes beyond hard-coded regexes. Validating against Elastic CloudTrail ML telemetry
+    keeps it calibrated. Surfacing the top-3 weighted features driving each high-risk label gives analysts
+    immediate explainability for whether a call genuinely weakens the security posture, supporting the
+    Defense Impairment investigation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Windows Event ID 4688
+  - 'NAI: Cloud provider IAM and audit logging services, Configuration Management Databases (CMDB), Administrator
+    workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  features = [has_wildcard, has_public, has_all, resource_type, cidr_breadth]
+
+      risk = LogisticRegression.predict_proba(features)
+
+      alert when risk.high > threshold
+
+      emit top3 weighted features per high-risk label'
+- question: Was a sensitive cloud API call (DeleteSubnet, ModifyInstanceAttribute, ModifySnapshotAttribute,
+    AuthorizeSecurityGroupIngress) executed with MfaAuthenticated=false?
+  context: Stolen long-lived credentials typically lack MFA context. Alerting when a sensitive cloud API
+    call (DeleteSubnet, ModifyInstanceAttribute, ModifySnapshotAttribute, AuthorizeSecurityGroupIngress)
+    is executed with MfaAuthenticated=false catches exactly the pattern repeatedly observed in stolen-credential
+    abuse documented by Unit 42. A sensitive infrastructure modification performed without MFA is a high-value,
+    low-noise indicator that an external actor is using compromised credentials to evade defenses.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: VPN concentrators, Cloud provider IAM and audit logging services, Endpoints of privileged users,
+    Geolocation databases'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  alert when cloud_audit.eventName in\n  [DeleteSubnet,ModifyInstanceAttribute,ModifySnapshotAttribute,AuthorizeSecurityGroupIngress]\n\
+      AND userIdentity.sessionContext.attributes.mfaAuthenticated == false"
+- question: Does an administrator's infrastructure-modification call deviate from their behavioral baseline
+    across two or more facets (API hours, source ASN, country), particularly involving first-seen identity/country/ASN/API
+    edges?
+  context: Context makes a benign action suspicious. Profiling each cloud admin's normal API hours, source
+    ASN, and country, then alerting on deviation across two or more facets (e.g., a 3 AM call from a new
+    country), catches credential misuse. Scoring first-seen (identity, country/ASN/API) edges with the
+    calibrated Bayesian new-edge model of Metelli & Heard and applying robust modified z-score thresholds
+    to continuous facets reduces noise. Weighting the alert higher when the off-baseline call also lacks
+    MFA or follows AccessDenied bursts ties contextual anomaly to likely defense-evasion intent.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: VPN concentrators, Cloud provider IAM and audit logging services, Endpoints of privileged users,
+    Geolocation databases'
+  range: Last 90 days (per-admin behavioral baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '  profile each admin: hours, source_ASN, country histogram
+
+      new_edge_score = Bayes_new_edge(identity, country|ASN|api)
+
+      dev = count(facets deviating via modified_zscore)
+
+      alert when dev>=2 OR new_edge_score high
+
+      weight up when mfa=false OR recent AccessDenied burst'
+- question: Does an Isolation Forest over caller-context features [user_id, hour_of_day, day_of_week,
+    source_ASN, is_mfa_authenticated, api_type, error_code] flag an infrastructure-modification call as
+    a contextual outlier?
+  context: Multivariate context anomalies are hard to capture with single-facet rules. Applying an Isolation
+    Forest to features [user_id, hour_of_day, day_of_week, source_ASN, is_mfa_authenticated, api_type,
+    error_code] isolates calls whose combination of context is anomalous, complementing UEBA anomalies
+    documented for Microsoft Sentinel. Outputting the top-3 features with the shortest path-length contributions
+    gives analysts an explainable reason (e.g., unusual ASN + no MFA + off-hours) to investigate the modification
+    as potential defense evasion.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: VPN concentrators, Cloud provider IAM and audit logging services, Endpoints of privileged users,
+    Geolocation databases'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  X = [user_id,hour_of_day,day_of_week,source_ASN,is_mfa_authenticated,api_type,error_code]
+
+      score = IsolationForest.decision_function(X)
+
+      alert when anomaly_score high (short path length)
+
+      emit top3 contributing features'
+- question: Did a single identity or source IP exceed a hard threshold of compute-modification calls (RunInstances/TerminateInstances/CreateSnapshot/DeleteSnapshot),
+    e.g. more than 50 calls in 15 minutes?
+  context: Automated or scripted abuse produces burst rates no human admin matches. A deterministic threshold
+    — one identity or source IP exceeding, e.g., >50 modification calls (RunInstances/TerminateInstances/CreateSnapshot/DeleteSnapshot)
+    in 15 minutes — catches scripted infrastructure churn used to mass-create attacker resources or destroy
+    evidence. Derive the environment-specific floor by detonating Stratus Red Team actions and measuring
+    benign automation, and validate identity context against Splunk's unseen-role detection. Keep this
+    deterministic floor alongside ML for defense in depth.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud provider audit logs (e.g., AWS CloudTrail, Azure Activity Log), CI/CD servers, Automation
+    service accounts'
+  range: Last 90 days (15-minute burst windows)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  count_calls = count(eventName in [RunInstances,TerminateInstances,CreateSnapshot,DeleteSnapshot])\n\
+      \  by identity, source_ip over sliding 15m\nalert when count_calls > 50  # tune via Stratus detonation\n\
+      enrich: is identity/role first-seen?"
+- question: Does a per-identity moving-average/stddev model of hourly modification rate, or a CloudWatch-style
+    anomaly band, show the current rate above the expected envelope — and is the delete/terminate AccessDenied
+    rate abnormal?
+  context: Hard thresholds miss slow-burn or environment-specific abuse. Computing a per-identity moving
+    average and standard deviation of hourly modification rate and alerting above the expected envelope
+    — preferring CloudWatch-style anomaly-detection bands for min/max and a robust modified z-score over
+    plain 3-sigma — handles bursty automation without excessive false positives. Profiling the delete/terminate
+    failure (AccessDenied) rate separately surfaces evidence-destruction reconnaissance, where an actor
+    probes which resources they can delete to remove traces of their presence.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud provider audit logs (e.g., AWS CloudTrail, Azure Activity Log), CI/CD servers, Automation
+    service accounts'
+  range: Last 90 days (per-identity moving average)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "  ma,sd = moving_avg/std(hourly modification_rate) per identity\nalert when rate outside CloudWatch\
+      \ anomaly_band\n       OR modified_zscore(rate) robust > threshold\nfreq: calls/min; state: AccessDenied\
+      \ rate on delete/terminate"
+- question: Does a SARIMA forecast of expected modification-call counts per user show actuals breaching
+    the forecast confidence interval?
+  context: Cloud activity has daily/weekly seasonality that naive baselines ignore. A SARIMA time-series
+    model forecasts expected modification-call counts per user and alerts when actuals exceed the forecast
+    confidence interval, consistent with volume-baselining in Elastic CloudTrail ML and CloudWatch ML.
+    Including the observed vs. forecast count and the breaching API name in the alert lets an analyst
+    quickly judge whether a spike in resource creation/deletion reflects scripted adversary activity rather
+    than expected seasonal automation.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - 'NAI: Cloud provider audit logs (e.g., AWS CloudTrail, Azure Activity Log), CI/CD servers, Automation
+    service accounts'
+  range: Last 90 days (seasonal forecast)
+  queries:
+  - technology: ML/pseudocode
+    query: '  model = SARIMA.fit(per_user modification_counts, seasonality=daily/weekly)
+
+      fc, ci = model.forecast()
+
+      alert when actual_count > ci.upper
+
+      emit observed vs forecast and breaching api_name'
+- question: Did a ModifySnapshotAttribute event make a snapshot public or share it externally, followed
+    within 1 hour by >1GB of outbound traffic from the related resource to an untrusted IP in Zeek conn.log?
+  context: Making a snapshot public or sharing it externally is an access-enabling modification that often
+    immediately precedes exfiltration. Alerting when a ModifySnapshotAttribute event shares/makes a snapshot
+    public (or shares to an external account, per Stratus Red Team) and within 1 hour Zeek conn.log shows
+    >1GB outbound from the related resource to an untrusted IP correlates the enabling change with the
+    actual data loss. Corroborating against Unit 42's stolen-credential exfil patterns raises confidence
+    that this is adversary data theft enabled by infrastructure modification.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider network gateways (e.g., NAT Gateway, Internet Gateway), VPC/VNet flow log collectors,
+    Cloud storage buckets, Cloud provider audit logging services'
+  range: Last 90 days (correlate modification with egress within 1 hour)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "  e1 = ModifySnapshotAttribute where shared_public OR shared_external_account\ne2 = zeek_conn\
+      \ where bytes_out > 1GB AND dest in UNTRUSTED_IPS\n       AND resource related to e1 AND e2.time\
+      \ within 1h of e1\nalert when e1 AND e2"
+- question: After a high-risk modification (new foreign-region instance or public snapshot), does the
+    first hour of outbound flow-log bytes for that resource exceed the 99th percentile of new-instance
+    baselines, and is the destination first-seen for the org?
+  context: Egress immediately following a risky modification is the strongest exfiltration signal. After
+    any high-risk modification (new foreign-region instance, public snapshot), monitoring the first hour
+    of outbound flow-log bytes for that resource and alerting above the 99th percentile of new-instance
+    baselines catches abnormal data movement. Setting the percentile robustly with the median/MAD modified
+    z-score and tracking per-identity rarity of the destination (Netflix cloudtrail-anomaly style) reduces
+    noise. Measuring byte count and out/in ratio and flagging destinations that are first-seen for the
+    org pinpoints likely exfiltration to attacker-controlled infrastructure.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider network gateways (e.g., NAT Gateway, Internet Gateway), VPC/VNet flow log collectors,
+    Cloud storage buckets, Cloud provider audit logging services'
+  range: Last 90 days (first-hour egress after modification)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '  trigger on high_risk_mod (foreign_region instance | public snapshot)
+
+      window = first 1h of flow_logs for resource
+
+      alert when bytes_out > p99(new_instance_baseline)  # median/MAD robust
+
+      volume: byte_count, out/in ratio; state: destination first_seen for org'
+- question: Does a graph linking users, cloud resources, and external IPs reveal an anomalous attack path
+    such as (User -> CreateSnapshot -> ModifySnapshotAttribute public -> CreateInstance -> large egress)?
+  context: Multi-step exfiltration chains are best seen as paths in a graph. Building a graph linking
+    users, cloud resources, and external IPs and flagging paths such as (User -> CreateSnapshot -> ModifySnapshotAttribute
+    public -> CreateInstance -> large egress) as anomalies using dynamic graph neural networks captures
+    relationships that flat correlation rules miss. Surfacing the top-3 anomalous edges/nodes contributing
+    to the path score gives analysts an explainable view of how an identity weakened controls and moved
+    data, directly addressing whether the adversary is evading defenses by modifying cloud compute infrastructure.
+  answer_sources:
+  - AWS CloudTrail logs
+  - Azure Activity Logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - 'NAI: Cloud provider network gateways (e.g., NAT Gateway, Internet Gateway), VPC/VNet flow log collectors,
+    Cloud storage buckets, Cloud provider audit logging services'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '  G = graph(nodes=[users,resources,external_ips], edges=API actions+flows)
+
+      scores = DynamicGNN.anomaly(G)
+
+      flag paths like User->CreateSnapshot->ModifySnapshotAttribute(public)->CreateInstance->large_egress
+
+      emit top3 anomalous edges/nodes by path score'
