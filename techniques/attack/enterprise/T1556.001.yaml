@@ -1,0 +1,812 @@
+name: 'T1556.001: Modify Authentication Process: Domain Controller Authentication'
+id: 1ff79b8b-febb-46a3-bd4a-98a72a4579e0
+description: 'This playbook helps an analyst determine whether an adversary has patched the authentication
+  process on a domain controller to create a master-credential backdoor (e.g., Skeleton Key) that lets
+  a single injected password authenticate as any domain account. It spans three adversary goals served
+  by the same tradecraft: maintaining persistence on the DC (TA0003), impairing defenses and the trustworthiness
+  of authentication (TA0112), and gaining credential access to any account (TA0006). It guides investigation
+  of the tell-tale artifacts and behaviours: modification of the LSA ''Security Packages'' registry value,
+  Mimikatz skeleton-key command lines and tooling on a DC, unauthorized access to and writes into lsass.exe
+  memory, modification of authentication DLLs (cryptdll.dll, msv1_0.dll, samsrv.dll) in System32, and
+  the downstream authentication anomalies a patched DC produces: successful logons by disabled or honey-token
+  accounts, fail-then-immediate-success logon pairs, missing MFA correlations, Kerberos encryption downgrades
+  to RC4, first-time interactive DC logons, lateral fan-out, and impossible-travel logons. Each question
+  pairs symbolic-logic, statistical, and machine-learning detection methods so an analyst can confirm,
+  scope, and triage suspected domain-controller authentication tampering.'
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: On any domain controller, was the LSA 'Security Packages' multi-string registry value (HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Security
+    Packages or the OSConfig variant) modified to add a DLL/package name that is not in the environment's
+    curated known-good Security Support Provider allow-list?
+  context: 'Skeleton-Key-style authentication tampering and Mimikatz ''misc::memssp'' register a malicious
+    Security Support Provider by writing a new DLL name into the LSA ''Security Packages'' value, which
+    LSASS then loads into the authentication pipeline. This sits at the heart of Persistence (TA0003)
+    and Defense Impairment (TA0112): the rogue SSP survives and silently subverts authentication. Compare
+    every SET on this value against an allow-list of legitimate packages (kerberos, msv1_0, schannel,
+    wdigest, tspkg, pku2u, cloudAP); any addition outside the list, especially an unsigned DLL or a non-Microsoft
+    DLL such as mimilib.dll, is high fidelity. A positive result is a near-certain compromise; a negative
+    result helps rule out the SSP persistence variant but does not exclude in-memory-only patching.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers'' registry'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source IN (WinEventLog:Security EventCode=4657, WinEventLog:Sysmon EventCode=13)
+
+      AND registry_path MATCHES "*\\Lsa\\Security Packages" AND operation="SetValue"
+
+      AND host IN domain_controllers
+
+      | eval added=diff(new_value, old_value)
+
+      WHERE NOT added IN (kerberos,msv1_0,schannel,wdigest,tspkg,pku2u,cloudAP)
+
+      -> alert("Unauthorized SSP added to LSA Security Packages")
+- question: Across the DC fleet, is a DLL listed in 'Security Packages' present on only a single domain
+    controller (a prevalence outlier), or did the count of 'Security Packages' SetValue events on any
+    DC step above its near-zero baseline outside an approved patch window?
+  context: Legitimate SSP configuration is uniform across domain controllers and changes only during controlled
+    patch/change windows, so its baseline event count is typically zero. Statistically profiling fleet-wide
+    DLL prevalence surfaces a package that exists on just one DC, and change-point detection (CUSUM/BOCPD/PELT)
+    plus standard-deviation baselining flag any step above the normal-zero rate. This supports Persistence
+    (TA0003) and Defense Impairment (TA0112) hunting by catching rare, off-cycle tampering even when the
+    DLL name itself is not yet known-bad. Any modification not tied to an approved change request is anomalous.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers'' registry'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source IN (4657, Sysmon:13) registry_path="*\\Lsa\\Security Packages" host IN domain_controllers
+
+      | stats dc(host) as dc_count by dll_name
+
+      | where dc_count==1  -> prevalence_outlier
+
+      ;; AND timechart span=1d count by host | CUSUM(count) baseline=0 -> alert step_above_baseline outside
+      patch_window
+- question: Does a time-series forecast of 'Security Packages' modification events flag an out-of-forecast
+    change, and does a PE classifier score the newly added DLL as suspicious (high entropy, anomalous
+    import-hash, unsigned), with the top-3 contributing features surfaced for triage?
+  context: A forecasting model learns the normal patch cadence of 'Security Packages' changes; a modification
+    outside the predicted window is anomalous on its own. Combining that with a classifier over the new
+    DLL's PE properties (entropy, imphash, signature status) prioritizes likely-malicious SSPs and reduces
+    false positives from legitimate patches. Surfacing the top-3 features (e.g., 'unsigned', 'single-DC
+    prevalence', 'out-of-window') keeps the alert explainable for analyst triage. This advances Persistence
+    (TA0003) and Defense Impairment (TA0112) detection against novel/renamed rogue SSPs.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers'' registry'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model=forecast(ts_of(SecurityPackages_set_events)) ; residual=actual-predicted
+
+      clf=pe_classifier(features=[entropy,imphash,signed,single_dc_prevalence,out_of_window])
+
+      WHERE residual>threshold OR clf.score>0.8 -> alert with top3_features(clf)
+- question: Was a process created on a domain controller whose command line contains Mimikatz skeleton-key
+    or credential-tampering keywords such as 'misc::skeleton', 'privilege::debug', 'sekurlsa::', or 'misc::memssp',
+    and is it part of a remote delivery chain (PsExec/remote service install spawning rundll32 or an installer
+    DLL)?
+  context: Deploying Skeleton Key requires running Mimikatz directly on the DC; its command syntax is
+    distinctive. Searching DC process-creation logs (4688/Sysmon 1) for these substrings is high fidelity,
+    and correlating the delivery chain (a remote service or PsExec spawning rundll32 or an installer DLL)
+    captures how the tool is pushed to the DC. This is central to Credential Access (TA0006) and Persistence
+    (TA0003). A match strongly indicates active tampering in progress; absence does not rule out renamed
+    or obfuscated tooling (see the ML method).
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source IN (4688, Sysmon:1) host IN domain_controllers
+
+      WHERE CommandLine MATCHES_ANY ("misc::skeleton","privilege::debug","sekurlsa::","misc::memssp")
+
+      OR (ParentImage IN (psexesvc.exe,services.exe) AND Image IN (rundll32.exe))
+
+      -> alert("Skeleton Key / Mimikatz command on DC")
+- question: On domain controllers, do any command lines exhibit anomalously high Shannon entropy or special-character
+    ratio above the 95th percentile for their parent process, or rare parent-child process tuples (e.g.,
+    services.exe -> rundll32.exe with a non-system DLL path)?
+  context: Adversaries obfuscate or encode command lines to evade keyword rules. Baselining entropy and
+    special-character ratio per parent process flags encoded payloads, and standard-deviation baselining
+    of parent-child tuples surfaces unusual execution chains used to launch credential-tampering tooling.
+    This statistical layer backstops the keyword rule for Credential Access (TA0006) and Persistence (TA0003)
+    when exact strings are hidden. High entropy on a DC command line that normally runs clean, scripted
+    admin commands is a strong lead.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source IN (4688, Sysmon:1) host IN domain_controllers
+
+      | eval H=shannon(CommandLine), sc=special_char_ratio(CommandLine)
+
+      | percentile by ParentImage | where H>p95 OR sc>p95
+
+      ;; stats count by ParentImage,Image | stddev_baseline -> flag rare tuples (services.exe->rundll32.exe
+      non-system DLL)
+- question: Does a command-line classifier (trained on length, special-character count, keyword presence,
+    n-gram frequency, and entropy) label any domain-controller command as malicious/obfuscated, catching
+    renamed tooling, with the top-3 driving features shown?
+  context: A supervised classifier generalizes beyond literal keywords to recognize malicious or obfuscated
+    command lines and renamed Mimikatz variants that evade blocklists. Training on lexical and statistical
+    features separates benign DC administration from credential-tampering commands. Surfacing the top-3
+    contributing features makes the alert explainable. This strengthens Credential Access (TA0006) detection
+    against evasive tooling on domain controllers.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      clf=cmdline_classifier(features=[len,special_count,keyword_flags,ngram_freq,entropy])
+
+      apply clf TO (4688/Sysmon:1 WHERE host IN domain_controllers)
+
+      WHERE clf.label="malicious" -> alert with top3_features(clf)
+- question: Was a successful logon (Logon Type 2, 3, 9, or 10) recorded on a domain controller for a user
+    account whose Active Directory userAccountControl is flagged ACCOUNTDISABLE?
+  context: A disabled account must always fail authentication. A Skeleton-Key master password lets a single
+    injected credential authenticate as ANY account, including disabled ones, so a successful logon for
+    a disabled TargetUserName is a high-fidelity signal of master-credential bypass. Maintain a SIEM watchlist
+    of disabled accounts from AD and join it to successful 4624 events. This directly tests Credential
+    Access (TA0006) and confirms the backdoor is in active use (Persistence, TA0003). Any hit warrants
+    immediate investigation and likely DC reboot/IR.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      lookup disabled_accounts (uac & 0x2) FROM AD
+
+      source=4624 host IN domain_controllers LogonType IN (2,3,9,10)
+
+      WHERE TargetUserName IN disabled_accounts -> alert("Disabled account successful logon")
+- question: Is the count of successful disabled-account logons non-zero over any interval, and how many
+    distinct disabled accounts and what per-hour rate are involved?
+  context: The baseline for successful disabled-account logons is exactly zero, so any non-zero count
+    is an infinite deviation and a change-point from the invariant. Reporting the per-hour rate and the
+    count of distinct disabled accounts quantifies the scope of backdoor use. This statistical framing
+    supports Credential Access (TA0006) and Persistence (TA0003) by both alerting and scoping. A growing
+    distinct-account count indicates broadening exploitation.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=4624 host IN domain_controllers WHERE TargetUserName IN disabled_accounts
+
+      | timechart span=1h count as logons, dc(TargetUserName) as distinct_disabled
+
+      | where logons>0 -> alert change_point_from_zero(scope=distinct_disabled, rate=logons)
+- question: Does a UEBA/time-series model show a spike from zero in the volume of distinct disabled accounts
+    authenticating, with growing account variety, and are the top-3 features (account, source host, logon
+    type) surfaced?
+  context: 'Modeling the volume of distinct disabled accounts that authenticate over time detects active
+    backdoor use: a spike from a zero baseline combined with increasing account variety signals an adversary
+    leveraging the master credential broadly. Surfacing the top-3 features (account, source host, logon
+    type) makes the alert actionable. This advances Credential Access (TA0006) detection and helps scope
+    persistence (TA0003).'
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      ts=volume(distinct disabled_account logons on DCs)
+
+      ueba_anomaly(ts) WHERE spike_from_zero AND rising_variety -> alert with top3_features(account,source_host,logon_type)
+- question: Was an interactive (Type 2/10) or remote-interactive (Type 7) logon to a domain controller
+    performed by an account that is NOT in the AD group/lookup of accounts authorized for interactive
+    DC logon?
+  context: Interactive logon to a DC should be restricted to a small set of authorized admins. Filtering
+    4624 on DCs for Logon Types 2, 7, and 10 and alerting on any account outside the authorized set catches
+    both unauthorized administration and the hands-on-keyboard activity used to deploy or operate a Skeleton-Key
+    backdoor. This supports Persistence (TA0003) and Defense Impairment (TA0112). A positive result identifies
+    who/what accessed the DC console or RDP outside policy.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=4624 host IN domain_controllers LogonType IN (2,7,10)
+
+      WHERE TargetUserName NOT IN authorized_dc_interactive_logon
+
+      -> alert("Unauthorized interactive DC logon")
+- question: For each account, does a 90-day rolling profile show a first-seen interactive logon to a domain
+    controller (historical frequency of zero for that logon type)?
+  context: Building a per-account 90-day profile of logon types to DCs lets you flag a first-ever interactive
+    DC logon as a state change. A first-seen interactive logon (frequency 0 -> 1) is risk-scored with
+    standard-deviation baselining and is suspicious even for accounts that are nominally allowed but never
+    actually use console/RDP access. This statistical layer supports Persistence (TA0003) and Defense
+    Impairment (TA0112) hunting for novel DC access patterns.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=4624 host IN domain_controllers LogonType IN (2,7,10)
+
+      | stats earliest(_time) as first_seen, count by TargetUserName,LogonType over 90d
+
+      | where first_seen within alert_window AND prior_count==0 -> flag first_time_interactive_logon
+- question: Does behavioural clustering of accounts (by logon types, frequency, time-of-day, source host)
+    show an account, especially a service account, shifting from a non-interactive cluster to an interactive
+    cluster, with the top-3 features explaining the shift?
+  context: Clustering accounts by logon behaviour establishes peer baselines; a service account that has
+    only ever logged on non-interactively suddenly appearing in an interactive cluster is a state-change
+    anomaly that often accompanies hands-on DC tampering. Reporting the top-3 features driving the cluster
+    shift makes the result explainable. This strengthens Persistence (TA0003) and Defense Impairment (TA0112)
+    detection of abnormal DC access.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      features=per_account(logon_types,freq,tod,source_host)
+
+      cluster(features) ; detect membership_shift(noninteractive->interactive)
+
+      -> alert with top3_features
+- question: Was a process created on a domain controller whose Image name or PE OriginalFileName matches
+    a known malicious credential-dumping or authentication-patching tool (e.g., mimikatz.exe), or whose
+    hash matches a known-bad list?
+  context: Comparing the Image and OriginalFileName fields (Sysmon 1) and file hashes on DCs against a
+    catalogue of known malicious tools catches tooling even when the file has been renamed but the PE
+    metadata persists. This is a direct Credential Access (TA0006) and Persistence (TA0003) indicator.
+    A match on a DC is high severity; OriginalFileName is more robust than the on-disk name because attackers
+    rename binaries.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source IN (4688, Sysmon:1) host IN domain_controllers
+
+      WHERE OriginalFileName IN known_bad_tool_names OR Hashes IN known_bad_hashes
+
+      OR basename(Image) IN known_bad_tool_names -> alert("Known malicious tool on DC")
+- question: On domain controllers, are any process names in the lowest 1st percentile of frequency (e.g.,
+    seen only once in 30 days), particularly unsigned ones?
+  context: Baselining all process names on DCs by frequency exposes rare executables; a name seen once
+    in 30 days, especially when unsigned, is a strong lead for newly introduced tooling that evades known-bad
+    lists. Standard-deviation/rarity baselining supports Credential Access (TA0006) and Persistence (TA0003).
+    DCs run a tightly bounded, predictable software set, so rarity is highly meaningful here.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source IN (4688, Sysmon:1) host IN domain_controllers
+
+      | stats count by Image,Signed over 30d
+
+      | where count<=p01 AND Signed=false -> flag rare_unsigned_process_on_dc
+- question: Does a lexical classifier (character-level n-grams and lexical features) flag any DC process
+    name as a likely malicious-tool variant (e.g., m1m1katz.exe, mimikatz_alt.exe), with the top-3 lexical
+    features shown?
+  context: Attackers defeat exact-match blocklists with typosquatted or modified tool names. A character-level
+    n-gram/lexical classifier scores names for similarity to known malicious tooling, catching variants
+    that string rules miss. Surfacing the top-3 lexical features keeps it explainable. This improves Credential
+    Access (TA0006) detection on domain controllers against renamed tools.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Domain Controllers'' process execution logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      clf=lexical_name_classifier(features=[char_ngrams,len,vowel_ratio,digit_subst])
+
+      apply TO process_names on domain_controllers
+
+      WHERE clf.score>0.8 -> alert with top3_lexical_features
+- question: On a domain controller, did a process other than an allow-listed legitimate caller (wininit.exe,
+    services.exe, approved EDR) request access to lsass.exe memory, especially with GrantedAccess including
+    write/operation masks (e.g., 0x1010, 0x1410, 0x143A => PROCESS_VM_WRITE/PROCESS_VM_OPERATION)?
+  context: Skeleton Key must open and WRITE lsass.exe memory to patch the authentication routines, so
+    a non-allow-listed process opening LSASS with write/operation access on a DC is a core indicator.
+    Sysmon Event 10 with TargetImage lsass.exe, filtered to disallowed SourceImages and write-capable
+    GrantedAccess masks, is high fidelity for Credential Access (TA0006) and Persistence (TA0003). Read-only
+    access can indicate dumping; write/operation access indicates in-memory patching.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers'' process memory access logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=Sysmon:10 host IN domain_controllers TargetImage="*\\lsass.exe"
+
+      WHERE SourceImage NOT IN (wininit.exe,services.exe,approved_edr)
+
+      AND GrantedAccess IN (0x1010,0x1410,0x143A,0x0F01FF) -> alert("Suspicious LSASS access on DC")
+- question: Modeling each LSASS-access session by volume (total bytes read) and frequency (number of open/read
+    attempts), are there first-time source processes or access-mask outliers that read/write large or
+    structured memory regions?
+  context: Benign LSASS callers touch few bytes; credential theft or injection reads or writes large/structured
+    regions. Profiling per-session volume and frequency, plus flagging first-time source processes and
+    access-mask outliers, captures the behavioural signature of dumping/patching on a DC. This statistical
+    method backstops the allow-list rule for Credential Access (TA0006). A first-time process opening
+    LSASS with high byte volume is a strong lead.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers'' process memory access logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=Sysmon:10 TargetImage="*\\lsass.exe" host IN domain_controllers
+
+      | stats sum(bytes) as vol, count as freq, earliest(_time) as first_seen by SourceImage,GrantedAccess
+
+      | where first_seen within window OR vol>p99 OR GrantedAccess outlier -> flag
+- question: Does a sequence model (LSTM/autoencoder) over the events preceding LSASS access (process creation
+    from an unusual path -> suspicious DLL load -> handle open) flag a deviation from learned benign sequences,
+    with the top-3 anomalous steps listed?
+  context: Credential-tampering tradecraft produces a characteristic event chain before touching LSASS.
+    A sequence model trained on benign chains flags deviations such as an unusual-path process creation
+    followed by a suspicious DLL load and an LSASS handle open. Listing the top-3 anomalous steps aids
+    triage. This advances Credential Access (TA0006) and Persistence (TA0003) detection of multi-step
+    LSASS attacks on DCs.
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: Domain Controllers'' process memory access logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      seq=ordered_events(proc_create,module_load,lsass_handle_open) per host_session on DCs
+
+      model=deeplog/autoencoder(seq) ; WHERE reconstruction_error>thr -> alert top3_anomalous_steps
+- question: Was a critical authentication DLL (cryptdll.dll, msv1_0.dll, samsrv.dll) in C:\Windows\System32
+    on a domain controller written or deleted by any process other than TrustedInstaller.exe?
+  context: cryptdll.dll and msv1_0.dll are the exact routines Skeleton Key patches; legitimate modification
+    of these files happens only via Windows servicing (TrustedInstaller). Enabling object-access auditing
+    on System32 and alerting on Write/Delete to this curated DLL list by any non-TrustedInstaller process
+    is high fidelity for Persistence (TA0003), Defense Impairment (TA0112), and Credential Access (TA0006).
+    A positive result is strong evidence of on-disk authentication tampering.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers'' C:\Windows\System32 directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source IN (Sysmon:11, 4663) host IN domain_controllers
+
+      TargetFilename IN ("*\\System32\\cryptdll.dll","*\\System32\\msv1_0.dll","*\\System32\\samsrv.dll")
+
+      AND AccessMask IN (WRITE,DELETE) AND ProcessName!="*\\TrustedInstaller.exe"
+
+      -> alert("Auth DLL modified by non-TrustedInstaller on DC")
+- question: Do the SHA256 hashes of authentication DLLs on any DC mismatch the maintained post-patch baseline,
+    or did the frequency of System32 modifications spike outside a patch window?
+  context: Maintaining baseline SHA256 hashes per authentication DLL across all DCs makes any hash mismatch
+    high fidelity, and tracking System32 modification frequency with standard-deviation baselining flags
+    spikes outside patch windows. This statistical layer supports Persistence (TA0003) and Defense Impairment
+    (TA0112) by detecting tampering even if the auditing rule was evaded. A hash mismatch on cryptdll.dll/msv1_0.dll
+    is a near-certain compromise indicator.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers'' C:\Windows\System32 directory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for dll in (cryptdll.dll,msv1_0.dll,samsrv.dll) on each DC: compare sha256 vs baseline
+
+      WHERE sha256 != baseline -> alert hash_mismatch
+
+      ;; timechart span=1d count(System32 modifications) by host | stddev_baseline -> flag spikes outside
+      patch_window
+- question: Does a forecast of System32 modification events flag an out-of-forecast change, and does a
+    classifier of the modifying process (name, path, parent, signature) score it as malicious, with the
+    top-3 contributing features surfaced?
+  context: Forecasting System32 modifications from historical patch data treats out-of-forecast changes
+    as anomalies, and a classifier over the modifying process's attributes (name, path, parent, signature)
+    prioritizes likely-malicious writes. Surfacing the top-3 features keeps the alert explainable. This
+    strengthens Persistence (TA0003) and Defense Impairment (TA0112) detection of authentication-DLL tampering
+    on DCs.
+  answer_sources:
+  - Sysmon Event ID 11
+  - Windows Event ID 4663
+  - 'NAI: Domain Controllers'' C:\Windows\System32 directory'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      fc=forecast(ts_of(System32_modifications)) ; residual=actual-predicted
+
+      clf=process_classifier(features=[name,path,parent,signed])
+
+      WHERE residual>thr OR clf.label=malicious -> alert top3_features
+- question: For a remote logon to an MFA-enforced domain-joined resource (4624, Logon Type 3 or 10), was
+    a successful primary authentication logged WITHOUT a corresponding successful MFA event from the MFA
+    provider for the same user within a +/- 2 minute window?
+  context: A master credential authenticates without the user's real second-factor flow, so a successful
+    remote primary logon with no matching MFA success is a high-priority MFA-bypass signal. Correlate
+    each 4624 (Type 3/10) with the MFA provider's logs for a success on the same user/IP within +/- 2
+    minutes; absence is suspicious. This supports Defense Impairment (TA0112) and Credential Access (TA0006)
+    by detecting authentication that sidesteps enforced MFA. Tune for break-glass and cached-credential
+    exceptions.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, MFA Authentication Servers, Network Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      win=4624 LogonType IN (3,10) on mfa_enforced_resources
+
+      | join user,src_ip [mfa_provider success WHERE _time BETWEEN win._time +/- 120s]
+
+      WHERE mfa_success IS NULL -> alert("Primary logon without MFA")
+- question: Per user, did the rolling 24-hour ratio of successful remote Windows logons to successful
+    MFA logons drop sharply from its expected ~1.0?
+  context: When MFA is functioning, each remote Windows logon pairs with an MFA success, giving a per-user
+    ratio near 1.0. A sudden drop (many Windows logons, few MFA) is a failure-mode signal of MFA bypass.
+    Computing this ratio over a rolling 24h window and applying change-point detection flags the shift.
+    This statistical method supports Defense Impairment (TA0112) and Credential Access (TA0006).
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, MFA Authentication Servers, Network Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      per user over rolling 24h: ratio = count(win_remote_logons)/count(mfa_success)
+
+      | change_point_detect(ratio) WHERE ratio drops far below 1.0 -> alert mfa_bypass_suspected
+- question: Does a sequence model over the per-session event chain (VPN connect -> Windows logon -> MFA
+    success) flag a missing or late MFA step, with the top-3 deviating steps reported?
+  context: Normal remote access produces an ordered chain culminating in MFA success. A sequence model
+    trained on benign session chains flags sessions where the MFA step is missing or late, capturing bypass
+    that simple correlation windows might miss. Reporting the top-3 deviating steps aids triage. This
+    advances Defense Impairment (TA0112) and Credential Access (TA0006) detection.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, MFA Authentication Servers, Network Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      seq=per_session(vpn_connect,win_logon,mfa_success)
+
+      model=deeplog(seq) WHERE missing_or_late(mfa_success) -> alert top3_deviating_steps
+- question: Was a successful logon (4624) recorded for a designated honey-token account (a disabled, high-privilege
+    account with no legitimate use case)?
+  context: Honey-token accounts are disabled high-privilege decoys that should NEVER authenticate. Because
+    a Skeleton-Key master password authenticates any account, these decoys will succeed where they should
+    always fail, making any successful 4624 for a honey-token TargetUserName an immediate, high-fidelity
+    tripwire. This is a powerful confirmation for Credential Access (TA0006) and Persistence (TA0003).
+    A single hit should trigger IR.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: source=4624 WHERE TargetUserName IN honey_token_accounts -> alert("Honey-token account authenticated")
+- question: Is the count of honey-token logons non-zero, and how many distinct honey-tokens have authenticated
+    over time?
+  context: The baseline for honey-token logons is zero; any success is an infinite deviation and a clear
+    change-point. Tracking the count of distinct honey-tokens authenticating over time provides a scope
+    indicator of how broadly the master credential is being exercised. This statistical framing supports
+    Credential Access (TA0006) and Persistence (TA0003) scoping.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=4624 WHERE TargetUserName IN honey_token_accounts
+
+      | timechart span=1h count as hits, dc(TargetUserName) as distinct_tokens
+
+      | where hits>0 -> alert change_point_from_zero(scope=distinct_tokens)
+- question: When a honey-token logon occurs, does source classification (internal/external, trusted/untrusted,
+    known-bad) enrich and prioritize the alert, with the top-3 enrichment features surfaced?
+  context: Classifying the logon source (IP/host) of a honey-token authentication as internal/external,
+    trusted/untrusted, or known-bad enriches and prioritizes the alert and helps identify the adversary's
+    foothold. Surfacing the top-3 enrichment features makes the result actionable. This supports Credential
+    Access (TA0006) triage and attribution.
+  answer_sources:
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Active Directory Database'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      on honey_token logon: clf=source_classifier(ip_geo,asn,trust,threat_intel)
+
+      -> enrich alert with class + top3_features
+- question: Was a failed logon (4625, Status 0xc000006d 'bad password') followed within 5 seconds by a
+    successful logon (4624) for the same user account from the same source IP address?
+  context: When the real password fails (0xc000006d) and the injected Skeleton-Key password immediately
+    succeeds, you get a rapid fail-then-succeed pair for the same user/IP. This behavioural signature
+    of master-credential use is detectable by correlating 4625 -> 4624 within a 5-second window per user/IP.
+    It supports Credential Access (TA0006) and Persistence (TA0003). Tune against benign typo-correction
+    with the timing/context methods below.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=4625 Status=0xc000006d
+
+      | follows_within(5s) [source=4624] BY (TargetUserName, IpAddress)
+
+      -> alert("Fail-then-immediate-success logon")
+- question: Per user/source, is the distribution of 4625->4624 inter-arrival deltas clustered near zero,
+    which is anomalous versus normal retry behaviour?
+  context: Modeling the inter-arrival time between a bad-password failure and the subsequent success per
+    user/source reveals that benign typo correction has variable, human-scale gaps, while a master-credential
+    bypass clusters near zero seconds. Change-point/standard-deviation baselining flags a near-zero cluster.
+    This statistical method backstops the symbolic rule for Credential Access (TA0006).
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      pairs=(4625->4624) by user,src ; delta=success_time-fail_time
+
+      | stats by user,src histogram(delta) | where mode(delta)~=0s AND density_near_zero>thr -> flag
+- question: Does a sequence model distinguish malicious fail-then-succeed chains from benign typo correction
+    by jointly weighting timing, source, and account context, with the top-3 features surfaced?
+  context: A sequence model that jointly considers inter-event timing, source host/IP, and account context
+    separates master-credential bypass from ordinary mistyped-password retries more reliably than fixed
+    thresholds. Surfacing the top-3 features keeps the alert explainable. This advances Credential Access
+    (TA0006) and Persistence (TA0003) detection.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - 'NAI: Domain Controllers'' authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model=seq_classifier(features=[delta,src_context,account_context,prior_fail_pattern]) on (4625->4624)
+      pairs
+
+      WHERE label=malicious -> alert top3_features
+- question: After a network logon (Type 3), did a user account access predefined crown-jewel assets it
+    is not authorized for, as seen in post-logon connections (Zeek conn.log correlated with Kerberos 4769
+    service tickets)?
+  context: A master credential enables broad lateral movement. Tracking post-logon connections (Zeek conn.log
+    correlated with 4769 ticket requests) and alerting when an account touches crown-jewel assets outside
+    its authorization catches abuse of the backdoor for access. This supports Credential Access (TA0006)
+    and the downstream lateral-movement goal. A positive result shows the adversary pivoting to sensitive
+    systems.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Member Servers, User Workstations, Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: >-
+      join conn.log (post-logon flows) WITH 4769 (service tickets) BY account,src,dst
+
+      WHERE dst IN crown_jewel_assets AND account NOT IN authorized(dst)
+
+      -> alert("Unauthorized access to crown-jewel asset")
+- question: Did an account connect to a number of distinct destination hosts within one hour that exceeds
+    the 99th percentile of its own 30-day rolling baseline (fan-out)?
+  context: Lateral fan-out is a hallmark of credential abuse. Building a 30-day rolling baseline of distinct
+    destination hosts per account per hour and alerting above the 99th percentile detects an account suddenly
+    reaching many hosts. This UBA method supports Credential Access (TA0006) and lateral-movement detection.
+    A sharp fan-out spike from a normally low-touch account is a strong lead.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Member Servers, User Workstations, Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=4624 LogonType=3 (+ Zeek conn.log)
+
+      | stats dc(dest_host) as fanout by account span=1h
+
+      | baseline 30d per account | where fanout>p99 -> alert lateral_fanout
+- question: Does an authentication-graph model score new/rare user-to-host edges (node2vec link-prediction)
+    and flag sudden access to new host communities, with the top-3 anomalous edges reported?
+  context: Modeling normal user-to-host access as a graph and scoring rare or new edges with node2vec
+    link-prediction surfaces an account suddenly accessing new host communities, a behaviour consistent
+    with credential-backed lateral movement. Reporting the top-3 anomalous edges aids triage. This advances
+    Credential Access (TA0006) and lateral-movement detection beyond simple counts.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Member Servers, User Workstations, Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      G=auth_graph(user->host edges from 4624/4769/conn.log)
+
+      emb=node2vec(G) ; score new_edges via link_prediction
+
+      WHERE edge.score=anomalous -> alert top3_anomalous_edges
+- question: For a successful remote logon (4624, Logon Type 10), is the geolocated source-IP country on
+    a blocked-country list (geographic IOC)?
+  context: Geolocating the source IP of each successful remote logon and alerting when the country is
+    on a blocked list is a simple geographic IOC rule that catches logons from prohibited locations. This
+    supports Credential Access (TA0006) by flagging suspicious remote authentication that may be using
+    a stolen or master credential. Combine with impossible-travel analysis for stronger signal.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Network Gateway, Cloud Service Authentication Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=4624 LogonType=10 | iplocation IpAddress
+
+      WHERE Country IN blocked_countries -> alert("Logon from blocked country")
+- question: Across two successful logons for the same user from different source IPs, does the great-circle
+    distance and time delta imply an impossible travel velocity above ~600 mph (965 kph)?
+  context: Impossible-travel analysis enriches each logon with geolocation, computes the great-circle
+    distance and time gap from the prior logon, derives the implied velocity, and alerts when it exceeds
+    a feasible threshold (~600 mph). Two near-simultaneous logons from distant locations indicate credential
+    sharing/theft consistent with a master credential. This statistical method supports Credential Access
+    (TA0006). Tune for VPN egress and cloud-proxy artifacts.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Network Gateway, Cloud Service Authentication Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=4624 | sort by user,_time
+
+      | eval dist=greatcircle(prev_geo,geo), dt=_time-prev_time, v=dist/dt
+
+      WHERE v>600mph -> alert impossible_travel
+- question: Does clustering of a user's typical geographic logon locations (office/home/carrier) flag
+    logons outside established clusters and track velocity for improbable jumps, with the top-3 features
+    (distance, velocity, cluster distance) surfaced?
+  context: Clustering a user's habitual logon geographies establishes a personal location baseline; logons
+    outside those clusters, combined with velocity tracking for improbable jumps, detect anomalous remote
+    authentication better than static thresholds. Surfacing the top-3 features (distance, velocity, cluster
+    distance) keeps the alert explainable. This advances Credential Access (TA0006) detection of stolen/master-credential
+    use.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Network Gateway, Cloud Service Authentication Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      per user: cluster(historical geo logons)
+
+      WHERE new_logon outside clusters OR velocity_jump improbable -> alert top3_features(distance,velocity,cluster_distance)
+- question: On a domain controller, are Kerberos AS-REQ/TGS-REQ tickets (4768/4769) being issued with
+    Ticket Encryption Type 0x17 (RC4_HMAC) for accounts or a realm whose established baseline is AES (0x11/0x12),
+    excluding allow-listed legacy accounts/services?
+  context: The injected Skeleton-Key authentication logic does not support AES, so after tampering the
+    DC forces a downgrade to RC4 (etype 0x17) for accounts/realm that previously negotiated AES. This
+    is a deterministic post-deployment network signature. Alerting on 4768/4769 RC4 tickets where AES
+    was the norm, with an allow-list for genuinely legacy RC4 accounts/services, is high fidelity for
+    Defense Impairment (TA0112), Persistence (TA0003), and Credential Access (TA0006). A realm-wide shift
+    to RC4 is a strong indicator of authentication tampering.
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - 'NAI: Domain Controllers'' Kerberos authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source IN (4768,4769) host IN domain_controllers TicketEncryptionType=0x17
+
+      WHERE TargetUserName NOT IN legacy_rc4_allowlist AND baseline_etype(TargetUserName) IN (0x11,0x12)
+
+      -> alert("Kerberos RC4 downgrade on DC")
+- question: Per domain controller, did the hourly RC4(0x17)-to-AES(0x12) ticket ratio step up from a near-zero
+    baseline, and how many distinct accounts suddenly began issuing RC4 tickets?
+  context: Computing the per-DC ratio of RC4 to AES tickets per hour and the count of distinct accounts
+    newly issuing RC4 tickets converts the downgrade signature into a measurable change-point. A step
+    increase from a near-zero baseline indicates tampering, and the RC4 failure/fallback rate is a distinct
+    corroborating signal. This statistical method supports Defense Impairment (TA0112) and Credential
+    Access (TA0006) by both alerting and scoping the affected accounts.
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - 'NAI: Domain Controllers'' Kerberos authentication logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source IN (4768,4769) host IN domain_controllers
+
+      | timechart span=1h by host eval rc4_ratio=count(etype=0x17)/count(etype=0x12), distinct_rc4_accounts=dc(TargetUserName
+      WHERE etype=0x17)
+
+      | change_point_detect(rc4_ratio) WHERE step_up_from_zero -> alert scope=distinct_rc4_accounts
+- question: Does a model of the per-DC Kerberos encryption-type distribution flag an anomalous surge in
+    RC4 usage, surfacing the top-3 contributing accounts/hosts and the RC4 fraction rather than only a
+    score?
+  context: Modeling the per-DC time series of Kerberos encryption-type distribution detects anomalous
+    surges in RC4 that simple thresholds may miss, accounting for normal periodic variation. The alert
+    must surface the top-3 contributing accounts/hosts and the RC4 fraction for explainable triage. This
+    advances Defense Impairment (TA0112), Persistence (TA0003), and Credential Access (TA0006) detection
+    of authentication downgrades caused by DC tampering.
+  answer_sources:
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - 'NAI: Domain Controllers'' Kerberos authentication logs'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      ts=per_DC(etype_distribution) ; model=anomaly_detector(ts)
+
+      WHERE rc4_surge anomalous -> alert with top3_contributors(account,host) + rc4_fraction
