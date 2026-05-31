@@ -1,0 +1,413 @@
+name: 'T1003.002: Security Account Manager'
+id: bb38664d-0426-484f-b6a9-413094acd1bb
+description: Investigate adversary attempts to extract local-account credential material from the Security
+  Account Manager (SAM) on Windows endpoints, whether through in-memory dumping or by copying the SAM/SYSTEM/SECURITY
+  registry hives for offline hash extraction. This playbook helps an analyst hunt for execution of known
+  credential-dumping tools (mimikatz, gsecdump, pwdump*, secretsdump.py, comsvcs.exe MiniDump), abuse
+  of native utilities (reg.exe, vssadmin.exe, esentutl.exe, ntdsutil.exe) to save or shadow-copy the hives,
+  suspicious file access to %SystemRoot%\System32\config\SAM, unauthorized handle requests to LSASS memory,
+  and anomalous reads of the HKLM\SAM and HKLM\SYSTEM registry keys. It combines signature/symbolic-logic
+  detections, statistical baselining of rare accessors, command-line entropy and failure-to-success bursts,
+  and machine-learning approaches (lineage anomaly, isolation forests, and provenance-graph models) so
+  a SOC analyst can confirm SYSTEM-level SAM credential theft on critical assets such as Domain Controllers,
+  Tier 0/1 servers, and administrator workstations.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process execute on a critical asset whose image name, original file name, or hash matches
+    a known credential-dumping tool used against the SAM?
+  context: 'Match process creation telemetry (Event ID 4688 / Sysmon 1) against a curated threat-intel
+    list of credential dumpers (mimikatz, gsecdump, pwdump*, secretsdump.py) and the LOLBin pattern of
+    rundll32 invoking comsvcs.exe MiniDump (ordinal #24). Because operators routinely rename binaries,
+    match on original_file_name and hash in addition to the on-disk name. A hit on a Domain Controller,
+    Tier 0/1 server, or admin workstation strongly indicates active SAM/LSASS credential theft; a negative
+    result narrows the hunt toward native-utility or registry-based dumping paths.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets like Domain Controllers, Tier 0/1
+    Servers, and Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      procs = FILTER (Event4688 OR Sysmon1) BY host IN critical_assets
+      ALERT WHERE procs.image_name IN TI_dumpers
+        OR procs.original_file_name IN TI_dumpers
+        OR procs.hash IN TI_dumper_hashes
+        OR (procs.image=='rundll32.exe' AND procs.cmdline ~ /comsvcs.*MiniDump|#24/i)
+- question: Is a privileged process launching with an abnormally long, high-entropy, or encoded command
+    line that could conceal a renamed or obfuscated SAM dumper?
+  context: Build a 30-day per-parent distribution of command-line Shannon entropy and length for privileged
+    parents, then alert on values above the 99th percentile or that contain base64/encoded arguments.
+    Renamed dumpers and encoded PowerShell loaders evade name-based signatures but still carry unusual
+    argument structure. Track execution-from-temp as an additional volume signal. High entropy on a privileged
+    parent is a strong lead toward obfuscated credential access; normal entropy suggests the execution
+    is benign or uses a clear-text command.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets like Domain Controllers, Tier 0/1
+    Servers, and Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS p99(entropy(cmdline)), p99(len(cmdline)) BY parent_image OVER last_30d WHERE privileged=true
+      ALERT WHERE entropy(cmdline) > base.p99_entropy
+        OR len(cmdline) > base.p99_len
+        OR cmdline ~ /[A-Za-z0-9+\/]{40,}={0,2}/  // base64
+      ANNOTATE exec_from_temp = path ~ /\\Temp\\/
+- question: Did a host show a burst of failed (access-denied / non-SYSTEM) credential-dumper invocations
+    immediately followed by a successful one?
+  context: Count per-host successful versus failed dumper executions in 10-minute windows. A cluster of
+    failed privileged invocations followed by a success is a distinct state signal that an adversary escalated
+    privileges and then succeeded in dumping the SAM. This temporal pattern is more reliable than a single
+    execution because it captures the trial-and-error of an operator working toward SYSTEM access.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets like Domain Controllers, Tier 0/1
+    Servers, and Administrator Workstations.'
+  range: Last 90 days, with 10-minute failure-to-success correlation windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      ev = FILTER (Event4688 OR Sysmon1) BY image IN TI_dumpers OR original_file_name IN TI_dumpers
+      win = WINDOW ev BY host EVERY 10m
+      ALERT WHERE count(win.failed)>=2 AND count(win.success)>=1 AND last(win).status=='success'
+- question: Does a supervised model classify a process execution as a likely credential dumper based on
+    its metadata and LOLBin lineage?
+  context: Train an XGBoost/Random Forest on process metadata (parent, command-line length, argument count,
+    entropy, signer, prevalence, user) and emit the top-3 contributing features with each alert. Pair
+    the score with parent-child lineage graphs to surface LOLBin chains (e.g., Office -> shell -> rundll32).
+    Model attribution lets an analyst quickly judge why an execution was flagged and whether the lineage
+    is consistent with hands-on-keyboard credential theft versus benign administration.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets like Domain Controllers, Tier 0/1
+    Servers, and Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      feats = EXTRACT(parent, cmdline_len, arg_count, entropy, signer, prevalence, user) FROM proc_events
+      score = MODEL.predict(feats)  // XGBoost/RandomForest
+      ALERT WHERE score > 0.9 EMIT top3_features(score) AND parent_child_lineage(proc)
+- question: Did a native system utility run with arguments that save, export, or shadow-copy the SAM,
+    SYSTEM, or SECURITY registry hives?
+  context: Regex-match command lines for reg save hklm\sam|system|security, esentutl /y /vss on SAM/ntds,
+    vssadmin create shadow, and ntdsutil ifm/create, then correlate with subsequent file copies out of
+    shadow-copy paths. These living-off-the-land techniques let an adversary obtain the hives without
+    dropping a dumper. A match on a Domain Controller or Tier 0 server is high-fidelity evidence of offline-hash-extraction
+    preparation; correlation with a follow-on file copy confirms exfiltration of the credential store.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets, particularly Domain Controllers
+    and Tier 0 Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ALERT WHERE cmdline ~ /reg(\.exe)?\s+save\s+hklm\\(sam|system|security)/i
+        OR cmdline ~ /esentutl.*\/y.*\/vss.*(sam|ntds)/i
+        OR cmdline ~ /vssadmin\s+create\s+shadow/i
+        OR cmdline ~ /ntdsutil.*(ifm|create)/i
+      THEN CORRELATE file_copy FROM /HarddiskVolumeShadowCopy/ WITHIN 10m
+- question: Is a host running reg/vssadmin/esentutl/ntdsutil with hive-dumping arguments far more often
+    than its baseline, or for the first time ever, outside a change window?
+  context: Baseline daily execution counts of these utilities with suspicious arguments per host, then
+    flag hosts exceeding the 95th percentile or any occurrence on hosts with zero 90-day history, excluding
+    approved change/maintenance windows. First-time or spike usage of hive-dumping commands on a server
+    that never performs them is a strong anomaly; routine occurrences on known backup/admin hosts inside
+    change windows are expected and can be suppressed.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets, particularly Domain Controllers
+    and Tier 0 Servers.'
+  range: Last 90 days, baselined over a 30-90 day window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS p95(daily_count), history_days BY host WHERE cmdline ~ /reg save|esentutl.*vss|vssadmin create shadow|ntdsutil/i
+      ALERT WHERE (daily_count > base.p95 OR base.history_days==0) AND NOT in_change_window(host,time)
+- question: Were there repeated failed or denied hive save / shadow-copy operations from a non-admin context
+    that preceded a successful one?
+  context: Track failed/denied save and shadow-copy operations as combined volume and state signals. Repeated
+    failures from a non-admin context followed by a success indicate a privilege-escalation-then-dump
+    sequence, where the operator gains the rights needed to read the hives and then succeeds. The failure-then-success
+    arc is far more indicative of malice than an isolated success by an administrator.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets, particularly Domain Controllers
+    and Tier 0 Servers.'
+  range: Last 90 days, with 10-minute failure-to-success correlation windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      ops = FILTER proc_events BY cmdline ~ /reg save hklm|vssadmin create shadow|esentutl.*vss/i
+      win = WINDOW ops BY host,user EVERY 10m
+      ALERT WHERE count(win.failed)>=2 AND any(win.success) AND win.user NOT IN admins
+- question: Were reg.exe, esentutl.exe, vssadmin.exe, or ntdsutil.exe spawned from an anomalous parent
+    such as a shell, Office app, or web server?
+  context: Apply parent-child anomaly modeling to flag these hive-handling utilities when they are launched
+    by parents that rarely or never spawn them (cmd/powershell launched by Office macros, w3wp.exe, or
+    other server processes), and surface the top contributing features for triage. Legitimate hive operations
+    typically originate from administrative tooling or scheduled backups, so an anomalous parent strongly
+    suggests exploitation-driven credential access.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1 (Sysmon)
+  - 'NAI: Command-line and process execution logs on critical assets, particularly Domain Controllers
+    and Tier 0 Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      feats = EXTRACT(parent_image, child_image, depth, signer, user) FROM proc_lineage
+        WHERE child_image IN [reg.exe,esentutl.exe,vssadmin.exe,ntdsutil.exe]
+      ALERT WHERE anomaly_model.score(feats) > threshold EMIT top_features
+- question: Did a process outside the approved allowlist read the on-disk SAM, SYSTEM, or SECURITY file
+    (including from a shadow-copy config path)?
+  context: Enable Audit Object Access (Success+Failure) with SACLs on %SystemRoot%\System32\config\ and
+    alert on Event ID 4663 reads of SAM/SYSTEM/SECURITY (and *ShadowCopy*\*\config\SAM) by processes outside
+    an allowlist of System, approved backup agents, and dllhost.exe. Direct file reads of the SAM by an
+    unexpected process are a clear indicator of credential theft; reads from a shadow-copy config path
+    reveal an attempt to evade locks on the live hive.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 11 (Sysmon)
+  - 'NAI: File system audit logs on Domain Controllers and Tier 0 Servers, specifically monitoring the
+    `%SystemRoot%\system32\config\` directory.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ALERT WHERE Event4663.object ~ /\\config\\(SAM|SYSTEM|SECURITY)$/i
+        OR Event4663.object ~ /ShadowCopy.*\\config\\SAM/i
+      AND Event4663.process NOT IN allowlist[System, backup_agents, dllhost.exe]
+      INCLUDE access_status IN [success, denied]
+- question: Is the process-host pair reading the SAM file a rare accessor against a 30-90 day baseline,
+    or did it generate an access-denied read?
+  context: Maintain a 30-90 day frequency baseline of accessing process-host pairs for the SAM file and
+    flag bottom-1st-percentile rare accessors. Treat access-denied (failed) reads of SAM as a distinct
+    high-value state signal because they reveal an attempt that lacked sufficient privilege. A never-seen
+    process touching the SAM, or a denied read, is far more suspicious than the steady access from backup
+    software that the baseline captures.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 11 (Sysmon)
+  - 'NAI: File system audit logs on Domain Controllers and Tier 0 Servers, specifically monitoring the
+    `%SystemRoot%\system32\config\` directory.'
+  range: Last 90 days, baselined over a 30-90 day window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS count BY (process,host) OVER last_90d WHERE object ~ /config\\SAM/i
+      ALERT WHERE percentile_rank((process,host)) <= 1 OR Event4663.access_status=='denied'
+- question: Does an unsupervised model flag a SAM file-access event as anomalous based on its process,
+    user, host, time, and access-mask features?
+  context: Train an Isolation Forest or One-Class SVM on file-access features (process, user, host, time,
+    access mask, success/fail) and surface the top-3 features driving each anomaly. This catches novel
+    accessors and unusual access masks (e.g., read requests at odd hours by uncommon users) that rule-based
+    allowlists may miss. Feature attribution tells the analyst whether the anomaly stems from an unusual
+    process, an off-hours time, or an abnormal access mask.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 11 (Sysmon)
+  - 'NAI: File system audit logs on Domain Controllers and Tier 0 Servers, specifically monitoring the
+    `%SystemRoot%\system32\config\` directory.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      feats = EXTRACT(process,user,host,hour,access_mask,status) FROM Event4663 WHERE object ~ /config\\SAM/i
+      score = IsolationForest.score(feats)
+      ALERT WHERE score anomalous EMIT top3_features(score)
+- question: Does provenance-graph learning flag a process node abnormally connecting to SAM/SYSTEM file
+    or registry nodes without a valid signature?
+  context: Use node-level provenance graph learning (GraphSAGE) to flag process nodes that abnormally
+    connect to SAM/SYSTEM file and registry nodes, particularly unsigned processes, and trace the surrounding
+    attack path. Graph models capture relationships a single event cannot, revealing when a suspicious
+    process bridges from a shell or download to the credential store. The reconstructed path gives the
+    analyst the context needed to scope the intrusion.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 11 (Sysmon)
+  - 'NAI: File system audit logs on Domain Controllers and Tier 0 Servers, specifically monitoring the
+    `%SystemRoot%\system32\config\` directory.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      G = BUILD_PROVENANCE_GRAPH(process,file,registry edges)
+      scores = GraphSAGE.node_anomaly(G)
+      ALERT WHERE node.type=='process' AND connects_to(SAM|SYSTEM nodes) AND scores[node] high AND node.signed==false
+      EMIT attack_path(node)
+- question: Did a process outside the allowlist open a handle to lsass.exe with memory-read access (GrantedAccess
+    0x1010/0x1410/0x1438), especially with unbacked call-trace frames?
+  context: Alert when Sysmon Event ID 10 shows lsass.exe accessed by SourceImages outside the allowlist
+    requesting GrantedAccess masks 0x1010/0x1410/0x1438, especially when the CallTrace contains unbacked
+    (non-image) frames indicative of injected or reflective dumping code. Although LSASS dumping is T1003.001,
+    operators frequently combine it with SAM theft, so unauthorized LSASS reads on the same critical assets
+    are a strong corroborating credential-access signal.
+  answer_sources:
+  - Windows Event ID 10 (Sysmon)
+  - 'NAI: Process memory access logs on critical assets like Domain Controllers, Tier 0/1 Servers, and
+    Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ALERT WHERE Sysmon10.TargetImage=='lsass.exe'
+        AND Sysmon10.SourceImage NOT IN allowlist
+        AND Sysmon10.GrantedAccess IN [0x1010,0x1410,0x1438]
+        AND Sysmon10.CallTrace ~ /UNKNOWN|unbacked/
+- question: Is the process accessing LSASS a rare or never-before-seen actor against a 30-day baseline,
+    or did it generate denied handle requests?
+  context: Baseline SourceImage/TargetImage pairs and SourceImage path entropy over 30 days and flag processes
+    that have never or rarely (bottom 1st percentile) accessed LSASS. Count failed/denied handle requests
+    as a distinct state signal because they reveal blocked dumping attempts (e.g., when Credential Guard
+    or PPL intervenes). A rare actor or a denied high-access request points to credential dumping rather
+    than routine system activity.
+  answer_sources:
+  - Windows Event ID 10 (Sysmon)
+  - 'NAI: Process memory access logs on critical assets like Domain Controllers, Tier 0/1 Servers, and
+    Administrator Workstations.'
+  range: Last 90 days, baselined over a 30-90 day window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS count BY (SourceImage,TargetImage) OVER last_30d WHERE TargetImage=='lsass.exe'
+      ALERT WHERE percentile_rank(SourceImage) <= 1 OR Sysmon10.GrantedAccess_denied==true
+      ANNOTATE path_entropy = entropy(SourceImage_path)
+- question: Does a temporal provenance GNN flag an lsass-read-then-dump-write subgraph as anomalous and
+    reconstruct it for triage?
+  context: Score per-edge reconstruction anomaly with a temporal GNN encoder-decoder over the provenance
+    graph to flag the lsass-read-then-dump-write subgraph and auto-reconstruct an attack summary. Temporal
+    modeling captures the ordered sequence of reading LSASS memory and then writing a dump file, which
+    is highly indicative of credential theft. The reconstructed summary accelerates analyst triage by
+    laying out the implicated edges in order.
+  answer_sources:
+  - Windows Event ID 10 (Sysmon)
+  - 'NAI: Process memory access logs on critical assets like Domain Controllers, Tier 0/1 Servers, and
+    Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      G = TEMPORAL_PROVENANCE(window=event_centered)
+      edge_scores = TGNN_encoder_decoder.reconstruction_error(G)
+      ALERT WHERE subgraph(lsass_read -> dump_file_write) has high edge_scores
+      EMIT reconstructed_attack_summary
+- question: Does a self-supervised masked graph autoencoder emit a high entity-level outlier score for
+    a process interacting with LSASS?
+  context: Apply a self-supervised masked graph autoencoder to emit entity-level outlier scores for processes
+    interacting with lsass, an approach robust to concept drift and benign-tool changes. Unlike static
+    allowlists, the model adapts as the environment evolves, reducing false positives from new but legitimate
+    tooling while still surfacing genuinely anomalous LSASS interactions tied to credential dumping.
+  answer_sources:
+  - Windows Event ID 10 (Sysmon)
+  - 'NAI: Process memory access logs on critical assets like Domain Controllers, Tier 0/1 Servers, and
+    Administrator Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      G = BUILD_GRAPH(process<->lsass interactions)
+      scores = MaskedGraphAutoencoder.entity_outlier(G)
+      ALERT WHERE scores[process] > drift_robust_threshold
+- question: Did a process outside the approved list access the HKLM\SAM or HKLM\SYSTEM registry hives,
+    including via reg.exe save operations?
+  context: Alert when Sysmon Events 12/13 or Windows Event ID 4656/4663 record HKLM\SAM or HKLM\SYSTEM
+    access by processes outside the approved list (lsass.exe, System, approved agents), including reg.exe
+    save operations. Direct registry access to these hives by an unexpected process is the registry-based
+    path to SAM credential theft; constraining to an allowlist isolates the rare malicious accessor from
+    the constant legitimate access by the OS.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 12 (Sysmon)
+  - Windows Event ID 13 (Sysmon)
+  - 'NAI: Windows Registry audit logs on Domain Controllers, Tier 0/1 Servers, and Administrator Workstations,
+    specifically monitoring the `HKLM\SAM` and `HKLM\SYSTEM` hives.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ALERT WHERE (Sysmon12 OR Sysmon13 OR Event4656 OR Event4663)
+        AND object ~ /HKLM\\(SAM|SYSTEM)/i
+        AND process NOT IN allowlist[lsass.exe, System, approved_agents]
+      OR (process=='reg.exe' AND cmdline ~ /save/i)
+- question: Did a process exhibit a statistically significant spike (Z-score > 3) in HKLM\SAM access counts,
+    or generate access-denied registry opens?
+  context: Compute per-process Z-scores over 5-minute windows for HKLM\SAM access counts and flag values
+    greater than 3, while profiling access-denied (failed) registry opens separately as a state signal.
+    A sudden burst of SAM-key reads is consistent with enumeration or dumping, and denied opens reveal
+    attempts that lacked privilege. Spikes against an otherwise quiet baseline are strong leads, whereas
+    steady low-rate access by system components is expected.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 12 (Sysmon)
+  - Windows Event ID 13 (Sysmon)
+  - 'NAI: Windows Registry audit logs on Domain Controllers, Tier 0/1 Servers, and Administrator Workstations,
+    specifically monitoring the `HKLM\SAM` and `HKLM\SYSTEM` hives.'
+  range: Last 30 days, with 5-minute correlation windows around any spike.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS mean,std BY process OF sam_access_count PER 5m
+      ALERT WHERE zscore(window_count, base.mean, base.std) > 3
+        OR Event4656.access_status=='denied'
+- question: Does the sequence of registry operations match a rare malicious pattern such as shell -> open
+    HKLM\SYSTEM -> open HKLM\SAM?
+  context: Build short n-gram profiles of legitimate registry-access sequences and flag low-frequency
+    sequences such as a shell opening HKLM\SYSTEM and then HKLM\SAM, using a mismatch-count threshold.
+    Modeling ordered behavior catches the characteristic dump preparation pattern where both hives are
+    opened together by an interactive process, which differs from the scattered, single-key access of
+    normal operation.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 12 (Sysmon)
+  - Windows Event ID 13 (Sysmon)
+  - 'NAI: Windows Registry audit logs on Domain Controllers, Tier 0/1 Servers, and Administrator Workstations,
+    specifically monitoring the `HKLM\SAM` and `HKLM\SYSTEM` hives.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      profile = NGRAM(reg_access_sequence, n=3) OVER baseline
+      ALERT WHERE sequence ~ [shell_spawn, open HKLM\SYSTEM, open HKLM\SAM]
+        AND profile.frequency(sequence) below mismatch_threshold
+- question: Does provenance-graph learning detect a process node abnormally accessing the SAM/SYSTEM hive
+    nodes, with contributing edges surfaced for review?
+  context: Use node-level provenance graph learning to detect process nodes abnormally accessing SAM/SYSTEM
+    hive nodes and surface the contributing edges and features for analyst review. The graph view links
+    the registry access back to its originating process chain, distinguishing an isolated benign read
+    from an access that is part of a broader intrusion path. Edge-level attribution lets the analyst validate
+    the finding and scope adjacent activity.
+  answer_sources:
+  - Windows Event ID 4656
+  - Windows Event ID 12 (Sysmon)
+  - Windows Event ID 13 (Sysmon)
+  - 'NAI: Windows Registry audit logs on Domain Controllers, Tier 0/1 Servers, and Administrator Workstations,
+    specifically monitoring the `HKLM\SAM` and `HKLM\SYSTEM` hives.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      G = BUILD_PROVENANCE_GRAPH(process,registry edges)
+      scores = ProvGraphLearner.node_anomaly(G)
+      ALERT WHERE node.type=='process' AND accesses(HKLM\SAM|HKLM\SYSTEM) AND scores[node] high
+      EMIT contributing_edges(node)
