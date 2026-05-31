@@ -1,0 +1,299 @@
+name: 'T1648.A001: Invoking Lambda Function'
+id: 84389904-0800-4d1d-84a1-5fbf064e2f19
+description: Investigate whether an adversary with sufficient AWS permissions has abused the ability to
+  invoke an existing Lambda function to run code for discovery, data exfiltration, persistence, or privilege
+  escalation. This playbook helps an analyst determine (1) whether a principal invoked a Lambda function
+  outside its normal operational pattern — targeting rarely used, privileged, or administrative functions,
+  originating from a new source context, or immediately followed by discovery, privilege-relevant, or
+  data-access activity performed by the function's execution role; and (2) whether a Lambda function's
+  runtime behavior is inconsistent with its intended purpose, such as first-time outbound connections,
+  unusual access to secrets or data stores, invocation bursts aligned with reconnaissance or credential
+  use, or execution logs showing command-like tasking and collection behavior. It combines symbolic-logic
+  detections (execution-role privileged operations, first-seen caller/function/action, AccessDenied probing
+  bursts, runtime drift, first-seen downstream service/egress), statistical baselining (modified Z-score
+  / Seasonal Hybrid ESD on invocation, execution, and egress profiles; Markov sequence modeling; command-like
+  log bursts), and machine-learning approaches (rare-population analysis, identity/cross-service graph
+  anomaly detection, LSTM log-sequence modeling) to surface abuse of Lambda invocation across the Execution
+  tactic.
+type: technique
+related:
+- tactic_id: TA0002
+  tactic_name: Execution
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a principal, source IP, user agent, or assumed role that is not normally associated with
+    a given Lambda function invoke that function, and did the resulting Lambda execution-role session
+    then perform privilege-relevant actions (IAM policy/role/user/key changes, sts:AssumeRole, secrets
+    retrieval, S3 object access, or IAM reads) within a short window?
+  context: 'This question targets the core Execution-tactic abuse pattern for T1648: an adversary uses
+    Invoke/InvokeFunction (eventSource lambda.amazonaws.com) to run code, and the function''s execution
+    role then performs actions beyond what the original caller would normally do. The canonical Elastic
+    ''IAM Sensitive Operations via Lambda Execution Role'' rule fires on event.outcome:success with user_identity.type:AssumedRole
+    and user_identity.invoked_by:lambda.amazonaws.com (or user_agent containing AWS_Lambda) for sensitive
+    event.action values such as CreateAccessKey, AttachRolePolicy, PutRolePolicy, CreateUser, CreateRole,
+    AddUserToGroup, plus correlated sts:AssumeRole, Secrets Manager retrieval, S3 GetObject, or IAM read
+    calls. A positive result means an invoke is chained to privilege escalation or data access through
+    the execution role and should be triaged immediately; a negative result helps confirm the invoke stayed
+    within expected scope. Tune by allow-listing approved IaC/onboarding execution-role ARNs/tags rather
+    than deleting the rule; validate coverage with Stratus Red Team.'
+  answer_sources: &id001
+  - CloudTrail management events
+  - CloudTrail data events
+  - CloudTrail Lake
+  - CloudWatch Logs
+  - Lambda Insights metrics
+  - VPC Flow Logs
+  - 'NAI: CloudTrail management and data events for Lambda, CloudWatch log groups for sensitive or administrative
+    functions, and VPC-connected Lambda telemetry in production AWS accounts'
+  range: Last 90 days; pivot to a +/- 1 hour window around each suspicious InvokeFunction for downstream
+    correlation
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nLET invokes = CloudTrail WHERE eventSource='lambda.amazonaws.com'\n  AND eventName IN\
+      \ ('Invoke','InvokeFunction') AND errorCode IS NULL\n  AND (sourceIPAddress, userIdentity.arn, userAgent)\
+      \ NOT IN baseline_for(functionName)\nLET role_actions = CloudTrail WHERE userIdentity.type='AssumedRole'\n\
+      \  AND (userIdentity.invokedBy='lambda.amazonaws.com' OR userAgent LIKE '%AWS_Lambda%')\n  AND event.outcome='success'\n\
+      \  AND eventName IN ('AddRoleToInstanceProfile','AddUserToGroup','AttachGroupPolicy',\n      'AttachRolePolicy','AttachUserPolicy','CreateAccessKey','CreateInstanceProfile',\n\
+      \      'CreateRole','CreateUser','PutRolePolicy','PutUserPolicy','AssumeRole',\n      'GetSecretValue','GetObject','GetPolicy','ListAttachedRolePolicies')\n\
+      ALERT WHEN invokes JOIN role_actions ON executionRoleSession\n  WITHIN 15m AND role_actions.time\
+      \ >= invokes.time"
+- question: Is a principal invoking lambda:Invoke/InvokeFunction against a specific function for the first
+    time, or is an execution role performing downstream actions never previously observed for it, over
+    a 30-90 day lookback?
+  context: First-seen analysis detects novelty that simple volume thresholds miss. By maintaining per-principal
+    and per-role baselines of historically observed CloudTrail actions (as in Splunk's 'Cloud API Calls
+    From Previously Unseen User Roles' and the Athena-based Netflix CloudTrail Anomaly Detector), the
+    analyst can flag a principal issuing Invoke against a given function for the first time, or an execution
+    role making never-before-seen downstream calls. In the Execution context, a first-seen caller/function
+    pairing or a first-seen downstream action is a strong signal that an adversary is leveraging credentials
+    in a new way — e.g., invoking an admin function they have never touched. A positive result warrants
+    confirming whether the activity maps to a legitimate new workflow or deployment; a negative (already-seen)
+    result lowers but does not eliminate suspicion.
+  answer_sources: *id001
+  range: Last 90 days (30-90 day baseline lookback for first-seen determination)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nLET baseline = CloudTrail[-90d..-1d] WHERE eventSource='lambda.amazonaws.com'\n  GROUP\
+      \ BY userIdentity.arn, requestParameters.functionName\nLET today = CloudTrail[-1d..now] WHERE eventName\
+      \ IN ('Invoke','InvokeFunction')\nALERT WHEN (today.userIdentity.arn, today.functionName) NOT IN\
+      \ baseline\n// also: execution-role first-seen downstream\nLET role_base = CloudTrail[-90d..-1d]\
+      \ WHERE userIdentity.invokedBy='lambda.amazonaws.com'\n  GROUP BY userIdentity.arn, eventName\n\
+      ALERT WHEN downstream(role).eventName NOT IN role_base FOR THAT role"
+- question: Is a single principal generating a burst of AccessDenied / UnauthorizedOperation errors on
+    lambda:Invoke, ListFunctions, GetFunction, GetPolicy, or on downstream Secrets/S3/IAM calls, indicating
+    permission enumeration before a successful invoke?
+  context: Failure state is a distinct, high-value signal. An adversary probing what they can do will
+    generate clusters of errorCode=AccessDenied or Client.UnauthorizedOperation as they enumerate permissions
+    (per Splunk's 'AWS IAM AccessDenied Discovery Events'). Counting denials per principal and alerting
+    on bursts — especially repeated denied lambda:Invoke/ListFunctions/GetFunction/GetPolicy or denied
+    downstream Secrets/S3/IAM calls that precede a successful invoke — reveals reconnaissance that ultimately
+    enables Execution. Derive the per-principal threshold from trailing-window medians rather than a fixed
+    global count so noisy automation does not mask real probing. A positive result (denial burst then
+    success) is a classic permission-probing-to-execution chain; investigate the principal's credential
+    source.
+  answer_sources: *id001
+  range: Last 90 days; evaluate denial bursts in rolling 1-hour and 24-hour windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nLET denials = CloudTrail WHERE errorCode IN ('AccessDenied','Client.UnauthorizedOperation')\n\
+      \  AND eventName IN ('Invoke','InvokeFunction','ListFunctions','GetFunction','GetPolicy',\n    \
+      \  'GetSecretValue','GetObject','AttachRolePolicy','PutRolePolicy')\nBIN BY principal, 1h: cnt =\
+      \ count()\nLET med = median(cnt) OVER trailing_30d PER principal\nALERT WHEN cnt > max(5, 4*med)\n\
+      \  AND EXISTS successful Invoke BY same principal WITHIN next 1h"
+- question: Does a Lambda function's invocation profile (invokes/min, caller identity, hour-of-day, source
+    network/ASN, payload size, execution duration, success-vs-error state, downstream-API volume) deviate
+    sharply from its trailing baseline or peer-class norms?
+  context: Statistical baselining catches abuse that stays within permitted actions but breaks normal
+    patterns. Build per-function and per-principal baselines across invocation frequency, caller, timing,
+    source network/ASN, payload size, duration, error state, and the downstream-API volume generated by
+    the execution role. Use a robust MAD-based modified Z-score (flag |Mi|>3.5) so batch jobs do not inflate
+    thresholds, and apply Seasonal Hybrid ESD to seasonal invoke/error series to catch off-hours spikes
+    against administrative functions. In the Execution context, an off-baseline invocation — new caller,
+    odd hour, unusual ASN, or an unusually large burst of downstream API calls after invoke — suggests
+    an adversary driving the function. A positive result flags the specific deviating feature(s) for analyst
+    review; expected seasonal variation should not alarm.
+  answer_sources: *id001
+  range: Last 90 days (trailing 30-day baseline; 95th-percentile per function class)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nFOR each functionName, principal:\n  features = [invokes_per_min, hour_of_day, sourceASN_novelty,\
+      \ payload_size,\n             duration, error_rate, downstream_api_count]\n  med = median(feature,\
+      \ 30d); madv = MAD(feature, 30d)\n  Mi = 0.6745*(x - med)/madv\n  ALERT WHEN abs(Mi) > 3.5 FOR any\
+      \ feature\nAPPLY SeasonalHybridESD(invoke_series, error_series) -> flag off-hours admin spikes\n\
+      ALERT WHEN downstream_api_count > p95(function_class)"
+- question: After a Lambda invoke, does the principal/role produce an improbable next-action chain (e.g.,
+    invoke -> enumerate -> sts:AssumeRole -> CreateAccessKey) that is unlikely given its recent action
+    history, even when each individual call is permitted and within normal volume?
+  context: Sequence implausibility detects malicious intent expressed through ordering rather than volume.
+    Model the conditional probability of the next CloudTrail action given the recent action sequence for
+    a principal/role using multi-order Markov modeling, so a low-probability post-invoke chain scores
+    anomalous even though every call is individually allowed. Pair with AWS CloudWatch band-based time-series
+    alarms and Contributor Insights top-contributor ranking. For the Execution tactic, the dangerous pattern
+    is an invoke immediately leading to discovery, then assumption of a more privileged role, then credential
+    creation — a hallmark of code execution leveraged for escalation/persistence. A positive result surfaces
+    the specific low-probability transition; a high-probability (routine) sequence is benign.
+  answer_sources: *id001
+  range: Last 90 days; score sequences in sliding per-principal sessions
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nTRAIN markov_k = order-2 transition matrix of CloudTrail eventName per principal/role\
+      \ (90d)\nFOR each new event e given prior (e-2, e-1):\n  p = P(e | e-2, e-1)\n  seq_score = -sum(log\
+      \ p) over rolling window\nALERT WHEN seq_score > p99 OR p(e|context) < 0.01\n  ESPECIALLY chain\
+      \ Invoke -> List*/Describe* -> AssumeRole -> CreateAccessKey\nCORRELATE WITH CloudWatch ContributorInsights\
+      \ top contributors"
+- question: Across all CloudTrail activity, which principals, regions, functions, or downstream actions
+    are rare for lambda:Invoke — e.g., rare principals/regions issuing Invoke, functions invoked by unusual
+    identities, or execution roles making rare downstream calls?
+  context: 'Rare-population (frequency-rarity) analysis surfaces low-frequency outliers that deterministic
+    rules miss, using Elastic CloudTrail ML jobs. It scores how rare a principal, region, function, or
+    downstream action is relative to the broader population, highlighting unusual identities invoking
+    functions or execution roles making rare calls. Rarity scoring is inherently explainable: the alert
+    must name the top-3 contributing features (rare principal, rare function, rare region/ASN, rare downstream
+    action). In the Execution context, a rarely-seen identity invoking a function from a rare region is
+    a strong lead for adversary code execution. A positive result should be enriched with the contributing
+    factors and corroborated against deterministic rules; common/expected populations are deprioritized.'
+  answer_sources: *id001
+  range: Last 90 days (ML model trained over rolling window)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\nRUN rare_population_jobs OVER CloudTrail:\n  job1: rare(userIdentity.arn) WHERE eventName\
+      \ IN ('Invoke','InvokeFunction')\n  job2: rare(requestParameters.functionName) BY userIdentity.arn\n\
+      \  job3: rare(awsRegion / sourceASN) WHERE Invoke\n  job4: rare(downstream eventName) WHERE invokedBy='lambda.amazonaws.com'\n\
+      ALERT WHEN rarity_score high\nOUTPUT top-3 contributing features (rare principal | function | region/ASN\
+      \ | downstream action)"
+- question: When invoke events and execution-role downstream calls are represented as a session graph,
+    do any principal-role-resource-action relationships score as anomalous edges relative to per-entity
+    and peer-group baselines?
+  context: Graph-based modeling captures relational anomalies that flat feature analysis cannot. Represent
+    invoke events and the execution-role downstream calls as edges in a session graph and score anomalous
+    principal-role-resource-action relationships using attention-based GNN detection over cloud IAM logs
+    or the tripartite-graph CS-GAD approach (reported 2-9% FPR / 100% TPR on its open dataset). Use per-entity
+    and peer-group baselining with contributing-factor enrichment (e.g., Microsoft Sentinel UEBA), surface
+    the top-3 contributing nodes/edges in the alert, and run it in parallel with — not as a replacement
+    for — the deterministic rules. For Execution-tactic abuse, an anomalous edge such as a principal reaching
+    a sensitive resource via an unusual execution role indicates code-execution-driven lateral movement
+    or data access. A positive result names the offending nodes/edges for investigation.
+  answer_sources: *id001
+  range: Last 90 days (graph built over rolling session windows)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\nBUILD session_graph: nodes={principal, execRole, resource, action}\n  edges = invoke +\
+      \ downstream calls (invokedBy='lambda.amazonaws.com')\nSCORE edges with attention-GNN / CS-GAD tripartite\
+      \ model\nBASELINE per-entity + peer-group (UEBA)\nALERT WHEN edge_anomaly_score high\nOUTPUT top-3\
+      \ contributing nodes/edges\nRUN in parallel with deterministic execution-role rules"
+- question: After a Lambda execution, does its execution role access Secrets Manager, SSM Parameter Store,
+    sensitive S3 buckets, or outbound destinations that are not documented for that function — especially
+    for the first time, or immediately after an unusual invoke source?
+  context: 'This question detects runtime drift: behavior at execution time that diverges from the function''s
+    intended purpose. Key on downstream events where user_identity.invoked_by is lambda.amazonaws.com
+    or the user agent contains AWS_Lambda, then test whether the execution role touched secrets, parameter
+    store, sensitive S3, or undocumented egress — prioritizing first-time observations for that function
+    or runs right after an anomalous invoke source (per the Elastic Lambda-execution-role rule and the
+    AWS Threat Technique Catalog T1648 abuse model). For the Execution tactic, runtime drift indicates
+    the invoked code is doing more than its design intends — likely adversary tasking for collection or
+    credential access. A positive result should be correlated with the invoke source and VPC Flow Logs;
+    generate validation telemetry with Stratus Red Team.'
+  answer_sources: &id002
+  - CloudWatch Logs
+  - Lambda Insights metrics
+  - VPC Flow Logs
+  - CloudTrail
+  - AWS X-Ray
+  - 'NAI: Lambda functions with network access, attached execution roles with access to sensitive services,
+    and monitoring points that capture runtime logs and outbound service communication'
+  range: Last 90 days; correlate each run with its invoke event and surrounding network telemetry
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nLET ld = CloudTrail WHERE (userIdentity.invokedBy='lambda.amazonaws.com'\n  OR userAgent\
+      \ LIKE '%AWS_Lambda%')\n  AND eventName IN ('GetSecretValue','GetParameter','GetParameters',\n \
+      \     'GetParametersByPath','GetObject','ListObjects')\nLET doc = documented_access_for(functionName)\
+      \  // baseline of allowed targets/egress\nALERT WHEN ld.resource NOT IN doc\n  OR first_seen(functionName,\
+      \ ld.resource)\n  OR EXISTS unusual_invoke_source WITHIN prior 15m\nENRICH with VPC Flow Logs for\
+      \ new outbound peer/port"
+- question: Is a function's execution role making first-seen downstream API calls or reaching first-seen
+    egress destinations relative to its trailing baseline, correlated with new outbound peers/ports in
+    VPC Flow Logs?
+  context: First-seen runtime behavior is a focused novelty signal for the execution stage. Using per-role
+    first-seen-action logic (Netflix CloudTrail Anomaly Detector and Splunk's previously-unseen-user-roles
+    search) combined with VPC Flow Logs, the analyst can flag an execution role making a downstream API
+    call it has never made or egressing to a destination it has never contacted. In the Execution context,
+    a function suddenly calling a new service or beaconing to a new external peer suggests its code path
+    was altered or hijacked to perform discovery, exfiltration, or C2. A positive result — a first-seen
+    downstream call plus a matching new outbound flow — is a strong indicator of malicious execution;
+    recurring baselined behavior is benign.
+  answer_sources: *id002
+  range: Last 90 days (trailing baseline for first-seen determination)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nLET role_base = CloudTrail[-90d..-1d] WHERE invokedBy='lambda.amazonaws.com'\n  GROUP\
+      \ BY execRole, eventName\nLET egress_base = VPCFlow[-90d..-1d] GROUP BY lambda_eni, dstAddr, dstPort\n\
+      ALERT WHEN downstream(execRole).eventName NOT IN role_base\nALERT WHEN VPCFlow(lambda_eni).(dstAddr,dstPort)\
+      \ NOT IN egress_base\nJOIN both signals ON execRole/time WITHIN 15m for high-confidence"
+- question: Does a Lambda execution's runtime profile (duration, memory, function-error and downstream
+    AccessDenied rate, bytes transferred, destination diversity, traced service calls, sensitive-API calls
+    per invocation) materially exceed its historical range or that of peer functions?
+  context: Execution/egress outlier scoring quantifies how far a single run departs from normal. Baseline
+    duration, memory, error rate (both function-error and downstream AccessDenied), bytes transferred,
+    destination diversity, X-Ray-traced service calls, and sensitive-API calls per invocation for each
+    function, then escalate runs whose runtime, outbound connection count, or secret-access volume exceeds
+    historical or peer norms. Use robust MAD-based modified Z-score thresholds and CloudWatch band-based
+    alarms, and treat downstream denial bursts as a distinct signal. For the Execution tactic, an outlier
+    run — long duration, heavy egress, or many secret reads — indicates the code performed work beyond
+    its design, such as bulk collection or exfiltration. A positive result flags the deviating metric(s)
+    for triage; within-band runs are normal.
+  answer_sources: *id002
+  range: Last 90 days (trailing baseline; peer-function comparison)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nFOR each functionName per invocation:\n  m = [duration, memory_used, function_error_rate,\
+      \ downstream_accessdenied_rate,\n       bytes_out, dst_diversity, traced_service_calls, sensitive_api_calls]\n\
+      \  med=median(m,30d); madv=MAD(m,30d); Mi=0.6745*(x-med)/madv\n  ALERT WHEN abs(Mi)>3.5 FOR any\
+      \ metric OR x>peer_p95\nTREAT downstream AccessDenied burst as separate alert (median-derived threshold)\n\
+      CORRELATE via CloudWatch band-based alarms"
+- question: Do CloudWatch function logs for an invocation show a spike in shell-like command tokens, environment-enumeration
+    strings, or exception bursts — a log vocabulary and sequence length that depart sharply from the function's
+    normal profile?
+  context: Command-like log burst detection inspects the content of execution logs for signs of interactive/adversary
+    tasking. Measure the rate of shell-like command tokens (e.g., curl, /bin/sh, base64, whoami, env),
+    environment-enumeration strings, and exception bursts in CloudWatch logs per invocation, plus the
+    plausibility of the log-event sequence, then flag runs whose log vocabulary and sequence length deviate
+    from the function's normal profile. Apply seasonal robust thresholds (Seasonal Hybrid ESD) where log
+    volume is periodic. In the Execution context, a function that normally emits structured business logs
+    suddenly emitting shell/enumeration tokens strongly suggests injected or hijacked code performing
+    discovery/collection. A positive result is a high-priority lead; routine log content is benign.
+  answer_sources: *id002
+  range: Last 90 days; per-invocation log analysis with seasonal thresholds
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nFOR each invocation's CloudWatch log stream:\n  cmd_tokens = count(tokens IN ['/bin/sh','curl','wget','base64','whoami','env',\n\
+      \               'cat /etc','aws sts','export AWS_'])\n  exc_burst = count(stacktrace|exception lines)\n\
+      \  seq_len = log_event_count\n  baseline via SeasonalHybridESD per function (periodic volume)\n\
+      ALERT WHEN cmd_tokens>0 above baseline OR exc_burst>>norm OR seq_len anomalous"
+- question: Do a function's CloudWatch log-event sequences and post-invoke CloudTrail event order contain
+    out-of-distribution next events, command-like activity, or anomalous parameters (new egress destinations,
+    secret access, unusual argument values) when modeled as expected execution behavior?
+  context: A runtime anomaly classifier learns each function's expected behavioral sequence and flags
+    deviations holistically. Model expected CloudWatch log-event sequences and post-invoke CloudTrail
+    event order with an LSTM such as DeepLog, flagging out-of-distribution next events, command-like activity,
+    and anomalous parameters (new egress destinations, secret access, unusual argument values). Combine
+    X-Ray-traced service calls and network features, corroborate with cross-service graph scoring (CS-GAD)
+    and rare-call population analysis (Elastic CloudTrail ML), and keep the deterministic runtime-drift
+    rule active in parallel. For the Execution tactic, an out-of-distribution execution sequence indicates
+    the invoked code deviated from its learned-normal path — a sign of adversary tasking. A positive result
+    must surface the top-3 contributing features (novel service combination, new egress path, command-like
+    log token) for the analyst.
+  answer_sources: *id002
+  range: Last 90 days (LSTM trained on per-function normal sequences)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\nTRAIN DeepLog LSTM ON per-function CloudWatch log-event sequences + post-invoke CloudTrail\
+      \ order\nINPUT features: log_event_keys, next_event, params(egress_dst, secret_access, arg_values),\n\
+      \  X-Ray traced service calls, network features\nALERT WHEN next_event out-of-distribution OR param\
+      \ anomaly\nCORROBORATE with CS-GAD cross-service graph + Elastic rare-call analysis\nOUTPUT top-3\
+      \ features (novel service combo | new egress | command-like token)\nKEEP deterministic runtime-drift\
+      \ rule in parallel"
