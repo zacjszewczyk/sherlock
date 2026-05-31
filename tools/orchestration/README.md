@@ -4,6 +4,10 @@ Self-contained tooling that **generates** and **reviews** the Sherlock analysis-
 corpus (`techniques/**/*.yaml`) in parallel from the Watson analytic-plan corpus
 (`../watson/techniques/**/*.json`), with atomic locking and per-playbook git commits.
 
+This orchestration design (atomic `mkdir` claim-locking, serial harvester, marker
+state machine, defensive POLICYBLOCK remediation) is adapted from the Watson
+deep-research pipeline — see `../../../watson/tools/orchestration/README.md`.
+
 There are **two agentic pipelines** plus **three deterministic helper tools**:
 
 | Pipeline | What it does | Driver | Agent model |
