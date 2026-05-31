@@ -1,0 +1,308 @@
+name: 'T0813: Denial of Control'
+id: 906226a9-6cbb-4a61-b677-2a9c214d75d0
+description: Investigate potential Denial of Control activity in which an adversary temporarily prevents
+  operators and engineers from interacting with process controls. This playbook helps an analyst determine
+  whether a critical ICS asset (PLC, RTU, HMI, SCADA server, or engineering workstation) is being subjected
+  to a denial of service flood toward ICS protocol ports, a barrage of unauthorized or out-of-spec high-risk
+  control commands, or operator-facing HMI/SCADA software crashes preceded by hostile network activity.
+  It correlates network telemetry (Zeek conn/modbus/s7comm/dnp3/files/dce_rpc/rdp logs), endpoint and
+  identity telemetry (Windows logon, process creation, and application error/hang events), and process-state
+  telemetry to confirm whether operators have lost the ability to observe or command the process, while
+  the underlying process may still be running in an undesired state. Detection combines deterministic
+  allowlist/specification rules, statistical baselining and change detection, and unsupervised/supervised
+  machine-learning models.
+type: technique
+related:
+- tactic_id: TA0105
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is an external or non-whitelisted source flooding an ICS protocol port on a critical asset
+    with half-open, rejected, or reset connections?
+  context: 'A denial of control can be achieved by exhausting the limited connection and processing resources
+    of a PLC, RTU, or SCADA server. Because ICS traffic is highly predictable and asset peers are well
+    known, a deny-by-default conduit ACL (per Purdue segmentation in NIST SP 800-82r3) makes a flood easy
+    to spot: a source IP that is not on the External_Comms_Whitelist opening a large number of connections
+    (conn_state S0/REJ/RSTO) to a Critical_ICS_Asset on a known ICS port (502 Modbus, 20000 DNP3, 102
+    S7Comm, 44818 EtherNet/IP) within a short window is almost certainly hostile. Extend the rule with
+    semantic/specification checks that also flag malformed or out-of-spec ICS PDUs (illegitimate function
+    codes, register ranges, or flow direction). A positive result means an active resource-exhaustion
+    attempt against control; tune the per-asset threshold from the asset''s observed peak legitimate connection
+    rate to keep false positives low.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network boundary points of Level 1 (Control) and Level 2 (Supervisory) ICS network segments,
+    including firewalls and network taps monitoring traffic to PLCs, RTUs, HMIs, and SCADA servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      FROM zeek_conn
+      WHERE id.resp_h IN Critical_ICS_Assets
+        AND id.resp_p IN (502, 20000, 102, 44818)
+        AND conn_state IN ('S0','REJ','RSTO')
+        AND id.orig_h NOT IN External_Comms_Whitelist
+      GROUP BY id.orig_h, id.resp_h, bucket(ts, 60s)
+      HAVING count(*) > per_asset_threshold  // derive from peak legitimate rate
+      OR malformed_pdu = true  // illegal function code / register range / direction
+      => alert 'ICS protocol flood / out-of-spec PDU'
+- question: Is there a connection or byte-rate surge to a critical ICS asset accompanied by a collapse
+    in source-IP entropy?
+  context: 'Distributed or spoofed-source floods produce a characteristic signature: traffic volume spikes
+    while the diversity (Shannon entropy) of source addresses and ports collapses, because many connections
+    concentrate from a small set of sources (Lakhina et al.). Maintain a 30-day baseline of 5-minute rolling
+    averages for connection_count, sum(orig_bytes), and the entropy of source IPs and ports per critical
+    asset. Alerting when volume exceeds its 99th percentile by 5x while source-IP entropy concurrently
+    drops below its 10th percentile for two consecutive intervals isolates a denial flood from a benign
+    busy period. A positive result indicates a volumetric attack capable of starving the operator''s ability
+    to command the asset.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network boundary points of Level 1 (Control) and Level 2 (Supervisory) ICS network segments,
+    including firewalls and network taps monitoring traffic to PLCs, RTUs, HMIs, and SCADA servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline = rolling_5m(conn_count, sum(orig_bytes), entropy(id.orig_h), entropy(id.orig_p)) over 30d per asset
+      ALERT WHEN (conn_count > p99(conn_count)*5 OR sum(orig_bytes) > p99(bytes)*5)
+        AND entropy(id.orig_h) < p10(entropy_orig_h)
+        FOR 2 consecutive 5m intervals
+- question: Are connection failure-state ratios or ICS exception/failed-command rates spiking, or is control
+    throughput sustaining an abnormal drop?
+  context: Denial of control often shows up as failure-mode signals rather than raw volume. Profile per-asset
+    ratios of half-open/rejected/reset connections (ratio_S0, ratio_REJ, ratio_RSTO) and Modbus/DNP3 exception
+    or failed-command rates, alerting when any exceeds its 99th-percentile baseline. To catch a slow,
+    sustained loss of control throughput that brief threshold rules miss, run a nonparametric CUSUM change
+    detector on the residual between observed and expected per-minute command/response throughput (Chamanbaz
+    et al.), tuned to a target false-alarm rate. A positive result means the asset is failing to service
+    legitimate control transactions, i.e., operators are effectively losing control even if some traffic
+    still flows.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network boundary points of Level 1 (Control) and Level 2 (Supervisory) ICS network segments,
+    including firewalls and network taps monitoring traffic to PLCs, RTUs, HMIs, and SCADA servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      per asset compute ratio_S0, ratio_REJ, ratio_RSTO, exception_rate per minute
+      ALERT WHEN any ratio > p99(baseline_30d)
+      residual = observed_throughput - expected_throughput
+      CUSUM(residual) > h  // drift k and threshold h tuned to target FAR
+      => alert 'sustained control-throughput denial'
+- question: Does an unsupervised time-series model flag anomalous traffic behavior on a critical ICS asset
+    consistent with a denial flood?
+  context: Deterministic and statistical rules can miss novel or low-and-slow floods. An unsupervised
+    time-series anomaly detector (LSTM autoencoder, or an online ensemble such as Kitsune/KitNET) trained
+    on at least 30 days of per-minute normal aggregations per asset learns the multivariate shape of legitimate
+    traffic. Features include log10(sum(orig_bytes)), log10(connection_count), entropy of source IPs and
+    ports, and ratios of S0/REJ connections. Trigger when reconstruction error exceeds a dynamic threshold
+    (e.g., 3 SD above mean) for more than 3 consecutive minutes and surface the top-3 error-contributing
+    features. Run this in parallel with the deterministic rules and continually evaluate against unseen
+    attack types, since ML IDS degrade on novel attacks (Wolsing et al.). A positive result is corroborating,
+    not conclusive on its own.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network boundary points of Level 1 (Control) and Level 2 (Supervisory) ICS network segments,
+    including firewalls and network taps monitoring traffic to PLCs, RTUs, HMIs, and SCADA servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      model = LSTM_autoencoder.fit(per_minute_features_30d_per_asset)
+      features = [log10(orig_bytes), log10(conn_count), entropy(orig_h), entropy(orig_p), ratio_S0, ratio_REJ]
+      err = reconstruction_error(model, live_window)
+      ALERT WHEN err > mean+3*sd FOR >3 consecutive minutes WITH top3_feature_attribution
+- question: Does process-state telemetry show frozen, stale, or off-nominal physical state while operators
+    cannot intervene?
+  context: 'The physical consequence of a denial of control is the most direct confirmation: the process
+    keeps running but operators can no longer observe or adjust it, leaving sensor/actuator values frozen,
+    stale, or drifting off-nominal, and expected periodic HMI/SCADA polling responses stop arriving. Train
+    a 1D-CNN (Kravchik and Shabtai) or Seq2Seq predictor (Kim et al.) on normal sensor/actuator and HMI-update
+    telemetry, then alert when reconstruction/prediction error spikes or expected responses cease, localizing
+    the affected measurement points and attaching SHAP-style top-contributing-signal explanations. A positive
+    result confirms operational impact and helps scope which part of the process lost control, complementing
+    network-layer detection.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network boundary points of Level 1 (Control) and Level 2 (Supervisory) ICS network segments,
+    including firewalls and network taps monitoring traffic to PLCs, RTUs, HMIs, and SCADA servers.'
+  range: Last 90 days; center analysis on the suspected control-loss window
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      model = Seq2Seq_or_1DCNN.fit(normal_sensor_actuator_HMI_update_telemetry)
+      ALERT WHEN prediction_error(live) spikes OR expected_HMI_poll_response missing
+      localize affected measurement points; attach SHAP top-signal explanation
+- question: Is a high-risk ICS control command being issued from a source, user, or process that is not
+    on the authorized allowlist (or is malformed/out-of-range)?
+  context: An adversary can deny control by issuing high-risk commands that stall or lock a controller,
+    such as Modbus write function codes 5/6/15/16, an S7Comm 'Stop CPU' job, or a DNP3 'Operate'. Query
+    the ICS protocol logs for these commands and correlate the source IP with Windows logon (4624) and
+    process creation (4688) to resolve the originating user and process. Alert when the tuple (User, Workstation_IP,
+    Process_Name, Target_PLC_IP, Command_Type) is not on a pre-defined allowlist of authorized operations,
+    following least-privilege/command-allowlisting guidance in NIST SP 800-82r3. Encode allowed function
+    codes, source->destination relationships, and register ranges as semantic specification rules to also
+    flag malformed or out-of-range control writes. A positive result is strong evidence of unauthorized
+    manipulation of control.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek modbus.log
+  - Zeek s7comm.log
+  - Zeek dnp3.log
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - 'NAI: Engineering Workstations (EWS), Human-Machine Interfaces (HMIs), SCADA servers, and network
+    taps monitoring Level 2 (Supervisory) to Level 1 (Control) network traffic, as well as Active Directory/Identity
+    Management systems for user authentication.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      high_risk = modbus.func IN (5,6,15,16) OR s7comm.job='StopCPU' OR dnp3.func='Operate'
+      JOIN win_4624, win_4688 ON id.orig_h -> (user, process)
+      ALERT WHEN (user, workstation_ip, process, target_plc_ip, command_type) NOT IN AuthorizedOps_Allowlist
+        OR function_code/register_range OUT OF spec
+- question: Is a control command sequence statistically improbable, issued outside normal hours, or arriving
+    at an abnormal rate?
+  context: Even from authorized sources, the pattern of commands betrays abuse. For each authorized (User,
+    Workstation, Target_PLC) triplet, build a 90-day baseline of command 3-gram probabilities and the
+    time-of-day/day-of-week distribution for command issuance (PRI-IDS, Marsden et al.). Alert if a command
+    sequence falls below the 1st percentile of historical probability, if a high-risk command is issued
+    more than 2 SD outside typical operational hours, or if the rate of write/operate commands exceeds
+    the asset's 99th-percentile baseline (a command-flood denial). Also track failed/exception command
+    responses per source as a distinct denial signal. A positive result suggests either a hijacked session
+    or an automated burst designed to overwhelm the controller.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek modbus.log
+  - Zeek s7comm.log
+  - Zeek dnp3.log
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - 'NAI: Engineering Workstations (EWS), Human-Machine Interfaces (HMIs), SCADA servers, and network
+    taps monitoring Level 2 (Supervisory) to Level 1 (Control) network traffic, as well as Active Directory/Identity
+    Management systems for user authentication.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      baseline per (user, workstation, target_plc): 3gram_prob, hour_of_day dist, cmd_rate
+      ALERT WHEN seq_prob < p1(historical)
+        OR high_risk_cmd issued > 2sd outside normal hours
+        OR write_operate_rate > p99(baseline)
+        OR exception_response_rate elevated
+- question: Does an unsupervised clustering / UEBA model flag a control session as an outlier?
+  context: To catch novel abuse patterns, profile historical ICS command sessions (a session = commands
+    from one user/workstation to one PLC within a 15-minute window) with an unsupervised clustering model
+    such as DBSCAN inside a UEBA framework, using features command_count, read_write_ratio, command_type_entropy,
+    and mean_inter_command_time. Alert when a new session is a noise point (outlier). Complement with
+    a supervised Random-Forest classifier on Modbus/OPC-UA flow features whose feature-importance surfaces
+    the top-3 contributing features per alert. Keep the deterministic allowlist as the floor and validate
+    against unseen attacks, since ML coverage drops on novel attacks (Wolsing et al.). A positive result
+    identifies a behaviorally anomalous control session warranting analyst review.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek modbus.log
+  - Zeek s7comm.log
+  - Zeek dnp3.log
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - 'NAI: Engineering Workstations (EWS), Human-Machine Interfaces (HMIs), SCADA servers, and network
+    taps monitoring Level 2 (Supervisory) to Level 1 (Control) network traffic, as well as Active Directory/Identity
+    Management systems for user authentication.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      session = commands(user, workstation, plc) within 15m
+      features = [command_count, read_write_ratio, command_type_entropy, mean_inter_command_time]
+      DBSCAN.fit(historical_sessions); ALERT WHEN new_session is noise_point
+      RandomForest classifier -> top3 feature importance per alert
+- question: Did an HMI or SCADA application crash or hang immediately after hostile or unexpected network
+    activity toward that workstation?
+  context: Crashing the operator's HMI/SCADA client is a direct way to deny control. Trigger on Windows
+    Event ID 1000 (application crash) or 1002 (hang) where Faulting_Application_Name matches a list of
+    critical HMI/SCADA executables, then query Zeek logs for the 5 minutes preceding the event for the
+    affected host. Escalate to high severity if that window reveals a connection from a threat-intel blocklisted
+    IP, an executable/script transfer (.exe, .dll, .ps1) from an untrusted source in files.log, or unauthorized
+    dce_rpc/rdp activity. Operator workstations should only talk to documented peers per the NIST SP 800-82r3
+    baseline, so any new conduit preceding a crash is corroborating evidence of an exploit or DoS rather
+    than a routine software fault.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1002
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dce_rpc.log
+  - Zeek rdp.log
+  - 'NAI: Operator workstations (Level 2), Human-Machine Interfaces (HMIs), Engineering Workstations (EWS),
+    and network taps monitoring traffic to and from these critical endpoints within the ICS network.'
+  range: Last 90 days; pivot to the 5 minutes preceding each crash/hang event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ON win_event IN (1000,1002) WHERE faulting_app IN Critical_HMI_Executables
+      LOOKBACK 5m zeek for host_ip:
+        conn from blocklisted_ip OR files.log transfer of (.exe,.dll,.ps1) from untrusted
+        OR unauthorized dce_rpc / rdp
+      => escalate HIGH 'HMI crash with hostile precursor traffic'
+- question: In the minutes before an HMI crash, did connection rate or payload-size entropy to that host
+    spike above baseline?
+  context: Upon an HMI software crash (Event ID 1000/1002), automatically analyze the preceding 5 minutes
+    of Zeek conn.log traffic to that host. For each source IP, compute the connection rate and the Shannon
+    entropy of payload sizes (orig_bytes) and compare to a 30-day rolling baseline for that source-destination
+    pair; floods and malformed bursts manifest as a rate spike with anomalous feature entropy (Lakhina
+    et al.). Alert if payload entropy or connection rate exceeds its 99th percentile, and separately profile
+    the rate of rejected/reset connections to the HMI as a distinct failure-mode denial signal. A positive
+    result links the crash to a network-borne trigger, distinguishing a deliberate denial from an unrelated
+    application bug.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1002
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dce_rpc.log
+  - Zeek rdp.log
+  - 'NAI: Operator workstations (Level 2), Human-Machine Interfaces (HMIs), Engineering Workstations (EWS),
+    and network taps monitoring traffic to and from these critical endpoints within the ICS network.'
+  range: Last 90 days; analyze the 5 minutes preceding each crash
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      ON HMI crash -> window = preceding 5m of conn.log to host
+      per source_ip: conn_rate, entropy(orig_bytes), ratio_REJ_RSTO
+      baseline = rolling_30d per (src,dst)
+      ALERT WHEN conn_rate > p99 OR entropy(orig_bytes) > p99 OR reject_rate elevated
+- question: Does a supervised model predict that current traffic to an HMI is likely to precede a crash?
+  context: Proactively, a supervised classifier (Gradient Boosting / Random Forest) can be trained to
+    predict whether a 60-second window of network traffic will precede an HMI crash. Label historical
+    crash events as 1 and benign windows as 0, using conn.log features total_bytes, connection_count,
+    avg_duration, entropy_of_source_ips, and ratio_of_rejected_connections. Score live traffic to HMIs
+    and alert when predicted crash probability exceeds a threshold (e.g., 0.90), surfacing the top-3 contributing
+    features via feature-importance/SHAP. Because supervised models miss unseen attack patterns (Wolsing
+    et al.), run this alongside the deterministic crash+precursor correlation rule rather than replacing
+    it. A positive result is an early warning that lets defenders act before the operator loses the HMI.
+  answer_sources:
+  - Windows Event ID 1000
+  - Windows Event ID 1002
+  - Zeek conn.log
+  - Zeek files.log
+  - Zeek dce_rpc.log
+  - Zeek rdp.log
+  - 'NAI: Operator workstations (Level 2), Human-Machine Interfaces (HMIs), Engineering Workstations (EWS),
+    and network taps monitoring traffic to and from these critical endpoints within the ICS network.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: |-
+      label: crash_window=1, benign_window=0 (60s windows)
+      features = [total_bytes, connection_count, avg_duration, entropy_of_source_ips, ratio_of_rejected_connections]
+      model = GradientBoosting/RandomForest.fit(...)
+      score live HMI traffic; ALERT WHEN P(crash) > 0.90 WITH top3 feature importance
