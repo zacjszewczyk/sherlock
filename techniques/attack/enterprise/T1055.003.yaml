@@ -1,0 +1,1506 @@
+name: 'T1055.003: Process Injection: Thread Execution Hijacking'
+id: 859d946f-b524-43c3-9a9f-a85f1326b015
+description: This playbook helps an analyst investigate Process Injection via Thread Execution Hijacking
+  (T1055.003), where an adversary suspends a live process and overwrites/redirects an existing thread
+  (the OpenThread->SuspendThread->VirtualAllocEx->WriteProcessMemory->SetThreadContext->ResumeThread chain)
+  to run code under a trusted process for defense evasion and privilege escalation. It guides examination
+  of Sysmon process-access (EID10), process-modification/CreateRemoteThread (EID8), and process-creation
+  (EID1/4688) telemetry for hijack access masks and integrity bridging; correlation of injection events
+  with credential-store access (SAM/LSA/LSASS), anomalous child-shell spawns, and first-in-lifetime behavior;
+  and network analysis (Zeek conn/ssl/dns) for post-hijack C2, rare destinations, non-standard ports,
+  DGA-like DNS, and zero-argument system processes making connections. It combines symbolic-logic rules,
+  statistical baselining, and explainable/anomaly ML to determine whether an adversary has injected code
+  into and elevated privileges through a hijacked thread.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is any process whose file hash matches a threat-intelligence indicator opening a handle to
+    a higher-integrity target process with thread-hijack access rights (PROCESS_VM_WRITE 0x0020, PROCESS_VM_OPERATION
+    0x0008, PROCESS_SUSPEND_RESUME 0x0800, PROCESS_SET_INFORMATION/SET_CONTEXT 0x0010, or full 0x1F0FFF)
+    in Sysmon Event ID 10?
+  context: 'Join Sysmon EID10 process-access records against your TI hash feeds (MD5/SHA1/SHA256 of SourceImage)
+    and flag any hash-matched source that requests memory-write or thread-control rights against a higher-integrity
+    target. These exact access masks correspond to the documented OpenThread->SuspendThread->WriteProcessMemory->SetThreadContext->ResumeThread
+    hijack chain. Exclude verified EDR agents and debuggers, which legitimately request such rights. A
+    positive match is a high-confidence indicator of code injection by a known-bad tool; a negative result
+    does not clear the host because unknown/custom tooling will not match the feed. In the context of
+    the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Join Sysmon Event ID
+    10 process-access logs with TI hash feeds and alert when a hash-matched SourceImage requests a higher-integrity
+    TargetImage with thread-hijack access masks (0x0020 VM_WRITE, 0x0008 VM_OPERATION, 0x0800 SUSPEND_RESUME,
+    0x0010 SET_CONTEXT, or full 0x1F0FFF), excluding verified EDR/debuggers. These masks correspond to
+    the documented OpenThread->SuspendThread->WriteProcessMemory->SetThreadContext->ResumeThread chain
+    ([Process Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1);
+    [Sysmon CreateRemoteThread Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| eval mask=lower(GrantedAccess)\n| join SourceImageHash [ inputlookup\
+      \ ti_malicious_hashes ]\n| where match(mask,\"0x1f0fff|0x0020|0x0008|0x0800|0x0010\")\n  AND TargetIntegrity\
+      \ > SourceIntegrity\n  AND NOT SourceImage IN (edr_allowlist, debugger_allowlist)\n| alert"
+- question: Did a non-allowlisted or TI-matched source process make repeated ACCESS_DENIED OpenProcess/OpenThread
+    attempts (status != 0) against high-integrity targets shortly before a successful write/thread-control
+    handle was granted?
+  context: 'Treat denied access attempts as a distinct probing State signal: an adversary often iterates
+    over requested rights until the OS grants a usable handle. Alert when three or more denied attempts
+    by the same source against high-integrity targets precede a successful write-mask grant inside a 60-second
+    window. This pattern reveals handle-rights probing that single-event rules miss. A positive result
+    indicates deliberate enumeration of injectable processes; benign software rarely retries access after
+    denial. In the context of the Stealth tactic (TA0005), this directly supports the mission question
+    "Has the adversary elevated privileges using thread execution hijacking?" Source method (Symbolic
+    Logic): Treat ACCESS_DENIED (status!=0) OpenProcess/OpenThread attempts by a hash-matched or non-allowlisted
+    SourceImage against high-integrity targets as a distinct State signal; alert when >=3 denied attempts
+    precede a successful write-mask grant within 60s, indicating handle-rights probing ([Sysmon CreateRemoteThread
+    Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Sysmon EventCode=10\n| eval denied=if(GrantedStatus!=0,1,0)\n| streamstats time_window=60s\
+      \ count(eval(denied=1)) as denies by SourceProcessGUID,TargetImage\n| where denies>=3 AND GrantedStatus=0\
+      \ AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage IN (allowlist)\n| alert"
+- question: Across the fleet, is a lower-integrity process opening a higher-integrity process with memory-write/thread-control
+    rights using a (SourceImage, TargetImage, GrantedAccess) tuple that is below the 1st percentile of
+    historical prevalence?
+  context: 'Maintain a fleet-wide prevalence baseline of distinct (SourceImage, TargetImage, GrantedAccess)
+    edges. Cross-process access with write/thread-control rights is rare in benign software, so a first-seen
+    or very-low-frequency edge that also crosses an integrity boundary upward is suspicious. Score by
+    frequency/volume of distinct source->target edges and alert below the 1st percentile. Positive results
+    surface novel injection relationships even when no hash or signature matches; tune the baseline window
+    per host role to limit noise. In the context of the Stealth tactic (TA0005), this directly supports
+    the mission question "Has the adversary elevated privileges using thread execution hijacking?" Source
+    method (Statistical Method): Maintain a fleet-wide prevalence baseline of (SourceImage, TargetImage,
+    GrantedAccess) tuples; alert when a lower-integrity process opens a higher-integrity process with
+    write/thread-control rights and the tuple is below the 1st percentile (Frequency/Volume of distinct
+    source->target edges) ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Sysmon EventCode=10 earliest=-90d\n| stats count as edge_count by SourceImage,TargetImage,GrantedAccess\n\
+      | eventstats perc1(edge_count) as p1\n| where edge_count<=p1 AND match(GrantedAccess,\"0x0020|0x0010|0x0800\"\
+      )\n  AND TargetIntegrity>SourceIntegrity\n| alert"
+- question: When a Gradient Boosting/Random Forest model scores a Sysmon EID10 access event as likely
+    thread-injection, what are the top-3 SHAP-explained features (e.g., VirtualAllocEx/WriteProcessMemory/SetThreadContext
+    presence, integrity delta, TI flag) driving the score?
+  context: 'Train an explainable classifier (Gradient Boosting or Random Forest) on labeled EID10 features:
+    source/target image, integrity levels, GrantedAccess bits, parent process lineage, TI flag, and call-stack/module
+    backing. Emit the top-3 SHAP contributors in each alert so an analyst can immediately judge why the
+    event scored high. This catches injection variants that evade static rules while keeping the verdict
+    interpretable. A high score with hijack-API features and an integrity bridge is strong evidence; low-confidence
+    scores should be triaged with the supporting symbolic-logic rules. In the context of the Stealth tactic
+    (TA0005), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Machine Learning): Train Gradient Boosting/Random Forest
+    on EID10 features (Source/Target image, integrity levels, GrantedAccess bits, parent process, TI flag,
+    call-stack backing) and emit the top-3 SHAP features (e.g., VirtualAllocEx/WriteProcessMemory/SetThreadContext
+    presence) in the alert text ([Hybrid CNN-GRU with LIME/SHAP, PeerJ](https://peerj.com/articles/cs-3258/);
+    [Detecting Injection via ETW Memory Analysis, Springer](https://link.springer.com/article/10.1007/s10207-024-00836-w)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = extract(EID10: source_img,target_img,src_IL,tgt_IL,granted_bits,parent,ti_flag,callstack_backed)
+
+      score = gbm.predict_proba(features)
+
+      if score>=0.85: alert(top3=shap(features), event=EID10)'
+- question: Does a single SourceProcessGUID produce multiple Sysmon EID10 events against the same TargetProcessGUID
+    within ~2 seconds requesting suspend (0x0800/0x0002), memory write (0x0020), and context set (0x0010)
+    in the canonical suspend->write->setcontext->resume order?
+  context: 'Rather than alerting on any single access mask (which is noisy), require the ordered burst
+    that defines thread execution hijacking: a rapid sequence of suspend, write, set-context, and resume
+    against one target by one source inside a 2-second window, excluding allowlisted debuggers/EDR. This
+    unified-ordering requirement strongly suppresses benign single-API noise and isolates the actual hijack
+    primitive. A positive match is a near-definitive behavioral signature of T1055.003. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Alert when a SourceProcessGUID
+    produces multiple EID10 entries for the same TargetProcessGUID within 2s requesting suspend (0x0800/0x0002),
+    memory write (0x0020), and context set (0x0010), excluding allowlisted debuggers/EDR. Require the
+    unified ordering (suspend->write->setcontext->resume) rather than any single mask to suppress benign
+    single-API noise ([Can You Run My Code?, ACM](https://dl.acm.org/doi/10.1145/3708821.3736206); [Process
+    Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| transaction SourceProcessGUID,TargetProcessGUID maxspan=2s\n\
+      | where like_seq(GrantedAccess,[suspend 0x0800,write 0x0020,setcontext 0x0010])\n  AND NOT SourceImage\
+      \ IN (debugger_allowlist,edr_allowlist)\n| alert"
+- question: Is a Sysmon EID8 (CreateRemoteThread) or resumed thread starting at an address in unbacked,
+    private RWX memory that is not mapped to any module on disk, in conjunction with cross-process EID10
+    access?
+  context: 'Cross-reference EID8 CreateRemoteThread and EID10 access events and inspect the new/resumed
+    thread''s StartAddress. A start address in private, executable, unbacked memory (not file-mapped)
+    is a hallmark of injected shellcode, since legitimate threads start in module-backed code. Cross-process
+    thread manipulation is itself rare in benign software. A positive result strongly indicates injected
+    execution; pair it with the source-process lineage to scope the intrusion. In the context of the Stealth
+    tactic (TA0005), this directly supports the mission question "Has the adversary elevated privileges
+    using thread execution hijacking?" Source method (Symbolic Logic): Cross-reference EID8 (CreateRemoteThread)
+    and EID10 where the new/resumed thread StartAddress lies in unbacked (private RWX) memory not mapped
+    to a module on disk; cross-process thread manipulation is rare in benign software ([Sysmon CreateRemoteThread
+    Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md);
+    [Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon (EventCode=8 OR EventCode=10)
+
+      | eval unbacked=if(StartAddressModule="" AND MemProtect="RWX" AND MemType="private",1,0)
+
+      | where unbacked=1 AND SourceProcessGUID!=TargetProcessGUID
+
+      | alert'
+- question: Is a non-administrative process exceeding mean+3*std in EID10 events-per-minute, or showing
+    a >3-std jump in the 5-minute rolling Shannon entropy of its GrantedAccess codes, indicating a burst
+    of varied access rights?
+  context: 'Baseline per-process EID10 volume (events/min) and rolling entropy of GrantedAccess values.
+    A hijack produces a short burst of distinct access rights (suspend, write, set-context, resume), which
+    spikes both event rate and entropy for a process that is normally quiet. Alert on either signal exceeding
+    3 standard deviations. This statistical view catches injection even when individual masks look benign;
+    expect tuning against admin tools and backup agents. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Statistical Method): Baseline per-process EID10 Volume (events/min) and
+    5-minute rolling entropy of GrantedAccess codes; alert when a non-admin tool exceeds mean+3*std event
+    rate OR entropy jumps >3 std, capturing the burst of distinct access rights during a hijack ([Threat
+    Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10
+
+      | bin _time span=1m
+
+      | stats count as vol dc(GrantedAccess) as variety by SourceImage,_time
+
+      | eventstats avg(vol) as m stdev(vol) as s by SourceImage
+
+      | where vol>m+3*s OR variety_entropy_jump>3*s
+
+      | alert'
+- question: When an LSTM/HMM trained on benign (EventID, GrantedAccess, TargetImage) sequences flags a
+    high-reconstruction-error or low-likelihood sequence, what offending n-gram of API steps characterizes
+    the anomalous hijack chain?
+  context: 'Train a sequence model (LSTM autoencoder or HMM) on benign ordered tuples of (EventID, GrantedAccess,
+    TargetImage). Hijack chains produce sequences that the model reconstructs poorly or assigns low likelihood.
+    Surface the specific n-gram of API steps that drove the anomaly so analysts can confirm the suspend->write->setcontext->resume
+    motif. This detects novel orderings and obfuscated variants; high reconstruction error warrants correlation
+    with the symbolic-logic rules above. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Machine Learning): Train an LSTM/HMM on benign (EventID, GrantedAccess, TargetImage)
+    sequences and flag high reconstruction error / low-likelihood sequences as anomalous hijack chains;
+    surface the offending n-gram of API steps in the alert ([LSTM Sequential Model for Windows API Calls,
+    PeerJ](https://peerj.com/articles/cs-285/); [Detecting Intrusions Using System Calls, IEEE](https://ieeexplore.ieee.org/document/766910)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = order_by_time(EID10/EID8 tuples: (eventid,granted,target) per SourceProcessGUID)
+
+      err = lstm_ae.reconstruction_error(seq)
+
+      if err>threshold: alert(offending_ngram=argmax_window(err), source=SourceProcessGUID)'
+- question: Does a Low or Medium integrity source process successfully obtain a handle to a High or System
+    integrity target with memory-write (0x0020), thread-context (0x0010), or suspend/resume (0x0800) rights?
+  context: 'These access masks are the privilege-bridging primitives of thread hijacking: writing into
+    and steering a higher-privileged process is how the adversary gains its context. Trigger when the
+    source integrity level is below the target and the granted rights include write/context/suspend. Positive
+    results directly answer whether privilege escalation via injection is being attempted; exclude legitimate
+    elevation brokers and EDR to reduce false positives. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Symbolic Logic): Trigger when EID10 shows Source IL Low/Medium targeting
+    High/System with GrantedAccess for memory write (0x0020), thread context (0x0010), or suspend/resume
+    (0x0800); these are the privilege-bridging primitives of thread hijacking ([Process Injection (Part
+    1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1); [Process Injection T1055
+    Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| where SourceIntegrity IN (\"Low\",\"Medium\") AND TargetIntegrity\
+      \ IN (\"High\",\"System\")\n  AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage\
+      \ IN (allowlist)\n| alert"
+- question: Per host role, is there a (SourceIL, TargetIL, GrantedAccess) integrity-transition combination
+    involving write/execute permissions that has less than 0.01% historical probability, especially a
+    first-seen source->target integrity edge?
+  context: 'Baseline integrity-transition distributions per host role (workstation, app server, DC). Upward
+    integrity transitions carrying write/execute rights are inherently rare; alert on combinations below
+    0.01% probability and prioritize first-seen edges. This statistically isolates the privilege-escalation
+    moment of a hijack without relying on signatures. A positive result is a strong escalation indicator;
+    calibrate the baseline separately per role since admin tooling differs by host type. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Statistical Method): Baseline (SourceIL,
+    TargetIL, GrantedAccess) distributions per host role and alert on combinations with <0.01% historical
+    probability that involve write/execute permissions, prioritizing first-seen source->target integrity
+    edges ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10 earliest=-90d
+
+      | stats count by host_role,SourceIntegrity,TargetIntegrity,GrantedAccess
+
+      | eventstats sum(count) as tot by host_role
+
+      | eval prob=count/tot
+
+      | where prob<0.0001 AND match(GrantedAccess,"0x0020|0x0010")
+
+      | alert'
+- question: When an Isolation Forest / One-Class SVM trained only on benign EID10 access flags an outlier
+    over (SourceIL, TargetIL, GrantedAccess, source-prevalence), which feature deltas explain the anomaly?
+  context: 'Fit an unsupervised outlier model (Isolation Forest or One-Class SVM) on benign-only EID10
+    access vectors and score new events; rare combinations of integrity levels, granted rights, and low
+    source prevalence surface as outliers. Report the contributing feature deltas so the analyst can see,
+    for example, an unusually low-prevalence source bridging an integrity gap. This catches escalation
+    attempts that evade rule thresholds; outliers should be corroborated with the deterministic integrity-escalation
+    rule. In the context of the Stealth tactic (TA0005), this directly supports the mission question "Has
+    the adversary elevated privileges using thread execution hijacking?" Source method (Machine Learning):
+    Apply Isolation Forest / One-Class SVM (trained only on benign EID10) over (SourceIL, TargetIL, GrantedAccess,
+    source-prevalence) to surface rare outliers; report the contributing feature deltas in the alert ([Malware
+    Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = vec(EID10: src_IL,tgt_IL,granted_bits,source_prevalence)
+
+      model = IsolationForest(train=benign_only)
+
+      if model.score(X)<thresh: alert(feature_deltas=explain(X))'
+- question: Within minutes of a suspicious EID10 (write/context mask) against a process, does that target
+    then access \SAM, HKLM\SECURITY\Policy\Secrets, obtain an lsass.exe handle/dump, or spawn a child
+    shell it normally never spawns?
+  context: 'Tie the injection event to its objective: a hijacked high-value process reaching for credential
+    stores (SAM, LSA secrets, LSASS) or unexpectedly spawning a shell is the payload acting under stolen
+    privileges. Correlate EID10 with 4663/4657 object-access and EID10 LSASS-handle events inside a few-minute
+    window. A positive correlation elevates a possible injection to a confirmed credential-access/escalation
+    incident; absence of follow-on activity may mean the payload is dormant or stealthy. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Alert when a suspicious
+    EID10 (write/context mask) is followed within minutes by access to \SAM, HKLM\SECURITY\Policy\Secrets,
+    or an lsass.exe handle/dump (4663/4657/EID10), or by the target spawning a child shell which it normally
+    never does ([Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon EventCode=10 [write/context mask] as inj
+
+      | join TargetProcessGUID [ search (EventCode=4663 OR EventCode=4657 ObjectName IN ("*\\SAM","*\\Secrets"))
+      OR (EventCode=10 TargetImage=lsass.exe) maxspan=5m ]
+
+      | alert'
+- question: After a high-risk process-access event, does the targeted process exhibit a cumulative rarity
+    score above the 99th percentile across child-process launches, registry accesses, and connection volume,
+    weighting first-in-lifetime actions?
+  context: 'Baseline each process''s normal child launches, registry touches, and network byte/connection
+    volume. After a high-risk access event, compute a cumulative rarity score that heavily weights actions
+    the process has never done before in its lifetime. Flag scores above the 99th percentile. This captures
+    the behavioral pivot a hijacked process makes toward the adversary''s goal. Positive results indicate
+    post-injection objective execution; tune weighting so routine first-runs (patch day) don''t dominate.
+    In the context of the Stealth tactic (TA0005), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Statistical Method):
+    Baseline child-process launches, registry accesses, and connection Volume (bytes, count/min) per process;
+    flag processes whose cumulative rarity score exceeds the 99th percentile after a high-risk access
+    event, weighting first-in-lifetime actions ([Threat Hunting Process Injection with Sysmon, Active
+    Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=post_access_window
+
+      | stats count(child) count(reg) sum(bytes) by TargetProcessGUID
+
+      | eval rarity=score_first_seen(child,reg,dest)
+
+      | eventstats perc99(rarity) as p99
+
+      | where rarity>p99
+
+      | alert'
+- question: Do a critical process's runtime metrics (network bytes, CPU, I/O, handle counts) become anomalous
+    per an Isolation Forest / One-Class SVM after a suspicious access event, and which metrics deviate
+    most?
+  context: 'Model the resource-usage profile of critical processes and score deviations after a suspicious
+    EID10. A hijacked process running shellcode often shows abnormal network egress, CPU, I/O, or handle
+    growth. Surface the top deviating metrics so the analyst knows whether to suspect exfiltration, mining,
+    or C2. This is a behavioral safety net for processes too sensitive to allow injection; corroborate
+    anomalies with the network/credential correlations. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Machine Learning): Model critical processes'' metrics (network bytes, CPU,
+    I/O, handle counts) with Isolation Forest / One-Class SVM and flag anomalies after a suspicious access,
+    surfacing the top deviating metrics ([Malware Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'm = metrics(target_proc: net_bytes,cpu,io,handles) post-access
+
+      if ocsvm.predict(m)==outlier: alert(top_dev=rank(deviation(m)))'
+- question: Does a normally quiet trusted process (svchost.exe, dllhost.exe, explorer.exe) connect to
+    a threat-intelligence-listed IP or domain within 5 minutes of being targeted by an EID10 write/context
+    access?
+  context: 'Trusted, network-capable system processes are prime injection hosts because their outbound
+    traffic blends in. Correlate EID10 hijack accesses with subsequent Zeek conn/ssl connections to TI-listed
+    destinations from those same processes inside a 5-minute window. A positive correlation links the
+    injection to active C2 and strongly supports a stealth/evasion verdict, since the adversary is masquerading
+    under a legitimate process. Combine with JA3/SNI to confirm. In the context of the Stealth tactic
+    (TA0005), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Symbolic Logic): Alert when normally quiet trusted processes
+    (svchost.exe, dllhost.exe, explorer.exe) connect to TI-listed IPs/domains within 5 minutes of being
+    targeted by EID10 with a write/context mask ([Novel Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies);
+    [Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'inj = sysmon_eid10[trusted target, write/context mask]
+
+      conn = conn.log JOIN ssl.log WHERE id.resp_h IN ti_indicators
+
+      ALERT WHEN conn.proc IN (svchost,dllhost,explorer) AND conn.ts - inj.ts <= 5m'
+- question: Is a system process (svchost.exe, services.exe, lsass.exe) with a zero-length/empty command
+    line making outbound network connections?
+  context: 'Legitimate svchost/services/lsass are launched with specific command-line arguments; a hollowed
+    or hijacked instance running injected shellcode frequently has an empty command line. An empty-command-line
+    system process initiating outbound traffic is a high-fidelity injection-plus-C2 signal. Join process-creation
+    command-line data (4688/EID1) with EID3/Zeek connections. A positive result is a classic masquerade
+    indicator and warrants immediate isolation. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Symbolic Logic): Alert when a system process (svchost/services/lsass) with a zero-length
+    command line makes outbound connections, indicating hollowed/hijacked shellcode lacking the original
+    args ([Zero-length Command-line Network Connections, Splunk](https://research.splunk.com/endpoint/54fa06c5-96a2-4406-a4a7-44d93ddbd173/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon EventCode=3
+
+      | join ProcessGUID [ search (EventCode=1 OR EventCode=4688) Image IN (svchost.exe,services.exe,lsass.exe)
+      (CommandLine="" OR len(CommandLine)<=len(Image)+2) ]
+
+      | alert'
+- question: Is a process connecting to destination countries/ASNs, ports, or byte volumes outside its
+    historical top 95%, producing first-ever outbound traffic from a previously network-silent process,
+    or showing elevated NXDOMAIN/blocked-connection rates?
+  context: 'Baseline per-process destination geography/ASN, ports, and byte volume. Flag connections outside
+    the top 95% of history, any outbound traffic from a process that was previously network-silent, and
+    elevated failed-State (NXDOMAIN/blocked) rates that indicate C2 resolution attempts. This statistically
+    isolates the anomalous egress a hijacked process generates. Positive results point to C2 or exfiltration;
+    tune the baseline to seasonal/CDN variation. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Statistical Method): Baseline each process''s destination countries/ASNs, ports, and
+    byte Volume; flag connections outside the top 95% of historical destinations, the appearance of any
+    outbound traffic from a previously network-silent process, and elevated NXDOMAIN/blocked-connection
+    (failed State) rates ([Novel Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE per proc: dest_asn,dest_country,port,bytes (90d)
+
+      ALERT conn WHERE dest NOT IN top95(proc) OR proc.prev_silent=true
+
+      ALERT WHEN nxdomain_rate(proc) > baseline+3*std'
+- question: 'When a Gradient Boosting/XGBoost model scores a post-hijack Zeek session (features: port,
+    duration, bytes up/down ratio, reputation, JA3) as malicious, what are the top-3 contributing features?'
+  context: 'Train an explainable classifier on Zeek connection features to score sessions that follow
+    a hijack access. Emit the top-3 contributing features (e.g., unusual JA3, high up/down ratio, low-reputation
+    destination) so analysts can validate quickly. This catches encrypted or novel C2 that signature/IOC
+    matching misses. A high score with C2-like features after an injection event is strong corroboration;
+    pair with the symbolic-logic TI correlation. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Machine Learning): Use Gradient Boosting/XGBoost on Zeek features (port, duration,
+    bytes up/down ratio, reputation, JA3) to score post-hijack connections, emitting the top-3 contributing
+    features in the alert ([Hybrid CNN-GRU with LIME/SHAP, PeerJ](https://peerj.com/articles/cs-3258/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'f = zeek_features(port,duration,bytes_up/bytes_down,dest_reputation,ja3)
+
+      s = xgb.predict_proba(f)
+
+      if s>=0.8 AND followed_hijack: alert(top3=shap(f))'
+- question: Is a watchlisted, network-capable application (explorer.exe, svchost.exe, chrome.exe, firefox.exe,
+    outlook.exe) accessed with 0x0020/0x0010/0x0800 rights by a non-allowlisted source process?
+  context: 'These applications are prime hijack hosts because of their trust and network capability; injecting
+    into them lets an adversary blend C2 into expected traffic. Trigger on EID10 when any watchlisted
+    target receives memory-write, set-context, or suspend/resume rights from a non-allowlisted source.
+    A positive result flags a high-value injection target being manipulated, supporting the stealth/defense-evasion
+    hypothesis. Maintain the source allowlist to control false positives. In the context of the Stealth
+    tactic (TA0005), this directly supports the mission question "Has the adversary elevated privileges
+    using thread execution hijacking?" Source method (Symbolic Logic): Trigger on EID10 when watchlisted
+    targets (explorer.exe, svchost.exe, chrome.exe, firefox.exe, outlook.exe) are accessed with 0x0020/0x0010/0x0800
+    by a non-allowlisted source; these are prime hijack hosts because of their network capability and
+    trust ([Process Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1);
+    [Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| where TargetImage IN (explorer.exe,svchost.exe,chrome.exe,firefox.exe,outlook.exe)\n\
+      \  AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage IN (allowlist)\n| alert"
+- question: Does the daily volume of suspicious accesses for a (source,target) pair exceed mean+3*std,
+    or do the distinct source images targeting a given watchlisted app exceed the historical norm?
+  context: 'Baseline daily suspicious-access volume per (source,target) pair and the count of distinct
+    sources targeting each watchlisted application. A campaign or worm-like injector causes either the
+    per-pair volume or the diversity of sources to spike. Alert beyond 3 standard deviations. This statistical
+    lens detects scaled-up injection activity that per-event rules treat as individually benign. Positive
+    results suggest coordinated or automated injection. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Statistical Method): Baseline daily suspicious-access Volume per (source,target)
+    pair and alert when a process exceeds mean+3*std, or when distinct source images targeting a given
+    app exceed the historical norm ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10 [suspicious mask]
+
+      | bin _time span=1d
+
+      | stats count as vol dc(SourceImage) as srcs by TargetImage,_time
+
+      | eventstats avg(vol) as m stdev(vol) as s by TargetImage
+
+      | where vol>m+3*s OR srcs>norm_srcs
+
+      | alert'
+- question: Where written memory content is observable (EID10 plus memory sampling/ETW), is the Shannon
+    entropy of the written region above ~7.2, consistent with packed/encrypted shellcode rather than the
+    5.0-6.5 native-code baseline?
+  context: 'Packed or encrypted shellcode written into a target has high entropy (>7.2), whereas normal
+    native code measures roughly 5.0-6.5. Where you can sample the written region via ETW or memory inspection,
+    compute Shannon entropy and flag high-entropy writes. This directly characterizes the injected payload,
+    distinguishing malicious code from benign cross-process writes. A high-entropy write is strong evidence
+    of injected shellcode; entropy alone cannot prove intent, so correlate with the access chain. In the
+    context of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary
+    elevated privileges using thread execution hijacking?" Source method (Statistical Method): Where memory
+    content is available (EID10 + memory sampling/ETW), compute Shannon entropy of written regions and
+    flag entropy >7.2 (packed/encrypted shellcode) vs the 5.0-6.5 native-code baseline ([Entropy Analysis
+    for Packed Malware, IEEE](https://ieeexplore.ieee.org/document/4140989); [Detecting Injection via
+    ETW Memory Analysis, Springer](https://link.springer.com/article/10.1007/s10207-024-00836-w)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=etw_memory OR eid10_with_membuf
+
+      | eval H=shannon_entropy(written_bytes)
+
+      | where H>7.2
+
+      | alert'
+- question: In the process-access graph, are there edges that bridge normally separate communities (e.g.,
+    winword.exe -> svchost.exe), and how rare is that edge?
+  context: 'Model the process-access relationships as a graph and detect community structure. Injection
+    often creates an edge between processes that normally never interact (an Office app accessing a system
+    service). Flag such bridging edges and report their rarity in the alert. This reveals injection relationships
+    invisible to per-event rules. A positive result highlights an anomalous trust-boundary crossing; investigate
+    the source process lineage to confirm. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Machine Learning): Model the process-access graph communities and flag edges bridging
+    uncommon groups (e.g., winword.exe -> svchost.exe), reporting the anomalous edge and its rarity in
+    the alert ([Can You Run My Code?, ACM](https://dl.acm.org/doi/10.1145/3708821.3736206)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = build_graph(EID10 edges source->target)
+
+      comms = community_detect(G)
+
+      for e in edges: if bridges_communities(e,comms) and rarity(e)>thr: alert(edge=e,rarity)'
+- question: Within 5 minutes of being targeted by an EID10 write/context access, does the target process
+    spawn a shell (cmd.exe, powershell.exe, wscript.exe) that it normally never spawns (e.g., lsass.exe
+    spawning a child)?
+  context: 'A hijacked process executing the adversary''s code frequently spawns an interpreter to run
+    follow-on commands. Correlate the EID10 injection event with subsequent child-process creation (4688/EID1)
+    of cmd/powershell/wscript within 5 minutes, especially for processes like lsass.exe that never legitimately
+    spawn children. A positive correlation is a near-definitive post-injection execution signal and warrants
+    immediate response. In the context of the Stealth tactic (TA0005), this directly supports the mission
+    question "Has the adversary elevated privileges using thread execution hijacking?" Source method (Symbolic
+    Logic): Alert when a process targeted in EID10 (write/context mask) spawns a shell (cmd.exe/powershell.exe/wscript.exe)
+    within 5 minutes; e.g., lsass.exe never spawns children and such a sequence indicates code executing
+    post-hijack ([Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'inj=Sysmon EID10[write/context mask]
+
+      | join TargetProcessGUID as ParentGUID [ search (EventCode=1 OR EventCode=4688) Image IN (cmd.exe,powershell.exe,wscript.exe)
+      maxspan=5m ]
+
+      | where ParentImage=lsass.exe OR ParentImage IN watchlist
+
+      | alert'
+- question: Is a target process producing child processes in the bottom 1% of historical frequency, DNS
+    queries with entropy in the 99th percentile (DGA-like), or an elevated NXDOMAIN failure rate after
+    a hijack access?
+  context: 'Baseline child-process frequencies and DNS query entropy per process. After an injection,
+    a hijacked process may launch rare children and resolve DGA-like high-entropy domains, with bursts
+    of NXDOMAIN responses as it hunts for live C2. Flag bottom-1% children, 99th-percentile DNS entropy,
+    and elevated failed-State resolutions as a distinct C2 signal. Positive results indicate post-hijack
+    C2 setup; combine DNS and child signals to raise confidence. In the context of the Stealth tactic
+    (TA0005), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Statistical Method): Baseline child-process frequencies
+    and DNS query entropy; flag children in the bottom 1% and DNS queries with entropy in the 99th percentile
+    (DGA-like), and treat elevated NXDOMAIN responses as a distinct failure-State C2-resolution signal
+    ([Entropy Analysis for Packed Malware, IEEE](https://ieeexplore.ieee.org/document/4140989); [Novel
+    Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE child_freq(proc), dns_entropy(proc)
+
+      ALERT WHEN child IN bottom1(proc) OR dns_entropy>perc99 OR nxdomain_rate>baseline+3*std'
+- question: When post-access metrics (child-creation rate, network bytes/min, DNS entropy, NXDOMAIN rate)
+    are fed to an Isolation Forest / sequence model, which top-3 features deviate enough to flag the process
+    as anomalous?
+  context: 'Feed the time series of a target process''s post-access behavior into an anomaly model and
+    flag deviations from its learned norm. This captures the combined behavioral pivot (new children,
+    egress spikes, DGA-like DNS) that follows a successful hijack. Surface the top-3 deviating features
+    for fast triage. Positive results indicate the injected code is executing its objective; corroborate
+    with the symbolic-logic shell-spawn and C2 correlations. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Machine Learning): Feed post-access metrics (child-creation rate, network
+    bytes/min, DNS entropy, NXDOMAIN rate) into an Isolation Forest / sequence model and flag deviations,
+    surfacing the top-3 deviating features ([Malware Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/);
+    [LSTM Sequential Model for Windows API Calls, PeerJ](https://peerj.com/articles/cs-285/)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = window_metrics(proc: child_rate,net_bpm,dns_entropy,nxdomain_rate)
+
+      if iforest.predict(ts)==outlier: alert(top3=rank_deviation(ts))'
+- question: After being targeted by an EID10 write/context access, does a process connect on a port outside
+    its approved per-process allowlist (e.g., a browser leaving TCP/80,443, or a previously network-silent
+    system process opening any port)?
+  context: 'Enforce per-process port allowlists derived from each application''s normal protocol use.
+    A hijacked process running shellcode often communicates on non-standard ports or protocols. Alert
+    when a process targeted by EID10 connects outside its approved port set, weighting previously network-silent
+    system processes most heavily. A positive result indicates anomalous egress consistent with injected
+    C2; maintain accurate per-process allowlists to avoid false positives from app updates. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Enforce per-process
+    port allowlists and alert when a process targeted by EID10 (write/context mask) connects on a port
+    outside its approved set, especially previously network-silent system processes ([Novel Detection
+    via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'inj=sysmon_eid10[write/context mask] target=P
+
+      ALERT conn.log WHERE conn.proc=P AND conn.resp_p NOT IN allowed_ports(P) AND conn.ts-inj.ts<=10m'
+- question: Is a process making connections on protocol/port pairs below its 1% historical frequency after
+    an injection, or showing elevated blocked/reset (failed-State) connection rates indicative of beaconing?
+  context: 'Baseline protocol-port frequency and byte volume per process. After injection, flag connections
+    below the 1% historical threshold and profile blocked/reset connection rates as a distinct beaconing
+    indicator, since C2 retries often produce failed connections. This statistically isolates anomalous
+    post-hijack egress patterns. Positive results suggest covert C2 channels; correlate failed-State spikes
+    with periodicity to confirm beaconing. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Statistical Method): Baseline protocol-port frequency and byte Volume per process;
+    alert when connections fall below the 1% historical threshold after injection and profile blocked/reset
+    (failed-State) connection rates as a distinct beaconing indicator ([Novel Detection via Network Anomalies,
+    Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE proto_port_freq(proc), bytes(proc) (90d)
+
+      ALERT conn WHERE freq(proto,port)<0.01 OR reset_rate(proc)>baseline+3*std'
+- question: When a One-Class SVM / Isolation Forest trained on benign network behavior for critical system
+    processes flags an outbound session as anomalous, which features (port, bytes, destination rarity)
+    deviate?
+  context: 'Train a one-class model on the benign network behavior of critical system processes and score
+    new outbound sessions. Sessions that deviate (unusual port, byte profile, or rare destination) after
+    a suspicious access surface as outliers. Report the deviating features so analysts can judge C2 likelihood.
+    This protects critical processes whose any-anomaly should be investigated. Positive outliers warrant
+    correlation with the access chain and TI; tune to legitimate update/telemetry traffic. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Machine Learning): Train a One-Class
+    SVM / Isolation Forest on benign network behavior for critical system processes and flag anomalous
+    outbound sessions, reporting the deviating features (port, bytes, destination rarity) in the alert
+    ([Malware Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = net_features(critical_proc: port,bytes,dest_rarity,duration)
+
+      model = OneClassSVM(train=benign_critical_proc)
+
+      if model.predict(X)==outlier: alert(dev=explain(X))'
+- question: Is any process whose file hash matches a threat-intelligence indicator opening a handle to
+    a higher-integrity target process with thread-hijack access rights (PROCESS_VM_WRITE 0x0020, PROCESS_VM_OPERATION
+    0x0008, PROCESS_SUSPEND_RESUME 0x0800, PROCESS_SET_INFORMATION/SET_CONTEXT 0x0010, or full 0x1F0FFF)
+    in Sysmon Event ID 10?
+  context: 'Join Sysmon EID10 process-access records against your TI hash feeds (MD5/SHA1/SHA256 of SourceImage)
+    and flag any hash-matched source that requests memory-write or thread-control rights against a higher-integrity
+    target. These exact access masks correspond to the documented OpenThread->SuspendThread->WriteProcessMemory->SetThreadContext->ResumeThread
+    hijack chain. Exclude verified EDR agents and debuggers, which legitimately request such rights. A
+    positive match is a high-confidence indicator of code injection by a known-bad tool; a negative result
+    does not clear the host because unknown/custom tooling will not match the feed. In the context of
+    the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the adversary
+    elevated privileges using thread execution hijacking?" Source method (Symbolic Logic): Join Sysmon
+    Event ID 10 process-access logs with TI hash feeds and alert when a hash-matched SourceImage requests
+    a higher-integrity TargetImage with thread-hijack access masks (0x0020 VM_WRITE, 0x0008 VM_OPERATION,
+    0x0800 SUSPEND_RESUME, 0x0010 SET_CONTEXT, or full 0x1F0FFF), excluding verified EDR/debuggers. These
+    masks correspond to the documented OpenThread->SuspendThread->WriteProcessMemory->SetThreadContext->ResumeThread
+    chain ([Process Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1);
+    [Sysmon CreateRemoteThread Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| eval mask=lower(GrantedAccess)\n| join SourceImageHash [ inputlookup\
+      \ ti_malicious_hashes ]\n| where match(mask,\"0x1f0fff|0x0020|0x0008|0x0800|0x0010\")\n  AND TargetIntegrity\
+      \ > SourceIntegrity\n  AND NOT SourceImage IN (edr_allowlist, debugger_allowlist)\n| alert"
+- question: Did a non-allowlisted or TI-matched source process make repeated ACCESS_DENIED OpenProcess/OpenThread
+    attempts (status != 0) against high-integrity targets shortly before a successful write/thread-control
+    handle was granted?
+  context: 'Treat denied access attempts as a distinct probing State signal: an adversary often iterates
+    over requested rights until the OS grants a usable handle. Alert when three or more denied attempts
+    by the same source against high-integrity targets precede a successful write-mask grant inside a 60-second
+    window. This pattern reveals handle-rights probing that single-event rules miss. A positive result
+    indicates deliberate enumeration of injectable processes; benign software rarely retries access after
+    denial. In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission
+    question "Has the adversary elevated privileges using thread execution hijacking?" Source method (Symbolic
+    Logic): Treat ACCESS_DENIED (status!=0) OpenProcess/OpenThread attempts by a hash-matched or non-allowlisted
+    SourceImage against high-integrity targets as a distinct State signal; alert when >=3 denied attempts
+    precede a successful write-mask grant within 60s, indicating handle-rights probing ([Sysmon CreateRemoteThread
+    Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Sysmon EventCode=10\n| eval denied=if(GrantedStatus!=0,1,0)\n| streamstats time_window=60s\
+      \ count(eval(denied=1)) as denies by SourceProcessGUID,TargetImage\n| where denies>=3 AND GrantedStatus=0\
+      \ AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage IN (allowlist)\n| alert"
+- question: Across the fleet, is a lower-integrity process opening a higher-integrity process with memory-write/thread-control
+    rights using a (SourceImage, TargetImage, GrantedAccess) tuple that is below the 1st percentile of
+    historical prevalence?
+  context: 'Maintain a fleet-wide prevalence baseline of distinct (SourceImage, TargetImage, GrantedAccess)
+    edges. Cross-process access with write/thread-control rights is rare in benign software, so a first-seen
+    or very-low-frequency edge that also crosses an integrity boundary upward is suspicious. Score by
+    frequency/volume of distinct source->target edges and alert below the 1st percentile. Positive results
+    surface novel injection relationships even when no hash or signature matches; tune the baseline window
+    per host role to limit noise. In the context of the Privilege Escalation tactic (TA0004), this directly
+    supports the mission question "Has the adversary elevated privileges using thread execution hijacking?"
+    Source method (Statistical Method): Maintain a fleet-wide prevalence baseline of (SourceImage, TargetImage,
+    GrantedAccess) tuples; alert when a lower-integrity process opens a higher-integrity process with
+    write/thread-control rights and the tuple is below the 1st percentile (Frequency/Volume of distinct
+    source->target edges) ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "source=Sysmon EventCode=10 earliest=-90d\n| stats count as edge_count by SourceImage,TargetImage,GrantedAccess\n\
+      | eventstats perc1(edge_count) as p1\n| where edge_count<=p1 AND match(GrantedAccess,\"0x0020|0x0010|0x0800\"\
+      )\n  AND TargetIntegrity>SourceIntegrity\n| alert"
+- question: When a Gradient Boosting/Random Forest model scores a Sysmon EID10 access event as likely
+    thread-injection, what are the top-3 SHAP-explained features (e.g., VirtualAllocEx/WriteProcessMemory/SetThreadContext
+    presence, integrity delta, TI flag) driving the score?
+  context: 'Train an explainable classifier (Gradient Boosting or Random Forest) on labeled EID10 features:
+    source/target image, integrity levels, GrantedAccess bits, parent process lineage, TI flag, and call-stack/module
+    backing. Emit the top-3 SHAP contributors in each alert so an analyst can immediately judge why the
+    event scored high. This catches injection variants that evade static rules while keeping the verdict
+    interpretable. A high score with hijack-API features and an integrity bridge is strong evidence; low-confidence
+    scores should be triaged with the supporting symbolic-logic rules. In the context of the Privilege
+    Escalation tactic (TA0004), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Machine Learning): Train Gradient Boosting/Random
+    Forest on EID10 features (Source/Target image, integrity levels, GrantedAccess bits, parent process,
+    TI flag, call-stack backing) and emit the top-3 SHAP features (e.g., VirtualAllocEx/WriteProcessMemory/SetThreadContext
+    presence) in the alert text ([Hybrid CNN-GRU with LIME/SHAP, PeerJ](https://peerj.com/articles/cs-3258/);
+    [Detecting Injection via ETW Memory Analysis, Springer](https://link.springer.com/article/10.1007/s10207-024-00836-w)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = extract(EID10: source_img,target_img,src_IL,tgt_IL,granted_bits,parent,ti_flag,callstack_backed)
+
+      score = gbm.predict_proba(features)
+
+      if score>=0.85: alert(top3=shap(features), event=EID10)'
+- question: Does a single SourceProcessGUID produce multiple Sysmon EID10 events against the same TargetProcessGUID
+    within ~2 seconds requesting suspend (0x0800/0x0002), memory write (0x0020), and context set (0x0010)
+    in the canonical suspend->write->setcontext->resume order?
+  context: 'Rather than alerting on any single access mask (which is noisy), require the ordered burst
+    that defines thread execution hijacking: a rapid sequence of suspend, write, set-context, and resume
+    against one target by one source inside a 2-second window, excluding allowlisted debuggers/EDR. This
+    unified-ordering requirement strongly suppresses benign single-API noise and isolates the actual hijack
+    primitive. A positive match is a near-definitive behavioral signature of T1055.003. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Symbolic Logic): Alert
+    when a SourceProcessGUID produces multiple EID10 entries for the same TargetProcessGUID within 2s
+    requesting suspend (0x0800/0x0002), memory write (0x0020), and context set (0x0010), excluding allowlisted
+    debuggers/EDR. Require the unified ordering (suspend->write->setcontext->resume) rather than any single
+    mask to suppress benign single-API noise ([Can You Run My Code?, ACM](https://dl.acm.org/doi/10.1145/3708821.3736206);
+    [Process Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| transaction SourceProcessGUID,TargetProcessGUID maxspan=2s\n\
+      | where like_seq(GrantedAccess,[suspend 0x0800,write 0x0020,setcontext 0x0010])\n  AND NOT SourceImage\
+      \ IN (debugger_allowlist,edr_allowlist)\n| alert"
+- question: Is a Sysmon EID8 (CreateRemoteThread) or resumed thread starting at an address in unbacked,
+    private RWX memory that is not mapped to any module on disk, in conjunction with cross-process EID10
+    access?
+  context: 'Cross-reference EID8 CreateRemoteThread and EID10 access events and inspect the new/resumed
+    thread''s StartAddress. A start address in private, executable, unbacked memory (not file-mapped)
+    is a hallmark of injected shellcode, since legitimate threads start in module-backed code. Cross-process
+    thread manipulation is itself rare in benign software. A positive result strongly indicates injected
+    execution; pair it with the source-process lineage to scope the intrusion. In the context of the Privilege
+    Escalation tactic (TA0004), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Cross-reference EID8
+    (CreateRemoteThread) and EID10 where the new/resumed thread StartAddress lies in unbacked (private
+    RWX) memory not mapped to a module on disk; cross-process thread manipulation is rare in benign software
+    ([Sysmon CreateRemoteThread Guide, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md);
+    [Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon (EventCode=8 OR EventCode=10)
+
+      | eval unbacked=if(StartAddressModule="" AND MemProtect="RWX" AND MemType="private",1,0)
+
+      | where unbacked=1 AND SourceProcessGUID!=TargetProcessGUID
+
+      | alert'
+- question: Is a non-administrative process exceeding mean+3*std in EID10 events-per-minute, or showing
+    a >3-std jump in the 5-minute rolling Shannon entropy of its GrantedAccess codes, indicating a burst
+    of varied access rights?
+  context: 'Baseline per-process EID10 volume (events/min) and rolling entropy of GrantedAccess values.
+    A hijack produces a short burst of distinct access rights (suspend, write, set-context, resume), which
+    spikes both event rate and entropy for a process that is normally quiet. Alert on either signal exceeding
+    3 standard deviations. This statistical view catches injection even when individual masks look benign;
+    expect tuning against admin tools and backup agents. In the context of the Privilege Escalation tactic
+    (TA0004), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Statistical Method): Baseline per-process EID10 Volume
+    (events/min) and 5-minute rolling entropy of GrantedAccess codes; alert when a non-admin tool exceeds
+    mean+3*std event rate OR entropy jumps >3 std, capturing the burst of distinct access rights during
+    a hijack ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10
+
+      | bin _time span=1m
+
+      | stats count as vol dc(GrantedAccess) as variety by SourceImage,_time
+
+      | eventstats avg(vol) as m stdev(vol) as s by SourceImage
+
+      | where vol>m+3*s OR variety_entropy_jump>3*s
+
+      | alert'
+- question: When an LSTM/HMM trained on benign (EventID, GrantedAccess, TargetImage) sequences flags a
+    high-reconstruction-error or low-likelihood sequence, what offending n-gram of API steps characterizes
+    the anomalous hijack chain?
+  context: 'Train a sequence model (LSTM autoencoder or HMM) on benign ordered tuples of (EventID, GrantedAccess,
+    TargetImage). Hijack chains produce sequences that the model reconstructs poorly or assigns low likelihood.
+    Surface the specific n-gram of API steps that drove the anomaly so analysts can confirm the suspend->write->setcontext->resume
+    motif. This detects novel orderings and obfuscated variants; high reconstruction error warrants correlation
+    with the symbolic-logic rules above. In the context of the Privilege Escalation tactic (TA0004), this
+    directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Machine Learning): Train an LSTM/HMM on benign (EventID, GrantedAccess,
+    TargetImage) sequences and flag high reconstruction error / low-likelihood sequences as anomalous
+    hijack chains; surface the offending n-gram of API steps in the alert ([LSTM Sequential Model for
+    Windows API Calls, PeerJ](https://peerj.com/articles/cs-285/); [Detecting Intrusions Using System
+    Calls, IEEE](https://ieeexplore.ieee.org/document/766910)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: All Windows Endpoints and Servers, especially those running critical services.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = order_by_time(EID10/EID8 tuples: (eventid,granted,target) per SourceProcessGUID)
+
+      err = lstm_ae.reconstruction_error(seq)
+
+      if err>threshold: alert(offending_ngram=argmax_window(err), source=SourceProcessGUID)'
+- question: Does a Low or Medium integrity source process successfully obtain a handle to a High or System
+    integrity target with memory-write (0x0020), thread-context (0x0010), or suspend/resume (0x0800) rights?
+  context: 'These access masks are the privilege-bridging primitives of thread hijacking: writing into
+    and steering a higher-privileged process is how the adversary gains its context. Trigger when the
+    source integrity level is below the target and the granted rights include write/context/suspend. Positive
+    results directly answer whether privilege escalation via injection is being attempted; exclude legitimate
+    elevation brokers and EDR to reduce false positives. In the context of the Privilege Escalation tactic
+    (TA0004), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Symbolic Logic): Trigger when EID10 shows Source IL Low/Medium
+    targeting High/System with GrantedAccess for memory write (0x0020), thread context (0x0010), or suspend/resume
+    (0x0800); these are the privilege-bridging primitives of thread hijacking ([Process Injection (Part
+    1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1); [Process Injection T1055
+    Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| where SourceIntegrity IN (\"Low\",\"Medium\") AND TargetIntegrity\
+      \ IN (\"High\",\"System\")\n  AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage\
+      \ IN (allowlist)\n| alert"
+- question: Per host role, is there a (SourceIL, TargetIL, GrantedAccess) integrity-transition combination
+    involving write/execute permissions that has less than 0.01% historical probability, especially a
+    first-seen source->target integrity edge?
+  context: 'Baseline integrity-transition distributions per host role (workstation, app server, DC). Upward
+    integrity transitions carrying write/execute rights are inherently rare; alert on combinations below
+    0.01% probability and prioritize first-seen edges. This statistically isolates the privilege-escalation
+    moment of a hijack without relying on signatures. A positive result is a strong escalation indicator;
+    calibrate the baseline separately per role since admin tooling differs by host type. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Statistical Method):
+    Baseline (SourceIL, TargetIL, GrantedAccess) distributions per host role and alert on combinations
+    with <0.01% historical probability that involve write/execute permissions, prioritizing first-seen
+    source->target integrity edges ([Threat Hunting Process Injection with Sysmon, Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10 earliest=-90d
+
+      | stats count by host_role,SourceIntegrity,TargetIntegrity,GrantedAccess
+
+      | eventstats sum(count) as tot by host_role
+
+      | eval prob=count/tot
+
+      | where prob<0.0001 AND match(GrantedAccess,"0x0020|0x0010")
+
+      | alert'
+- question: When an Isolation Forest / One-Class SVM trained only on benign EID10 access flags an outlier
+    over (SourceIL, TargetIL, GrantedAccess, source-prevalence), which feature deltas explain the anomaly?
+  context: 'Fit an unsupervised outlier model (Isolation Forest or One-Class SVM) on benign-only EID10
+    access vectors and score new events; rare combinations of integrity levels, granted rights, and low
+    source prevalence surface as outliers. Report the contributing feature deltas so the analyst can see,
+    for example, an unusually low-prevalence source bridging an integrity gap. This catches escalation
+    attempts that evade rule thresholds; outliers should be corroborated with the deterministic integrity-escalation
+    rule. In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission
+    question "Has the adversary elevated privileges using thread execution hijacking?" Source method (Machine
+    Learning): Apply Isolation Forest / One-Class SVM (trained only on benign EID10) over (SourceIL, TargetIL,
+    GrantedAccess, source-prevalence) to surface rare outliers; report the contributing feature deltas
+    in the alert ([Malware Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: All Windows Endpoints and Servers, with a focus on systems processing sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = vec(EID10: src_IL,tgt_IL,granted_bits,source_prevalence)
+
+      model = IsolationForest(train=benign_only)
+
+      if model.score(X)<thresh: alert(feature_deltas=explain(X))'
+- question: Within minutes of a suspicious EID10 (write/context mask) against a process, does that target
+    then access \SAM, HKLM\SECURITY\Policy\Secrets, obtain an lsass.exe handle/dump, or spawn a child
+    shell it normally never spawns?
+  context: 'Tie the injection event to its objective: a hijacked high-value process reaching for credential
+    stores (SAM, LSA secrets, LSASS) or unexpectedly spawning a shell is the payload acting under stolen
+    privileges. Correlate EID10 with 4663/4657 object-access and EID10 LSASS-handle events inside a few-minute
+    window. A positive correlation elevates a possible injection to a confirmed credential-access/escalation
+    incident; absence of follow-on activity may mean the payload is dormant or stealthy. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Symbolic Logic): Alert
+    when a suspicious EID10 (write/context mask) is followed within minutes by access to \SAM, HKLM\SECURITY\Policy\Secrets,
+    or an lsass.exe handle/dump (4663/4657/EID10), or by the target spawning a child shell which it normally
+    never does ([Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon EventCode=10 [write/context mask] as inj
+
+      | join TargetProcessGUID [ search (EventCode=4663 OR EventCode=4657 ObjectName IN ("*\\SAM","*\\Secrets"))
+      OR (EventCode=10 TargetImage=lsass.exe) maxspan=5m ]
+
+      | alert'
+- question: After a high-risk process-access event, does the targeted process exhibit a cumulative rarity
+    score above the 99th percentile across child-process launches, registry accesses, and connection volume,
+    weighting first-in-lifetime actions?
+  context: 'Baseline each process''s normal child launches, registry touches, and network byte/connection
+    volume. After a high-risk access event, compute a cumulative rarity score that heavily weights actions
+    the process has never done before in its lifetime. Flag scores above the 99th percentile. This captures
+    the behavioral pivot a hijacked process makes toward the adversary''s goal. Positive results indicate
+    post-injection objective execution; tune weighting so routine first-runs (patch day) don''t dominate.
+    In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission question
+    "Has the adversary elevated privileges using thread execution hijacking?" Source method (Statistical
+    Method): Baseline child-process launches, registry accesses, and connection Volume (bytes, count/min)
+    per process; flag processes whose cumulative rarity score exceeds the 99th percentile after a high-risk
+    access event, weighting first-in-lifetime actions ([Threat Hunting Process Injection with Sysmon,
+    Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=post_access_window
+
+      | stats count(child) count(reg) sum(bytes) by TargetProcessGUID
+
+      | eval rarity=score_first_seen(child,reg,dest)
+
+      | eventstats perc99(rarity) as p99
+
+      | where rarity>p99
+
+      | alert'
+- question: Do a critical process's runtime metrics (network bytes, CPU, I/O, handle counts) become anomalous
+    per an Isolation Forest / One-Class SVM after a suspicious access event, and which metrics deviate
+    most?
+  context: 'Model the resource-usage profile of critical processes and score deviations after a suspicious
+    EID10. A hijacked process running shellcode often shows abnormal network egress, CPU, I/O, or handle
+    growth. Surface the top deviating metrics so the analyst knows whether to suspect exfiltration, mining,
+    or C2. This is a behavioral safety net for processes too sensitive to allow injection; corroborate
+    anomalies with the network/credential correlations. In the context of the Privilege Escalation tactic
+    (TA0004), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Machine Learning): Model critical processes'' metrics
+    (network bytes, CPU, I/O, handle counts) with Isolation Forest / One-Class SVM and flag anomalies
+    after a suspicious access, surfacing the top deviating metrics ([Malware Detection Using One-Class
+    Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Certificate Authorities, Servers hosting LSA secrets, File Servers with
+    sensitive data.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'm = metrics(target_proc: net_bytes,cpu,io,handles) post-access
+
+      if ocsvm.predict(m)==outlier: alert(top_dev=rank(deviation(m)))'
+- question: Does a normally quiet trusted process (svchost.exe, dllhost.exe, explorer.exe) connect to
+    a threat-intelligence-listed IP or domain within 5 minutes of being targeted by an EID10 write/context
+    access?
+  context: 'Trusted, network-capable system processes are prime injection hosts because their outbound
+    traffic blends in. Correlate EID10 hijack accesses with subsequent Zeek conn/ssl connections to TI-listed
+    destinations from those same processes inside a 5-minute window. A positive correlation links the
+    injection to active C2 and strongly supports a stealth/evasion verdict, since the adversary is masquerading
+    under a legitimate process. Combine with JA3/SNI to confirm. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question "Has the adversary elevated privileges
+    using thread execution hijacking?" Source method (Symbolic Logic): Alert when normally quiet trusted
+    processes (svchost.exe, dllhost.exe, explorer.exe) connect to TI-listed IPs/domains within 5 minutes
+    of being targeted by EID10 with a write/context mask ([Novel Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies);
+    [Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'inj = sysmon_eid10[trusted target, write/context mask]
+
+      conn = conn.log JOIN ssl.log WHERE id.resp_h IN ti_indicators
+
+      ALERT WHEN conn.proc IN (svchost,dllhost,explorer) AND conn.ts - inj.ts <= 5m'
+- question: Is a system process (svchost.exe, services.exe, lsass.exe) with a zero-length/empty command
+    line making outbound network connections?
+  context: 'Legitimate svchost/services/lsass are launched with specific command-line arguments; a hollowed
+    or hijacked instance running injected shellcode frequently has an empty command line. An empty-command-line
+    system process initiating outbound traffic is a high-fidelity injection-plus-C2 signal. Join process-creation
+    command-line data (4688/EID1) with EID3/Zeek connections. A positive result is a classic masquerade
+    indicator and warrants immediate isolation. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Symbolic Logic): Alert when a system process (svchost/services/lsass) with
+    a zero-length command line makes outbound connections, indicating hollowed/hijacked shellcode lacking
+    the original args ([Zero-length Command-line Network Connections, Splunk](https://research.splunk.com/endpoint/54fa06c5-96a2-4406-a4a7-44d93ddbd173/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=Sysmon EventCode=3
+
+      | join ProcessGUID [ search (EventCode=1 OR EventCode=4688) Image IN (svchost.exe,services.exe,lsass.exe)
+      (CommandLine="" OR len(CommandLine)<=len(Image)+2) ]
+
+      | alert'
+- question: Is a process connecting to destination countries/ASNs, ports, or byte volumes outside its
+    historical top 95%, producing first-ever outbound traffic from a previously network-silent process,
+    or showing elevated NXDOMAIN/blocked-connection rates?
+  context: 'Baseline per-process destination geography/ASN, ports, and byte volume. Flag connections outside
+    the top 95% of history, any outbound traffic from a process that was previously network-silent, and
+    elevated failed-State (NXDOMAIN/blocked) rates that indicate C2 resolution attempts. This statistically
+    isolates the anomalous egress a hijacked process generates. Positive results point to C2 or exfiltration;
+    tune the baseline to seasonal/CDN variation. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Statistical Method): Baseline each process''s destination countries/ASNs,
+    ports, and byte Volume; flag connections outside the top 95% of historical destinations, the appearance
+    of any outbound traffic from a previously network-silent process, and elevated NXDOMAIN/blocked-connection
+    (failed State) rates ([Novel Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE per proc: dest_asn,dest_country,port,bytes (90d)
+
+      ALERT conn WHERE dest NOT IN top95(proc) OR proc.prev_silent=true
+
+      ALERT WHEN nxdomain_rate(proc) > baseline+3*std'
+- question: 'When a Gradient Boosting/XGBoost model scores a post-hijack Zeek session (features: port,
+    duration, bytes up/down ratio, reputation, JA3) as malicious, what are the top-3 contributing features?'
+  context: 'Train an explainable classifier on Zeek connection features to score sessions that follow
+    a hijack access. Emit the top-3 contributing features (e.g., unusual JA3, high up/down ratio, low-reputation
+    destination) so analysts can validate quickly. This catches encrypted or novel C2 that signature/IOC
+    matching misses. A high score with C2-like features after an injection event is strong corroboration;
+    pair with the symbolic-logic TI correlation. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Machine Learning): Use Gradient Boosting/XGBoost on Zeek features (port,
+    duration, bytes up/down ratio, reputation, JA3) to score post-hijack connections, emitting the top-3
+    contributing features in the alert ([Hybrid CNN-GRU with LIME/SHAP, PeerJ](https://peerj.com/articles/cs-3258/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Sysmon Event ID 10
+  - Sysmon Event ID 3
+  - 'NAI: Network Egress Points, DNS Servers, User Workstations, Web Proxies.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'f = zeek_features(port,duration,bytes_up/bytes_down,dest_reputation,ja3)
+
+      s = xgb.predict_proba(f)
+
+      if s>=0.8 AND followed_hijack: alert(top3=shap(f))'
+- question: Is a watchlisted, network-capable application (explorer.exe, svchost.exe, chrome.exe, firefox.exe,
+    outlook.exe) accessed with 0x0020/0x0010/0x0800 rights by a non-allowlisted source process?
+  context: 'These applications are prime hijack hosts because of their trust and network capability; injecting
+    into them lets an adversary blend C2 into expected traffic. Trigger on EID10 when any watchlisted
+    target receives memory-write, set-context, or suspend/resume rights from a non-allowlisted source.
+    A positive result flags a high-value injection target being manipulated, supporting the stealth/defense-evasion
+    hypothesis. Maintain the source allowlist to control false positives. In the context of the Privilege
+    Escalation tactic (TA0004), this directly supports the mission question "Has the adversary elevated
+    privileges using thread execution hijacking?" Source method (Symbolic Logic): Trigger on EID10 when
+    watchlisted targets (explorer.exe, svchost.exe, chrome.exe, firefox.exe, outlook.exe) are accessed
+    with 0x0020/0x0010/0x0800 by a non-allowlisted source; these are prime hijack hosts because of their
+    network capability and trust ([Process Injection (Part 1), Elastic](https://www.elastic.co/security-labs/process-injection-part-1);
+    [Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=Sysmon EventCode=10\n| where TargetImage IN (explorer.exe,svchost.exe,chrome.exe,firefox.exe,outlook.exe)\n\
+      \  AND match(GrantedAccess,\"0x0020|0x0010|0x0800\")\n  AND NOT SourceImage IN (allowlist)\n| alert"
+- question: Does the daily volume of suspicious accesses for a (source,target) pair exceed mean+3*std,
+    or do the distinct source images targeting a given watchlisted app exceed the historical norm?
+  context: 'Baseline daily suspicious-access volume per (source,target) pair and the count of distinct
+    sources targeting each watchlisted application. A campaign or worm-like injector causes either the
+    per-pair volume or the diversity of sources to spike. Alert beyond 3 standard deviations. This statistical
+    lens detects scaled-up injection activity that per-event rules treat as individually benign. Positive
+    results suggest coordinated or automated injection. In the context of the Privilege Escalation tactic
+    (TA0004), this directly supports the mission question "Has the adversary elevated privileges using
+    thread execution hijacking?" Source method (Statistical Method): Baseline daily suspicious-access
+    Volume per (source,target) pair and alert when a process exceeds mean+3*std, or when distinct source
+    images targeting a given app exceed the historical norm ([Threat Hunting Process Injection with Sysmon,
+    Active Countermeasures](https://www.activecountermeasures.com/threat-hunting-process-injection-with-jupyter-notebook-and-sysmon/)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=Sysmon EventCode=10 [suspicious mask]
+
+      | bin _time span=1d
+
+      | stats count as vol dc(SourceImage) as srcs by TargetImage,_time
+
+      | eventstats avg(vol) as m stdev(vol) as s by TargetImage
+
+      | where vol>m+3*s OR srcs>norm_srcs
+
+      | alert'
+- question: Where written memory content is observable (EID10 plus memory sampling/ETW), is the Shannon
+    entropy of the written region above ~7.2, consistent with packed/encrypted shellcode rather than the
+    5.0-6.5 native-code baseline?
+  context: 'Packed or encrypted shellcode written into a target has high entropy (>7.2), whereas normal
+    native code measures roughly 5.0-6.5. Where you can sample the written region via ETW or memory inspection,
+    compute Shannon entropy and flag high-entropy writes. This directly characterizes the injected payload,
+    distinguishing malicious code from benign cross-process writes. A high-entropy write is strong evidence
+    of injected shellcode; entropy alone cannot prove intent, so correlate with the access chain. In the
+    context of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has
+    the adversary elevated privileges using thread execution hijacking?" Source method (Statistical Method):
+    Where memory content is available (EID10 + memory sampling/ETW), compute Shannon entropy of written
+    regions and flag entropy >7.2 (packed/encrypted shellcode) vs the 5.0-6.5 native-code baseline ([Entropy
+    Analysis for Packed Malware, IEEE](https://ieeexplore.ieee.org/document/4140989); [Detecting Injection
+    via ETW Memory Analysis, Springer](https://link.springer.com/article/10.1007/s10207-024-00836-w)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=etw_memory OR eid10_with_membuf
+
+      | eval H=shannon_entropy(written_bytes)
+
+      | where H>7.2
+
+      | alert'
+- question: In the process-access graph, are there edges that bridge normally separate communities (e.g.,
+    winword.exe -> svchost.exe), and how rare is that edge?
+  context: 'Model the process-access relationships as a graph and detect community structure. Injection
+    often creates an edge between processes that normally never interact (an Office app accessing a system
+    service). Flag such bridging edges and report their rarity in the alert. This reveals injection relationships
+    invisible to per-event rules. A positive result highlights an anomalous trust-boundary crossing; investigate
+    the source process lineage to confirm. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Machine Learning): Model the process-access graph communities and flag
+    edges bridging uncommon groups (e.g., winword.exe -> svchost.exe), reporting the anomalous edge and
+    its rarity in the alert ([Can You Run My Code?, ACM](https://dl.acm.org/doi/10.1145/3708821.3736206)).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - 'NAI: User Workstations, Application Servers, any system with internet access.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = build_graph(EID10 edges source->target)
+
+      comms = community_detect(G)
+
+      for e in edges: if bridges_communities(e,comms) and rarity(e)>thr: alert(edge=e,rarity)'
+- question: Within 5 minutes of being targeted by an EID10 write/context access, does the target process
+    spawn a shell (cmd.exe, powershell.exe, wscript.exe) that it normally never spawns (e.g., lsass.exe
+    spawning a child)?
+  context: 'A hijacked process executing the adversary''s code frequently spawns an interpreter to run
+    follow-on commands. Correlate the EID10 injection event with subsequent child-process creation (4688/EID1)
+    of cmd/powershell/wscript within 5 minutes, especially for processes like lsass.exe that never legitimately
+    spawn children. A positive correlation is a near-definitive post-injection execution signal and warrants
+    immediate response. In the context of the Privilege Escalation tactic (TA0004), this directly supports
+    the mission question "Has the adversary elevated privileges using thread execution hijacking?" Source
+    method (Symbolic Logic): Alert when a process targeted in EID10 (write/context mask) spawns a shell
+    (cmd.exe/powershell.exe/wscript.exe) within 5 minutes; e.g., lsass.exe never spawns children and such
+    a sequence indicates code executing post-hijack ([Process Injection T1055 Report, Red Canary](https://redcanary.com/threat-detection-report/techniques/process-injection/)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'inj=Sysmon EID10[write/context mask]
+
+      | join TargetProcessGUID as ParentGUID [ search (EventCode=1 OR EventCode=4688) Image IN (cmd.exe,powershell.exe,wscript.exe)
+      maxspan=5m ]
+
+      | where ParentImage=lsass.exe OR ParentImage IN watchlist
+
+      | alert'
+- question: Is a target process producing child processes in the bottom 1% of historical frequency, DNS
+    queries with entropy in the 99th percentile (DGA-like), or an elevated NXDOMAIN failure rate after
+    a hijack access?
+  context: 'Baseline child-process frequencies and DNS query entropy per process. After an injection,
+    a hijacked process may launch rare children and resolve DGA-like high-entropy domains, with bursts
+    of NXDOMAIN responses as it hunts for live C2. Flag bottom-1% children, 99th-percentile DNS entropy,
+    and elevated failed-State resolutions as a distinct C2 signal. Positive results indicate post-hijack
+    C2 setup; combine DNS and child signals to raise confidence. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question "Has the adversary elevated privileges
+    using thread execution hijacking?" Source method (Statistical Method): Baseline child-process frequencies
+    and DNS query entropy; flag children in the bottom 1% and DNS queries with entropy in the 99th percentile
+    (DGA-like), and treat elevated NXDOMAIN responses as a distinct failure-State C2-resolution signal
+    ([Entropy Analysis for Packed Malware, IEEE](https://ieeexplore.ieee.org/document/4140989); [Novel
+    Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE child_freq(proc), dns_entropy(proc)
+
+      ALERT WHEN child IN bottom1(proc) OR dns_entropy>perc99 OR nxdomain_rate>baseline+3*std'
+- question: When post-access metrics (child-creation rate, network bytes/min, DNS entropy, NXDOMAIN rate)
+    are fed to an Isolation Forest / sequence model, which top-3 features deviate enough to flag the process
+    as anomalous?
+  context: 'Feed the time series of a target process''s post-access behavior into an anomaly model and
+    flag deviations from its learned norm. This captures the combined behavioral pivot (new children,
+    egress spikes, DGA-like DNS) that follows a successful hijack. Surface the top-3 deviating features
+    for fast triage. Positive results indicate the injected code is executing its objective; corroborate
+    with the symbolic-logic shell-spawn and C2 correlations. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question "Has the adversary elevated privileges
+    using thread execution hijacking?" Source method (Machine Learning): Feed post-access metrics (child-creation
+    rate, network bytes/min, DNS entropy, NXDOMAIN rate) into an Isolation Forest / sequence model and
+    flag deviations, surfacing the top-3 deviating features ([Malware Detection Using One-Class Classification,
+    PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/); [LSTM Sequential Model for Windows API Calls,
+    PeerJ](https://peerj.com/articles/cs-285/)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Windows Endpoints, Domain Controllers, DNS Servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = window_metrics(proc: child_rate,net_bpm,dns_entropy,nxdomain_rate)
+
+      if iforest.predict(ts)==outlier: alert(top3=rank_deviation(ts))'
+- question: After being targeted by an EID10 write/context access, does a process connect on a port outside
+    its approved per-process allowlist (e.g., a browser leaving TCP/80,443, or a previously network-silent
+    system process opening any port)?
+  context: 'Enforce per-process port allowlists derived from each application''s normal protocol use.
+    A hijacked process running shellcode often communicates on non-standard ports or protocols. Alert
+    when a process targeted by EID10 connects outside its approved port set, weighting previously network-silent
+    system processes most heavily. A positive result indicates anomalous egress consistent with injected
+    C2; maintain accurate per-process allowlists to avoid false positives from app updates. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Symbolic Logic): Enforce
+    per-process port allowlists and alert when a process targeted by EID10 (write/context mask) connects
+    on a port outside its approved set, especially previously network-silent system processes ([Novel
+    Detection via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'inj=sysmon_eid10[write/context mask] target=P
+
+      ALERT conn.log WHERE conn.proc=P AND conn.resp_p NOT IN allowed_ports(P) AND conn.ts-inj.ts<=10m'
+- question: Is a process making connections on protocol/port pairs below its 1% historical frequency after
+    an injection, or showing elevated blocked/reset (failed-State) connection rates indicative of beaconing?
+  context: 'Baseline protocol-port frequency and byte volume per process. After injection, flag connections
+    below the 1% historical threshold and profile blocked/reset connection rates as a distinct beaconing
+    indicator, since C2 retries often produce failed connections. This statistically isolates anomalous
+    post-hijack egress patterns. Positive results suggest covert C2 channels; correlate failed-State spikes
+    with periodicity to confirm beaconing. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question "Has the adversary elevated privileges using thread execution
+    hijacking?" Source method (Statistical Method): Baseline protocol-port frequency and byte Volume per
+    process; alert when connections fall below the 1% historical threshold after injection and profile
+    blocked/reset (failed-State) connection rates as a distinct beaconing indicator ([Novel Detection
+    via Network Anomalies, Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'BASELINE proto_port_freq(proc), bytes(proc) (90d)
+
+      ALERT conn WHERE freq(proto,port)<0.01 OR reset_rate(proc)>baseline+3*std'
+- question: When a One-Class SVM / Isolation Forest trained on benign network behavior for critical system
+    processes flags an outbound session as anomalous, which features (port, bytes, destination rarity)
+    deviate?
+  context: 'Train a one-class model on the benign network behavior of critical system processes and score
+    new outbound sessions. Sessions that deviate (unusual port, byte profile, or rare destination) after
+    a suspicious access surface as outliers. Report the deviating features so analysts can judge C2 likelihood.
+    This protects critical processes whose any-anomaly should be investigated. Positive outliers warrant
+    correlation with the access chain and TI; tune to legitimate update/telemetry traffic. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question "Has the
+    adversary elevated privileges using thread execution hijacking?" Source method (Machine Learning):
+    Train a One-Class SVM / Isolation Forest on benign network behavior for critical system processes
+    and flag anomalous outbound sessions, reporting the deviating features (port, bytes, destination rarity)
+    in the alert ([Malware Detection Using One-Class Classification, PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11243998/)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Sysmon Event ID 10
+  - 'NAI: Network Egress Points, Internal Network Segments, DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = net_features(critical_proc: port,bytes,dest_rarity,duration)
+
+      model = OneClassSVM(train=benign_critical_proc)
+
+      if model.predict(X)==outlier: alert(dev=explain(X))'
