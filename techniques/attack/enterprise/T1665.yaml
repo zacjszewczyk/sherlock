@@ -1,0 +1,574 @@
+name: 'T1665: Hide Infrastructure'
+id: efd6ba3a-d1c4-496a-89bd-76d5f5e16f82
+description: 'Investigate adversary attempts to hide and obscure command-and-control (C2) infrastructure
+  so that it evades detection, blocking, and takedown. This playbook helps an analyst hunt for: outbound
+  connections, DNS queries, and TLS handshakes matching threat-intel for known C2 redirectors, malicious
+  proxies, and abused hosting; SSL/TLS sessions using self-signed or free-CA certificates to non-whitelisted
+  cloud ASNs with rare or known-bad JA4/JA3 fingerprints; DNS anomalies including dynamic-DNS domains,
+  high-entropy/oversized-answer tunneling, NXDOMAIN spikes, and fast-flux domains resolving to large,
+  ASN-diverse, low-TTL IP sets; domain fronting (SNI vs HTTP Host mismatch) and trusted-CDN-to-low-reputation
+  redirect chains; periodic low-volume beaconing; and VPN/anonymizer/residential-proxy concealment with
+  geolocation spoofing used to bypass conditional-access and anti-abuse controls. Each question pairs
+  symbolic-logic, statistical, and machine-learning methods against network (Zeek, firewall) and endpoint
+  (Windows/auditd/Sysmon) telemetry to surface hidden C2 while suppressing benign periodicity, CDNs, and
+  corporate proxies.'
+type: technique
+related:
+- tactic_id: TA0011
+  tactic_name: Command And Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any outbound connections, DNS resolutions, or TLS handshakes from internal hosts matching
+    threat intelligence for known C2 redirectors, malicious proxies, or abused infrastructure (by IP,
+    domain, or certificate/JA4 fingerprint)?
+  context: Adversaries hide C2 behind redirectors, proxies, and abused hosting that defenders already
+    track in threat-intel feeds. Correlating first-party Zeek conn/dns/ssl telemetry against subscribed
+    feeds for IP, domain, and certificate-hash matches gives the highest-confidence detection of hidden
+    C2 under the Command and Control tactic. Operationalize the join on first-party logs (as in RITA)
+    and prefer stable JA4+ TLS fingerprints over churning JA3 values, since browser ClientHello randomization
+    destabilizes JA3. A positive match is a high-severity lead warranting host isolation and scoping;
+    a negative result narrows toward unknown/novel infrastructure that the statistical and ML methods
+    below are designed to surface.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., perimeter firewalls, web proxies), enterprise DNS resolvers, and
+    network sensor tap points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log, dns.log, ssl.log\n  | join threat_intel on (id.resp_h==ti.ip OR query==ti.domain\
+      \ OR ssl.cert_hash==ti.cert OR ja4==ti.ja4)\n  | where ti.category in ('C2_redirector','malicious_proxy','abused_infra')\n\
+      \  | alert severity=high"
+- question: Which non-corporate destination ASNs are receiving connections from an abnormally large number
+    of distinct internal hosts, and are dominated by proxy/VPN/residential IP categories?
+  context: Adversaries blend C2 into trusted hosting, proxy, and residential-proxy ranges so individual
+    connections look benign. Aggregating outbound connections by destination ASN and IP-reputation category,
+    then flagging non-corporate ASNs whose distinct-internal-host count exceeds the per-environment 95th
+    percentile (from a 30-day baseline) AND whose destinations are >50% proxy/VPN, surfaces this blending
+    under the Command and Control tactic. A flagged ASN is a pivot point for reviewing which hosts and
+    processes are talking to it; a clean profile reduces concern about proxy-based concealment.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., perimeter firewalls, web proxies), enterprise DNS resolvers, and
+    network sensor tap points.'
+  range: Last 30 days (baseline) with 24h evaluation windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  stats dc(src_ip) as hosts, sum(if(reputation in ('Proxy','VPN','Residential'),1,0))/count\
+      \ as proxy_ratio by dest_asn\n  | where dest_asn not in corp_asns AND hosts > p95_baseline(dest_asn)\
+      \ AND proxy_ratio > 0.5\n  | alert"
+- question: Are any external destinations showing anomalous, bimodal connection success/failure profiles
+    consistent with selectively filtering defensive or scanner traffic?
+  context: Adversary infrastructure that filters out incident-responder and security-appliance traffic
+    produces unusual ratios of failed/reset/blocked connections relative to successful ones. For each
+    external destination compute the ratio of conn_state S0/REJ/RSTO to SF plus firewall deny counts per
+    source over 1h, and flag destinations whose blocked-connection ratio exceeds 3 standard deviations
+    above the per-host baseline. Under Command and Control, this exposes concealment via selective filtering
+    even when the destination is not yet on any feed; benign destinations show stable, unimodal success
+    profiles.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., perimeter firewalls, web proxies), enterprise DNS resolvers, and
+    network sensor tap points.'
+  range: Last 90 days with 1h evaluation windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  stats sum(if(conn_state in ('S0','REJ','RSTO'),1,0)) as fail, sum(if(conn_state=='SF',1,0))\
+      \ as ok by dest_ip, src_ip\n  | eval fail_ratio=fail/(ok+1)\n  | where fail_ratio > baseline_mean+3*baseline_std\n\
+      \  | alert"
+- question: When connections are scored by a supervised classifier on enriched flow and certificate features,
+    which are predicted suspicious-C2, and what features drive each prediction?
+  context: A logistic-regression or gradient-boosted-tree classifier trained on features (threat-intel
+    match, destination port, protocol, duration, bytes sent/received and ratio, geo-rarity, IP-reputation
+    category, connection-failure ratio, and certificate properties such as self-signed/issuer/validity)
+    can rank connections benign vs suspicious-C2, catching combinations no single rule covers. Surfacing
+    the top-3 contributing features (coefficients/SHAP) makes alerts explainable and triageable under
+    Command and Control. For TLS 1.3 flows where certificate fields are encrypted, fall back to version-agnostic
+    flow features. High-probability predictions are investigative leads; the feature attributions guide
+    the analyst to the concealment behavior.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., perimeter firewalls, web proxies), enterprise DNS resolvers, and
+    network sensor tap points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=logreg_or_gbt(features=[ti_match,dport,proto,duration,bytes_out,bytes_in,ratio,geo_rarity,rep_cat,fail_ratio,cert_selfsigned,cert_issuer,cert_validity])\n\
+      \  | predict label, prob on connections\n  | where label=='suspicious_c2'\n  | annotate top3=shap(features)\
+      \ | alert"
+- question: Are any TLS sessions using self-signed or free-CA (e.g., Let's Encrypt) certificates to destinations
+    in non-whitelisted public-cloud/hosting ASNs while presenting a known-bad JA4/JA4S/JA4X fingerprint?
+  context: Hidden C2 frequently runs on cloud/hosting IPs behind self-signed or free certificates and
+    a custom TLS client stack. From Zeek ssl.log, flag sessions where issuer is empty or equals subject
+    (self-signed) or contains free-CA strings, cross-reference the destination ASN in conn.log against
+    a non-whitelisted public-cloud/hosting list, and alert when the JA4/JA4S/JA4X fingerprint matches
+    a known-bad C2 fingerprint. Prefer JA4 over JA3 because browser ClientHello randomization destabilizes
+    JA3. Under Command and Control this catches implants masquerading with cheap TLS on rented infrastructure;
+    legitimate enterprise services typically use whitelisted CAs and ASNs.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Network security monitoring sensors with SSL/TLS visibility (e.g., Zeek), and network egress
+    points with access to connection metadata.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  ssl.log | where issuer=='' OR issuer==subject OR issuer~='Let\\'s Encrypt|free-CA'\n\
+      \  | join conn.log on uid | where dest_asn in cloud_hosting_asns AND dest_asn not in whitelist\n\
+      \  | where ja4 in known_bad_ja4 OR ja4s in known_bad OR ja4x in known_bad\n  | alert"
+- question: Among sessions matching the self-signed/free-CA-to-cloud criteria, which present JA4 (or legacy
+    JA3/JA3S) fingerprints that are statistically rare across the enterprise?
+  context: Custom or non-standard client stacks used by C2 implants produce TLS fingerprints rarely seen
+    elsewhere in the environment. For sessions matching the certificate+ASN criteria, compute the enterprise-wide
+    30-day frequency of each observed JA4 (and legacy JA3/JA3S) hash and flag those in the bottom 5th
+    percentile of frequency. Under Command and Control, rarity combined with the suspicious certificate/ASN
+    context strongly suggests a bespoke implant; common fingerprints (browsers, standard libraries) are
+    deprioritized.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Network security monitoring sensors with SSL/TLS visibility (e.g., Zeek), and network egress
+    points with access to connection metadata.'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  stats count by ja4 over 30d\n  | eval pct=percentrank(count)\n  | join candidate_sessions\
+      \ on ja4 | where pct < 5\n  | alert"
+- question: Are any destinations exhibiting elevated TLS handshake-failure/alert rates or high proportions
+    of sessions aborted before application data?
+  context: Redirectors that fingerprint and reject scanners or sandboxes generate abnormally high TLS
+    handshake-failure and aborted-session ratios. Track per-destination handshake failure/alert rates
+    and the proportion of sessions terminating before application data, and flag destinations exceeding
+    3 standard deviations above baseline. Under Command and Control this is a distinct failure-mode signal
+    of concealment-by-filtering that complements certificate and fingerprint checks; benign endpoints
+    complete handshakes consistently.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Network security monitoring sensors with SSL/TLS visibility (e.g., Zeek), and network egress
+    points with access to connection metadata.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  ssl.log | stats sum(if(handshake_failed OR aborted_pre_appdata,1,0)) as fail, count\
+      \ as total by dest_ip\n  | eval rate=fail/total | where rate > baseline_mean+3*baseline_std | alert"
+- question: When SSL/TLS session metadata is scored with an Isolation Forest, which sessions are the highest-anomaly
+    outliers, and what features explain them?
+  context: An Isolation Forest over SSL/TLS metadata (certificate validity period, destination port, free/self-signed
+    flag, destination ASN, JA4 rarity score, handshake-failure rate, and bytes ratio) isolates rare combinations
+    characteristic of hidden C2 without needing labeled data. Investigate the highest-anomaly sessions
+    and list the top-3 contributing features in each alert. Augment with version-agnostic flow features
+    and self-supervised encrypted-traffic embeddings for TLS 1.3 where certificate detail is encrypted.
+    Under Command and Control, high anomaly scores plus suspicious feature attributions are strong leads;
+    low scores indicate routine TLS.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: Network security monitoring sensors with SSL/TLS visibility (e.g., Zeek), and network egress
+    points with access to connection metadata.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=IsolationForest(features=[cert_validity,dport,free_selfsigned,dest_asn,ja4_rarity,handshake_fail_rate,bytes_ratio])\n\
+      \  | score ssl_sessions | sort -anomaly_score | head\n  | annotate top3=feature_contrib | alert"
+- question: Are internal hosts querying dynamic-DNS domains or using tunneling-associated record types
+    (NULL, TXT, long CNAME chains) with anomalous label structure?
+  context: Adversaries hide and make resilient their C2 via dynamic-DNS providers and DNS tunneling over
+    uncommon record types. Scan Zeek dns.log for queries whose registered domain matches a maintained
+    dynamic-DNS list (ddns.net, no-ip.com, duckdns.org) OR that use tunneling-associated record types
+    (NULL, TXT, CNAME chains) with anomalous label structure, and correlate hits with process creation
+    (Windows Event ID 4688) to identify the responsible process. Under Command and Control this exposes
+    both cheap resilient infrastructure and covert DNS channels; benign dynamic-DNS use should be small
+    and attributable.
+  answer_sources:
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Enterprise DNS resolvers, endpoint devices (for process context), and DNS forwarders to external
+    resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  dns.log | where registered_domain in dyndns_list OR qtype in ('NULL','TXT') OR cname_chain_len>3\n\
+      \  | join win4688 on host,time_window | alert"
+- question: Which DNS queries have high-entropy subdomains (by KL divergence from an English n-gram model)
+    or oversized TXT/NULL answers indicative of tunneling?
+  context: DNS tunneling and DGA encode data in long, random-looking subdomains and large TXT/NULL responses.
+    For each query compute the subdomain's KL divergence from an English n-gram model (more discriminative
+    than raw Shannon entropy for short labels) and flag the 98th percentile; separately, per registered
+    domain track unique-subdomain count, average label length, and query rate, and flag TXT/NULL responses
+    exceeding 3 standard deviations above the 30-day rolling mean. Under Command and Control these are
+    hallmark covert-channel signals; normal lookups have low divergence and modest answer sizes.
+  answer_sources:
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Enterprise DNS resolvers, endpoint devices (for process context), and DNS forwarders to external
+    resolvers.'
+  range: Last 90 days with 30-day rolling baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  dns.log | eval kl=kldiv(subdomain, english_ngram) | where kl > p98\n  | stats dc(subdomain)\
+      \ as subs, avg(label_len) as alen, count as qrate by registered_domain\n  | where (qtype in ('TXT','NULL')\
+      \ AND answer_size > mean+3*std) | alert"
+- question: Which hosts show abnormal NXDOMAIN-to-total-query ratios or SERVFAIL spikes indicative of
+    DGA-style domain cycling for resilient hidden C2?
+  context: Malware using domain-generation algorithms cycles through many candidate domains, most of which
+    do not resolve, producing NXDOMAIN spikes before locking onto live C2. Compute per-host NXDOMAIN-to-total-query
+    ratio and SERVFAIL rate over 1h and flag hosts exceeding 3 standard deviations above their baseline.
+    Under Command and Control this is a distinct failure-mode signal of resilient/hidden infrastructure;
+    benign hosts have low, stable NXDOMAIN ratios.
+  answer_sources:
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Enterprise DNS resolvers, endpoint devices (for process context), and DNS forwarders to external
+    resolvers.'
+  range: Last 90 days with 1h evaluation windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  dns.log | stats sum(if(rcode=='NXDOMAIN',1,0)) as nx, sum(if(rcode=='SERVFAIL',1,0))\
+      \ as sf, count as total by host\n  | eval nx_ratio=nx/total | where nx_ratio > baseline_mean+3*baseline_std\
+      \ | alert"
+- question: Do any hosts exceed forecasted DNS query volumes or score as anomalous on stateless lexical/volumetric
+    features consistent with DNS tunneling?
+  context: Combine a seasonal forecast (e.g., SARIMA) of per-host DNS volume with an Isolation Forest
+    over stateless lexical/volumetric features (subdomain count, entropy, label length, record-type mix).
+    Alert when observed volume exceeds forecast and/or the domain scores anomalous, then enrich by correlating
+    with high-KL subdomains and NXDOMAIN spikes from the same host and surface the top-3 features driving
+    the score. Under Command and Control this catches covert DNS channels that evade single thresholds;
+    benign hosts track their seasonal forecast and score low.
+  answer_sources:
+  - Zeek dns.log
+  - Windows Event ID 4688
+  - 'NAI: Enterprise DNS resolvers, endpoint devices (for process context), and DNS forwarders to external
+    resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  forecast=SARIMA(dns_volume per host); flag where observed>forecast\n  | model=IsolationForest(features=[subdomain_count,entropy,label_len,rtype_mix])\
+      \ | score domains\n  | correlate high_kl, nxdomain_spike same host | annotate top3 | alert"
+- question: Are there decrypted sessions where the TLS SNI (server_name) does not match the HTTP Host
+    header, the defining indicator of domain fronting?
+  context: Domain fronting hides the true C2 backend behind a trusted front domain on a shared CDN by
+    mismatching the encrypted SNI from the inner HTTP Host header. In a decrypted environment, join Zeek
+    http.log and ssl.log on session UID and alert when http host != ssl server_name. Where decryption
+    is unavailable, use JA4H HTTP fingerprints plus certificate JA4X to flag non-browser clients connecting
+    to CDN endpoints. Under Command and Control a confirmed mismatch is high-confidence concealment; matched
+    values are normal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Decrypting web proxies, network TAPs placed between users and the internet, and network security
+    monitoring sensors.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  join http.log, ssl.log on uid\n  | where http.host != ssl.server_name\n  | alert severity=high\n\
+      \  // fallback: where decrypt unavailable, flag ja4h non-browser to cdn endpoints"
+- question: Which hosts show rare transitions from a high-reputation CDN/URL-shortener connection immediately
+    into a low-reputation or uncategorized C2-like connection?
+  context: Adversaries present benign content on trusted CDN/shortener domains that then redirect victims
+    to malicious infrastructure once conditions are met. Identify initial connections to high-reputation
+    CDN/URL-shortener domains, analyze the next connection within a 5s window, estimate the transition
+    probability from CDN to a C2-like connection (long duration, low byte volume, non-corporate destination),
+    and flag hosts whose transition probability is >3 standard deviations from the population mean. Under
+    Command and Control this captures trusted-domain redirection to hidden backends; ordinary browsing
+    rarely chains CDN to rare uncategorized IPs.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Decrypting web proxies, network TAPs placed between users and the internet, and network security
+    monitoring sensors.'
+  range: Last 90 days with 5s correlation window
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  seq = connections ordered by time per host\n  | where prev.dest in cdn_or_shortener\
+      \ AND next within 5s AND next.duration_long AND next.bytes_low AND next.dest not in corp\n  | stats\
+      \ transition_prob by host | where transition_prob > pop_mean+3*pop_std | alert"
+- question: Are any hosts showing elevated HTTP 30x redirect or 4xx/blocked response ratios following
+    CDN connections, consistent with user-agent/geo-gated redirectors?
+  context: Adversary redirectors that gate by user-agent or geolocation produce elevated redirect-then-uncategorized-destination
+    and 404/blocked patterns. Track per-host ratios of HTTP 30x redirects and 4xx/blocked responses following
+    CDN connections and flag outliers above 3 standard deviations from baseline. Under Command and Control
+    this distinct failure-mode signal exposes gating logic that hides C2 from scanners and researchers;
+    legitimate CDN use shows low redirect/4xx ratios.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Decrypting web proxies, network TAPs placed between users and the internet, and network security
+    monitoring sensors.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  http.log | where referrer_or_prev in cdn\n  | stats sum(if(status~='3..',1,0)) as redir,\
+      \ sum(if(status~='4..',1,0)) as err, count as total by host\n  | eval ratio=(redir+err)/total |\
+      \ where ratio > baseline_mean+3*baseline_std | alert"
+- question: When per-host browsing sequences are modeled with an LSTM, which sequences are anomalous (e.g.,
+    trusted-CDN to rare uncategorized IP) indicative of a redirector?
+  context: A sequence model (LSTM) trained on per-host session-metadata sequences (destination IP/domain/ASN/port/protocol/bytes)
+    learns normal browsing patterns and flags anomalous transitions such as trusted-CDN-to-rare-uncategorized-IP
+    that signal redirector use. For encrypted/TLS 1.3 traffic use self-supervised flow embeddings and
+    version-agnostic flow features, and report the top-3 contributing features in alerts. Under Command
+    and Control, anomalous sequences are leads toward hidden redirection chains; typical browsing scores
+    as normal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Decrypting web proxies, network TAPs placed between users and the internet, and network security
+    monitoring sensors.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=LSTM(seq=[dest_ip,domain,asn,port,proto,bytes] per host)\n  | score sequences\
+      \ | where anomaly AND trusted_cdn_to_rare_ip\n  | annotate top3 | alert"
+- question: Are any internal hosts connecting to TOR exit nodes, malicious proxies, or known C2 providers
+    (especially over non-standard web ports) with rare or known-bad JA4 fingerprints?
+  context: Beaconing C2 often egresses through anonymizing proxies and known C2 providers on unusual ports.
+    Enrich Zeek conn.log with IP reputation and alert on internal-host connections to external IPs categorized
+    'TOR Exit Node', 'Malicious Proxy', or known C2 provider, especially over non-standard web ports,
+    corroborating with rare/known-bad JA4 fingerprints and intel matches (as implemented in RITA). Under
+    Command and Control this directly catches concealed beacon egress; benign traffic uses standard ports
+    and reputable destinations.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., firewalls), network sensor tap points, and endpoint devices for
+    process and command-line context.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log | enrich ip_reputation\n  | where reputation in ('TOR_Exit','Malicious_Proxy','C2_provider')\
+      \ OR dport not in (80,443)\n  | where ja4 in known_bad OR intel_match | alert"
+- question: Which source-destination pairs exhibit low inter-arrival-time variance and consistently low
+    byte counts characteristic of automated beaconing?
+  context: Automated beacons connect at near-constant intervals with small payloads. For each source-destination
+    IP pair, group connections into 24h windows and compute the coefficient of variation of inter-arrival
+    times and mean bytes; flag pairs with low inter-arrival-time CV/standard deviation (<1.0s) and low
+    mean byte count (<1KB). Tune thresholds against benign-periodicity baselines (software updates, NTP,
+    telemetry) to suppress false positives. Under Command and Control this is a core beaconing signal;
+    jittered beacons are caught by the periodicity and ML methods below.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., firewalls), network sensor tap points, and endpoint devices for
+    process and command-line context.'
+  range: Last 90 days with 24h windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log | stats stdev(inter_arrival) as iat_sd, cv(inter_arrival) as iat_cv, avg(bytes)\
+      \ as mbytes by src,dest\n  | where iat_sd < 1.0 AND mbytes < 1024 AND not benign_periodic(src,dest)\
+      \ | alert"
+- question: Do any host-destination time series show strong periodicity by FFT/autocorrelation analysis
+    robust to jitter, and are those beacon connections succeeding or failing?
+  context: Build per-(host,destination) connection time series and apply FFT/power-spectral-density and
+    autocorrelation regularity tests to surface dominant periods robust to jitter and missing observations,
+    ranking candidates as in BAYWATCH and RITA. Profile the success/fail state of beacon connections (SF
+    vs S0/REJ) to distinguish live C2 from dead infrastructure. Under Command and Control, a strong dominant
+    period with successful connections is a high-confidence live-beacon lead; failing periodic attempts
+    may indicate dormant or taken-down infrastructure.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., firewalls), network sensor tap points, and endpoint devices for
+    process and command-line context.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  ts = count per (host,dest) per time_bucket\n  | apply FFT/PSD + autocorrelation | rank\
+      \ dominant_period\n  | annotate conn_state SF vs S0/REJ | where strong_periodicity | alert"
+- question: When connection metadata is clustered with DBSCAN, which small distinct clusters separate
+    from benign traffic, and what originating processes generated them?
+  context: Apply DBSCAN to connection metadata using features log(bytes_sent), log(duration), CV(inter_arrival_time),
+    destination_port, and connection-state ratios; investigate small clusters distinct from the dense
+    benign-traffic cluster. Correlate timestamps with process creation (Windows Event ID 4688, Sysmon
+    Event ID 1) to identify the originating process, and report the top-3 features separating the cluster.
+    For high-jitter beacons that defeat interval statistics, apply time-series ML. Under Command and Control,
+    small outlier clusters tied to suspicious processes are strong hidden-C2 leads.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 3
+  - 'NAI: Network egress points (e.g., firewalls), network sensor tap points, and endpoint devices for
+    process and command-line context.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=DBSCAN(features=[log(bytes_sent),log(duration),cv(inter_arrival),dport,connstate_ratio])\n\
+      \  | cluster connections | where small_distinct_cluster\n  | join win4688/sysmon1 on host,time |\
+      \ annotate top3 | alert"
+- question: Are internal hosts resolving domains on a fast-flux C2 intel feed, or domains matching FluxBuster-style
+    pre-filters (very low TTL, IPs spanning many /24s and ASNs, residential/dynamic reverse-DNS)?
+  context: 'Fast-flux hides C2 behind a constantly rotating pool of compromised IPs. Monitor Zeek dns.log
+    for queries to domains on a fast-flux C2 intel feed and alert on any internal host resolving them,
+    and apply FluxBuster-style deterministic pre-filters: very low TTL combined with resolved IPs spanning
+    many /24 networks and ASNs, plus reverse-DNS patterns typical of residential/dynamic pools. Under
+    Command and Control this catches resilient hidden infrastructure; legitimate CDNs show stable, low-ASN-diversity,
+    higher-TTL profiles.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Enterprise DNS resolvers, DNS forwarders, and network security monitoring sensors capturing
+    DNS traffic.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  dns.log | where domain in fastflux_feed OR (ttl<300 AND dc(/24)>N AND dc(asn)>M AND\
+      \ ptr~='dynamic|residential')\n  | alert"
+- question: Which domains have high flux scores combining many unique IPs and ASNs with very low average
+    TTL?
+  context: 'For each domain compute a flux score over a rolling 1h window: (Count(Unique IPs) * Count(Unique
+    ASNs)) / (Average(TTL)+1), and flag domains in the 99th percentile (derive per environment from baseline).
+    This separates fast-flux C2 from legitimate CDNs, which have stable, low-ASN-diversity, higher-TTL
+    profiles. Under Command and Control a high flux score is a strong indicator of hidden, resilient infrastructure
+    warranting investigation of the resolving hosts.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Enterprise DNS resolvers, DNS forwarders, and network security monitoring sensors capturing
+    DNS traffic.'
+  range: Last 90 days with 1h rolling windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  dns.log | stats dc(ip) as ips, dc(asn) as asns, avg(ttl) as attl by domain over 1h\n\
+      \  | eval flux=(ips*asns)/(attl+1) | where flux > p99_baseline | alert"
+- question: Which domains show high A-record churn per hour combined with elevated connection-failure
+    ratios on the resolved IPs?
+  context: Track the rate of distinct A-record changes per domain per hour and the proportion of resolutions
+    yielding subsequently-unreachable IPs (failed follow-on connections), flagging domains >3 standard
+    deviations above baseline churn. High IP churn with elevated connection-failure ratios is a distinct
+    fast-flux/concealment signal that complements flux scoring. Under Command and Control this exposes
+    rotating infrastructure with many dead nodes; stable services show low churn and reliable connectivity.
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Enterprise DNS resolvers, DNS forwarders, and network security monitoring sensors capturing
+    DNS traffic.'
+  range: Last 90 days with 1h windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  dns.log | stats dc(a_record) as churn by domain per hour\n  | join conn.log | eval fail_ratio=failed_followon/total\n\
+      \  | where churn > baseline+3*std AND fail_ratio high | alert"
+- question: When domains are classified with a decision-tree/Random Forest on DNS-response features, which
+    are predicted fast-flux versus legitimate CDN, and what features drive the call?
+  context: 'Train a C4.5/Random Forest classifier on per-domain DNS-response features over a time window:
+    count of unique IPs, unique ASNs, unique /24 networks, average and standard deviation of TTL, IP growth
+    ratio, domain length, and KL-divergence name score. Classify domains benign / legitimate-CDN / fast-flux
+    and surface the top-3 features (tree importance) in alerts. Under Command and Control this disambiguates
+    fast-flux C2 from CDNs that superficially resemble it; the feature importances make each verdict explainable
+    for triage.'
+  answer_sources:
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: Enterprise DNS resolvers, DNS forwarders, and network security monitoring sensors capturing
+    DNS traffic.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=RandomForest(features=[uniq_ips,uniq_asns,uniq_24,avg_ttl,std_ttl,ip_growth,domain_len,kl_name])\n\
+      \  | predict {benign,legit_cdn,fast_flux} per domain\n  | where pred=='fast_flux' | annotate top3=tree_importance\
+      \ | alert"
+- question: Are there outbound connections to VPN/anonymizer/residential-proxy ASNs or flows matching
+    OpenVPN/obfuscated-tunnel fingerprints used to disguise C2 source IPs?
+  context: Adversaries route C2 through VPNs, anonymizers, and residential proxies to disguise source
+    IPs and spoof geolocation. Alert on outbound connections to destination IPs in VPN/anonymizer/residential-proxy
+    reputation categories and on flows matching OpenVPN opcode/byte-pattern signatures (including obfuscated
+    XOR/obfsproxy variants) detectable from flow metadata, corroborating with rare JA4 stacks and intel
+    matches. Under Command and Control this exposes tunneling-based concealment; legitimate sanctioned
+    VPNs should be whitelisted to reduce noise.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Firewall logs
+  - Windows Event ID 5156
+  - 'NAI: Network egress points, VPN concentrators, web proxies, and authentication/conditional-access
+    logs.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log | where reputation in ('VPN','Anonymizer','Residential_Proxy') OR openvpn_signature(flow)\
+      \ OR obfsproxy_pattern(flow)\n  | where ja4 in rare_or_known_bad OR intel_match | alert"
+- question: Are there authentication or egress events where source-IP geolocation/ASN mismatches the user's
+    baseline or aligns to victim IP ranges, indicating conditional-access or anti-abuse evasion?
+  context: Adversaries spoof geolocation (e.g., via a virtual private cloud aligned to victim IP ranges)
+    to bypass conditional-access policies and anti-abuse protections. For authentication and egress events,
+    compare source-IP geolocation/ASN against the user's historical baseline and the organization's IP
+    ranges; flag improbable-travel and source IPs aligned to victim ranges via cloud/VPN, and profile
+    failed-then-succeeded logon sequences as a distinct failure-mode signal of access-policy evasion.
+    Under Command and Control this catches IP/geo spoofing used to blend in and bypass geofencing.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Firewall logs
+  - Windows Event ID 5156
+  - 'NAI: Network egress points, VPN concentrators, web proxies, and authentication/conditional-access
+    logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  auth+egress | compare src_geo/asn vs user_baseline AND vs corp_ranges\n  | flag improbable_travel\
+      \ OR (src_ip aligned_to_victim_range via cloud/vpn)\n  | profile failed_then_success logon | alert"
+- question: Which candidate VPN endpoints show anomalous connection success/failure or active-probe response
+    profiles consistent with selective filtering or probe resistance?
+  context: Track connection success/failure ratios and active-probe responses for candidate VPN endpoints;
+    selectively filtered or probe-resistant servers exhibit anomalous response profiles, and you should
+    flag destinations >3 standard deviations from baseline. Under Command and Control this distinct failure-mode
+    signal helps separate adversary-controlled concealment infrastructure from ordinary VPN services,
+    which respond consistently to probes and connections.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Firewall logs
+  - Windows Event ID 5156
+  - 'NAI: Network egress points, VPN concentrators, web proxies, and authentication/conditional-access
+    logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log | stats success/fail ratio, probe_response_rate by vpn_endpoint\n  | where\
+      \ profile > baseline_mean+3*baseline_std | alert"
+- question: When encrypted flows are scored by a flow-feature classifier, which are predicted VPN/proxy-tunneled
+    C2 rather than benign encrypted traffic, and what features drive the prediction?
+  context: Train a flow-feature classifier (packet sizes, directions, inter-arrival times, burst structure,
+    byte ratios) to distinguish VPN/proxy-tunneled C2 from benign encrypted traffic without decryption,
+    surfacing the top-3 contributing features in each alert. Under Command and Control this detects concealed
+    tunnels even when payloads are encrypted (including TLS 1.3); high-probability predictions with suspicious
+    feature attributions are investigative leads, while benign encrypted traffic scores low.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Firewall logs
+  - Windows Event ID 5156
+  - 'NAI: Network egress points, VPN concentrators, web proxies, and authentication/conditional-access
+    logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  model=flow_classifier(features=[pkt_sizes,directions,inter_arrival,burst_structure,byte_ratios])\n\
+      \  | predict {benign_encrypted, tunneled_c2} on flows\n  | where pred=='tunneled_c2' | annotate\
+      \ top3 | alert"
