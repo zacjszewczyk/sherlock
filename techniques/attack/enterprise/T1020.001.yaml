@@ -1,0 +1,579 @@
+name: 'T1020.001: Traffic Duplication'
+id: 344877a6-e6fb-4a8c-a897-6108b7b695d2
+description: Investigate suspected data exfiltration via Traffic Duplication (network traffic mirroring)
+  across on-premises network devices and IaaS/cloud control planes under TA0010 Exfiltration. Adversaries
+  abuse native mirror/SPAN/RSPAN/ERSPAN/GRE features on routers and switches, or AWS Traffic Mirroring,
+  GCP Packet Mirroring, and Azure vTAP, to silently copy and redirect traffic to infrastructure they control.
+  This playbook helps an analyst hunt for unauthorized mirror-session configuration on management hosts
+  and network devices, cloud management-plane API calls that create or modify traffic-mirroring resources,
+  encapsulated (GRE/ERSPAN) flows to non-allowlisted destinations, and the resulting large, asymmetric,
+  high-entropy, or threat-intel-matching outbound flows. It combines symbolic-logic rules, statistical
+  baselining and change-point/forecast methods, and machine-learning anomaly scoring over Zeek network
+  logs, Windows process/authentication events, network-device syslog, and cloud audit/flow logs to surface
+  both overt and low-and-slow covert exfiltration channels.
+type: technique
+related:
+- tactic_id: TA0010
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any internal hosts sending outbound flows to external IPs or resolved domains that appear
+    on high-confidence threat-intelligence feeds tagged as Command-and-Control or Exfiltration-Dropzone?
+  context: This question helps confirm whether duplicated/mirrored traffic is being shipped to known-bad
+    infrastructure. Join Zeek conn.log with dns.log so both raw IP destinations and resolved domains can
+    be matched against curated, high-confidence TI entries categorized as C2 or Exfiltration-Dropzone.
+    A positive match on a high-quality feed is a strong, defensible exfiltration indicator under TA0010;
+    a negative result does not clear the host because adversaries rotate infrastructure. To preserve precision,
+    curate feeds carefully and allowlist authorized monitoring partners and known SaaS/CDN ranges so legitimate
+    mirroring or analytics traffic does not generate noise.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, Cloud virtual network gateways'
+  range: Last 90 days, with priority triage on the most recent 24 hours.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'JOIN Zeek_conn WITH Zeek_dns ON conn.id_resp_h = dns.answer_ip OR conn.id_resp_h = dns.query_ip;
+
+      match = LOOKUP(dest_ip, resolved_domain) IN TI_feed WHERE category IN [''Command and Control'',''Exfiltration
+      Dropzone''] AND confidence=''high'';
+
+      ALERT where match=true AND dest NOT IN allowlist(SaaS,CDN,authorized_monitoring);
+
+      OUTPUT src_ip, dest_ip, resolved_domain, ti_category, bytes_out.'
+- question: Which external destinations are the top information-carrying egress heavy hitters, and are
+    any of them first-seen destinations newly appearing in the top-K by bytes-out and information-per-minute?
+  context: Traffic duplication produces sustained, voluminous outbound transfer to a small set of destinations.
+    Rank external destinations by bytes-out and estimated information carried per minute using a streaming
+    information-based heavy-hitter approach, and alert when a previously unseen destination enters the
+    top-K. Set the per-destination information bound from compression-based covert-channel limits so that
+    even efficiently encoded channels are caught. A first-seen heavy hitter in the egress top-K is a high-value
+    lead for mirrored-data shipping; combine with TI and ratio checks to prioritize.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, Cloud virtual network gateways'
+  range: Last 90 days, with streaming top-K evaluation refreshed continuously.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FOR each conn event: update_information_sketch(dest, bytes_out, qname_features) per minute;
+
+      topK = heavy_hitters(sketch, K=50);
+
+      ALERT where dest IN topK AND first_seen(dest) within=lookback AND info_per_min > covert_channel_bound;
+
+      OUTPUT dest, bytes_out, info_per_min, first_seen_ts.'
+- question: Are there connections to new external IPs where the outbound-to-inbound byte ratio is extreme
+    (orig_bytes/resp_bytes > 100:1) and the outbound volume exceeds the 95th percentile for the host class?
+  context: 'Exfiltration via mirroring is highly asymmetric: large volumes leave while little returns.
+    For newly-seen external destinations, flag flows whose orig_bytes/resp_bytes exceeds 100:1 and whose
+    orig_bytes is above the 95th percentile for that host''s class. Derive per-subnet percentiles over
+    a rolling 30-day window so thresholds reflect each segment''s normal behavior. This volume-plus-state-asymmetry
+    rule is a deterministic, defensible floor that catches bulk shipping while the percentile component
+    reduces false positives from naturally upload-heavy hosts.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, Cloud virtual network gateways'
+  range: Last 90 days, with 30-day rolling percentile baselines per subnet.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'p95 = rolling_percentile(orig_bytes, by=host_class, days=30, pct=95);
+
+      ALERT FROM Zeek_conn WHERE first_seen(dest_ip)=true AND (orig_bytes/NULLIF(resp_bytes,0)) > 100
+      AND orig_bytes > p95;
+
+      OUTPUT src_ip, dest_ip, orig_bytes, resp_bytes, ratio.'
+- question: Do any DNS queries associated with these egress flows score as algorithmically-generated or
+    covert domains under entropy/lexical anomaly scoring?
+  context: Adversaries pairing traffic duplication with DNS-based covert channels or DGA infrastructure
+    will produce queries with anomalous lexical and entropy characteristics. Score dns.log queries with
+    stateless lexical/entropy features and an Isolation Forest, escalating domains in the top isolation
+    percentile. Emit the top-3 contributing features (entropy, length, unique-subdomain rate) in each
+    alert so analysts can quickly validate. A high isolation score combined with a matching heavy outbound
+    flow strengthens the case for an exfiltration dropzone; clean scores reduce, but do not eliminate,
+    suspicion.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, DNS resolvers, Cloud virtual network gateways'
+  range: Last 90 days, with model scoring on incoming DNS events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'features = lexical_entropy_features(Zeek_dns.qname: [entropy, length, unique_subdomain_rate,
+      ngram]);
+
+      score = isolation_forest.predict(features);
+
+      explain = top3_contributors(features);
+
+      ALERT where score >= isolation_p99; OUTPUT qname, score, explain.'
+- question: Did any process-creation event or network-device configuration command on a management host
+    contain traffic-mirroring keywords such as 'monitor session', 'span', 'rspan', 'erspan', 'gre', or
+    'vTap'?
+  context: Configuring traffic duplication leaves behind a configuration footprint. Alert when Windows
+    Event ID 4688 (or network-device syslog via CLI/NETCONF/SNMP) from management hosts contains mirroring
+    keywords. Tune against an authorized-monitoring allowlist so legitimate SPAN reconfiguration by network
+    engineers does not flood the queue. A keyword hit from an unexpected host, user, or outside a change
+    window is a direct sign of mirror-session setup for exfiltration under TA0010; absence of hits pushes
+    the hunt toward device-native logs the EDR cannot see.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Network management servers, Core switches/routers, Virtual network control planes (Cloud)'
+  range: Last 90 days, with immediate alerting on new configuration events.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'ALERT FROM (EID_4688 OR networkdevice_syslog)
+
+      WHERE host IN management_hosts
+
+      AND command_line MATCHES /(monitor session|span|rspan|erspan|gre|vtap|mirror port)/i
+
+      AND NOT (user, host, change_ticket) IN authorized_monitoring_allowlist;
+
+      OUTPUT host, user, command_line, ts.'
+- question: Are there any encapsulated GRE/ERSPAN flows directed to external destinations that are not
+    on the allowlist of authorized network-monitoring partners, especially with unusually long duration
+    or high volume?
+  context: Mirrored traffic is frequently encapsulated (GRE/ERSPAN) to reach a remote collector. Baseline
+    GRE/ERSPAN flows to allowlisted destinations, then flag any new external target outside the allowlist
+    - particularly when duration or volume exceed the 95th percentile - using single-flow temporal features
+    (duration, byte/packet rate, asymmetry). A rare encapsulated flow to an unknown external endpoint
+    is a strong indicator of illicit traffic redirection; allowlisted, baselined targets are expected
+    and suppressed.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Network management servers, Core switches/routers, Virtual network control planes (Cloud)'
+  range: Last 90 days, with 30-day baseline of authorized encapsulated destinations.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'encap = Zeek_conn WHERE proto IN [gre,erspan] OR service IN [gre,erspan];
+
+      baseline = known_encap_targets(allowlist);
+
+      p95 = percentile(duration, byte_rate, 95);
+
+      ALERT where dest NOT IN baseline AND (duration>p95 OR byte_rate>p95);
+
+      OUTPUT src_ip, dest_ip, proto, duration, bytes, pkt_rate.'
+- question: Does any per-interface GRE/ERSPAN byte counter show a sustained level shift (change point)
+    marking a newly activated mirror session?
+  context: A newly enabled mirror session manifests as a sudden, sustained increase in encapsulated traffic
+    on an interface. Apply CUSUM/PELT change-point detection to per-interface GRE/ERSPAN byte counters
+    and alert on a sustained level shift rather than transient spikes. The onset of a durable level shift
+    pinpoints when a mirror session was activated, giving analysts a precise time anchor to correlate
+    with configuration changes and admin logins. Brief, self-resolving spikes are ignored to limit false
+    positives.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Network management servers, Core switches/routers, Virtual network control planes (Cloud)'
+  range: Last 90 days, with change-point evaluation over per-interface time series.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = per_interface_byte_counter(proto IN [gre,erspan], interval=5m);
+
+      cp = changepoint(series, method=''CUSUM|PELT'');
+
+      ALERT where cp.level_shift=true AND sustained_windows>=N;
+
+      OUTPUT interface, shift_ts, pre_level, post_level.'
+- question: Are there admin command or configuration-change sequences on management hosts that score as
+    high-anomaly and may indicate setup of illicit mirroring?
+  context: Beyond single keyword matches, the sequence and context of administrative actions can reveal
+    covert mirror configuration. Train an Isolation Forest on admin command/config-change sequences and
+    highlight high-anomaly sessions. Surface the top-3 contributing features (command rarity, host, time-of-day)
+    in the alert so analysts can judge relevance. An anomalous admin session on a network-management host
+    - rare commands, unusual host, off-hours - is a meaningful lead for traffic-duplication setup that
+    may evade keyword rules; normal sessions score low and are deprioritized.
+  answer_sources:
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Network management servers, Core switches/routers, Virtual network control planes (Cloud)'
+  range: Last 90 days, with 30-day baseline of admin session behavior.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'seq = admin_config_sequences(host, user, [command, time_of_day, command_rarity]);
+
+      score = isolation_forest.predict(seq);
+
+      explain = top3_contributors(seq);
+
+      ALERT where score>=anomaly_threshold; OUTPUT host, user, session, score, explain.'
+- question: Are there any single outbound connections from standard user subnets to external IPs exceeding
+    a hard 1 GB volume floor?
+  context: A deterministic volume floor catches blatant bulk exfiltration that any baseline method should
+    also flag. Alert on single connections from standard user subnets to external IPs exceeding 1 GB,
+    tuning the floor per subnet but never removing it entirely so a reliable backstop always exists. This
+    symbolic Volume rule is simple and defensible; while sophisticated actors stay under thresholds, commodity
+    malware and careless insiders frequently do not, and a 1 GB single-flow upload from a workstation
+    warrants immediate review.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points, Server subnets, User workstation subnets, Database server segments'
+  range: Last 90 days, with per-subnet tuned floors.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'ALERT FROM Zeek_conn WHERE src_subnet IN user_subnets AND dest_ip IS external AND orig_bytes
+      > subnet_floor(default=1GB);
+
+      OUTPUT src_ip, dest_ip, orig_bytes, ts.'
+- question: Which hosts show a daily outbound-volume spike exceeding their 30-day mean plus 3 standard
+    deviations, and does the onset look like a sustained level shift?
+  context: Mirrored-data exfiltration inflates a host's outbound volume above its own norm. Baseline daily
+    orig_bytes per host over 30 days and flag days exceeding mean + 3 sigma, then confirm by treating
+    the onset as a level shift via change-point detection. The combination of a statistical spike plus
+    a durable change point distinguishes a real exfiltration onset from a one-day blip. A sustained shift
+    in a host's egress baseline is a strong lead under TA0010; transient spikes that revert are lower
+    priority.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points, Server subnets, User workstation subnets, Database server segments'
+  range: Last 90 days, with 30-day rolling per-host baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = rolling_mean_std(orig_bytes_daily, by=host, days=30);
+
+      spike = today_orig_bytes > baseline.mean + 3*baseline.std;
+
+      cp = changepoint(orig_bytes_daily series, by=host);
+
+      ALERT where spike=true AND cp.level_shift=true; OUTPUT host, day, value, baseline.mean.'
+- question: For critical network segments, do observed outbound volumes fall outside the forecasted prediction
+    interval after accounting for daily and weekly seasonality?
+  context: Critical segments (database, server farms) have predictable egress rhythms. Forecast outbound
+    volume with ARIMA/SARIMA and alert on observations outside the 99% prediction interval, accounting
+    for daily/weekly seasonality so normal business cycles are not flagged. A breach of the forecast interval
+    on a sensitive segment indicates anomalous data movement that may reflect mirrored traffic being shipped
+    out. Seasonality-aware forecasting reduces false positives from expected peaks (e.g., nightly backups)
+    while still catching genuine anomalies.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points, Server subnets, User workstation subnets, Database server segments'
+  range: Last 90 days for model training; active scoring on current windows.
+  queries:
+  - technology: ML time-series pseudocode
+    query: 'model = fit_sarima(segment_outbound_volume, seasonality=[daily,weekly]);
+
+      forecast, lo, hi = model.predict_interval(ci=0.99);
+
+      ALERT where observed < lo OR observed > hi; OUTPUT segment, ts, observed, hi.'
+- question: Which hosts or segments are outliers when their flow feature vectors (bytes, ratio, duration,
+    rate) are scored by an unsupervised anomaly model?
+  context: Some exfiltration patterns evade single-metric thresholds but stand out in multi-feature space.
+    Score per-host/per-segment flow feature vectors (bytes, ratio, duration, rate) with an Isolation Forest,
+    a strong low-latency zero-day baseline, and report the top-3 features driving each score. This catches
+    novel or low-and-slow patterns that thresholds miss, while the feature attribution gives analysts
+    an explainable basis for triage. A high anomaly score with bytes/ratio drivers points toward exfiltration;
+    benign hosts cluster as normal.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network egress points, Server subnets, User workstation subnets, Database server segments'
+  range: Last 90 days for baseline; continuous scoring of flow vectors.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'X = flow_features(host_or_segment: [orig_bytes, byte_ratio, duration, byte_rate]);
+
+      score = isolation_forest.predict(X);
+
+      explain = top3_features(X);
+
+      ALERT where score>=threshold; OUTPUT entity, score, explain.'
+- question: Are high-volume outbound flows (orig_bytes > 100 MB) correlated with Zeek weird.log notices
+    such as 'inappropriate_FIN' or 'data_before_established'?
+  context: 'Tunneled or manipulated connections often trigger protocol anomalies that Zeek records as
+    ''weird'' notices. Alert when weird.log notices (inappropriate_FIN, data_before_established) tie to
+    outbound flows exceeding 100 MB, combining the State anomaly with a Volume signal. The pairing is
+    far more specific than either alone: a large transfer over a protocol-anomalous connection suggests
+    obfuscated or tunneled exfiltration of mirrored data. Clean protocol behavior on large flows is comparatively
+    reassuring but should still be checked against other methods.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, Application servers, DNS resolvers'
+  range: Last 90 days, correlating weird notices to concurrent flows.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'weird = Zeek_weird WHERE name IN [''inappropriate_FIN'',''data_before_established''];
+
+      flows = Zeek_conn WHERE orig_bytes > 100MB;
+
+      ALERT on JOIN(weird, flows, uid); OUTPUT src_ip, dest_ip, weird_name, orig_bytes.'
+- question: Do any domain names or flow payloads exhibit Shannon entropy above natural-language/structured-data
+    baselines (e.g., >7.2), indicating encryption, compression, or tunneling?
+  context: Encrypted or compressed exfiltration content has near-maximal entropy. Flag domain names and
+    flow payloads whose Shannon entropy exceeds natural-language/structured-data baselines (around >7.2
+    indicates encrypted/compressed), setting the percentile cut from your own DNS baseline. High entropy
+    on a domain or payload associated with a large egress flow suggests covert encoding consistent with
+    traffic-duplication exfiltration. Because some legitimate traffic is also high-entropy (TLS, archives),
+    pair this with volume, TI, and allowlist context before escalating.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, Application servers, DNS resolvers'
+  range: Last 90 days, with entropy baselines from local DNS/flow data.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'entropy = shannon(domain_name) ; payload_entropy = shannon(flow_payload_sample);
+
+      cut = local_baseline_percentile(entropy, pct=99);
+
+      ALERT where entropy > 7.2 OR entropy >= cut; OUTPUT domain, flow_uid, entropy.'
+- question: Does the estimated information carried to any destination, measured via lossless compression,
+    exceed covert-channel information bounds?
+  context: Covert channels can be detected by how much information they actually transfer, independent
+    of raw byte counts. Estimate information carried per destination via lossless compression and alert
+    when it exceeds established covert-channel bounds. This reframes exfiltration as an information-transfer
+    problem, catching low-and-slow channels that stay under volume thresholds yet still move significant
+    compressed information. Exceeding the bound is a strong covert-channel signal; staying under it is
+    consistent with benign chatter.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, Application servers, DNS resolvers'
+  range: Last 90 days, computed per destination and trended.
+  queries:
+  - technology: Analytics/statistics pseudocode
+    query: 'stream = concat_payload_or_qnames(by=dest, window=day);
+
+      info_estimate = compression_bound(stream);
+
+      ALERT where info_estimate > covert_channel_policy_bound(segment); OUTPUT dest, info_estimate, bound.'
+- question: Do Zeek/flow features (state, bytes, packet sizes, timing) produce high reconstruction error
+    under an online autoencoder ensemble, indicating obfuscated or tunneled connections?
+  context: Obfuscated or tunneled traffic deviates from learned-normal flow structure. Score Zeek/flow
+    features (state, bytes, packet sizes, timing) with an online autoencoder ensemble (Kitsune-style)
+    and flag connections with high reconstruction error, surfacing the top per-feature reconstruction
+    errors in the alert. Online learning adapts to network drift while still flagging anomalous tunneling
+    consistent with traffic duplication. High reconstruction error on packet-size/timing features is a
+    meaningful lead; well-reconstructed flows are normal.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, Application servers, DNS resolvers'
+  range: Last 90 days for baseline; continuous online scoring.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'feat = flow_features([conn_state, bytes, pkt_size_dist, inter_arrival]);
+
+      err = online_autoencoder_ensemble.reconstruction_error(feat);
+
+      ALERT where err > anomaly_threshold; OUTPUT flow_uid, err, top_feature_errors.'
+- question: Can an explainable, poisoning-resilient outlier model flag high-entropy egress while listing
+    the top-3 features driving each alert?
+  context: Operational ML detections must be defensible and robust. Run an Isolation Forest / One-Class
+    SVM with LIME feature attribution so every high-entropy egress alert includes its top-3 contributing
+    features and is resilient to adversarial poisoning. The explainability lets analysts validate each
+    detection and supports escalation, while robustness reduces susceptibility to attacker manipulation
+    of the baseline. An alert with clear high-entropy/volume drivers is actionable; transparent attributions
+    also help tune out benign high-entropy sources.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek weird.log
+  - Zeek dns.log
+  - 'NAI: Network egress points, Application servers, DNS resolvers'
+  range: Last 90 days, with robust baselines and per-alert explanations.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'model = robust_isolation_forest_or_ocsvm(egress_features);
+
+      score = model.predict(features); explain = lime_top3(features);
+
+      ALERT where score>=threshold; OUTPUT flow_uid, score, explain.'
+- question: Is there a failed-then-successful login (4625 followed by 4624 from the same IP within 5 minutes)
+    on a network-management host that is then followed by a mirroring keyword process/config within 15
+    minutes?
+  context: An attacker who guesses or sprays credentials to reach a network device leaves a failed-then-success
+    authentication pattern, then quickly configures mirroring. Alert when Event ID 4624 on a net-mgmt
+    host follows a 4625 from the same source IP within 5 minutes (failed-then-success State signal) and
+    is followed by a mirroring-keyword process/config exec within 15 minutes. This tight temporal chain
+    links credential access to traffic-duplication setup, a high-confidence exfiltration precursor; either
+    element alone is weaker, but together they are compelling.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Authentication servers (Active Directory), Network management servers, VPN concentrators, Network
+    egress points'
+  range: Last 90 days, with 5-minute auth and 15-minute config correlation windows.
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: 'fail = EID_4625 ; succ = EID_4624 WHERE host IN mgmt_hosts;
+
+      chain = JOIN fail->succ ON src_ip WHERE succ.ts-fail.ts <= 5m;
+
+      mirror = (EID_4688 OR syslog) MATCHES mirror_keywords WHERE ts-succ.ts <= 15m AND host=succ.host;
+
+      ALERT on JOIN(chain, mirror); OUTPUT host, account, src_ip, command_line.'
+- question: Which administrative logins deviate from normal hours, subnets, or session durations, and
+    are they followed by outlier outbound flows from the managed segment?
+  context: Anomalous admin authentication is an early sign of compromise that precedes mirror configuration.
+    Score admin logins by deviation from normal hours/subnets/durations and monitor for subsequent outlier
+    outbound flows from the managed segment, applying change-point detection to the post-login egress
+    series. A risky login followed by a change point in segment egress strongly suggests the login enabled
+    exfiltration. Routine logins with stable egress are deprioritized, focusing analyst attention on the
+    riskiest sessions.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Authentication servers (Active Directory), Network management servers, VPN concentrators, Network
+    egress points'
+  range: Last 90 days, with 30-day baselines of admin login behavior.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'risk = login_risk_score(EID_4624, [hour_dev, subnet_novelty, duration_dev]);
+
+      egress = changepoint(managed_segment_outbound_bytes after login);
+
+      ALERT where risk>=threshold AND egress.level_shift=true; OUTPUT account, host, risk, shift_ts.'
+- question: After an anomalous admin login, do the managed segment's outbound flows show periodic beaconing
+    consistent with automated, periodic shipping of mirrored data?
+  context: Automated exfiltration of mirrored traffic often runs on a fixed schedule. After an anomalous
+    admin login, FFT-rank the managed segment's outbound flows for periodicity (BAYWATCH-style) to catch
+    automated periodic shipping. Strong spectral periodicity in egress following a risky login indicates
+    a scheduled exfiltration channel rather than human-driven activity. Confirming periodicity adds high
+    confidence; aperiodic, bursty traffic is less indicative of an automated mirror-shipping process.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Authentication servers (Active Directory), Network management servers, VPN concentrators, Network
+    egress points'
+  range: Last 90 days, with FFT periodicity scoring post-login.
+  queries:
+  - technology: SIEM/Time-series pseudocode
+    query: 'series = outbound_flow_counts(managed_segment, after=anomalous_login, bin=1m);
+
+      spectrum = FFT(series); periodicity = dominant_peak_strength(spectrum);
+
+      ALERT where periodicity >= threshold; OUTPUT segment, period, peak_strength.'
+- question: Do user-host-external communication graphs reveal new edges or fan-in hubs where an admin
+    logs into a device that then sends a large transfer to a novel IP, or a mirror target becomes an unexpected
+    fan-in hub?
+  context: 'Traffic duplication creates distinctive graph structure: a device suddenly fanning data out
+    to a novel destination, or a collector becoming an unexpected fan-in hub receiving many mirrored streams.
+    Build user-host-external communication graphs and flag new edges/hubs using GCN-based traffic-graph
+    modeling, listing the new edge and top contributing nodes in the alert. This relational view catches
+    exfiltration topology that per-flow rules miss. A new high-volume edge right after an admin login,
+    or an anomalous fan-in hub, is a strong structural indicator under TA0010.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Authentication servers (Active Directory), Network management servers, VPN concentrators, Network
+    egress points'
+  range: Last 90 days, with graph snapshots and edge-novelty scoring.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'G = build_graph(nodes=[user,host,external_ip], edges=auth+conn);
+
+      model = gcn_traffic_model(G);
+
+      ALERT where new_edge(host->novel_ip, large_transfer) OR fan_in_degree(mirror_target) > baseline;
+
+      OUTPUT new_edge, top_nodes, scores.'
+- question: Are there cloud management-plane API calls to create or modify traffic-mirroring resources
+    (e.g., AWS CreateTrafficMirrorSession/ModifyTrafficMirrorTarget, GCP Packet Mirroring, Azure vTAP)
+    by a principal, source role, or target outside the authorized-monitoring allowlist?
+  context: Cloud traffic mirroring is configured through the management plane, so its abuse is visible
+    in audit logs. Alert on CreateTrafficMirrorSession/ModifyTrafficMirrorTarget (and GCP/Azure equivalents)
+    when the principal, source role, or mirror target is outside the authorized-monitoring allowlist.
+    Curate the allowlist carefully to limit false positives from legitimate observability tooling. An
+    unauthorized mirror-configuration API call is a direct, high-confidence indicator of traffic duplication
+    for exfiltration in IaaS; allowlisted, expected configuration is suppressed.
+  answer_sources:
+  - AWS:CloudTrail
+  - AWS:VPCFlowLogs
+  - 'NAI: Cloud virtual network control planes, Mirror target instances/ENIs, VPC flow collectors'
+  range: Last 90 days, with immediate alerting on mirror-config API calls.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'ALERT FROM CloudTrail WHERE eventName IN [''CreateTrafficMirrorSession'',''ModifyTrafficMirrorTarget'',''CreateTrafficMirrorFilter'']
+      OR gcp_packet_mirroring_create OR azure_vtap_config
+
+      AND (principal, source_role, mirror_target) NOT IN authorized_monitoring_allowlist;
+
+      OUTPUT principal, region, eventName, target_eni, ts.'
+- question: Which principals, regions, and destinations are first-seen combinations invoking traffic-mirroring
+    APIs compared to the established baseline?
+  context: Even principals with mirror permissions have a normal pattern of use. Baseline which principals,
+    regions, and destinations normally invoke mirroring APIs and alert on first-seen combinations, mirroring
+    cloud control-plane behavioral baselining techniques. A first-seen principal/region/target combination
+    configuring mirroring is suspicious even if technically authorized, because adversaries reuse compromised
+    credentials in unusual ways. Established combinations are expected; novel ones warrant review for
+    credential compromise driving traffic duplication.
+  answer_sources:
+  - AWS:CloudTrail
+  - AWS:VPCFlowLogs
+  - 'NAI: Cloud virtual network control planes, Mirror target instances/ENIs, VPC flow collectors'
+  range: Last 90 days, with baselining of normal mirror-API usage.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = known_combos(principal, region, target) FROM mirror_api_history(90d);
+
+      ALERT FROM CloudTrail mirror_events WHERE (principal, region, target) NOT IN baseline;
+
+      OUTPUT principal, region, target, eventName, first_seen_ts.'
+- question: Does VPC Flow Log telemetry on the mirror destination ENI confirm received traffic exceeding
+    the 95th percentile for that instance class or a change-point level shift, corroborating an active
+    mirror session?
+  context: A mirror-config API call is more conclusive when corroborated by actual mirrored traffic arriving
+    at the destination. Correlate the API call with VPC Flow Logs on the destination ENI and confirm when
+    received bytes exceed the 95th percentile for that instance class or rise as a change point. Observed
+    traffic on the target ENI converts a configuration-only signal into confirmed data flow, raising confidence
+    that exfiltration is live. No corroborating volume may indicate a staged-but-inactive session still
+    worth investigating.
+  answer_sources:
+  - AWS:CloudTrail
+  - AWS:VPCFlowLogs
+  - 'NAI: Cloud virtual network control planes, Mirror target instances/ENIs, VPC flow collectors'
+  range: Last 90 days, correlating API events with destination-ENI flow volume.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'api = mirror_config_event(target_eni);
+
+      flow = VPCFlowLogs WHERE eni=target_eni;
+
+      p95 = percentile(bytes_received, by=instance_class, 95); cp = changepoint(bytes_received series);
+
+      ALERT where api present AND (flow.bytes_received > p95 OR cp.level_shift=true);
+
+      OUTPUT target_eni, principal, bytes_received, ts.'
+- question: Which cloud audit events (action, principal, source IP, region, target) are rare mirror-configuration
+    events flagged by an anomaly model with explainable top features?
+  context: Rare, anomalous control-plane events can reveal mirror abuse that rule-based allowlists miss.
+    Score cloud audit events (action, principal, source IP, region, target) with an Isolation Forest and
+    surface the top-3 contributing features for rare mirror-configuration events. The model catches unusual
+    combinations - e.g., a mirror API from an atypical source IP/region - and the feature attribution
+    makes each alert triage-ready. A high anomaly score on a mirror-related action is a strong lead for
+    cloud traffic-duplication exfiltration; common, expected events score low.
+  answer_sources:
+  - AWS:CloudTrail
+  - AWS:VPCFlowLogs
+  - 'NAI: Cloud virtual network control planes, Mirror target instances/ENIs, VPC flow collectors'
+  range: Last 90 days, with anomaly scoring of cloud audit events.
+  queries:
+  - technology: ML pipeline pseudocode
+    query: 'features = cloud_audit_features([action, principal, source_ip, region, target]);
+
+      score = isolation_forest.predict(features WHERE action like ''%TrafficMirror%'' OR mirror_related);
+
+      explain = top3_contributors(features);
+
+      ALERT where score>=threshold; OUTPUT eventName, principal, source_ip, score, explain.'
