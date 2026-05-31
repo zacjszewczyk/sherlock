@@ -1,0 +1,519 @@
+name: 'T1021.001: Remote Desktop Protocol'
+id: 6c30a69a-bdb0-4914-8763-1aa3384e8bf3
+description: >-
+  Investigate adversary lateral movement that abuses the Remote Desktop Protocol (RDP) with valid accounts.
+  This playbook helps an analyst hunt successful and failed RDP logons from threat-intelligence watchlists,
+  hosts whose security posture is silently modified to permit RDP (fDenyTSConnections, non-standard RDP
+  port, NLA disablement, firewall openings) followed by use, loopback/reverse-tunneled RDP sessions, RDP
+  fan-out and credential-spraying across many hosts, first-time and segmentation-violating source-destination
+  pairs, low-probability and community-bridging authentication-graph edges, and suspicious post-login
+  session behavior (reconnaissance, credential dumping, and anomalous network/DNS activity). It combines
+  symbolic-logic correlation rules, robust statistical baselining, and machine-learning scoring across
+  Windows Security events, Sysmon, and Zeek network logs.
+type: technique
+related:
+- tactic_id: TA0008
+  tactic_name: Lateral Movement
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Did any successful interactive RDP logon (Windows Event ID 4624, Logon Type 10) originate from a source
+    IP address or use a user account that appears on an active threat-intelligence watchlist of known-malicious
+    indicators?
+  context: >-
+    This is the highest-confidence lateral-movement lead for RDP: an authentication that succeeds AND
+    matches curated threat intel. Build a SIEM rule that cross-references the source IP ('IpAddress' in
+    Event ID 4624, or id.orig_h in Zeek conn.log) and the 'TargetUserName' of every Logon Type 10 event
+    against your watchlist of known-bad IPs and compromised accounts. To prove the session was a genuine
+    interactive RDP session and not a mislabeled logon, correlate the matching TargetLogonId to TerminalServices-RemoteConnectionManager
+    Event ID 1149 and TerminalServices-LocalSessionManager events 21/22/25 (per JPCERT/CC). A positive
+    match means an adversary on your watchlist is actively moving laterally and should escalate immediately;
+    include the matched indicator and the logon GUID in the alert so responders can pivot fast.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Domain Controllers, Critical Application Servers, Threat Intelligence Feeds, VPN Concentrators
+  range: >-
+    Last 90 days, centered on the matching logon with +/- 10 minutes for session-correlation events.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      rdp = FILTER Event4624 BY LogonType=10
+      hit = JOIN rdp WITH watchlist ON (rdp.IpAddress=watchlist.ip OR rdp.TargetUserName=watchlist.account)
+      sess = JOIN hit WITH (Event1149 OR LocalSessionMgr[21,22,25]) ON TargetLogonId
+      ALERT severity=HIGH FIELDS matched_indicator, TargetUserName, IpAddress, TargetLogonId
+  - technology: Zeek/pseudocode
+    query: |-
+      rdp = FILTER conn.log BY id.resp_p==3389
+      ALERT WHERE rdp.id.orig_h IN watchlist_ips
+- question: >-
+    Is a watchlisted source IP or account generating failed RDP logons, or a failed RDP logon immediately
+    followed by a success, indicating brute force or credential reuse that worked?
+  context: >-
+    This is the failure-mode companion to the successful-match rule. Alert when a watchlisted source generates
+    failed RDP logons (Event ID 4625 with Logon Type 10, or Zeek rdp.log result != success). Count failures
+    per source over a 10-minute window; >=5 failed RDP logons from a watchlisted source, OR any single
+    4625 immediately followed by a 4624 Type 10 from the same source, indicates a successful brute-force/credential-reuse
+    state transition. The failure-then-success pattern is the strongest signal because it shows the adversary
+    actively working toward and achieving access from a known-bad origin, mirroring the brute-force-to-success
+    transition documented in Atomic Red Team T1021.001.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Domain Controllers, Critical Application Servers, Threat Intelligence Feeds, VPN Concentrators
+  range: >-
+    Last 90 days, with a 10-minute sliding window for failure counting.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      fails = FILTER Event4625 BY LogonType=10 AND IpAddress IN watchlist_ips
+      GROUP fails BY IpAddress OVER window(10m) COMPUTE n=count()
+      ALERT WHERE n>=5
+      # state transition
+      ALERT WHERE EXISTS(4625 Type10 from src) THEN(4624 Type10 from same src within 10m)
+- question: >-
+    Is the source IP that triggered a watchlist RDP alert novel or a statistical outlier for this destination
+    host in terms of connection frequency and per-session byte volume?
+  context: >-
+    Enrich each watchlist alert with behavioral context so analysts can gauge how unusual the connection
+    is. For the target host, baseline its inbound RDP sources and per-session byte volume (orig_bytes/resp_bytes
+    in Zeek conn.log). Compute how often the triggering source IP has historically connected to this destination
+    and flag it if it is first-time-seen or a robust outlier. Use Median Absolute Deviation (modified
+    z-score > 3.5) rather than mean/stddev so a few large legitimate transfers do not mask anomalies.
+    A novel source plus an abnormal byte volume strengthens the case that this is adversary-driven lateral
+    movement rather than routine administration. Derive thresholds per environment from 30-90 days of
+    authentication/flow history.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Domain Controllers, Critical Application Servers, Threat Intelligence Feeds, VPN Concentrators
+  range: Last 90 days for baselining; score the current session.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS conn.log[id.resp_p==3389] BY dest_host COMPUTE src_freq, median(bytes), mad(bytes)
+      score = (cur_bytes - median)/ (1.4826*mad)
+      ALERT WHERE src never_seen_for(dest_host) OR abs(score)>3.5
+- question: >-
+    When scored by a supervised classifier trained on labeled historical RDP sessions, does the current
+    watchlist-related session rank as high-priority malicious?
+  context: >-
+    Train a supervised classifier (Logistic Regression or Random Forest) on labeled historical RDP sessions
+    using features: source/destination subnet, account role, time-of-day, day-of-week, session byte volume,
+    count of failed logons preceding success, and binary watchlist flags. Score new sessions to triage
+    and prioritize response among many candidate alerts. Crucially, for explainability, emit the top-3
+    contributing features (e.g., 'novel source-dest edge', 'watchlist IP', 'off-hours') in the alert text
+    rather than just a bare probability, so the analyst can validate the model's reasoning. A high score
+    with intelligible drivers focuses limited responder time on the sessions most likely to be genuine
+    lateral movement.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Domain Controllers, Critical Application Servers, Threat Intelligence Feeds, VPN Concentrators
+  range: >-
+    Train on 90+ days of labeled history; score in near-real-time.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = [src_subnet, dst_subnet, account_role, hour, dow, bytes, pre_success_fails, watchlist_flag]
+      p = RandomForest.predict_proba(features)
+      ALERT WHERE p>threshold FIELDS top3_feature_contributions(p)
+- question: >-
+    Was a host's security posture modified to enable RDP (registry fDenyTSConnections=0, non-standard
+    PortNumber, fAllowToGetHelp=1, or a firewall rule allowing TCP 3389) and then followed within 10 minutes
+    by a port-3389 connection from that same host?
+  context: >-
+    Adversaries frequently enable RDP on a host that does not normally accept it, then immediately use
+    it. Create a SIEM correlation rule that fires when an RDP-enablement event is observed and is followed
+    within 10 minutes by a port-3389 connection from the same host. Cover the concrete artifacts: Event
+    ID 4657 on HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\fDenyTSConnections set to 0; a change
+    to ...\WinStations\RDP-Tcp\PortNumber away from 0xd3d (3389) implying a non-standard RDP port; fAllowToGetHelp
+    set to 1; or a firewall rule change (Event ID 4947) allowing TCP 3389. Confirm the follow-on via Zeek
+    conn.log or process creation of mstsc.exe. The tight enable-then-connect coupling distinguishes malicious
+    activation from benign, long-standing configuration.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Windows Event ID 4947
+  - >-
+    NAI: User Endpoints, Workstations, Servers not typically configured for RDP access
+  range: >-
+    Last 90 days; 10-minute correlation window between enablement and connection.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      enable = Event4657(fDenyTSConnections->0) OR Event4657(PortNumber!=0xd3d) OR Event4657(fAllowToGetHelp->1) OR Event4947(port=3389/tcp)
+      conn = conn.log[id.resp_p==3389 from same host] OR Event4688(mstsc.exe)
+      ALERT WHERE enable THEN conn WITHIN 10m ON host
+- question: >-
+    Did an inbound RDP logon arrive from a loopback source address (127.0.0.1/::1), or was Network Level
+    Authentication disabled or downgraded via the registry, on a host that does not normally accept RDP?
+  context: >-
+    These are two high-fidelity tampering states. (1) An inbound RDP logon (Event ID 4624 Type 10) whose
+    source network address is 127.0.0.1 or ::1 indicates RDP relayed through a local reverse tunnel (e.g.,
+    plink or chisel) — a hallmark of an adversary forwarding RDP through an established foothold. (2)
+    Disabling Network Level Authentication via registry (...\RDP-Tcp\UserAuthentication = 0) or a SecurityLayer
+    downgrade weakens pre-authentication protections to ease access. Either condition on a host that does
+    not normally accept RDP is a strong lateral-movement indicator and should be triaged with host context
+    to determine whether a tunneling tool or credential-relay is present.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Windows Event ID 4947
+  - >-
+    NAI: User Endpoints, Workstations, Servers not typically configured for RDP access
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      ALERT WHERE Event4624.LogonType==10 AND IpAddress IN ['127.0.0.1','::1']
+      ALERT WHERE Event4657 ON RDP-Tcp\UserAuthentication SET 0
+      ALERT WHERE Event4657 ON RDP-Tcp\SecurityLayer downgraded
+      # scope to hosts not in rdp_baseline
+- question: >-
+    Around an RDP-enablement change, does the initiating command line show high entropy (obfuscation)
+    or did the change come from a process with no history of that action, or was it followed by a FAILED
+    outbound 3389 connection?
+  context: >-
+    For alerts from the symbolic enable rules, analyze the surrounding process creation events (Event
+    ID 4688 / Sysmon 1). Compute Shannon entropy of the initiating command line and flag values > 4.5
+    for powershell.exe/cmd.exe/reg.exe, indicating obfuscated/encoded commands. Also profile the state
+    of the operation: a registry/netsh change executed by a process with no prior history of that action
+    on the host, or a change followed by a failed outbound 3389 connection (blocked by firewall — Zeek
+    conn.log conn_state S0/REJ), is a distinct anomaly that signals experimentation or misconfiguration
+    by an intruder. Derive entropy and rarity thresholds from enterprise command baselines.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Windows Event ID 4947
+  - >-
+    NAI: User Endpoints, Workstations, Servers not typically configured for RDP access
+  range: Last 90 days for baselining; evaluate at change time.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      proc = Event4688|Sysmon1 around enable_event
+      H = shannon_entropy(proc.CommandLine)
+      ALERT WHERE H>4.5 AND proc.Image IN [powershell.exe,cmd.exe,reg.exe]
+      ALERT WHERE proc.action rare_for(host)
+      ALERT WHERE enable THEN conn.log[3389].conn_state IN [S0,REJ]
+- question: >-
+    Does the ordered sequence of administrative events (RDP enable -> process execution -> outbound RDP
+    connection) on a host fall outside what a learned log-sequence model predicts as normal?
+  context: >-
+    Train a log-sequence model (an LSTM as in DeepLog, or an HMM) on normal ordered administrative event
+    streams across registry, firewall, process, and network events. Flag a host when the sequence 'RDP
+    enable (registry/firewall) -> process execution -> outbound RDP connection' falls outside the model's
+    top-g predicted next events, i.e., it is a rare deviation from learned legitimate administration.
+    Surface the specific out-of-vocabulary step and the two preceding events in the alert so analysts
+    can immediately see why the sequence was flagged as anomalous. This catches novel attacker workflows
+    that individually look benign but are abnormal in order.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - Windows Event ID 4947
+  - >-
+    NAI: User Endpoints, Workstations, Servers not typically configured for RDP access
+  range: >-
+    Train on 90+ days of ordered admin event streams; score in near-real-time.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      seq = ORDERED_EVENTS(host)[registry,firewall,process,network]
+      pred = DeepLog.next_event_topg(seq.prefix)
+      ALERT WHERE seq.next NOT IN pred FIELDS out_of_vocab_step, prev2_events
+- question: >-
+    Is a single source IP or user account establishing successful RDP connections to an anomalously high
+    number of distinct destination hosts within a short window (e.g., more than 5 in one hour)?
+  context: >-
+    RDP fan-out is a classic lateral-spread / internal-scanning signal. Implement a SIEM rule that groups
+    by source IP (id.orig_h in Zeek conn.log) or username (TargetUserName in Event ID 4624 Type 10) and
+    counts the distinct destination IPs (id.resp_h / WorkstationName) for connections to TCP 3389 within
+    a 1-hour sliding window. Trigger when the count exceeds a static floor (start at 5; tune per role,
+    since jump servers and admins legitimately fan out more). This deterministic floor is a cheap, explainable
+    first pass that surfaces a source touching many hosts in a manner inconsistent with normal point-to-point
+    administration.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments, Core Switches, Domain Controller security logs
+  range: >-
+    Last 90 days; 1-hour sliding window for distinct-destination counting.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      GROUP (conn.log[id.resp_p==3389] OR Event4624 Type10) BY source
+      OVER window(1h) COMPUTE d=distinct_count(dest)
+      ALERT WHERE d>5 FIELDS source, d, dest_list
+- question: >-
+    Is a source attempting RDP against many distinct destinations with a high failure ratio, indicating
+    credential spraying or scanning rather than legitimate administration?
+  context: >-
+    This is the failure-mode counterpart to successful fan-out. Count the distinct destinations a source
+    attempts but FAILS to authenticate to via RDP (Event ID 4625 Type 10, or Zeek rdp.log non-success
+    result) in a 1-hour window. A source attempting RDP against many hosts with a high failure ratio (e.g.,
+    >=10 distinct destinations with a success ratio < 20%) indicates credential spraying or scanning rather
+    than legitimate admin work, which normally succeeds. Profile success-vs-fail state separately from
+    successful fan-out and weight the failure ratio in triage; a high failure ratio across many hosts
+    is a strong early indicator before the adversary finds working credentials.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments, Core Switches, Domain Controller security logs
+  range: Last 90 days; 1-hour sliding window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      fail = Event4625 Type10 OR rdp.log[result!=success]
+      GROUP fail BY source OVER window(1h) COMPUTE d=distinct(dest), sr=success/(success+fail)
+      ALERT WHERE d>=10 AND sr<0.20
+- question: >-
+    Does the current count of unique RDP destinations for this user or source exceed that entity's own
+    historical baseline (99th percentile or a robust MAD outlier)?
+  context: >-
+    A static floor misses low-and-slow actors and over-alerts on naturally chatty admins, so add per-entity
+    baselining. For each user and source IP, build a historical baseline of unique RDP destinations per
+    hour (volume and frequency) and monitor a sliding window; alert when the current count exceeds the
+    99th percentile of that entity's own history or a robust MAD outlier (modified z-score > 3.5). Report
+    both the baseline value and the current value in the alert for explainability so the analyst can see
+    the magnitude of deviation. This catches a normally single-target account that suddenly fans out,
+    even if the absolute count is modest.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments, Core Switches, Domain Controller security logs
+  range: >-
+    Last 90 days for per-entity baseline; evaluate current 1-hour window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      base = STATS hist BY entity COMPUTE p99(uniq_dest_per_hour), median, mad
+      score=(cur-median)/(1.4826*mad)
+      ALERT WHERE cur>base.p99 OR score>3.5 FIELDS baseline, cur
+- question: >-
+    When per-source RDP behavior is clustered, does this source fall outside all dense clusters (classified
+    as noise), marking it as anomalous fan-out?
+  context: >-
+    Apply density-based clustering (DBSCAN) to per-source RDP feature vectors: count of unique destinations
+    per hour, mean inter-connection time, total bytes, and failed-logon ratio. Points classified as noise
+    (outside all dense clusters) represent anomalous fan-out that does not resemble any established behavioral
+    group. This unsupervised approach needs no labels and adapts to your environment's natural admin patterns.
+    Output the 3 feature values that most separate the noise point from its nearest cluster centroid in
+    the alert, so the analyst understands which behaviors (e.g., very high destination count plus high
+    failure ratio) made the source anomalous.
+  answer_sources:
+  - Windows Event ID 4624
+  - Zeek rdp.log
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments, Core Switches, Domain Controller security logs
+  range: Last 90 days for feature aggregation and clustering.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      X = per_source[uniq_dest_per_hr, mean_inter_conn_time, total_bytes, fail_ratio]
+      labels = DBSCAN(X)
+      ALERT WHERE label==NOISE FIELDS top3_separating_features
+- question: >-
+    Did an RDP connection cross an unauthorized network segment boundary as defined by asset/identity
+    enrichment (e.g., a user-VLAN workstation connecting to a database-VLAN server)?
+  context: >-
+    Restricting and monitoring which systems and segments may originate RDP is the primary mitigation
+    for this technique. Enrich network events with asset/identity data that defines segments and host
+    roles (e.g., 'DEV_VLAN', 'DB_SERVER') and alert on any RDP connection (Zeek conn.log, TCP 3389) that
+    crosses an unauthorized segment boundary (for example source_segment 'DEV_VLAN' -> destination_segment
+    'FINANCE_VLAN'). A crossing that violates segmentation policy is rarely legitimate and strongly suggests
+    an adversary pivoting toward higher-value assets; prioritize crossings that terminate on sensitive
+    segments.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek rdp.log
+  - Windows Event ID 4624
+  - >-
+    NAI: Network Firewalls, VLAN access control lists (ACLs), Core Switches, Server and Endpoint logs
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      rdp = ENRICH conn.log[id.resp_p==3389] WITH asset_segment(src), asset_segment(dst)
+      ALERT WHERE (src_segment,dst_segment) NOT IN allowed_segment_matrix
+- question: >-
+    Is this RDP connection the first time this specific (source_ip, destination_ip) pair has ever communicated
+    via RDP within the lookback window?
+  context: >-
+    First-time edges are the core signal of host-graph lateral-movement detection. Maintain a 90-day lookup
+    of all (source_ip, destination_ip) pairs that have communicated via RDP. For each new RDP connection,
+    query the table; if the tuple has never been seen, flag it, prioritizing first-time edges that touch
+    high-value assets. New edges are suspicious because legitimate administration tends to follow established,
+    repeated paths, whereas an adversary exploring the network creates novel connections. Derive the lookback
+    window from your environment's history; a 90-day window balances catching novelty against false positives
+    from infrequent-but-legitimate paths.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek rdp.log
+  - Windows Event ID 4624
+  - >-
+    NAI: Network Firewalls, VLAN access control lists (ACLs), Core Switches, Server and Endpoint logs
+  range: Last 90 days as the new-edge lookback table.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      seen = SET of (src_ip,dst_ip) from rdp over last 90d
+      FOR each new rdp conn: ALERT WHERE (src_ip,dst_ip) NOT IN seen
+      PRIORITIZE WHERE dst IN high_value_assets
+- question: >-
+    Beyond simple first-seen, does this RDP edge have a vanishingly low probability given the historical
+    authentication-graph structure?
+  context: >-
+    Some malicious edges are technically 'seen' before but are vanishingly rare for that account/host
+    pair, so binary first-seen misses them. Estimate the probability of each RDP edge from historical
+    authentication-graph structure and alert on low-probability edges. Use a link-probability scoring
+    approach (validated on LANL data with >85% TPR at ~0.0004% FPR) and include the computed edge probability
+    in the alert. A very low probability means the connection is structurally unexpected — the account/host
+    pair almost never interact — which is a strong lateral-movement indicator even when an exact-match
+    first-seen rule would stay silent.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek rdp.log
+  - Windows Event ID 4624
+  - >-
+    NAI: Network Firewalls, VLAN access control lists (ACLs), Core Switches, Server and Endpoint logs
+  range: >-
+    Last 90 days of authentication-graph history for probability estimation.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      G = auth_graph(last 90d)
+      p_edge = link_probability(G, src, dst)
+      ALERT WHERE p_edge < epsilon FIELDS p_edge
+- question: >-
+    Does a new RDP edge bridge two previously disconnected host communities, or is it predicted with very
+    low likelihood by a temporal link-prediction model?
+  context: >-
+    Build a graph of hosts where edges are historical RDP connections and run community detection (Louvain)
+    plus temporal link prediction (e.g., Euler). A new RDP edge that bridges two previously disconnected
+    communities, or that the temporal model predicts with very low likelihood, is a high-confidence lateral-movement
+    indicator: adversaries routinely connect parts of the network that normal operations keep separate.
+    Surface the two communities/endpoints bridged and the model likelihood in the alert text so analysts
+    can immediately understand the structural significance and scope the potential blast radius.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek rdp.log
+  - Windows Event ID 4624
+  - >-
+    NAI: Network Firewalls, VLAN access control lists (ACLs), Core Switches, Server and Endpoint logs
+  range: >-
+    Last 90 days for graph construction and temporal model training.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      G = rdp_host_graph(history); comms = Louvain(G)
+      lik = TemporalLinkPredict(G, new_edge)
+      ALERT WHERE comm(src)!=comm(dst) OR lik<threshold FIELDS bridged_communities, lik
+- question: >-
+    Following a successful interactive RDP login (Event ID 4624 Type 10), did the associated logon session
+    spawn reconnaissance, credential-dumping, or lateral-movement tooling?
+  context: >-
+    Post-access behavior is often the clearest sign that an RDP session is hostile. Correlate a successful
+    RDP login (Event ID 4624, Logon Type 10) to subsequent process creation (Event ID 4688 / Sysmon 1)
+    via the shared LogonId/TargetLogonId, and alert if any child command line matches reconnaissance (ipconfig
+    /all, net user, net group, qwinsta, nltest, whoami), credential dumping (mimikatz, procdump lsass,
+    comsvcs.dll MiniDump), or lateral-movement tooling (psexec, wmiexec, wmic /node:). The LogonId-to-process
+    correlation attributes activity precisely to the interactive session, so a positive match ties hands-on-keyboard
+    malicious actions directly to the RDP login under investigation.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Zeek dns.log
+  - >-
+    NAI: Domain Controllers, Critical Servers, Privileged Access Workstations, DNS Servers, Endpoint Process
+    Logs
+  range: >-
+    Last 90 days; correlate within the lifetime of the logon session.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      login = Event4624 Type10
+      proc = JOIN (Event4688|Sysmon1) WITH login ON LogonId
+      ALERT WHERE proc.CommandLine MATCHES recon|creddump|latmove_patterns
+- question: >-
+    Within an RDP session, are there rare child processes, high-entropy command arguments, anomalous outbound
+    byte volume, or spikes in failed connections and NXDOMAIN responses?
+  context: >-
+    Add statistical depth to the post-login analysis. For each RDP session, compute the enterprise-wide
+    prevalence of each child process name + command line and the session's network volume (bytes via Zeek
+    conn.log) and DNS query count. Flag sessions executing bottom-5th-percentile-rare processes, commands
+    with unusually long or high-entropy arguments (encoded payloads), or anomalous outbound byte volume,
+    using robust per-entity baselining. Include a distinct failure-mode feature: the count of failed network
+    connections (Zeek conn_state S0/REJ) and NXDOMAIN DNS responses (dns.log rcode) generated by the session,
+    which spike during internal scanning and C2 resolution. Together these reveal hands-on activity that
+    signature rules miss.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Zeek dns.log
+  - >-
+    NAI: Domain Controllers, Critical Servers, Privileged Access Workstations, DNS Servers, Endpoint Process
+    Logs
+  range: Last 90 days for prevalence/baselines; evaluate per session.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      per_sess = AGG by LogonId: rare_proc_pctile, max(arg_entropy), out_bytes, dns_count, s0_rej_count, nxdomain_count
+      ALERT WHERE rare_proc_pctile<5 OR arg_entropy>4.5 OR out_bytes>mad_outlier OR nxdomain_count>baseline
+- question: >-
+    When scored by a per-session classifier (and an LSTM over the event sequence), does this RDP session
+    rank as malicious, and what are the top contributing features?
+  context: >-
+    Train a gradient-boosting classifier on per-session features — count of recon commands, presence of
+    rare processes, DNS-query entropy, NXDOMAIN/failed-connection counts, failed-logon count, and total
+    bytes transferred — to score sessions benign vs. malicious. Complement it with an LSTM (DeepLog-style)
+    over the session's process/event sequence to catch rare action ordering that point features miss.
+    Keep alert volume low and emit the top-3 contributing features (e.g., 'mimikatz child', 'first-time
+    dest', '7 NXDOMAIN') with each score so analysts can triage quickly. A high score with intelligible
+    drivers lets the SOC confidently prioritize the sessions most likely to be genuine hands-on lateral
+    movement.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Zeek dns.log
+  - >-
+    NAI: Domain Controllers, Critical Servers, Privileged Access Workstations, DNS Servers, Endpoint Process
+    Logs
+  range: >-
+    Train on 90+ days of labeled sessions; score in near-real-time.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      feat = [recon_cmd_count, rare_proc_flag, dns_entropy, nxdomain_count, failed_conn_count, pre_fail_logons, total_bytes]
+      p = GradientBoosting.predict(feat); seq_anom = LSTM.score(session_event_seq)
+      ALERT WHERE p>thr OR seq_anom>thr FIELDS top3_contributions
