@@ -1,0 +1,592 @@
+name: 'T1546.015: Component Object Model Hijacking'
+id: 1964552b-d30e-44a0-8085-07d6c7650b9d
+description: Investigate Component Object Model (COM) hijacking, in which an adversary modifies Registry
+  references to COM objects so that their malicious code executes in place of legitimate system components.
+  This playbook helps an analyst hunt for COM server keys (InProcServer32 / LocalServer32 / TreatAs) and
+  TypeLib entries under both the per-user HKCU/HKU\Software\Classes\CLSID hive (persistence) and the machine-wide
+  HKLM\SOFTWARE\Classes\CLSID hive (privilege escalation) that have been repointed to known-bad binaries,
+  script interpreters (powershell.exe, mshta.exe, wscript.exe), scrobj.dll (squiblydoo), remote 'script:'
+  monikers, or user-writable staging directories (%APPDATA%, %TEMP%, C:\Users\Public). It correlates those
+  Registry writes with the process that performed them (integrity level, parent-child rarity), with subsequent
+  suspicious child processes spawned by COM-loading hosts (explorer.exe, svchost.exe), and with anomalous
+  or failed network egress that signals attempted remote-payload retrieval or C2. The playbook combines
+  deterministic symbolic-logic detections, statistical baselining (frequency, entropy, and rarity thresholds),
+  and machine-learning approaches (Random Forest/XGBoost, Isolation Forest, DBSCAN, One-Class SVM, ARIMA/LSTM
+  time-series, and provenance-graph learning) to surface both routine commodity persistence and sophisticated,
+  stealthy COM hijacking.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any per-user COM server Registry value (HKCU\Software\Classes\CLSID\...\InProcServer32
+    or LocalServer32) been modified to reference a binary whose hash matches a known-bad threat-intelligence
+    feed, point to scrobj.dll, or shadow an existing HKLM default for the same CLSID?
+  context: COM hijacking for persistence most often happens in the per-user hive because writing there
+    does not require administrative rights yet still causes the adversary's code to run whenever the hijacked
+    object is loaded. Filter Event ID 4657 / Sysmon 13 for 'Object Name' containing 'HKCU\Software\Classes\CLSID\'
+    or 'HKEY_USERS\<SID>_Classes\CLSID\' ending in '\InProcServer32\(Default)' or '\LocalServer32\(Default)'.
+    Extract and hash the file in 'New Value' and compare against a known-bad-hash feed. Independent of
+    TI, alert deterministically when the value is 'scrobj.dll' (squiblydoo) or when an HKCU CLSID shadows
+    an HKLM default for the same CLSID while pointing to a non-system DLL - a hallmark of COM hijacking
+    persistence. A positive match is high-confidence persistence; a negative result does not rule out
+    a novel binary, so pair with the statistical and ML checks.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Remote Desktop Servers, VDI Environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search EventID=4657 OR (sysmon EventID=13)
+
+      | where ObjectName matches ''(?i)HK(CU|EY_USERS\\\\[^\\\\]+_Classes)\\\\Software\\\\Classes\\\\CLSID\\\\.*\\\\(InProcServer32|LocalServer32)\\\\\(Default\)''
+
+      | eval payload=NewValue, h=file_hash(payload)
+
+      | where lookup_ti(h)==''known_bad'' OR lower(payload)==''scrobj.dll'' OR shadows_hklm_default(CLSID,
+      payload)
+
+      | alert severity=high'
+- question: Which hosts or writing processes (reg.exe, powershell.exe) are performing an abnormally high
+    volume of HKCU COM CLSID modifications relative to their own historical baseline, especially outside
+    of patch windows?
+  context: Legitimate per-user COM registration is infrequent and clusters around software installs. Baseline
+    HKCU COM modifications per host per day and per writing process, then alert when a host exceeds its
+    95th percentile or mean + 3 standard deviations, particularly outside patch/maintenance windows. Writes
+    by processes that rarely register COM classes (a rare parent-process tuple) add signal. This surface-level
+    frequency anomaly catches automated or scripted persistence deployment that a single deterministic
+    rule might miss; correlate flagged hosts with the symbolic-logic matches above for confirmation.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Remote Desktop Servers, VDI Environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKCU*Software\\Classes\\CLSID*''
+
+      | bin _time span=1d | stats count as edits by host, writing_process, _time
+
+      | eventstats avg(edits) as mu, stdev(edits) as sd, perc95(edits) as p95 by host
+
+      | where edits > p95 OR edits > mu + 3*sd
+
+      | where NOT in_patch_window(_time)
+
+      | alert'
+- question: When an HKCU COM modification is scored by a supervised model on features such as file-path
+    entropy, temp/appdata/public keywords, parent-process rarity, unsigned-binary status, and off-hours
+    timing, which events receive a high malicious probability?
+  context: A Random Forest / XGBoost classifier (in the style of the ProblemChild parent-child model)
+    learns the combination of features that distinguish malicious COM persistence from benign registration.
+    Score each HKCU COM write using new-value path entropy, presence of 'temp'/'appdata'/'public' keywords,
+    parent-process name and rarity, an unsigned-binary flag, and an off-hours flag; alert on high probability
+    and include the top-3 contributing features for explainable triage. In unlabeled environments substitute
+    an Extended Isolation Forest on the same feature vector. A high score with intuitive top features
+    (e.g., high entropy + unsigned + appdata) is a strong lead.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Remote Desktop Servers, VDI Environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=randomforest_com_hijack
+
+      | score features(entropy(NewValue), kw_temp_appdata_public(NewValue), parent_proc, parent_rarity,
+      unsigned_flag, offhours_flag)
+
+      | where prob_malicious > 0.85
+
+      | eval top3=top_features(3)
+
+      | alert include=top3'
+- question: Has any HKCU COM CLSID value been set to a command line that invokes a script interpreter
+    (powershell, pwsh, wscript, cscript, mshta, rundll32), to scrobj.dll, or to a 'script:' moniker referencing
+    an http(s) URL (the TypeLib remote-payload variant)?
+  context: A normal COM server value is a low-entropy path to a DLL or EXE. When the value instead contains
+    an interpreter with arguments, scrobj.dll, or a remote 'script:' moniker, it is almost certainly malicious
+    - the adversary executes inline or remote script every time the COM object is loaded. Regex-match
+    the 'New Value' of HKCU COM CLSID writes for '(powershell|pwsh|wscript|cscript|mshta|rundll32)\.exe
+    .*', for 'scrobj.dll', and for 'script:.*https?://'. Any match warrants an alert. This is one of the
+    highest-fidelity COM hijacking persistence detections and directly catches the TypeLib remote-script
+    variation.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "search EventID=4657 OR (sysmon EventID=13)\n| where ObjectName matches '(?i)HK(CU|EY_USERS).*Software\\\
+      \\\\\\Classes\\\\\\\\CLSID'\n| where NewValue matches '(?i)(powershell|pwsh|wscript|cscript|mshta|rundll32)\\\
+      .exe .+'\n    OR lower(NewValue) contains 'scrobj.dll'\n    OR NewValue matches '(?i)script:.*https?://'\n\
+      | alert severity=high"
+- question: Which HKCU COM server values have character entropy exceeding the 99th percentile of the baseline,
+    indicating obfuscated or inline-script content rather than a simple file path?
+  context: Legitimate COM server values are short, low-entropy file paths. Obfuscated inline scripts or
+    encoded commands passed as COM server arguments produce markedly higher entropy. Compute Shannon character
+    entropy of the 'New Value' for all HKCU COM server writes, baseline the distribution, and alert when
+    an event exceeds the 99th percentile. This statistical approach catches obfuscation that does not
+    match a known interpreter regex. Correlate high-entropy hits with the deterministic interpreter/moniker
+    rule and with the writing process for triage.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKCU*Software\\Classes\\CLSID*''
+
+      | eval ent=char_entropy(NewValue)
+
+      | eventstats perc99(ent) as p99
+
+      | where ent > p99
+
+      | alert'
+- question: Does the per-host rate of interpreter-bearing COM modifications show a statistically significant
+    time-series spike (ARIMA/EWMA), and do individual events score as outliers under an Extended Isolation
+    Forest?
+  context: Automated persistence deployment often appears as a sudden burst of interpreter-bearing COM
+    modifications. Run ARIMA/EWMA time-series anomaly detection on the per-host rate of such modifications
+    and alert on significant spikes. In parallel, score each event's feature vector (new-value entropy,
+    interpreter flag, path location) with an Extended Isolation Forest and surface the top contributing
+    features. A spike combined with high-isolation events is a strong indicator of scripted COM persistence
+    at scale; investigate the originating process and the script content.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKCU*CLSID*'' NewValue=''*powershell*'' OR ''*mshta*'' OR
+      ''*wscript*''
+
+      | timechart span=1h count by host
+
+      | arima_forecast() | where actual > upper_ci
+
+      | join eif_score(features(entropy, interpreter_flag, path_location)) where iso_score>0.9
+
+      | alert include=top_features'
+- question: Has any HKCU/HKU COM CLSID value been repointed to a user-writable or staging directory such
+    as \AppData\Local, \Temp, \Downloads, \Public, C:\ProgramData, \Perflogs, the color-profile spool
+    path, the Startup folder, \Favorites, or \Contacts?
+  context: Legitimate COM servers live in protected locations like System32 or Program Files under signed
+    vendor directories. A COM value pointing into a user-writable staging directory strongly suggests
+    an adversary dropped a payload where they could write and then hijacked a COM object to execute it
+    for persistence. Match the 'New Value' path of HKCU/HKU COM key writes against a watchlist of staging
+    directories (\AppData\Local\, \Temp\, \Downloads\, \Public\, C:\ProgramData\, \Perflogs\, \System32\spool\drivers\color\,
+    \Start Menu\Programs\Startup\, \Favorites\, \Contacts\) and alert on any match. This is a high-fidelity,
+    low-noise rule drawn from Sigma and Elastic COM-hijack detections.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Multi-user servers (e.g., Citrix, RDS)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search EventID=4657 OR (sysmon EventID=13)
+
+      | where ObjectName matches ''(?i)HK(CU|EY_USERS).*Software\\\\Classes\\\\CLSID''
+
+      | where NewValue matches ''(?i)(\\\\AppData\\\\Local\\\\|\\\\Temp\\\\|\\\\Downloads\\\\|\\\\Public\\\\|C:\\\\ProgramData\\\\|\\\\Perflogs\\\\|spool\\\\drivers\\\\color\\\\|Start
+      Menu\\\\Programs\\\\Startup\\\\|\\\\Favorites\\\\|\\\\Contacts\\\\)''
+
+      | alert severity=high'
+- question: Has an HKCU COM key been repointed to a directory that is rare enterprise-wide (seen on fewer
+    than 0.1% of endpoints, or entirely new) compared with the baseline of legitimate COM server directories?
+  context: Even outside the explicit staging-directory watchlist, a COM value pointing to a directory
+    almost never used for COM servers across the fleet is suspicious. Baseline all unique directory paths
+    observed in legitimate COM server values enterprise-wide and compute their prevalence. Alert when
+    a COM key is repointed to a directory below a rarity threshold (e.g., present on <0.1% of endpoints
+    or never seen before). This prevalence/rarity approach catches novel locations the static watchlist
+    misses; corroborate with the writing process and binary signer.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Multi-user servers (e.g., Citrix, RDS)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKCU*CLSID*''
+
+      | eval dir=parent_dir(NewValue)
+
+      | eventstats dc(host) as hosts_with_dir by dir | eval prevalence=hosts_with_dir/total_hosts()
+
+      | where prevalence < 0.001 OR isnull(seen_before(dir))
+
+      | alert'
+- question: When COM modification events are clustered by target directory, parent process, file extension,
+    and signer, which events fall outside the dense clusters formed by legitimate installs and appear
+    as one-off outliers?
+  context: Legitimate software installs generate COM modifications that share parent processes, signers,
+    and target directories, forming dense clusters. Cluster COM modification events with DBSCAN using
+    features (target directory, parent process, file extension, signer); sparse outliers that do not join
+    any dense cluster are likely one-off persistence attempts. Report the features driving each outlier
+    for triage. Extended Isolation Forest is a scalable unsupervised alternative for high event volumes.
+    Outliers with user-profile parents, unsigned binaries, and odd directories are the strongest leads.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Multi-user servers (e.g., Citrix, RDS)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=dbscan(features=[target_dir, parent_proc, file_ext, signer], eps=auto, min_samples=5)
+
+      | where cluster_label == -1
+
+      | eval drivers=outlier_features()
+
+      | alert include=drivers'
+- question: Did a COM-loading host process (explorer.exe, svchost.exe) spawn a script interpreter (cmd.exe,
+    powershell.exe, mshta.exe, rundll32.exe) within 5 minutes of a related COM CLSID Registry write on
+    the same host?
+  context: 'The payoff of COM hijacking is execution: after the Registry is altered, the next time a COM-loading
+    host process touches the object the adversary''s code runs, often spawning an interpreter. Correlate
+    a COM CLSID write (4657 / Sysmon 13) with a subsequent process creation (4688 / Sysmon 1) by explorer.exe
+    or svchost.exe on the same host within 5 minutes, and alert when the child is an interpreter. Encode
+    the full write -> COM load -> child -> egress chain as a query graph and score rare parent-child tuples.
+    A confirmed chain is strong evidence of active COM persistence executing; absence of a child does
+    not clear the write, which may fire later.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search (EventID=4657 ObjectName=''*CLSID*'') OR (EventID=4688 OR sysmon EventID=1)
+
+      | transaction host maxspan=5m startswith=(EventID=4657) endswith=(EventID=4688)
+
+      | where parent_proc IN (''explorer.exe'',''svchost.exe'') AND child_proc IN (''cmd.exe'',''powershell.exe'',''mshta.exe'',''rundll32.exe'')
+
+      | eval rarity=parent_child_rarity(parent_proc, child_proc)
+
+      | alert'
+- question: After a COM modification, did a COM-loading process (explorer.exe, svchost.exe) connect to
+    a destination in the bottom 5th percentile of prevalence, or generate NXDOMAIN / connection-refused
+    / blocked-egress / HTTP 404 failures consistent with fetching a remote 'script:' payload?
+  context: 'Remote-script COM hijacking (the TypeLib ''script:'' moniker variant) reaches out to an external
+    server to pull its payload. From Zeek conn.log, baseline destinations contacted by explorer.exe/svchost.exe
+    per host; after a COM modification, alert on connections to bottom-5th-percentile destinations. Treat
+    failure modes as distinct, high-value evidence: NXDOMAIN, connection-refused, blocked egress, and
+    404 responses following a COM write strongly indicate an attempted but failed remote-payload retrieval.
+    Both successful rare connections and failed fetches confirm the persistence is reaching for external
+    code.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*CLSID*'' | join host [search zeek conn.log proc IN (''explorer.exe'',''svchost.exe'')]
+
+      | where conn_time between reg_time and reg_time+10m
+
+      | eval prev=dest_prevalence(dest_ip, host)
+
+      | where prev < p05 OR conn_state IN (''REJ'',''S0'') OR dns_rcode=''NXDOMAIN'' OR http_status=404
+
+      | alert'
+- question: Does a process/registry/network provenance graph contain an anomalous subgraph linking a rare
+    HKCU CLSID write to explorer.exe, then powershell.exe, then a new external IP?
+  context: Individual events may look benign, but their composition into a rare HKCU CLSID write -> explorer.exe
+    -> powershell.exe -> new external IP subgraph reveals COM persistence executing into C2. Build provenance
+    graphs and detect the anomalous subgraph using node-level ThreaTrace or per-edge temporal scoring
+    with attack-graph reconstruction (KAIROS); MAGIC offers self-supervised, drift-tolerant training.
+    Surface the ranked anomalous edges/nodes in the alert so an analyst can follow the chain. This catches
+    stealthy, multi-stage persistence that point detections miss.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'build provenance_graph(window=24h, nodes=[process,registry,network])
+
+      | score subgraph_anomaly(model=threatrace|kairos|magic)
+
+      | match pattern: HKCU_CLSID_write -> explorer.exe -> powershell.exe -> new_external_ip
+
+      | rank anomalous_edges desc | alert include=ranked_edges'
+- question: Has any machine-wide COM server key (HKLM\SOFTWARE\Classes\CLSID\...\InProcServer32 or LocalServer32)
+    been modified to reference a known-bad hash, a user-writable path (\Users\, \ProgramData\, %APPDATA%,
+    %TEMP%), or scrobj.dll?
+  context: HKLM COM hijacking affects every user on the machine and requires elevated rights, so it is
+    a strong privilege-escalation signal. Filter Event ID 4657 / Sysmon 13 for 'HKLM\SOFTWARE\Classes\CLSID\...\InProcServer32|LocalServer32'
+    writes, hash the referenced file, and alert on known-bad matches. Independently, alert deterministically
+    when an HKLM COM value points under \Users\, \ProgramData\, %APPDATA%, or %TEMP%, or equals scrobj.dll
+    - machine-wide COM should reference signed system or vendor binaries, never user-writable locations.
+    A hit on a Tier 0 server or admin workstation is critical.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Tier 0 Servers, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "search EventID=4657 OR (sysmon EventID=13)\n| where ObjectName matches '(?i)HKLM\\\\\\\\SOFTWARE\\\
+      \\\\\\Classes\\\\\\\\CLSID\\\\\\\\.*\\\\\\\\(InProcServer32|LocalServer32)'\n| eval h=file_hash(NewValue)\n\
+      | where lookup_ti(h)=='known_bad'\n    OR NewValue matches '(?i)(\\\\\\\\Users\\\\\\\\|\\\\\\\\\
+      ProgramData\\\\\\\\|%APPDATA%|%TEMP%)'\n    OR lower(NewValue) contains 'scrobj.dll'\n| alert severity=high"
+- question: Which hosts exceed a low daily threshold of HKLM COM writes (e.g., more than 2), or deviate
+    more than 3 standard deviations from baseline outside patching windows, given that machine-wide COM
+    registration is rare except during software installs?
+  context: HKLM COM writes are rare outside of sanctioned software installs, so even small volumes are
+    notable. Baseline daily HKLM COM write counts per host and alert when a host exceeds a low absolute
+    threshold (e.g., >2) or deviates more than 3 standard deviations from its baseline outside patch/maintenance
+    windows. Because the legitimate rate is so low, this frequency anomaly is a sensitive escalation indicator;
+    corroborate flagged hosts with the writing-process rarity and integrity-level checks to separate real
+    escalation from a large but legitimate update.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Tier 0 Servers, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKLM*SOFTWARE\\Classes\\CLSID*''
+
+      | bin _time span=1d | stats count as writes by host, _time
+
+      | eventstats avg(writes) as mu, stdev(writes) as sd by host
+
+      | where (writes > 2 OR writes > mu + 3*sd) AND NOT in_patch_window(_time)
+
+      | alert'
+- question: When HKLM COM modifications are scored by a One-Class SVM trained on legitimate installer
+    writes (parent msiexec.exe/TrustedInstaller.exe, signed reputable vendor binary), which writes fall
+    outside the learned boundary, and what do LIME attributions identify as the driving features?
+  context: 'Legitimate HKLM COM modifications have a consistent profile: a trusted installer parent and
+    a signed, reputable vendor binary. Train a One-Class SVM on this benign population and flag out-of-boundary
+    writes as potential escalation. Use LIME to surface the top contributing features per alert (e.g.,
+    unsigned binary, user-profile parent, user-writable target) so the analyst can rapidly assess the
+    lead. An Extended Isolation Forest is the unsupervised alternative for environments lacking clean
+    training data. Out-of-boundary writes with intuitive driving features are strong escalation candidates.'
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: Domain Controllers, Tier 0 Servers, Administrator Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=oneclass_svm(train=legit_hklm_com[parent IN msiexec,TrustedInstaller; signer=reputable])
+
+      | score features(parent_proc, signer, target_path, unsigned_flag)
+
+      | where decision_function < 0 (outside boundary)
+
+      | eval drivers=lime_explain()
+
+      | alert include=drivers'
+- question: Has any write occurred to InProcServer32, LocalServer32, or TreatAs of a high-risk or built-in
+    CLSID on the HKLM watchlist - for example the RomCom PSFactoryBuffer CLSID {c90250f3-4d7d-4991-9b69-a5c5bc1c2ae6},
+    which should only ever reference ActXPrxy.dll?
+  context: Certain system CLSIDs are loaded by SYSTEM-level processes and are prime targets for escalation;
+    hijacking them runs adversary code in a high-privilege context. Maintain a watchlist of high-risk/built-in
+    CLSIDs (including the RomCom PSFactoryBuffer CLSID, which must reference ActXPrxy.dll) under HKLM\SOFTWARE\Classes\CLSID\.
+    Trigger high severity on any write to InProcServer32/LocalServer32/TreatAs of a listed CLSID, applying
+    the benign filters from Sigma COM-hijack rules to suppress legitimate vendor updates. A write to one
+    of these CLSIDs by anything other than a trusted installer is a strong escalation lead.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search EventID=4657 OR (sysmon EventID=13)
+
+      | where ObjectName matches ''(?i)HKLM\\\\SOFTWARE\\\\Classes\\\\CLSID''
+
+      | eval clsid=extract_clsid(ObjectName)
+
+      | where clsid IN watchlist_highrisk_clsids AND ObjectName matches ''(?i)(InProcServer32|LocalServer32|TreatAs)''
+
+      | where NOT benign_vendor_update(NewValue)
+
+      | alert severity=high'
+- question: Which processes modifying HKLM COM keys are statistically rare for that action - e.g., cmd.exe,
+    powershell.exe, reg.exe, or any process running from a user profile - versus the expected installers
+    (msiexec.exe, setup.exe, TrustedInstaller.exe)?
+  context: Machine-wide COM keys are normally written only by trusted installer processes. Baseline the
+    images that legitimately modify HKLM COM keys (msiexec.exe, setup.exe, TrustedInstaller.exe) and alert
+    on writes by statistically rare images for this action - cmd.exe, powershell.exe, reg.exe, or any
+    process launched from a user profile directory. A rare writer touching HKLM COM is a strong indicator
+    of an escalation attempt rather than a sanctioned install; correlate with the integrity-level check
+    and the CLSID watchlist.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "search EventID=4657 ObjectName='*HKLM*SOFTWARE\\\\Classes\\\\CLSID*'\n| eventstats count by\
+      \ writing_process | eval prevalence=count/total_writes()\n| where writing_process NOT IN ('msiexec.exe','setup.exe','TrustedInstaller.exe')\n\
+      \    AND (prevalence < 0.005 OR image_path matches '(?i)\\\\\\\\Users\\\\\\\\')\n| alert"
+- question: When community detection / graph learning is run on a process-registry interaction graph,
+    does an isolated write to a high-risk HKLM CLSID by a non-installer process appear as an anomalous
+    node outside the dense communities formed by legitimate installs?
+  context: Legitimate installers and the keys they write form dense, interconnected communities in a process-registry
+    interaction graph. Run community detection / graph learning (in the spirit of MAGIC and ProblemChild
+    parent-child scoring) over this graph; a lone write to a high-risk HKLM CLSID by a non-installer process
+    will not belong to any known-good install community and surfaces as an anomalous node. This catches
+    escalation attempts that do not match a specific watchlist or signature by leveraging the structural
+    difference between sanctioned installs and one-off hijacks; investigate the isolated node's process
+    lineage.
+  answer_sources:
+  - Windows Event ID 4657
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "build process_registry_graph(window=7d)\n| run community_detection() \n| eval node_anom =\
+      \ isolation_from_install_communities(write_node)\n| where target_clsid IN watchlist_highrisk_clsids\
+      \ AND writer NOT IN installer_set AND node_anom > threshold\n| alert include=community_features"
+- question: Did a Medium or Low integrity process successfully modify a key under HKLM\SOFTWARE\Classes\CLSID\,
+    or did a non-'NT AUTHORITY' (non-privileged-installer) context perform such a write, indicating a
+    privilege bypass?
+  context: Writing to HKLM normally requires high integrity; a successful HKLM COM write by a Medium (S-1-16-8192)
+    or Low (S-1-16-4096) integrity process indicates the adversary bypassed access controls - the very
+    definition of privilege escalation. For each Event ID 4657 modifying HKLM\SOFTWARE\Classes\CLSID\,
+    join the Process ID to its creation event (4688) and alert immediately when the token Mandatory Label
+    is Medium or Low integrity, or when the user.domain is not 'NT AUTHORITY'. This is a high-confidence
+    escalation detection; investigate the originating process and how it obtained write access.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKLM*SOFTWARE\\Classes\\CLSID*''
+
+      | join ProcessId [search EventID=4688]
+
+      | where MandatoryLabel IN (''S-1-16-8192'',''S-1-16-4096'') OR user_domain != ''NT AUTHORITY''
+
+      | alert severity=high'
+- question: Across the enterprise, does the frequency of HKLM class-key writes by Medium/Low integrity
+    processes deviate beyond 3 standard deviations from a baseline that should be near zero in a hardened
+    environment?
+  context: In a hardened environment, the frequency of HKLM\SOFTWARE\Classes\CLSID\ writes by Medium/Low
+    integrity processes should approach zero. Compute enterprise-wide frequency of HKLM class-key writes
+    grouped by process integrity level, baseline it, and alert on any deviation beyond 3 sigma. Because
+    the expected rate is essentially zero, even a single such write is a high-confidence escalation alert.
+    This statistical framing catches slow or distributed escalation attempts that individual rules might
+    under-prioritize.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKLM*Classes\\CLSID*''
+
+      | stats count as writes by integrity_level, _time
+
+      | eventstats avg(writes) as mu, stdev(writes) as sd by integrity_level
+
+      | where integrity_level IN (''Medium'',''Low'') AND writes > mu + 3*sd
+
+      | alert'
+- question: After a low-integrity HKLM COM write is detected, how does a behavior classifier label the
+    subsequent parent/child activity (command-line tokens, child interpreters, network connections) -
+    e.g., 'escalation for C2' versus 'escalation for local discovery'?
+  context: Knowing intent accelerates response. On detection of a low-integrity HKLM write, classify the
+    subsequent parent/child behavior - command-line tokens, child interpreters, and network connections
+    - using a parent-child anomaly model (ProblemChild style) to label the likely objective, such as escalation
+    for C2 versus escalation for local discovery. Surface the top contributing features so the analyst
+    understands the classification. This enriches the deterministic low-integrity alert with predicted
+    intent, helping prioritize containment.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - 'NAI: All Windows Servers and Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'trigger on low_integrity_hklm_write
+
+      | collect subsequent(parent_cmdline, child_interpreters, network_conns, span=15m)
+
+      | model=problemchild_classifier | predict intent_label, prob
+
+      | where prob > 0.8 | alert include=top_features, intent_label'
+- question: Did a high-privilege process (services.exe, lsass.exe, a SYSTEM service host) initiate a network
+    connection to a non-allowlisted external IP within 10 minutes of an HKLM COM key write on the same
+    host?
+  context: After hijacking a machine-wide COM object, adversary code can run inside a SYSTEM-level process
+    and beacon out. Correlate an HKLM COM key write (Event ID 4657) with subsequent Zeek conn.log connections
+    by a high-privilege process (services.exe, lsass.exe, SYSTEM service host) on the same host within
+    10 minutes, and alert when the destination is an external IP not on an allowlist. Encode the escalation
+    chain as a graph query. A SYSTEM process reaching an unknown external host right after a COM write
+    is a serious escalation-to-C2 indicator, especially on Tier 0 assets.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Tier 0 Servers, Domain Controllers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'search EventID=4657 ObjectName=''*HKLM*CLSID*'' | join host [search zeek conn.log proc IN
+      (''services.exe'',''lsass.exe'',''svchost.exe'') user=''SYSTEM'']
+
+      | where conn_time between reg_time and reg_time+10m AND is_external(dest_ip) AND dest_ip NOT IN
+      allowlist
+
+      | alert severity=high'
+- question: After an HKLM COM modification, did a high-privilege process on a critical server connect
+    to a destination in the bottom 1st percentile of prevalence, or produce blocked/refused connections
+    or NXDOMAIN responses?
+  context: 'From Zeek conn.log, baseline destination IPs/domains for high-privilege processes on critical
+    servers. After an HKLM COM modification, alert when such a process connects to a bottom-1st-percentile
+    destination. Profile failure modes explicitly: blocked/refused connections and NXDOMAIN from a SYSTEM
+    process after a COM write are distinct escalation signals indicating an attempted payload fetch or
+    C2 callback that was thwarted. Both rare successful connections and failed attempts confirm the escalated
+    code is reaching outward; prioritize Tier 0 and domain controllers.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Tier 0 Servers, Domain Controllers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "search EventID=4657 ObjectName='*HKLM*CLSID*' | join host [search zeek conn.log proc=high_priv]\n\
+      | where conn_time between reg_time and reg_time+10m\n| eval prev=dest_prevalence(dest, proc) \n\
+      | where prev < p01 OR conn_state IN ('REJ','S0') OR dns_rcode='NXDOMAIN'\n| alert"
+- question: Does an LSTM model of per-process connection patterns (bytes, frequency, destination port)
+    reveal a new periodic beacon emerging from a high-privilege/SYSTEM process after an HKLM COM write,
+    and does the provenance subgraph score as anomalous?
+  context: Escalation-to-C2 often manifests as a newly emerging periodic beacon from a SYSTEM process.
+    Apply LSTM time-series anomaly detection to per-process connection patterns (bytes, frequency, destination
+    port) of high-privilege processes; flag a new beacon appearing after a COM write. Complement with
+    provenance-graph scoring of the escalation subgraph via KAIROS or ThreaTrace, surfacing the ranked
+    anomalous edges. This combined behavioral-plus-graph approach detects stealthy, low-and-slow C2 that
+    threshold rules miss; the ranked edges guide rapid investigation.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Tier 0 Servers, Domain Controllers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=lstm_beacon(per_process: bytes, interval, dport)
+
+      | where new_periodic_beacon==true AND proc IN high_priv AND post_event=hklm_com_write
+
+      | join graph_score(model=kairos|threatrace) on subgraph
+
+      | rank anomalous_edges desc | alert include=ranked_edges'
