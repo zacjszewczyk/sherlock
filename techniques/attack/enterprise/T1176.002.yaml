@@ -1,0 +1,397 @@
+name: 'T1176.002: IDE Extensions'
+id: 47a34bdf-dfa6-4b30-82fb-08d7dbd19bc8
+description: Investigate adversary abuse of integrated development environment (IDE) extensions and plugins
+  (Visual Studio Code, IntelliJ/JetBrains, Eclipse) for persistence by fusing host telemetry (Windows
+  Event IDs 4688/4663, Sysmon process/file/network events, Linux auditd, and macOS unified logs) with
+  network evidence from Zeek (conn/dns/ssl). The playbook helps an analyst confirm installation or side-loading
+  of malicious extensions (hash and IOC matches against extension-directory writes, code/AST signatures
+  for install hooks and payloads), detect IDE processes spawning high-risk child command lines (encoded
+  PowerShell, hidden windows, download utilities, miner flags), verify extension download provenance against
+  approved marketplace allowlists, surface IDE-ancestry access to credential stores and SSH/cloud keys,
+  and uncover C2 beaconing, DNS tunneling, and abnormal data egress from IDE processes (including benign-extension
+  abuse such as VSCode Remote SSH tunneling). Deterministic rules, statistical baselines, and machine-learning
+  models run in parallel so each method reinforces rather than replaces the others.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a newly created or modified file in an IDE extension directory hash-match a known-malicious
+    signature, contain payload/install-hook code signatures, or did an IDE process initiate an outbound
+    connection to a destination on a threat-intelligence blocklist?
+  context: This is a high-confidence, low-noise check for a planted malicious IDE extension and its callbacks,
+    supporting the Persistence tactic where a malicious extension runs every time the IDE launches. Continuously
+    monitor file-creation events in extension directories (Windows Event ID 4663 / Sysmon EID 11 on %USERPROFILE%\.vscode\extensions,
+    %APPDATA%\JetBrains\<IDE>\plugins, %LOCALAPPDATA%\Eclipse\p2\; auditd open/creat/rename on ~/.vscode/extensions,
+    ~/.config/JetBrains, ~/.eclipse; macOS unified log under ~/Library/Application Support/Code*/extensions).
+    For each new or changed file compute its hash and compare against a malicious-IOC feed, and scan packaged
+    JS/TS/Python for known install-hook and payload markers such as eval(, child_process.exec, base64.b64decode,
+    atob(, hardcoded webhook/pastebin URLs, and crypto-miner pool strings. Concurrently join Zeek conn.log/dns.log
+    to attribute IDE-process outbound flows and alert on any id.resp_h or query matching a CTI blocklist.
+    A positive result is strong evidence of a malicious extension establishing persistence; keep these
+    deterministic thresholds as a floor beneath the statistical and ML methods.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - Zeek conn.log
+  - 'NAI: Developer workstations, build servers, network egress points, threat intelligence platforms.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "files = FROM (Event4663, Sysmon11, auditd_open, macos_unifiedlog)\n        WHERE path MATCHES\
+      \ extension_dirs(\".vscode/extensions\",\"JetBrains/*/plugins\",\"eclipse/p2\")\nfiles = files COMPUTE\
+      \ sha256(file), code_sig=scan(file, [\"eval(\",\"child_process.exec\",\"base64.b64decode\",\"atob(\"\
+      ,miner_pools,webhook_urls])\nnet   = FROM ZeekConn JOIN ZeekDns ATTRIBUTE_TO ide_process\nALERT\
+      \ WHERE files.sha256 IN malicious_iocs OR files.code_sig != NULL\n      OR net.id_resp_h IN cti_blocklist\
+      \ OR net.query IN cti_blocklist"
+- question: For each destination domain queried by an IDE process, is the domain abnormally high-entropy,
+    rarely resolved across the enterprise fleet, or generating a spike in failed DNS resolutions consistent
+    with DGA or dead-drop probing?
+  context: Malicious extensions establishing persistence often reach algorithmically generated or rarely
+    seen domains for command-and-control or update staging. Correlate Zeek dns.log with Sysmon EID 1 /
+    auditd execve to attribute resolutions to IDE processes, then compute Shannon entropy and enterprise-wide
+    prevalence over a 30-day rolling window using fleet-wide frequency/prevalence stacking. Flag domains
+    with high entropy (start at > 3.5 bits/char; tune to your DNS baseline) or in the 99th percentile
+    for rarity. Separately profile the per-host NXDOMAIN/SERVFAIL failure rate as a distinct signal —
+    a spike in failed resolutions from an IDE process indicates DGA or dead-drop probing. Derive thresholds
+    per environment from the empirical entropy/rarity/failure distributions. Under Persistence, an IDE
+    process reaching rare high-entropy infrastructure is a strong lead even when no IOC match exists.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - Zeek conn.log
+  - 'NAI: Developer workstations, build servers, network egress points, threat intelligence platforms.'
+  range: Last 30 days (rolling window for entropy/prevalence baselining)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "dns = FROM ZeekDns JOIN ide_process ON host,time\ndns = dns COMPUTE entropy=shannon(query),\
+      \ prevalence=count_distinct(host) OVER 30d,\n          fail_rate=ratio(rcode IN [NXDOMAIN,SERVFAIL])\
+      \ PER host\nALERT WHERE entropy > 3.5 OR prevalence <= pct(1) OR fail_rate > baseline_p99(host)"
+- question: Does a supervised C2 classifier (with parallel Isolation Forest) flag a network flow attributed
+    to an IDE process as malicious command-and-control, and which top contributing features (rare JA4,
+    byte-out ratio, connection state) drove the score?
+  context: 'To catch C2 callbacks from compromised IDE extensions that evade signature and simple statistical
+    checks, train a supervised classifier (Random Forest / Gradient Boosting) on features from connections
+    attributed to IDE processes: duration, orig_bytes/resp_bytes and their ratio, proto, conn_state (including
+    failed/rejected states such as S0/REJ as explicit failure features), destination rarity/age, and JA3/JA4/JA3S
+    fingerprints from Zeek ssl.log to surface non-browser TLS stacks. Score live traffic and alert at
+    high confidence (e.g., > 0.90); the alert MUST list the top-3 contributing features so analysts can
+    triage. Run an Isolation Forest in parallel for novel/zero-day callbacks the supervised model has
+    not seen. For the Persistence tactic, a high-confidence classification on an IDE-process flow indicates
+    the extension is actively beaconing to an operator.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - Zeek conn.log
+  - 'NAI: Developer workstations, build servers, network egress points, threat intelligence platforms.'
+  range: Last 90 days (with model trained on longer historical baseline)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'flows = FROM ZeekConn JOIN ZeekSsl ATTRIBUTE_TO ide_process
+
+      feat  = features(duration, orig_bytes, resp_bytes, byte_ratio, proto, conn_state, dst_rarity, ja3,
+      ja4, ja3s)
+
+      score = RandomForest.predict_proba(feat); iso = IsolationForest.score(feat)
+
+      ALERT WHERE score > 0.90 OR iso ANOMALOUS WITH top3_features(feat)'
+- question: Did a known IDE executable (code.exe, idea64.exe, eclipse.exe, or node under the IDE tree)
+    spawn a child process whose command line matches high-risk patterns such as encoded PowerShell, hidden
+    execution, download utilities, or cryptominer flags?
+  context: 'A malicious or compromised extension frequently executes its payload by spawning child processes
+    from the IDE. Trigger on process creation (Windows EID 4688 / Sysmon EID 1; auditd execve; macOS unified
+    log) where ParentProcessName is a known IDE executable (code.exe, Code, idea64.exe, idea, eclipse.exe,
+    node under the IDE tree) and the command line matches high-risk regex: powershell -enc, -w hidden,
+    IEX, Invoke-Expression, curl, wget, nc.exe, child_process, base64 -d, or miner flags (--stratum, xmrig).
+    These map to documented extension-malware execution behaviors. A match is high-fidelity evidence that
+    an installed extension is executing arbitrary code under the Persistence tactic; retain this rule
+    as a deterministic floor beneath the statistical and ML baselines.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - 'NAI: Developer workstations, virtual desktop infrastructure (VDI) used for development, build servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc = FROM (Event4688, Sysmon1, auditd_execve, macos_unifiedlog)\nALERT WHERE parent_image\
+      \ IN [\"code.exe\",\"Code\",\"idea64.exe\",\"idea\",\"eclipse.exe\",\"node(ide_tree)\"]\n      AND\
+      \ command_line MATCHES /powershell -enc|-w hidden|IEX|Invoke-Expression|curl|wget|nc\\.exe|child_process|base64\
+      \ -d|--stratum|xmrig/"
+- question: Relative to each user's 30-day baseline, did an IDE parent process spawn an unusually rare
+    child, exhibit a spawn-rate spike, or launch a command line with anomalously high argument entropy
+    or a burst of failed/access-denied executions?
+  context: Obfuscated or novel payloads from a malicious extension deviate from a user's normal IDE child-process
+    behavior. For each IDE parent process per user, baseline the set of normal child process names, their
+    spawn frequency (count/min), and command-line structure over 30 days. Use a z-score (> 3) on the rarity
+    of a (parent,child) pair (e.g., svchost.exe<-code.exe) and on spawn-rate spikes, and flag command-line
+    argument entropy above the 95th percentile of the baseline to catch obfuscation. Also profile failed
+    executions / non-zero exit and access-denied spawns as a distinct state signal. Derive per-environment
+    thresholds from the observed distributions. Under Persistence, a statistically rare IDE-spawned child
+    or obfuscated command line warrants investigation even without a signature hit.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - 'NAI: Developer workstations, virtual desktop infrastructure (VDI) used for development, build servers.'
+  range: Last 30 days (rolling baseline window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "proc = FROM (Event4688, Sysmon1) WHERE parent_image IN ide_executables\nbase = baseline(child_set,\
+      \ spawn_rate, cmdline_entropy) PER user OVER 30d\nALERT WHERE zscore(rarity(parent,child)) > 3 OR\
+      \ zscore(spawn_rate) > 3\n      OR cmdline_entropy > base.p95 OR failed_exec_rate > base.fail_p95"
+- question: Does an unsupervised command-line anomaly model flag an IDE-spawned process as abnormal, and
+    which tokens or features (e.g., -enc, base64 blob length, rare child image) explain the anomaly?
+  context: To detect zero-day payload execution that signatures and simple baselines miss, train an unsupervised
+    model (Isolation Forest or variational autoencoder) on vectorized command lines (TF-IDF or token embeddings)
+    from IDE-spawned processes to learn normal activity; flag events whose anomaly score exceeds the 99th-percentile
+    training threshold. Alerts must surface the top-3 contributing tokens/features (e.g., -enc, base64
+    blob length, rare child image) for triage. Optionally apply static/LLM analysis of the parent extension's
+    code and metadata to corroborate intent. For the Persistence tactic, an anomalous IDE-child command
+    line is a lead that an extension is executing unexpected, potentially malicious code.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - 'NAI: Developer workstations, virtual desktop infrastructure (VDI) used for development, build servers.'
+  range: Last 90 days (model trained on longer historical baseline)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'proc = FROM (Event4688, Sysmon1) WHERE parent_image IN ide_executables
+
+      vec  = tfidf_or_embed(command_line)
+
+      score = IsolationForest_or_VAE.score(vec)
+
+      ALERT WHERE score > train_p99 WITH top3_tokens(vec)'
+- question: Was an IDE extension written to disk shortly after a download from a domain not on the approved
+    marketplace allowlist, or written by a process (cmd.exe, powershell.exe, mshta.exe, bash, curl) that
+    is not a recognized IDE or package manager?
+  context: Side-loading and untrusted marketplace installs are primary delivery vectors for malicious
+    IDE extensions used for persistence. Maintain an allowlist of approved marketplace domains (marketplace.visualstudio.com,
+    *.vsassets.io, plugins.jetbrains.com, open-vsx.org) and treat the marketplace/registry as a distribution-stage
+    trust boundary requiring provenance/signing. Correlate Zeek conn.log with extension-directory file
+    writes (Sysmon EID 11 / auditd) and alert if a write follows a download from a non-allowlisted domain
+    within minutes, or if the writer's parent process (Sysmon EID 1) is not a recognized IDE or package
+    manager — a side-loading indicator. A positive result indicates an extension entered the environment
+    outside sanctioned channels; keep as a deterministic floor.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, network egress points, internal software repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "dl    = FROM ZeekConn WHERE resp_host NOT IN allowlist([marketplace.visualstudio.com,*.vsassets.io,plugins.jetbrains.com,open-vsx.org])\n\
+      write = FROM (Sysmon11, auditd_open) WHERE path IN extension_dirs\nALERT WHERE (write FOLLOWS dl\
+      \ WITHIN 5m ON host)\n      OR write.parent_image NOT IN [ide_executables, package_managers]\n \
+      \        AND write.parent_image IN [\"cmd.exe\",\"powershell.exe\",\"mshta.exe\",\"bash\",\"curl\"\
+      ]"
+- question: Across the fleet over 90 days, is the source domain, extension ID, or publisher behind a given
+    extension-directory write a long-tail rarity, and do elevated HTTP 4xx/404 or TLS/connection failures
+    to that source suggest staged or probing delivery?
+  context: Coordinated supply-chain pushes and one-off side-loads stand out statistically against normal
+    install telemetry. Profile source domains that result in extension-directory writes; over 90 days
+    compute per-source prevalence (unique downloading hosts) and flag the bottom 5th percentile (very
+    rare sources) as candidate side-loads, using fleet-wide stacking. Likewise stack extension IDs and
+    publishers and flag long-tail rarities. Track HTTP 4xx/404 and TLS/connection failure rates to those
+    sources as a distinct state signal of probing or staged delivery. Derive cutoffs from your install
+    telemetry. Under Persistence, a rare publisher or source feeding extension writes is a candidate malicious-install
+    event worth corroborating with the deterministic and ML methods.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, network egress points, internal software repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "writes = FROM (Sysmon11, auditd_open) WHERE path IN extension_dirs JOIN ZeekConn ON host,time\n\
+      agg = writes COMPUTE prevalence=count_distinct(host) PER source_domain, ext_id, publisher OVER 90d,\n\
+      \        fail_rate=ratio(http_status IN [4xx,404] OR tls_fail) PER source_domain\nALERT WHERE prevalence\
+      \ <= pct(5) OR fail_rate > baseline"
+- question: Does a time-series model flag an anomalous spike in bytes written to extension directories
+    (or screening of a new package via static/AST and LLM analysis surface obfuscation, suspicious APIs,
+    exfil endpoints, or miners) indicating a coordinated supply-chain push?
+  context: To catch coordinated supply-chain pushes and to vet new extensions before trust, use a time-series
+    model (Prophet/LSTM) on hourly byte volume written to extension directories (including the orig/resp
+    byte ratio of the source download) to flag anomalous spikes outside the 99% forecast interval. Before
+    trusting a new package, screen it with static/AST plus on-device LLM analysis for obfuscation, suspicious
+    APIs, exfiltration endpoints, and miners, and apply a behavioral classifier over API/keyword features
+    generalized from package-malware corpora. Alerts must list the top-3 contributing features. For the
+    Persistence tactic, a forecast-breaking install spike or a package flagged by static/LLM screening
+    indicates a likely malicious extension entering the environment.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, network egress points, internal software repositories.'
+  range: Last 90 days (hourly time-series with 99% forecast interval)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts  = FROM (Sysmon11, auditd_open) WHERE path IN extension_dirs COMPUTE bytes_written PER
+      hour
+
+      fc  = Prophet_or_LSTM.forecast(ts)
+
+      scan = static_ast_llm(new_package, [obfuscation, suspicious_apis, exfil_endpoints, miners])
+
+      ALERT WHERE ts.actual OUTSIDE fc.interval(0.99) OR scan.malicious WITH top3_features'
+- question: Did a process whose ancestry traces to a known IDE access sensitive paths such as SSH keys,
+    cloud credential files (~/.aws/credentials, ~/.config/gcloud, ~/.kube/config), browser login databases,
+    or OS keychains/system directories?
+  context: 'Malicious extensions commonly harvest secrets after establishing persistence. Alert when a
+    process whose ancestry traces to a known IDE accesses sensitive predefined paths (Sysmon EID 11 /
+    Event ID 4663; auditd open; macOS unified log): %USERPROFILE%\.ssh\, ~/.ssh/, %USERPROFILE%\.aws\credentials,
+    ~/.aws/credentials, ~/.config/gcloud, ~/.kube/config, browser login databases (AppData\Local\Google\Chrome\User
+    Data\Default\Login Data), and OS keychains / C:\Windows\System32. This is grounded in demonstrated
+    cross-extension credential-data exposure in VSCode and info-stealing behavior of malicious packages.
+    A positive result is high-fidelity evidence that a persistent extension is stealing credentials; retain
+    as a deterministic floor.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, servers hosting sensitive user profiles (e.g., file servers, domain
+    controllers), code repositories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "acc = FROM (Sysmon11, Event4663, auditd_open, macos_unifiedlog)\n      WHERE ancestry_includes(ide_executables)\n\
+      ALERT WHERE target_path MATCHES /\\.ssh|\\.aws\\\\credentials|\\.config\\/gcloud|\\.kube\\/config|Login\
+      \ Data|Keychain|System32/"
+- question: Relative to each user's normal project scope, does an IDE process touch directories with little
+    or no overlap to its 30-day baseline, or generate a burst of access-denied/failed-open events against
+    secret paths indicating enumeration?
+  context: Credential enumeration by a malicious extension manifests as access far outside a developer's
+    normal project files. For each user, baseline the set of parent directories IDE processes touch over
+    30 days ('normal project scope'). For new accesses, compute the Jaccard distance to the baseline set;
+    flag distance > 0.8 (little/no overlap). Separately count read volume (bytes/files) and access-denied/failed-open
+    events per IDE process — a burst of failed opens against secret paths is a distinct enumeration signal.
+    Tune the distance and failure-rate thresholds to each user's historical distribution. Under Persistence,
+    an IDE process reaching well outside its established project scope, especially toward secret stores,
+    is a strong lead for credential theft.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, servers hosting sensitive user profiles (e.g., file servers, domain
+    controllers), code repositories.'
+  range: Last 30 days (rolling baseline window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "acc  = FROM (Sysmon11, Event4663, auditd_open) WHERE ancestry_includes(ide_executables)\n\
+      base = baseline(parent_dirs) PER user OVER 30d\nALERT WHERE jaccard_distance(acc.parent_dirs, base)\
+      \ > 0.8\n      OR failed_open_rate(secret_paths) > baseline_p95 PER user"
+- question: Does a provenance-graph anomaly model flag an IDE process chain — for example reading a credential
+    store and then making an outbound connection — and can it localize the offending node and reconstruct
+    the chain?
+  context: To detect multi-stage credential theft and exfiltration that single-event rules miss, build
+    a heterogeneous provenance graph (process/file/network nodes; spawn/access/connect edges) from Sysmon/auditd
+    and learn normal IDE activity with a graph neural network; score anomalous edges/nodes such as an
+    IDE process suddenly reading a credential store and then making an outbound connection. These models
+    localize the offending node and reconstruct the chain; surface the top-3 contributing edges/features
+    in the alert. For the Persistence tactic, a provenance anomaly linking IDE secret-access to network
+    egress is strong evidence of an extension exfiltrating credentials.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 11 (File Create)
+  - 'NAI: Developer workstations, servers hosting sensitive user profiles (e.g., file servers, domain
+    controllers), code repositories.'
+  range: Last 90 days (graph learned over historical baseline)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "graph = build_provenance(Sysmon, auditd; nodes=[process,file,network]; edges=[spawn,access,connect])\n\
+      model = GNN.learn_normal(graph WHERE root IN ide_executables)\nALERT WHERE model.anomaly(edge|node)\
+      \ e.g. ide_process ACCESS credential_store THEN CONNECT external\n      WITH localized_node, top3_edges"
+- question: Does a network flow attributed to an IDE process reach a CTI-blocklisted destination, show
+    DNS-tunneling patterns (service=dns on non-53 ports, oversized/high-entropy queries, elevated NXDOMAIN),
+    or present a TLS JA3/JA4 fingerprint that does not match the IDE's known updater?
+  context: Compromised or abused IDE extensions (including benign VSCode Remote SSH tunneling) establish
+    covert channels for persistence and C2. Correlate Sysmon EID 1 with Zeek conn.log / Sysmon EID 3 to
+    attribute network activity to IDE processes; alert on connections to CTI-blocklisted destinations.
+    Detect IDE-tunneling/DNS abuse by flagging Zeek records where service=dns but id.resp_p != 53, oversized/high-entropy
+    DNS queries, and elevated NXDOMAIN counts. Flag IDE-host TLS flows whose JA3/JA4 do not match the
+    IDE's known updater fingerprint as non-browser/implant clients. Keep as a deterministic floor. Under
+    Persistence, these patterns indicate an extension maintaining an operator-controlled channel.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 3 (Network Connection)
+  - 'NAI: Developer workstations, network egress points (firewalls, proxies), DNS servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "net = FROM (ZeekConn, Sysmon3) JOIN Sysmon1 ATTRIBUTE_TO ide_process\nALERT WHERE resp_h IN\
+      \ cti_blocklist\n      OR (service=\"dns\" AND resp_p != 53) OR dns_query_len > 100 OR dns_entropy\
+      \ > 3.5 OR nxdomain_count > baseline\n      OR (ssl.ja3/ja4 NOT IN ide_updater_fingerprints)"
+- question: Do connections from an IDE process exhibit a fixed-interval beacon cadence (very low inter-arrival
+    variation), exceed the 99th-percentile egress volume baseline, or show an elevated failed/rejected
+    connection-state rate?
+  context: C2 heartbeats and bulk exfiltration from a persistent extension stand out statistically. Per
+    (src,dst) pair from IDE processes, compute the coefficient of variation / standard deviation of inter-arrival
+    times; a very low value (e.g., std-dev < 1.0s or CV below your baseline over 5+ connections) indicates
+    a fixed-interval heartbeat. Compute the 99th percentile of orig_bytes per user's IDE processes over
+    30 days and flag connections exceeding it (volume), and track the failed/rejected connection-state
+    rate (S0/REJ) as a distinct signal. Derive cadence and volume thresholds from each host's baseline.
+    Under Persistence, a regular beacon or an egress-volume spike from an IDE process is a strong indicator
+    of an active C2 or exfiltration channel.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 3 (Network Connection)
+  - 'NAI: Developer workstations, network egress points (firewalls, proxies), DNS servers.'
+  range: Last 30 days (baseline) with 5+ connection minimum for cadence analysis
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "flows = FROM ZeekConn ATTRIBUTE_TO ide_process GROUP BY (src,dst)\nALERT WHERE cv(interarrival_times)\
+      \ < baseline_cv AND count >= 5\n      OR orig_bytes > p99(orig_bytes PER user OVER 30d)\n      OR\
+      \ rate(conn_state IN [S0,REJ]) > baseline"
+- question: Does time-series decomposition of per-host IDE-process traffic produce a residual beyond ~3
+    standard deviations, or an Isolation Forest over flow features flag a novel beacon, and which features
+    (low interval CV, high bytes-out, rare JA4) explain it?
+  context: To catch beacons and exfiltration that evade fixed thresholds, apply time-series decomposition
+    (STL) to per-host-per-minute IDE-process traffic (bytes sent, connection counts) and alert when the
+    residual exceeds ~3 standard deviations, capturing anomalies not explained by trend/seasonality. Complement
+    with an Isolation Forest over flow features (intervals, byte ratios, conn_state, JA4) for novel beacons.
+    Alerts must surface the top-3 contributing features (e.g., low interval CV, high bytes-out, rare JA4).
+    For the Persistence tactic, a residual spike or anomalous flow attributed to an IDE process indicates
+    a previously unseen covert channel maintained by an extension.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 4688
+  - Sysmon Event ID 1 (ProcessCreate)
+  - Sysmon Event ID 3 (Network Connection)
+  - 'NAI: Developer workstations, network egress points (firewalls, proxies), DNS servers.'
+  range: Last 90 days (per-minute time-series with model baseline)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts  = FROM ZeekConn ATTRIBUTE_TO ide_process COMPUTE bytes_sent, conn_count PER host PER minute
+
+      res = STL.decompose(ts).residual
+
+      iso = IsolationForest.score(features(interval, byte_ratio, conn_state, ja4))
+
+      ALERT WHERE res > 3*stddev OR iso ANOMALOUS WITH top3_features'
