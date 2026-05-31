@@ -1,0 +1,356 @@
+name: 'D3-NAM: Network Access Mediation'
+id: 2b7ceb6b-3536-4973-9a82-d4b6dd8cc03f
+description: 'Network Access Mediation controls authorize access to systems by users (or processes acting
+  on their behalf) communicating over local, wide-area, and Internet networks. This playbook helps an
+  analyst validate how effectively network access controls are segmenting traffic and enforcing policy.
+  It guides the investigation of two broad failure modes: (1) traffic observed between network segments
+  that should be isolated, indicating a bypass or misconfiguration of mediation controls — including profiling
+  of volume, frequency, and the rate of blocked/denied attempts at segment boundaries; and (2) anomalous
+  patterns in network access authentication events — such as an unusual number of failures from a single
+  source, distributed low-volume password sprays, successful authentications from non-compliant devices
+  or infeasible locations, or improbable new access edges — that reveal weaknesses in the mediation process.
+  The questions combine deterministic symbolic-logic rules, statistical baselining/change-point detection,
+  and unsupervised machine-learning methods over network flow logs (Zeek), firewall logs, and authentication
+  telemetry (Windows Event IDs, VPN/RADIUS).'
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there any successful Zeek connections (conn_state SF/S1/S3 with orig_bytes>0) between
+    a 'sensitive' IP range (e.g., the production database subnet) and an 'untrusted' IP range (e.g., guest
+    Wi-Fi) where the default-deny, enumerated-allow segmentation policy dictates that no such flow should
+    exist, or any allowed segment-to-segment flow that did not transit an authorized Policy Enforcement
+    Point?
+  context: 'This deterministic rule operationalizes the Isolate tactic: under a default-deny, enumerated-allow
+    policy (NIST SP 800-125B) and Zero Trust (NIST SP 800-207), specific subnet pairs must never communicate,
+    and all permitted cross-segment flows must traverse an authorized Policy Enforcement Point. The analyst
+    maintains a forbidden-subnet-pair table as a hard rule. A successful, established flow (conn_state
+    SF/S1/S3, bytes transferred) between any forbidden pair, or a cross-segment flow that bypassed the
+    PEP, is a clear segmentation/mediation bypass. A positive result is a Zero Trust violation requiring
+    immediate triage; a negative result confirms the boundary held. Tune the forbidden-pair table, do
+    not delete entries.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM zeek_conn\nWHERE conn_state IN (\"SF\",\"S1\",\"S3\") AND orig_bytes > 0\n  AND ((src_ip\
+      \ IN sensitive_subnets AND dst_ip IN untrusted_subnets)\n       OR (src_ip IN untrusted_subnets\
+      \ AND dst_ip IN sensitive_subnets)\n       OR pair(src_subnet,dst_subnet) IN forbidden_pair_table\n\
+      \       OR transited_authorized_PEP == FALSE)\n| ALERT \"Zero Trust segmentation violation\""
+- question: Do Zeek dce_rpc.log / smb_files.log records show remote service-control, scheduled-task, or
+    WMI operations whose originator and responder fall in segments that policy forbids from communicating,
+    indicating mediation bypass via lateral movement?
+  context: Applying BZAR Zeek analytics to DCE-RPC and SMB logs flags the remote-execution primitives
+    (service control manager, task scheduler, WMI) that adversaries use to move laterally. In the context
+    of the Isolate tactic, the key qualifier is that the originator and responder fall in segments policy
+    forbids from communicating — so even 'normal-looking' admin RPC becomes a mediation-bypass indicator
+    when it crosses a forbidden boundary. This runs entirely on first-party Zeek logs with no external
+    lookup. A hit means lateral movement crossed a boundary the mediation control should have blocked;
+    investigate the source host for compromise.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM zeek_dce_rpc, zeek_smb_files\nWHERE operation IN bzar_remote_exec_ops  // svcctl, atsvc/tsch,\
+      \ wmi\n  AND pair(src_segment,dst_segment) IN forbidden_pair_table\n| ALERT \"Cross-segment remote\
+      \ execution (BZAR)\""
+- question: For each defined network segment, does the Shannon entropy of its distinct destination subnets
+    (communication partners) and the per-partner byte-volume distribution indicate poor isolation, and
+    does change-point detection on per-segment partner-count and inter-segment byte-volume time series
+    reveal the onset of new cross-segment communication?
+  context: 'A truly isolated segment should talk to few, well-known partners. Computing Shannon entropy
+    over a segment''s distinct destination subnets quantifies isolation: high entropy (many diverse partners)
+    signals leaky segmentation. Layering CUSUM/PELT change-point detection (Aminikhanghahi & Cook) on
+    per-segment partner-count and inter-segment byte-volume time series catches the moment new cross-segment
+    communication begins, rather than relying on a static threshold. Baseline per segment and flag values
+    above the 99th percentile. The alert must name the top-3 new/highest-volume destination subnets driving
+    the score so the analyst can pursue the specific leak. This directly measures how well the Isolate
+    tactic is holding.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM zeek_conn | BIN time 1h | BY src_segment\n  COMPUTE entropy = shannon(distinct dst_subnet),\n\
+      \          partner_count = dcount(dst_subnet),\n          xseg_bytes = sum(bytes WHERE dst_segment\
+      \ != src_segment)\n| baseline per segment; change_point(CUSUM|PELT) on partner_count, xseg_bytes\n\
+      | WHERE entropy > p99(entropy_baseline)\n| ALERT with top3 new/high-volume dst_subnets"
+- question: From firewall deny logs and Zeek conn.log rejected/aborted states (conn_state in REJ, S0,
+    RSTO), is there a sustained rise in per-source or per-segment blocked-connection counts per minute
+    toward an isolated segment that exceeds the rolling 99th percentile, indicating probing or bypass
+    attempts?
+  context: 'Denied connections at a segment boundary are a distinct, high-value signal: a sustained increase
+    in blocked attempts toward an isolated segment indicates someone is probing or attempting to bypass
+    the mediation control. By computing per-source and per-segment blocked-connection counts per minute
+    from firewall deny logs and Zeek rejected/aborted states (REJ, S0, RSTO), then baselining normal deny
+    rates and alerting on deviations above the rolling 99th percentile, the analyst separates benign noise
+    from a campaign. Grounded in beaconing/frequency analysis (RITA), the alert reports source IP, target
+    segment, and a denied-port histogram so the analyst can see whether it is a scan, a targeted service,
+    or a misconfigured host.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM firewall_deny, zeek_conn(conn_state IN (\"REJ\",\"S0\",\"RSTO\"))\n| BIN time 1m | BY\
+      \ src_ip, target_segment\n  COMPUTE denied = count()\n| baseline normal deny rate per source/segment\n\
+      | WHERE denied > rolling_p99\n| ALERT with src_ip, target_segment, denied_port_histogram"
+- question: When the Louvain community-detection algorithm is run on the weighted network graph from Zeek
+    conn.log (nodes=IPs, edge weight=connection/byte count), do any hosts get placed in a behavioral community
+    that spans multiple administratively-defined segments, revealing segmentation weakness?
+  context: 'Louvain community detection (Blondel et al.) discovers the de facto communication communities
+    in the network purely from observed flows. Comparing these machine-learned communities to the administratively-defined
+    segments exposes mismatches: a host whose behavioral community straddles multiple admin segments is
+    communicating in ways the Isolate tactic intends to prevent. This is unsupervised and needs no labels.
+    A positive result names the offending host, its administrative segment, and the top-3 cross-segment
+    peers responsible for the mismatch — giving the analyst an immediate pivot to confirm whether it is
+    misconfiguration or active bypass.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "GRAPH from zeek_conn: nodes=IP, edge_weight=conn_count|byte_count\nRUN louvain(weighted) ->\
+      \ communities\nFOR each host: if community spans >1 admin_segment:\n  ALERT host, admin_segment,\
+      \ top3 cross-segment peers"
+- question: Does the unsupervised anomaly ensemble (PCA residual scoring, k-means peer clustering, MAD
+    robust outliers) over host-communication features (distinct peers, cross-segment edges, byte volume)
+    flag any host whose connectivity deviates from its peer baseline?
+  context: Following Bohara et al., this ensemble combines PCA residual scoring, k-means peer clustering,
+    and MAD robust outlier detection over host-communication features — distinct peers, cross-segment
+    edges, byte volume — to find hosts behaving unlike their peer group, with no labeled data required.
+    In the Isolate context, a host that suddenly has new cross-segment peers or anomalous volume is a
+    candidate for mediation bypass or compromise. The alert surfaces the top-3 contributing features (e.g.,
+    new cross-segment peer, volume outlier) so the analyst knows why the host scored high. Baselines can
+    be built from the LANL authentication dataset or local equivalents.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall deny/allow logs
+  - 'NAI: Internal network segments (e.g., Development, Production, Corporate VLANs), Network chokepoints,
+    Segment-boundary firewalls/PEPs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'FEATURES per host: distinct_peers, cross_segment_edges, byte_volume
+
+      RUN ensemble: pca_residual + kmeans_peer_clusters + mad_outliers
+
+      SCORE hosts vs peer baseline
+
+      | WHERE anomaly_score high
+
+      | ALERT with top3 contributing features'
+- question: Is there any successful network access authentication (e.g., a VPN login correlated with Windows
+    Event ID 4624) originating from an IP on a known-malicious or non-standard ASN blocklist, or from
+    a device that failed the posture/compliance gating required by Zero Trust?
+  context: This deterministic floor implements NIST SP 800-207 posture/compliance gating. By correlating
+    VPN logins with Windows Event ID 4624 and checking the source IP against known-malicious/non-standard
+    ASN blocklists and device compliance state, the analyst catches authentications that succeeded despite
+    originating from disallowed networks or non-compliant devices — a direct mediation weakness. Keep
+    the blocklist/compliance rules as a deterministic floor beneath the statistical and ML detections.
+    A hit means an access decision was made that the policy should have denied; investigate the account
+    and device immediately.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM win_4624 JOIN vpn_auth ON account, time_window\nWHERE result == SUCCESS\n  AND (src_asn\
+      \ IN malicious_or_nonstandard_asn_blocklist\n       OR device_compliance == FAIL)\n| ALERT \"Non-compliant/blocklisted\
+      \ successful auth\""
+- question: For consecutive successful authentications (Event ID 4624 / VPN) of the same account, does
+    the great-circle distance between source-IP geolocations divided by elapsed time imply a travel velocity
+    exceeding a feasibility threshold (e.g., ~900 km/h)?
+  context: 'Impossible-travel logic (Microsoft WO2018085161A1) detects credential abuse: a single account
+    cannot physically authenticate from two distant locations within a short interval. For each pair of
+    consecutive successful logons, compute the great-circle distance between source-IP geolocations and
+    divide by elapsed time; an implied velocity above ~900 km/h is infeasible and suggests the credential
+    is being used from two places at once. This supports the mediation process by flagging logons no legitimate
+    user could produce. The alert reports both source locations and the time delta so the analyst can
+    confirm against expected travel or VPN-egress patterns.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM win_4624, vpn_auth WHERE result==SUCCESS\n| ORDER BY account, time\n| FOR consecutive\
+      \ logons of same account:\n    v = greatcircle(geo(src_ip_prev), geo(src_ip)) / (t - t_prev)\n|\
+      \ WHERE v > 900_kmh\n| ALERT with both locations and time delta"
+- question: Against a baseline of historical (account, source-host, destination-host) authentication triplets,
+    are there first-seen rare authentication edges into sensitive segments that are not on the expected-administrative-edge
+    allow-list?
+  context: Authentication-graph edge rarity (Kent et al., over the LANL dataset) is a strong indicator
+    of credential abuse. The analyst maintains a baseline of historical (account, source-host, destination-host)
+    triplets from 4624/auth logs and alerts on first-seen rare edges into sensitive segments. In the mediation
+    context, a brand-new authentication path into a sensitive segment suggests an attacker using valid
+    credentials to reach a resource they normally do not touch. An allow-list of expected administrative
+    edges suppresses known-good admin behavior, reducing false positives. A positive result is a new,
+    unexplained access path that warrants account review.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "BASELINE triplets (account, src_host, dst_host) over history\nFROM win_4624/auth current window\n\
+      WHERE triplet NOT IN baseline\n  AND dst_host IN sensitive_segments\n  AND triplet NOT IN admin_edge_allowlist\n\
+      | ALERT \"Rare new authentication edge into sensitive segment\""
+- question: For each user, does the ratio of failed (Event ID 4625) to successful (Event ID 4624) remote-access
+    attempts over a rolling 24-hour window exceed the 95th percentile, and are any logins using known-breached
+    credentials, indicating brute force or credential stuffing?
+  context: 'Brute force and credential stuffing leave a tell: a high ratio of failed (4625) to successful
+    (4624) remote-access attempts. Computing this ratio per user over a rolling 24-hour window and flagging
+    users above the 95th percentile surfaces accounts under attack. Because credential-stuffing traffic
+    is distributed, low-rate, and reuse-driven (Thomas et al.), the rule also gates logins that use known-breached
+    credentials. The alert reports failure count, success count, and distinct source-IP count so the analyst
+    can distinguish a single misconfigured client from a credential-abuse campaign against the mediation
+    layer.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM win_4625, win_4624 | BIN time 24h rolling | BY user\n  COMPUTE ratio = count(4625) /\
+      \ max(count(4624),1)\n| WHERE ratio > p95(ratio_baseline)\n   OR credential IN breached_credential_set\n\
+      | ALERT with fail_count, success_count, distinct_src_ip"
+- question: Do CUSUM/PELT/Bayesian-online change-point detectors applied to per-hour 4625 failure counts
+    and 4624 success counts reveal regime shifts (the onset of an attack campaign) that static thresholds
+    would miss?
+  context: Static thresholds miss slow ramps and campaign onsets. Applying change-point detection (CUSUM/PELT/Bayesian-online,
+    per Aminikhanghahi & Cook) to per-hour 4625 failure counts and 4624 success counts detects regime
+    shifts — the moment authentication behavior changes — rather than fixed levels. The failed-logon rate
+    is profiled as a signal distinct from success volume, because a campaign may spike failures, successes,
+    or both. In the mediation context, a detected change-point timestamps when the access pattern shifted;
+    the alert reports the change-point timestamp and pre/post rates so the analyst can scope the campaign
+    window.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM win_4625, win_4624 | BIN time 1h\n  SERIES fail = count(4625), success = count(4624)\n\
+      RUN change_point(CUSUM|PELT|BOCPD) on fail and success\n| WHERE change_point detected\n| ALERT with\
+      \ change_point_ts, pre_rate, post_rate"
+- question: Does a time-series forecasting model (e.g., ARIMA) trained on the per-hour aggregate volume
+    of successful authentications (Event ID 4624) flag any hour where observed volume exceeds the prediction
+    confidence interval, indicating widespread compromise or policy bypass?
+  context: Forecasting normal authentication volume lets the analyst spot abnormal surges in legitimate-looking
+    successes. An ARIMA (or similar) model trained on per-hour 4624 success counts predicts the next hour
+    with a confidence interval; an observed value above the interval indicates an unexpected mass of successful
+    authentications, which can mean widespread credential compromise or a mediation/policy bypass enabling
+    many accounts at once. The alert must report observed vs. expected counts and the contributing accounts/source
+    subnets so the analyst can determine whether the spike is a benign event (e.g., a patch reboot wave)
+    or an attack.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'FROM win_4624 | BIN time 1h SERIES success = count()
+
+      TRAIN ARIMA on history; FORECAST next hour with CI
+
+      | WHERE observed > forecast_upper_CI
+
+      | ALERT observed vs expected, contributing accounts/src_subnets'
+- question: When 4625 failures are aggregated tenant-wide and clustered by behavioral features (distinct
+    targeted accounts per source, source-IP/ASN diversity, timing), do any clusters reveal distributed
+    low-volume password sprays that evade per-account failure thresholds?
+  context: Low-and-slow password sprays defeat per-account thresholds by spreading a few attempts across
+    many accounts from many sources. Aggregating 4625 failures tenant-wide and clustering by behavioral
+    features — distinct targeted accounts per source, source-IP/ASN diversity, and timing — surfaces this
+    distributed pattern (per Microsoft Sentinel's low-and-slow spray ML). It runs in parallel with the
+    deterministic per-user failure-ratio rule, catching what that rule misses. The alert surfaces the
+    breadth of accounts targeted and the top source IPs, so the analyst can confirm a coordinated spray
+    against the mediation layer rather than scattered individual failures.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'FROM win_4625 (tenant-wide)
+
+      FEATURES per source: distinct_target_accounts, src_ip/asn_diversity, timing
+
+      RUN clustering -> spray clusters
+
+      | WHERE cluster matches low-and-slow spray profile
+
+      | ALERT accounts_targeted_breadth, top_source_ips'
+- question: Using unsupervised graph embeddings and temporal link prediction over the authentication graph
+    (accounts/hosts as nodes, logons as edges), do any new cross-segment authentication edges score as
+    low-probability, flagging credential abuse that bypasses mediation?
+  context: Temporal graph link prediction (CyberGraph, Bowman et al.; Euler, King & Huang) models the
+    authentication graph and scores how probable each new access edge is given learned, time-aware embeddings.
+    A low-probability cross-segment authentication is exactly the kind of improbable new access edge that
+    credential abuse bypassing the mediation control produces. The alert lists the top-3 features driving
+    the score — edge rarity, peer-group distance, time-of-day — so the analyst understands the reasoning.
+    Baseline with the LANL authentication dataset or a local equivalent. This complements the deterministic
+    rare-edge rule with a probabilistic, learned view.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - VPN/RADIUS authentication logs
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers), VPN Concentrators, Identity
+    providers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'GRAPH from win_4624/auth: nodes=account|host, edges=logons (temporal)
+
+      LEARN unsupervised embeddings; SCORE each new edge via link-prediction
+
+      | WHERE edge_probability low AND edge is cross-segment
+
+      | ALERT with top3 features (edge_rarity, peer_distance, time_of_day)'
