@@ -1,0 +1,493 @@
+name: 'T1521: Encrypted Channel'
+id: 1a46d1d3-6caa-4897-a6f3-e294e7b9597b
+description: 'Investigate whether an adversary is using a known encryption algorithm to conceal command
+  and control (C2) traffic to or from managed Android and iOS mobile devices, beyond the protections inherent
+  to a communication protocol. This playbook helps a SOC analyst hunt for application-layer encrypted
+  channels across multiple vantage points: anomalous TLS certificate and domain attributes (self-signed
+  certs, non-approved CAs, short validity windows, newly registered or low-reputation domains); TLS validation
+  failures and blocked egress bursts that signal C2 retries; rare or high-entropy destination domains;
+  non-allowlisted or statistically rare TLS-stack fingerprints (JA3/JA3S/JA4/JA4S); encrypted beaconing
+  characterized by periodicity, low jitter, low byte variance, and unusually long-lived low-throughput
+  connections; and on-device evidence where a managed app invokes cryptographic APIs (AES/RSA/KeyStore)
+  on locally staged data and then transmits structured traffic in the background, while the device is
+  locked, or without user interaction, including static crypto-API misuse such as ECB mode, hardcoded
+  keys, and constant IVs/salts. Detection methods span deterministic symbolic logic, statistical baselining,
+  and machine learning so an analyst can determine whether a custom or non-standard encrypted channel
+  is being used to control compromised mobile devices.'
+type: technique
+related:
+- tactic_id: TA0037
+  tactic_name: Command And Control
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a managed mobile device establish a TLS session whose certificate is self-signed, issued
+    by a Certificate Authority outside the trusted-CA allowlist, valid for an unusually short window (under
+    30 days), or carrying low-entropy subject/issuer fields, especially to a newly registered or low-reputation
+    domain?
+  context: Adversaries concealing C2 in an encrypted channel frequently terminate TLS on infrastructure
+    they control, which often presents a self-signed certificate, a certificate from a CA that is not
+    in the enterprise trust store, or a short-lived certificate minted just for the campaign. By joining
+    Zeek ssl.log to x509.log on the connection uid you can inspect issuer, validity window, and subject/issuer
+    entropy together, then enrich with DNS, WHOIS, and threat intelligence to flag domains registered
+    within the last 30 days or with poor reputation. A positive hit (self-signed cert + newly registered
+    domain from a mobile IP) is a strong indicator of a custom encrypted C2 channel; a clean, well-known
+    CA to an established domain lowers suspicion but should still be weighed against the other checks.
+    These certificate anomalies are empirically tied to malware TLS in Anderson and McGrew. In the Command
+    and Control context this directly surfaces the infrastructure an adversary uses to control a compromised
+    device.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Internet Egress Points (e.g., corporate Wi-Fi gateways, VPN concentrators) instrumented with
+    Zeek sensors. Cloud Access Security Broker (CASB) providing visibility into cloud app traffic. Mobile
+    Device Management (MDM) platform for device and user context.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      ssl = read('ssl.log'); x = read('x509.log');
+      j = join(ssl, x, on='cert_chain_fuids/uid');
+      for s in j where src_ip in mobile_device_subnet:
+        self_signed = (s.issuer == s.subject);
+        bad_ca = s.issuer not in trusted_ca_allowlist;
+        short_valid = (s.not_after - s.not_before) < 30d;
+        low_entropy = entropy(s.subject)+entropy(s.issuer) < threshold;
+        new_dom = whois_age(s.server_name) < 30d or ti_reputation(s.server_name)=='bad';
+        if self_signed or bad_ca or short_valid or low_entropy or new_dom:
+          alert(device=src_ip, server_name=s.server_name, issuer=s.issuer, reasons=[...])
+- question: Is any (device, destination) pair from the managed mobile fleet generating a sustained burst
+    of TLS handshake or certificate-validation failures, NXDOMAIN responses, or blocked outbound connections
+    (roughly 5 or more per minute) that would indicate a device repeatedly retrying unreachable or rotating
+    C2 infrastructure?
+  context: 'When primary C2 is taken down, sinkholed, or blocked by egress controls, implanted malware
+    on a mobile device commonly retries aggressively, producing characteristic failure-state telemetry:
+    repeated TLS handshake/validation errors, DNS NXDOMAIN responses for dead domains, and firewall/proxy
+    blocks. Treating these failure states as first-class signals (rather than noise) lets you detect C2
+    even when the successful sessions are encrypted and opaque. Baseline the benign retry rate per device/destination
+    and alert on a (device,destination) pair sustaining >=5 failures/min, which exceeds normal transient
+    connectivity issues. A positive result points to an implant cycling through resilient C2; benign causes
+    (captive portals, expired enterprise certs) should be ruled out via context. Use change-point baselining
+    per Aminikhanghahi and Cook. In Command and Control terms, reconnect storms reveal the adversary''s
+    effort to maintain a control channel.'
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Internet Egress Points (e.g., corporate Wi-Fi gateways, VPN concentrators) instrumented with
+    Zeek sensors. Cloud Access Security Broker (CASB) providing visibility into cloud app traffic. Mobile
+    Device Management (MDM) platform for device and user context.'
+  range: Last 90 days, with event-centered correlation across the burst window
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      conn = read('conn.log'); ssl = read('ssl.log'); dns = read('dns.log');
+      events = union(
+        ssl where validation_status != 'ok',
+        dns where rcode_name == 'NXDOMAIN',
+        conn where conn_state in ('REJ','S0') or blocked==true);
+      for (device,dest), w in window(events, key=(src_ip,dest), size=1min)
+          where src_ip in mobile_device_subnet:
+        if count(w) >= 5 and count(w) > baseline_p95(device,dest):
+          alert(device, dest, failures=count(w), window=w.start)
+- question: Is a managed mobile device connecting over TLS to a server_name not observed anywhere in the
+    fleet during the prior 30 days, where the domain's character entropy ranks in the top 5th percentile
+    (algorithmically generated) or its threat-intel reputation ranks in the bottom 5th percentile?
+  context: Custom encrypted C2 often relies on previously unseen domains, frequently produced by domain
+    generation algorithms (DGAs) that yield high-entropy, random-looking hostnames. By tracking the set
+    of server_name values seen across the fleet over a rolling 30-day window you can isolate genuinely
+    new destinations, then rank them by domain entropy and TI reputation to prioritize the ones most likely
+    to be malicious. Per-fleet percentile thresholds (top 5th percentile entropy, bottom 5th percentile
+    reputation) adapt the detector to your environment, and suppressing known periodic/automated services
+    (per Mack et al.) keeps benign CDNs and telemetry endpoints from flooding the queue. A positive result
+    is a rare, high-entropy, poorly-reputed new domain from a mobile IP; a familiar low-entropy domain
+    is likely benign. This supports Command and Control detection by spotlighting freshly stood-up adversary
+    infrastructure.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Internet Egress Points (e.g., corporate Wi-Fi gateways, VPN concentrators) instrumented with
+    Zeek sensors. Cloud Access Security Broker (CASB) providing visibility into cloud app traffic. Mobile
+    Device Management (MDM) platform for device and user context.'
+  range: Last 90 days, with a 30-day rolling baseline of seen domains
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      seen30 = distinct(ssl.server_name where ts in last_30d);
+      for s in ssl where ts in today and src_ip in mobile_device_subnet:
+        if s.server_name not in seen30:
+          e = shannon_entropy(s.server_name);
+          rep = ti_reputation_score(s.server_name);
+          if e >= percentile(fleet_entropy, 95) or rep <= percentile(fleet_rep, 5):
+            if s.server_name not in benign_periodic_allowlist:
+              alert(device=s.src_ip, domain=s.server_name, entropy=e, reputation=rep)
+- question: When a supervised model scores TLS sessions from managed mobile devices using certificate,
+    fingerprint, and flow features, which sessions receive a high malicious-probability score, and what
+    are the top contributing features driving each prediction?
+  context: Some malicious encrypted channels evade single-attribute rules but reveal themselves in the
+    combination of features. Train a Random Forest on labeled TLS data using certificate validity window,
+    subject/issuer entropy, key length and algorithm, self-signed flag, newly-registered-domain flag,
+    and flow byte/packet statistics (per Anderson and McGrew), then alert on sessions with high malicious
+    probability. Surfacing the top-3 contributing features via SHAP in the alert lets an analyst quickly
+    judge whether the model latched onto a self-signed cert, an odd cipher, or anomalous flow shape. Critically,
+    run this model in parallel with the deterministic CA/cert rules, never replacing them, so a model
+    miss does not blind you. A high score with corroborating features is a strong lead; a high score with
+    weak features warrants tuning. In the Command and Control context this catches concealed C2 sessions
+    that any one heuristic would miss.
+  answer_sources:
+  - Zeek ssl.log
+  - Zeek x509.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - Threat intelligence indicators
+  - WHOIS records
+  - 'NAI: Internet Egress Points (e.g., corporate Wi-Fi gateways, VPN concentrators) instrumented with
+    Zeek sensors. Cloud Access Security Broker (CASB) providing visibility into cloud app traffic. Mobile
+    Device Management (MDM) platform for device and user context.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      feats = build_features(ssl join x509 join conn,
+        ['cert_validity_days','subject_entropy','issuer_entropy','key_length',
+         'key_alg','self_signed','newly_registered_domain','orig_bytes','resp_bytes',
+         'orig_pkts','resp_pkts']) where src_ip in mobile_device_subnet;
+      model = load('rf_tls_malicious.pkl');
+      for f in feats:
+        p = model.predict_proba(f)[malicious];
+        if p >= 0.8:
+          alert(device=f.src_ip, server_name=f.server_name, score=p,
+                top_features=shap_top3(model,f))  # runs alongside, not instead of, cert rules
+- question: Did any managed mobile TLS session present a JA3/JA3S or JA4/JA4S client/server fingerprint
+    that is outside the allowlist of fingerprints expected from the sanctioned managed application inventory?
+  context: Each TLS client stack produces a characteristic handshake fingerprint. By building an allowlist
+    of JA3/JA3S and GREASE-resilient JA4/JA4S fingerprints generated by the enterprise's sanctioned managed
+    apps, you can flag any mobile TLS session whose fingerprint falls outside that set, which suggests
+    an unsanctioned or malicious TLS implementation, e.g. a custom C2 client or a repackaged app. JA4
+    is preferred because it resists the TLS extension randomization (GREASE) that degrades JA3 reliability.
+    A positive result (an unknown fingerprint from a managed device) merits identifying the responsible
+    app via MDM inventory; a fingerprint matching a known app is benign. This maps to Command and Control
+    by exposing non-standard TLS clients used to carry concealed C2.
+  answer_sources:
+  - Zeek ssl.log
+  - Threat intelligence indicators
+  - 'NAI: Network sensors (e.g., Zeek) at internet egress points and virtual network taps monitoring traffic
+    to/from the mobile device subnet. The Mobile Device Management (MDM) platform is used as a contextual
+    source for application and device inventories.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      allow = load_allowlist('sanctioned_app_ja3_ja4');
+      for s in ssl where src_ip in mobile_device_subnet:
+        fp = coalesce(s.ja4, s.ja3);
+        fps = coalesce(s.ja4s, s.ja3s);
+        if fp not in allow and fps not in allow:
+          alert(device=s.src_ip, server_name=s.server_name, ja3=s.ja3, ja4=s.ja4)
+- question: Across the managed mobile fleet over the last 30 days, which JA3/JA4 TLS-stack fingerprints
+    occur in the bottom 1st percentile of prevalence, and do any correlate with public malware-fingerprint
+    intelligence?
+  context: 'Even without an explicit allowlist, rarity is a powerful signal: malicious or custom TLS clients
+    used for C2 tend to be vanishingly rare across a fleet of standardized managed devices. Compute the
+    30-day prevalence of each JA3/JA4 fingerprint and alert on those in the bottom 1st percentile, then
+    enrich with public malware-fingerprint associations to raise confidence. The percentile must be tuned
+    to fleet size so that sanctioned-but-rare apps do not dominate the alerts. A positive result is a
+    fingerprint seen on only one or a few devices that also matches known-bad intel; a rare fingerprint
+    that maps to a legitimate niche app is benign after review. In the Command and Control context this
+    isolates the uncommon TLS stacks an adversary''s tooling introduces.'
+  answer_sources:
+  - Zeek ssl.log
+  - Threat intelligence indicators
+  - 'NAI: Network sensors (e.g., Zeek) at internet egress points and virtual network taps monitoring traffic
+    to/from the mobile device subnet. The Mobile Device Management (MDM) platform is used as a contextual
+    source for application and device inventories.'
+  range: Last 90 days, with a 30-day fleet prevalence baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      counts = count_by(ssl.ja4 where ts in last_30d and src_ip in mobile_device_subnet,
+                        key='ja4', measure='distinct_devices');
+      thr = percentile(counts.values, 1);
+      for fp, c in counts where c <= thr:
+        malware = ti_malware_fingerprints(fp);
+        alert(fingerprint=fp, prevalence=c, devices=devices_with(fp), malware_assoc=malware)
+- question: When managed mobile devices are clustered by their TLS feature vectors, which devices fall
+    into noise points or tiny clusters that indicate anomalous TLS behavior relative to the fleet, and
+    which features distinguish them?
+  context: Devices doing the same job should cluster together by their TLS behavior; a device running
+    covert encrypted C2 will look different. Apply DBSCAN to per-device feature vectors built from one-hot
+    JA3/JA4 fingerprints, cipher suites, certificate attributes, byte ratios, and destination ASN, then
+    treat noise points and very small clusters as anomalous and surface the distinguishing features per
+    device. For TLS 1.3 and Encrypted Client Hello (ECH), where handshake metadata is opaque, augment
+    the vectors with version-agnostic flow features (per Novo and Morla) so the clustering still works.
+    A positive result is a device flagged as a noise point whose distinguishing features point to unknown
+    destinations or odd ciphers; a device sitting in a large homogeneous cluster is normal. This supports
+    Command and Control detection by spotlighting devices whose encrypted-traffic profile deviates from
+    their peers.
+  answer_sources:
+  - Zeek ssl.log
+  - Threat intelligence indicators
+  - 'NAI: Network sensors (e.g., Zeek) at internet egress points and virtual network taps monitoring traffic
+    to/from the mobile device subnet. The Mobile Device Management (MDM) platform is used as a contextual
+    source for application and device inventories.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      vec = per_device_vector(ssl, conn,
+        features=['ja3_onehot','ja4_onehot','cipher_set','cert_attrs','byte_ratio',
+                 'dest_asn','tls13_flow_features']) for d in mobile_device_subnet;
+      labels = DBSCAN(eps, min_samples).fit_predict(vec);
+      for d,l in zip(devices,labels):
+        if l == -1 or cluster_size(l) < min_cluster:
+          alert(device=d, cluster=l, distinguishing_features=top_features(vec[d]))
+- question: Are there encrypted TCP sessions from managed mobile IP addresses lasting more than 8 hours,
+    cleanly established and closed (conn_state SF), yet transferring fewer than 10 KB total, consistent
+    with a persistent low-and-slow C2 channel?
+  context: 'A held-open connection that moves almost no data is a classic covert C2 pattern: the channel
+    stays available for tasking while staying quiet to avoid volume-based detection. Flag TCP sessions
+    from mobile IPs with duration >8 hours, conn_state=SF, and total bytes <10 KB, using long-connection
+    logic as in RITA. Retain these concrete thresholds and tune them per environment rather than removing
+    them, since mobile devices on cellular/Wi-Fi may legitimately hold some long connections (push notification
+    sockets) that must be allowlisted. A positive result is a quiet, long-lived encrypted session to an
+    unfamiliar destination; benign push services should be filtered. In Command and Control terms this
+    catches a maintained control socket designed to evade throughput alarms.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network flow data collected from core network switches, VPN concentrators, and network taps
+    monitoring traffic from mobile device subnets, including traffic subject to split-tunneling policies.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: |-
+      for c in conn where src_ip in mobile_device_subnet and proto=='tcp':
+        if c.duration > 8h and c.conn_state == 'SF'
+           and (c.orig_bytes + c.resp_bytes) < 10KB:
+          if c.dest not in push_service_allowlist:
+            alert(device=c.src_ip, dest=c.dest, duration=c.duration, bytes=c.orig_bytes+c.resp_bytes)
+- question: For each (device, destination) pair on the managed fleet, do the connection inter-arrival
+    times and originated-byte volumes within 1-hour windows show abnormally low variance (bottom 5th percentile)
+    with a dominant frequency in the FFT power spectrum, indicating a regular encrypted C2 heartbeat?
+  context: Beaconing malware checks in on a near-fixed schedule, producing tightly clustered inter-arrival
+    times and consistent payload sizes. In 1-hour windows, compute the standard deviation of inter-arrival
+    times (frequency) and orig_bytes (volume) per (device,destination) pair and alert when both fall in
+    the bottom 5th percentile, then confirm with FFT power-spectrum scoring and autocorrelation, suppressing
+    benign services via a whitelist (per BAYWATCH) and baselining benign periodic mobile push/telemetry
+    (per Mack et al.). A positive result is a low-variance, strongly periodic encrypted exchange to a
+    single destination; legitimate push/sync that is already baselined should be suppressed. This directly
+    serves Command and Control detection by exposing the regular heartbeat of an automated control channel.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network flow data collected from core network switches, VPN concentrators, and network taps
+    monitoring traffic from mobile device subnets, including traffic subject to split-tunneling policies.'
+  range: Last 90 days, evaluated in 1-hour windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for (dev,dst), w in window(conn, key=(src_ip,dest), size=1h)
+          where src_ip in mobile_device_subnet:
+        iats = diff(sort(w.ts)); vols = w.orig_bytes;
+        if stddev(iats) <= p5(fleet_iat_std) and stddev(vols) <= p5(fleet_vol_std):
+          spec = fft(iats); dom = dominant_freq(spec);
+          if dom and autocorr(iats) high and dst not in benign_periodic_allowlist:
+            alert(device=dev, dest=dst, period=1/dom, iat_std=stddev(iats))
+- question: Do per-device time series of connection rate, byte volume, or failed/blocked connection counts
+    contain a statistically significant change point that marks the onset of beaconing or a reconnect
+    storm on a managed mobile device?
+  context: 'A device transitioning from clean to compromised exhibits a regime change: connection rate,
+    byte volume, or failure counts shift to a new sustained level when an implant begins beaconing or
+    when it enters a reconnect storm after losing C2. Apply online change-point detection (CUSUM, PELT,
+    or Bayesian, per Aminikhanghahi and Cook) to these per-device time series to flag the moment the behavior
+    changes, which is valuable because the absolute rates may look modest while the change itself is the
+    tell. A positive result is a clear, sustained shift in a device''s connection/byte/failure cadence
+    with no benign explanation (new app rollout, OS update); a one-off spike is not a change point. In
+    Command and Control terms, detecting beacon onset gives early warning that a device has come under
+    adversary control.'
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network flow data collected from core network switches, VPN concentrators, and network taps
+    monitoring traffic from mobile device subnets, including traffic subject to split-tunneling policies.'
+  range: Last 90 days, modeled as a continuous per-device time series
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for dev in mobile_device_subnet:
+        rate_ts = timeseries(count(conn), by=dev, bin=5min);
+        vol_ts  = timeseries(sum(orig_bytes), by=dev, bin=5min);
+        fail_ts = timeseries(count(conn where conn_state in ('REJ','S0')), by=dev, bin=5min);
+        for ts in [rate_ts, vol_ts, fail_ts]:
+          cp = changepoint(ts, method='PELT|CUSUM|BOCPD');
+          if cp and magnitude(cp) significant:
+            alert(device=dev, signal=ts.name, changepoint=cp.time, shift=cp.delta)
+- question: Does an unsupervised time-series model flag a managed mobile device's connection inter-arrival
+    pattern as an anomalous power spectrum (regular beacon) or, for jittered beacons that defeat FFT,
+    produce high residual scores under an LSTM/transformer sequence model?
+  context: Sophisticated implants add random jitter to their check-in interval to defeat simple periodicity
+    detectors. Apply FFT to the inter-arrival time series and use a one-class SVM to flag anomalous power
+    spectra with dominant frequencies for the regular case; for high-jitter beacons that wash out the
+    FFT, model the inter-arrival series with an LSTM or transformer and score the prediction residuals,
+    alerting on devices whose sequences are poorly predicted by the normal model (per Gupta et al.). Surfacing
+    the top-3 contributing time-series features in the alert speeds triage. A positive result is a device
+    whose check-in timing is either too regular or anomalously structured despite jitter; ordinary bursty
+    human-driven traffic scores normally. This supports Command and Control detection by catching both
+    clockwork and deliberately irregular beacons.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Network flow data collected from core network switches, VPN concentrators, and network taps
+    monitoring traffic from mobile device subnets, including traffic subject to split-tunneling policies.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      for dev,dst in pairs(conn) where src_ip in mobile_device_subnet:
+        iats = diff(sort(conn[(dev,dst)].ts));
+        spec = fft(iats);
+        if ocsvm_spectrum.predict(spec) == anomaly:
+          alert(device=dev, dest=dst, type='periodic', top_features=...)
+        resid = lstm_iat_model.residual(iats)  # for high-jitter beacons
+        if resid >= resid_threshold:
+          alert(device=dev, dest=dst, type='jittered', residual=resid, top_features=...)
+- question: Does static analysis of a managed app's bytecode reveal crypto-API misuse, such as ECB mode,
+    hardcoded or constant symmetric keys, constant IVs/salts, low-iteration PBKDF, or seeded SecureRandom,
+    particularly in apps not on the enterprise-approved list?
+  context: This technique relies on a known encryption algorithm with secrets embedded in the sample,
+    which is precisely the class of weakness that static crypto-API rules detect. Apply CryptoLint-style
+    rules (Egele et al.) to managed-app bytecode to find ECB mode, hardcoded/constant symmetric keys,
+    constant IV/salt, low-iteration PBKDF, and seeded SecureRandom, then alert on apps not in the enterprise-approved
+    list that exhibit these patterns. These embedded-key weaknesses are exactly what an adversary uses
+    to conceal C2 with a known algorithm while keeping the implant self-contained, and they also make
+    the channel reverse-engineerable by defenders. A positive result is an unapproved app shipping a hardcoded
+    key or ECB-mode crypto; a vetted app using sound crypto is benign. In Command and Control terms, this
+    finds the cryptographic machinery of a custom encrypted channel before it is even used on the wire.
+  answer_sources:
+  - MobileEDR OS API Execution telemetry
+  - MobileEDR File Creation telemetry
+  - MobileEDR Application State
+  - MDM Application Permission/Inventory
+  - Zeek conn.log
+  - 'NAI: MobileEDR agent telemetry on managed Android/iOS devices (crypto-API invocation, file/buffer
+    writes, app foreground/background and device-lock state) correlated with MDM application inventory/permissions
+    and Zeek conn.log at the egress gateway.'
+  range: Per managed-app build/version; re-evaluate on each app inventory change
+  queries:
+  - technology: Static-analysis/pseudocode
+    query: |-
+      for app in mdm_app_inventory where app not in enterprise_approved_list:
+        bc = decompile(app.bytecode);
+        findings = cryptolint_rules(bc, checks=['ECB_mode','hardcoded_key',
+          'constant_IV','constant_salt','low_iter_PBKDF','seeded_SecureRandom']);
+        if findings:
+          alert(app=app.id, package=app.package, findings=findings)
+- question: Did a managed app invoke AES/RSA/KeyStore on a local buffer, write a high-entropy blob to
+    storage, and then send outbound network traffic while the app was in the background, the device was
+    locked, or there was no recent user interaction, and the app is outside the enterprise-approved list?
+  context: 'The behavioral signature of staged encrypted exfiltration/C2 on mobile is a tight sequence:
+    encrypt local data, write the high-entropy result, then transmit, all without a user present. Correlate
+    MobileEDR OS-API execution (crypto calls), file-creation telemetry (high-entropy blob), application
+    state (background / device_locked / no recent interaction), MDM app inventory (not approved), and
+    Zeek conn.log (the outbound flow) to alert on this chain. Profiling failure states such as blocked
+    egress or repeated failed sends adds confirmation that the app is trying to reach C2. A positive result
+    is an unapproved app performing crypto-then-stage-then-transmit while backgrounded; a foreground,
+    user-initiated, approved-app action is benign. This directly addresses Command and Control by catching
+    the on-device construction and dispatch of an encrypted channel without user awareness.'
+  answer_sources:
+  - MobileEDR OS API Execution telemetry
+  - MobileEDR File Creation telemetry
+  - MobileEDR Application State
+  - MDM Application Permission/Inventory
+  - Zeek conn.log
+  - 'NAI: MobileEDR agent telemetry on managed Android/iOS devices (crypto-API invocation, file/buffer
+    writes, app foreground/background and device-lock state) correlated with MDM application inventory/permissions
+    and Zeek conn.log at the egress gateway.'
+  range: Last 90 days, correlated within a short sequence window per app/device
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      crypto = edr_api where call in ('AES','RSA','KeyStore');
+      blob = edr_file_create where entropy(file) high;
+      net = conn where src_ip in mobile_device_subnet;
+      for (dev,app), seq in correlate([crypto, blob, net], by=(device,app), order=true, window=5min):
+        st = app_state(dev,app);
+        if st in ('background','device_locked','no_user_interaction')
+           and app not in enterprise_approved_list:
+          alert(device=dev, app=app, sequence=seq, state=st,
+                failures=count(net where blocked or failed))
+- question: For each managed app, does the per-minute count or byte volume of background crypto-then-transmit
+    sequences exceed the app's own 30-day 95th-percentile baseline, distinguishing staged exfiltration
+    from benign periodic background sync?
+  context: Many legitimate apps do background crypto and sync, so the discriminator is deviation from
+    each app's own normal rhythm. Baseline, per app over 30 days, the frequency and byte volume of background
+    crypto-then-transmit sequences and alert when counts/min or bytes exceed the 95th percentile (volume
+    + frequency). This separates benign periodic sync (stable, within baseline) from staged exfiltration
+    or chatty C2 (spikes above baseline). A positive result is an app whose background encrypt-and-send
+    activity surges past its historical envelope; an app operating within its baseline is benign. In Command
+    and Control terms, this catches an encrypted channel that ramps up tasking or data movement beyond
+    the app's legitimate background behavior.
+  answer_sources:
+  - MobileEDR OS API Execution telemetry
+  - MobileEDR File Creation telemetry
+  - MobileEDR Application State
+  - MDM Application Permission/Inventory
+  - Zeek conn.log
+  - 'NAI: MobileEDR agent telemetry on managed Android/iOS devices (crypto-API invocation, file/buffer
+    writes, app foreground/background and device-lock state) correlated with MDM application inventory/permissions
+    and Zeek conn.log at the egress gateway.'
+  range: Last 90 days, with a 30-day per-app baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      for app in managed_apps:
+        base_cnt = p95(history_30d.background_crypto_transmit_count_per_min[app]);
+        base_byte = p95(history_30d.background_transmit_bytes[app]);
+        cur_cnt = count_per_min(background_crypto_transmit[app]);
+        cur_byte = sum(background_transmit_bytes[app]);
+        if cur_cnt > base_cnt or cur_byte > base_byte:
+          alert(app=app, count=cur_cnt, bytes=cur_byte, baseline=(base_cnt,base_byte))
+- question: When label-free anomaly detectors and self-supervised encrypted-traffic models score the egress
+    flows produced by managed apps, which flows are flagged as out-of-distribution relative to each app's
+    learned normal encrypted-flow profile, and what features explain the anomaly?
+  context: You usually cannot decrypt mobile TLS, so detection must work on flow metadata alone. Score
+    egress flows with label-free anomaly detectors (Isolation Forest or One-Class SVM with LIME top-feature
+    attribution, per the Robust IoT Security study) and self-supervised encrypted-traffic models (ET-SSL
+    and ET-BERT) that learn each app's normal encrypted-flow distribution and flag out-of-distribution
+    flows. Surfacing the top-3 contributing features in the alert lets an analyst see why a flow is anomalous
+    (timing, size sequence, direction ratio) without needing plaintext. A positive result is a flow that
+    deviates sharply from the app's learned profile; flows consistent with the learned distribution are
+    benign. This serves Command and Control detection by exposing concealed encrypted channels purely
+    from their traffic shape, even under TLS 1.3/ECH.
+  answer_sources:
+  - MobileEDR OS API Execution telemetry
+  - MobileEDR File Creation telemetry
+  - MobileEDR Application State
+  - MDM Application Permission/Inventory
+  - Zeek conn.log
+  - 'NAI: MobileEDR agent telemetry on managed Android/iOS devices (crypto-API invocation, file/buffer
+    writes, app foreground/background and device-lock state) correlated with MDM application inventory/permissions
+    and Zeek conn.log at the egress gateway.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      flows = encrypted_flow_features(conn join edr_app_attribution)
+              where src_ip in mobile_device_subnet;
+      iso = IsolationForest(); ocsvm = OneClassSVM();
+      etbert = load('et_bert_perapp.pt'); etssl = load('et_ssl.pt');
+      for f in flows:
+        if iso.anomaly(f) or ocsvm.anomaly(f) or etbert.ood(f) or etssl.ood(f):
+          alert(device=f.src_ip, app=f.app, flow=f.id,
+                top_features=lime_top3(iso,f))
