@@ -1,0 +1,468 @@
+name: 'T1555.002: Securityd Memory'
+id: 25e98766-f39b-4952-8c08-10d2b30baa18
+description: Investigate whether an adversary with root or equivalent privileges has attempted to extract
+  credentials by reading the memory of the macOS securityd daemon (or analogous Linux credential daemons).
+  securityd caches the user's logon master key (PBKDF2-derived) in memory, so a privileged attacker can
+  scan its heap to recover the keychain master key and decrypt plaintext passwords for users, WiFi, mail,
+  browsers, certificates, and secure notes. This playbook helps an analyst hunt for execution of keychain/securityd
+  credential-dumping tooling (e.g., keychaindump, OSX/Keydnap), suspicious use of memory-inspection utilities
+  (gdb, lldb, dtrace, strings, vmmap) against securityd, unauthorized memory-read API calls (task_for_pid,
+  mach_vm_read, ptrace, /proc/<pid>/mem), heap-scan read-volume bursts and failed master-key trials, and
+  the full kill chain of securityd PID discovery -> memory read -> outbound exfiltration. It combines
+  symbolic-logic detections, statistical rarity and anomaly scoring, and machine-learning models across
+  endpoint (macOS Unified Log, ESF, auditd) and network (Zeek) telemetry.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Have any processes executed on our macOS or Linux endpoints whose file name or hash matches
+    known keychain/securityd credential-dumping tooling (such as keychaindump or the dumpers bundled by
+    OSX/Keydnap), including correlated file transfers seen in Zeek?
+  context: securityd memory dumping is most often performed by purpose-built tools like keychaindump and
+    the credential-stealers embedded in macOS malware such as OSX/Keydnap. By monitoring ESF NOTIFY_EXEC
+    and Linux auditd EXECVE for process names and SHA256 hashes that match a curated threat-intel feed
+    of these dumpers, and correlating Zeek files.log transfers against the same indicators, an analyst
+    can catch known-bad tooling at execution or delivery time. A positive hit on a known dumper hash is
+    a high-confidence indicator of credential-access activity and warrants immediate host isolation and
+    keychain credential rotation; a name-only match still merits triage because attackers rename tools.
+    This directly supports the Credential Access mission of detecting attempts to steal account passwords
+    from securityd memory.
+  answer_sources: &id001
+  - macOS Unified Log
+  - ESF NOTIFY_EXEC events
+  - EDR process telemetry
+  - Linux auditd EXECVE
+  - Zeek files.log
+  - 'NAI: macOS developer workstations, macOS build servers, executive macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve)
+
+      | eval h=lower(sha256), n=lower(process_name)
+
+      | lookup cred_dumper_intel sha256 AS h OUTPUT verdict AS hash_hit
+
+      | lookup cred_dumper_intel name AS n OUTPUT verdict AS name_hit
+
+      | where isnotnull(hash_hit) OR isnotnull(name_hit)
+
+      | join host [search sourcetype=zeek_files | lookup cred_dumper_intel sha256 AS sha256 OUTPUT verdict
+      AS file_hit | where isnotnull(file_hit)]
+
+      | table _time host user process_name sha256 hash_hit name_hit file_hit'
+- question: Are any candidate credential-dumping binaries executing while unsigned, newly introduced to
+    the host, or launched from user-writable paths such as /tmp, /Users/*, or ~/Downloads outside approved
+    tooling locations?
+  context: OSX/Keydnap and similar threats drop their dumper into user-writable directories and run unsigned
+    binaries, unlike legitimate Apple/security tooling that is code-signed and lives in system paths.
+    Escalating detections when a potential dumper is unsigned, first-seen on the host, or executed from
+    /tmp, /Users/*, or ~/Downloads sharply reduces false positives from sanctioned tools while catching
+    the Keydnap distribution pattern. A positive result (unsigned + user-writable path + recently dropped)
+    is a strong credential-access signal; a negative (signed, system-path, long-established) lowers priority.
+    This guards the Credential Access objective by separating attacker tooling from benign administration.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve)
+
+      | eval userwritable=if(match(exe_path,"^(/tmp/|/Users/|.*/Downloads/)"),1,0)
+
+      | eval unsigned=if(code_signature_status!="valid",1,0)
+
+      | eval firstseen=if(host_first_seen_days<=1,1,0)
+
+      | where (unsigned=1 OR firstseen=1) AND userwritable=1
+
+      | eval risk=unsigned+firstseen+userwritable
+
+      | where risk>=2
+
+      | table _time host user process_name exe_path code_signature_status risk'
+- question: Which process names or hashes are executing at very low historical frequency (bottom 5th percentile
+    over 30 days), especially when spawned by shells like zsh/bash or running with root context?
+  context: Credential dumpers are rare in a normal environment, so a frequency-based approach flags executions
+    in the bottom 5th percentile of a 30-day baseline. Weighting executions launched by interactive shells
+    (zsh, bash) or with elevated/root context further enriches the signal, since memory access to securityd
+    requires root. The per-environment percentile cutoff should be derived from your own exec baseline
+    rather than a fixed global threshold. A flagged rare-and-rooted execution is worth investigating for
+    credential theft; a common, well-known binary executing frequently is likely benign. This advances
+    the Credential Access mission by surfacing anomalous tooling that evades signature lists.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve) earliest=-30d
+
+      | eval rooted=if(euid=0 OR user="root",1,0), shellparent=if(parent_process IN ("zsh","bash","sh"),1,0)
+
+      | stats count AS execs by process_name
+
+      | eventstats perc5(execs) AS p5
+
+      | where execs<=p5
+
+      | join process_name [search index=edr earliest=-24h | where rooted=1 OR shellparent=1 | stats values(host)
+      AS hosts by process_name]
+
+      | table process_name execs p5 hosts'
+- question: For each peer group (developer, build-server, executive macOS endpoints), which credential-dumper-candidate
+    processes deviate beyond the 99th percentile rarity relative to that group's normal execution behavior?
+  context: Different macOS populations have very different normal software. Developers run debuggers and
+    build tools that would be alarming on an executive's laptop. Building role-aware execution baselines
+    and alerting only when a candidate dumper exceeds the 99th percentile rarity for its own peer group
+    reduces noise while catching genuinely anomalous tooling. This peer-relative method (inspired by self/non-self
+    modeling of Unix processes) is robust because it compares like with like. A process common among developers
+    but appearing once on an executive endpoint is a strong lead; a tool typical for that role is deprioritized.
+    This supports detecting securityd credential theft tailored to each user population.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve) earliest=-30d
+
+      | lookup asset_roles host OUTPUT role
+
+      | stats count AS execs by role process_name
+
+      | eventstats sum(execs) AS role_total by role
+
+      | eval freq=execs/role_total
+
+      | eventstats perc1(freq) AS p1 by role
+
+      | where freq<=p1
+
+      | table role process_name execs freq p1'
+- question: When scored by a supervised classifier using parent lineage, code-signing status, user/root
+    context, command-line length, argument entropy, and file-path rarity, which new executions are predicted
+    to be credential dumpers, and what features drove the score?
+  context: A supervised model (Random Forest/GBM) trained on labeled benign and credential-dumping executions
+    can combine many weak signals—parent process lineage, code-signing validity, root context, command-line
+    length, argument entropy, and file-path rarity—into a single risk score that generalizes beyond known
+    hashes. Surfacing the top-3 contributing features (e.g., unsigned + user-writable path + root) in
+    the alert gives analysts immediate triage context. A high-probability classification with explainable
+    features merits investigation as securityd credential theft; low scores can be safely down-ranked.
+    This ML approach, modeled on LSASS-theft detection research, strengthens the Credential Access detection
+    beyond static rules.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "model = load('exec_creddump_rf.pkl')\nfor e in stream(esf_exec, auditd_execve):\n    feats\
+      \ = [e.parent_lineage_id, e.signed, e.is_root, len(e.cmdline), shannon_entropy(e.args), path_rarity(e.exe_path)]\n\
+      \    p = model.predict_proba(feats)[1]\n    if p > 0.8:\n        alert(host=e.host, proc=e.process_name,\
+      \ score=p, top_features=top3_shap(model, feats))"
+- question: Does an ensemble model combining process provenance, file access, and follow-on memory-read
+    and network signals classify an execution as true credential dumping rather than benign security tooling,
+    and which graph edges contributed?
+  context: Single-signal detectors struggle to separate genuine credential dumping from legitimate security
+    and debugging tools. An ensemble (modeled on ThreaTrace) that fuses process provenance, file access
+    patterns, and follow-on memory-read and network behavior captures the full behavioral arc of a dumper.
+    Reporting the contributing provenance edges lets analysts validate the verdict quickly. A positive
+    ensemble classification with coherent edges (e.g., shell -> dumper -> securityd read -> egress) is
+    high-confidence; benign tooling that touches securityd for legitimate reasons should score low. This
+    directly serves the Credential Access mission by improving precision on securityd memory theft.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "graph = build_provenance_graph(window='1h')\nensemble = load('credaccess_ensemble.pkl')  #\
+      \ provenance + file + memread + net learners\nfor node in graph.process_nodes():\n    feats = node.features(provenance=True,\
+      \ file_access=True, memread=True, net=True)\n    if ensemble.vote(feats) == 'cred_dumping':\n  \
+      \      alert(node=node.id, contributing_edges=ensemble.explain_edges(node))"
+- question: Have memory-inspection or text-search utilities (gdb, lldb, dtrace, strings, grep, vmmap)
+    been launched with command lines that reference 'securityd' or resolve/target its PID via pgrep/ps?
+  context: Before extracting keychain master keys, attackers typically enumerate and probe securityd with
+    general-purpose utilities. A command line for gdb, lldb, dtrace, strings, grep, or vmmap that mentions
+    'securityd' or pipes from pgrep/ps to resolve its PID is a strong reconnaissance/extraction signal.
+    Alerting specifically on vmmap memory-map enumeration of securityd catches the recon step that precedes
+    heap key extraction. A positive match is a clear lead for credential-access activity; absence of such
+    patterns lowers concern. Encoding this as a regex over ESF/auditd command lines directly supports
+    detecting the securityd memory technique.
+  answer_sources: &id002
+  - ESF NOTIFY_EXEC events
+  - macOS Unified Log
+  - Linux auditd EXECVE
+  - 'NAI: All macOS endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve)
+
+      | where process_name IN ("gdb","lldb","dtrace","strings","grep","vmmap")
+
+      | eval cl=lower(cmdline)
+
+      | where match(cl,"securityd") OR match(cl,"(pgrep|ps).*securityd") OR match(cl,"vmmap.*securityd")
+
+      | table _time host user process_name cmdline'
+- question: For each system utility, do its command-line argument counts, lengths, or Shannon entropy
+    deviate by more than two standard deviations from baseline when the arguments target sensitive processes
+    like securityd?
+  context: Common utilities have stable, predictable argument profiles in normal use. Baselining argument
+    counts, lengths, and Shannon entropy per utility and flagging executions that deviate beyond two standard
+    deviations—particularly when arguments reference securityd—catches abuse of otherwise legitimate binaries.
+    The sigma threshold should be tuned from your own utility-usage distribution. A high-deviation invocation
+    targeting securityd is a credential-access lead; routine usage within normal bounds is benign. This
+    statistical guardrail surfaces anomalous misuse of system tools for securityd memory access.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr (sourcetype=esf_exec OR sourcetype=auditd_execve) earliest=-30d
+
+      | eval argc=mvcount(split(cmdline," ")), arglen=len(cmdline), ent=shannon_entropy(cmdline)
+
+      | eventstats avg(argc) AS m_argc stdev(argc) AS s_argc avg(arglen) AS m_len stdev(arglen) AS s_len
+      avg(ent) AS m_ent stdev(ent) AS s_ent by process_name
+
+      | eval dev=max((argc-m_argc)/s_argc,(arglen-m_len)/s_len,(ent-m_ent)/s_ent)
+
+      | where dev>2 AND match(lower(cmdline),"securityd")
+
+      | table _time host process_name cmdline dev'
+- question: Does a utility's short system-call n-gram profile during an invocation contain memory-inspection
+    syscalls (task_for_pid, mach_vm_read, ptrace) that are absent from its benign baseline?
+  context: A utility that normally never performs memory inspection but suddenly issues task_for_pid,
+    mach_vm_read, or ptrace is behaving anomalously. Comparing the short syscall n-gram profile of an
+    invocation against the utility's benign baseline (the classic self/non-self approach) flags such deviations
+    even when the command line looks innocuous. A spike in memory-read syscalls within a tool that normally
+    doesn't use them is a strong securityd-extraction signal; matching the benign profile is reassuring.
+    This method detects credential access that hides behind ordinary-looking utility names.
+  answer_sources: *id002
+  range: Last 90 days; correlate events within a 2-minute window centered on the securityd access
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr sourcetype=auditd_syscall earliest=-30d
+
+      | transaction process_id host maxpause=5s
+
+      | eval ngram=syscall_ngrams(syscalls,2)
+
+      | lookup utility_syscall_baseline process_name OUTPUT baseline_ngrams
+
+      | eval novel=mvfilter(NOT match(ngram, baseline_ngrams))
+
+      | where match(mvjoin(syscalls,","),"(task_for_pid|mach_vm_read|ptrace)") AND mvcount(novel)>0
+
+      | table _time host process_name syscalls novel'
+- question: Which command lines produce high reconstruction error from an autoencoder trained on benign
+    command-line logs, and do the rare driving tokens include 'securityd' or PID-targeting flags?
+  context: An autoencoder trained on benign command lines learns to reconstruct normal usage with low
+    error; anomalous commands—such as those targeting securityd memory—yield high reconstruction error.
+    Listing the rare tokens driving the score (e.g., 'securityd', PID flags) gives analysts immediate
+    insight into why a command was flagged. High reconstruction error with securityd-related tokens is
+    a credential-access lead; low error indicates routine activity. This unsupervised approach (DeepLog-style)
+    catches novel command patterns that signature and threshold rules miss, supporting the securityd memory
+    detection mission.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "ae = load('cmdline_autoencoder.pt')\nfor e in stream(esf_exec, auditd_execve):\n    vec =\
+      \ tokenize(e.cmdline)\n    err = ae.reconstruction_error(vec)\n    if err > threshold_p99:\n   \
+      \     alert(host=e.host, cmdline=e.cmdline, error=err, rare_tokens=ae.top_error_tokens(vec))"
+- question: Has any process NOT on the authorized allowlist invoked task_for_pid or mach_vm_read against
+    securityd (macOS), or ptrace(PEEKTEXT/PEEKDATA) or opened /proc/<securityd-pid>/mem (Linux)?
+  context: Legitimate access to securityd's memory comes from a small, known set of processes. Maintaining
+    an allowlist of authorized accessors and alerting whenever any other process invokes task_for_pid/mach_vm_read
+    against securityd (macOS) or uses ptrace PEEKTEXT/PEEKDATA or opens /proc/<pid>/mem of the credential
+    daemon (Linux) provides high-fidelity detection of memory-read credential theft. The allowlist should
+    be built from observed legitimate accessors. A non-allowlisted memory read of securityd is a near-certain
+    credential-access event requiring immediate response; allowlisted access is expected. This is the
+    core detection for the securityd memory technique.
+  answer_sources: &id003
+  - EDR logs monitoring task_for_pid or mach_vm_read API calls
+  - macOS ESF
+  - Linux auditd SYSCALL (ptrace)
+  - Linux auditd FILE (/proc/*/mem)
+  - 'NAI: All macOS endpoints with EDR agents capable of monitoring memory access APIs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=edr (sourcetype=macos_esf OR sourcetype=auditd_syscall OR sourcetype=auditd_file)\n\
+      | where (api IN (\"task_for_pid\",\"mach_vm_read\") AND target_process=\"securityd\")\n    OR (syscall=\"\
+      ptrace\" AND a0 IN (\"PTRACE_PEEKTEXT\",\"PTRACE_PEEKDATA\") AND target_process=\"securityd\")\n\
+      \    OR (syscall=\"open\" AND match(path,\"/proc/\\d+/mem\") AND target_process=\"securityd\")\n\
+      | lookup securityd_access_allowlist process_name OUTPUT allowed\n| where isnull(allowed)\n| table\
+      \ _time host user process_name api target_process"
+- question: Is any single process issuing many sequential memory reads across distinct securityd heap
+    regions (e.g., more than 10 region reads or MALLOC_TINY-range scanning) within a short window?
+  context: keychaindump locates the keychain master key by scanning many securityd heap regions, especially
+    the MALLOC_TINY zone. Flagging a single process that issues a burst of sequential memory reads across
+    distinct securityd heap regions (e.g., >10 region reads in a short window) catches this brute-force
+    search behavior even when the accessing tool is unknown. High-volume sequential heap scanning of securityd
+    is a strong indicator of master-key extraction; a single isolated read is less concerning. This threshold
+    detection targets the actual mechanics of securityd credential theft for the Credential Access mission.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr sourcetype=macos_esf api IN ("mach_vm_read","task_for_pid") target_process="securityd"
+
+      | bin _time span=60s
+
+      | stats dc(target_region) AS regions count AS reads values(zone) AS zones by _time host process_id
+      process_name
+
+      | where regions>10 OR match(mvjoin(zones,","),"MALLOC_TINY")
+
+      | table _time host process_name regions reads zones'
+- question: Which source-target process pairs accessing securityd fall below the 1st percentile of historical
+    frequency, and which of those sessions read an unusually high volume of bytes or made many read attempts?
+  context: Most processes never touch securityd, so the set of source-target pairs that access it is small
+    and stable. Computing the historical frequency of each pair and flagging those below the 1st percentile
+    surfaces never-before-seen accessors. Characterizing each access session by total bytes read and number
+    of read attempts further highlights high-volume rare sessions consistent with heap scanning. A rare
+    pair reading large volumes is a strong credential-theft lead; a common pair with light access is benign.
+    This rarity-plus-volume scoring (LSASS-theft research style) detects anomalous securityd access.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr sourcetype=macos_esf target_process="securityd" earliest=-90d
+
+      | stats count AS accesses sum(bytes_read) AS total_bytes by source_process target_process
+
+      | eventstats perc1(accesses) AS p1
+
+      | where accesses<=p1
+
+      | sort - total_bytes
+
+      | table source_process target_process accesses total_bytes p1'
+- question: Are any processes generating bursts of denied/error memory-access attempts (task_for_pid/ptrace
+    returning EPERM/ESRCH) or many failed keychain master-key candidate trials against securityd?
+  context: 'Brute-force heap scanning produces many failed attempts: task_for_pid/ptrace returning EPERM/ESRCH
+    and repeated failed master-key candidate trials. Tracking per-process denial/error rates for memory-access
+    attempts and keychain-decrypt failures provides a signal distinct from successful access—bursts of
+    denied reads indicate active probing. A spike in failed reads or many candidate trials from one process
+    is a strong sign of master-key brute forcing; steady low error rates are normal. This monitors the
+    noisy failure side of securityd credential theft, catching attempts that have not yet succeeded.'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=edr (sourcetype=macos_esf OR sourcetype=auditd_syscall) target_process="securityd"
+
+      | eval failed=if(result IN ("EPERM","ESRCH") OR status="denied",1,0)
+
+      | bin _time span=60s
+
+      | stats sum(failed) AS failures count AS attempts by _time host process_id process_name
+
+      | eval fail_rate=failures/attempts
+
+      | where failures>20 OR fail_rate>0.5
+
+      | table _time host process_name failures attempts fail_rate'
+- question: When normal process-interaction communities are clustered, do any memory-access attempts against
+    securityd originate from processes outside its established interaction cluster?
+  context: Processes that legitimately interact with securityd form a stable community in a process-interaction
+    graph. Clustering these communities and flagging memory-access attempts from nodes outside the established
+    securityd cluster (a ThreaTrace-style approach) detects anomalous accessors without relying on signatures.
+    Returning the anomalous node and its neighbors gives analysts the surrounding context for triage.
+    An out-of-cluster process reading securityd memory is a strong credential-access anomaly; in-cluster
+    access is expected. This graph-based method strengthens detection of securityd memory theft.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "g = build_process_interaction_graph(window='7d')\nclusters = community_detect(g)\nsecurityd_cluster\
+      \ = clusters.of('securityd')\nfor edge in g.memory_access_edges(target='securityd'):\n    if edge.source\
+      \ not in securityd_cluster:\n        alert(node=edge.source, neighbors=g.neighbors(edge.source),\
+      \ target='securityd')"
+- question: Has a single process performed securityd PID discovery (pgrep/ps securityd), then a securityd
+    memory-read attempt, then an external network connection, all within a short window (e.g., 2 minutes)?
+  context: 'The full securityd credential-theft kill chain is a tight sequence: discover the securityd
+    PID, read its memory, then exfiltrate over the network. Correlating host (ESF/auditd) and network
+    (Zeek) logs to detect this chain from one process within a short window (e.g., 2 minutes) provides
+    high-confidence detection. Encoding it once as a TTP query graph (POIROT-style) enables inexact matching
+    that resists single-event evasion. Observing all three stages in sequence is a near-certain credential-access
+    incident; isolated stages are weaker. This correlation directly captures the end-to-end securityd
+    memory technique.'
+  answer_sources: &id004
+  - macOS Unified Log
+  - ESF NOTIFY_EXEC events
+  - EDR process access telemetry
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All macOS endpoints, Network egress points, DNS servers'
+  range: Last 90 days; correlate events within a 2-minute window centered on the securityd access
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=edr OR index=zeek\n| transaction host process_id maxspan=2m\n  startswith=eval(match(lower(cmdline),\"\
+      (pgrep|ps).*securityd\"))\n  endswith=eval(sourcetype=\"zeek_conn\" AND local_orig=true AND NOT\
+      \ cidrmatch(\"10.0.0.0/8\",dest_ip))\n| search (api IN (\"task_for_pid\",\"mach_vm_read\") OR syscall=\"\
+      ptrace\") target_process=\"securityd\"\n| table _time host process_id process_name dest_ip"
+- question: After a securityd access sequence, is the outbound destination IP/domain in the 99th percentile
+    of rarity, newly registered, or a Tor/anonymizer egress consistent with Keydnap-style exfiltration?
+  context: OSX/Keydnap exfiltrates stolen credentials to attacker infrastructure, often over Tor or to
+    newly registered domains. After observing a securityd access sequence, scoring the rarity of the outbound
+    destination and flagging those in the 99th percentile, newly registered, or anonymizer egress points
+    highlights likely exfiltration. A rare or anonymized destination following securityd access is a strong
+    exfiltration lead; a connection to well-known corporate infrastructure is benign. This destination
+    scoring complements the access detections by catching the credential-access payoff—data leaving the
+    host.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_conn earliest=-90d
+
+      | join host [search index=edr target_process="securityd" api IN ("task_for_pid","mach_vm_read")
+      | fields host _time]
+
+      | stats count AS hits by dest_ip dest_domain host
+
+      | eventstats perc99(hits) AS p99
+
+      | lookup domain_age dest_domain OUTPUT age_days
+
+      | lookup tor_exit_nodes dest_ip OUTPUT is_tor
+
+      | where hits<=( 100-p99 ) OR age_days<30 OR is_tor="yes"
+
+      | table host dest_ip dest_domain hits age_days is_tor'
+- question: Does an LSTM/HMM trained on benign event sequences assign very low probability to an exec
+    -> securityd-memory-access -> egress sequence, and which predicted-vs-observed events deviate?
+  context: Benign process/file/network event sequences follow learnable patterns. An LSTM or HMM trained
+    on these can flag the exec -> securityd-memory-access -> egress sequence as highly improbable. Surfacing
+    the predicted-vs-observed deviating events shows analysts exactly where the sequence broke from normal.
+    A very low-probability sequence ending in egress after securityd access is a strong credential-theft
+    indicator; high-probability sequences are routine. This DeepLog-style sequence modeling captures the
+    temporal signature of securityd memory theft beyond point detections.
+  answer_sources: *id004
+  range: Last 90 days; correlate events within a 2-minute window centered on the securityd access
+  queries:
+  - technology: ML/pseudocode
+    query: "seq_model = load('event_lstm.pt')\nfor seq in per_process_event_sequences(window='5m'):\n\
+      \    p = seq_model.sequence_probability(seq)\n    if p < threshold_low and contains(seq,['exec','securityd_memread','egress']):\n\
+      \        alert(host=seq.host, prob=p, deviations=seq_model.predicted_vs_observed(seq))"
+- question: Does a temporal graph neural network over whole-system provenance flag a rare non-allowlisted
+    process -> securityd memory-read edge followed by keychain read and egress, and can it reconstruct
+    the attack subgraph?
+  context: A temporal graph neural network (KAIROS-style) over whole-system provenance can detect the
+    rare edge of a non-allowlisted process reading securityd memory, plus the subsequent keychain read
+    and network egress, in the context of the entire system's activity. Auto-reconstructing a compact,
+    analyst-readable attack subgraph dramatically speeds triage and scoping. A flagged anomalous edge
+    chain ending in egress is a high-confidence credential-theft incident; common provenance edges are
+    benign. This whole-system approach provides the most complete detection and explanation of securityd
+    memory credential theft.
+  answer_sources: *id004
+  range: Last 90 days; correlate events within a 2-minute window centered on the securityd access
+  queries:
+  - technology: ML/pseudocode
+    query: "pg = load_temporal_provenance_graph(window='24h')\ntgnn = load('kairos_tgnn.pt')\nscores =\
+      \ tgnn.score_edges(pg)\nfor e in scores.anomalous(threshold=p999):\n    if e.type=='memread' and\
+      \ e.dst=='securityd' and e.src not in allowlist:\n        subg = pg.reconstruct_subgraph(e, follow=['keychain_read','network_egress'])\n\
+      \        alert(edge=e, subgraph=subg.render())"
