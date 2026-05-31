@@ -1,0 +1,395 @@
+name: 'T1027.002: Obfuscated Files or Information: Software Packing'
+id: 4f394827-3716-46bd-98ec-8fcd356fb230
+description: Investigate adversary use of software packing and virtual-machine software protection to
+  conceal malicious executables and evade signature-based detection. This playbook helps an analyst move
+  from a static packing indicator on an executable (PE, ELF, or Mach-O) to corroborating runtime evidence
+  of in-memory unpacking and post-unpack malicious activity. It covers matching known malicious packed-sample
+  hashes and named-packer signatures (UPX, MPRESS, ASPack, Themida, VMProtect), applying deterministic
+  PE/ELF/Mach-O structural rules (writable+executable sections, abnormal entry points, sparse imports,
+  anomalous section layouts), computing whole-file and per-section Shannon entropy against host-role baselines
+  to localize high-entropy overlays, profiling rare section names and signer/prevalence drift, and using
+  supervised and unsupervised machine learning over static PE features. It then correlates packed-binary
+  detections with runtime unpacking primitives (RWX memory allocation, mprotect/VirtualProtect to executable,
+  execution from non-image memory), suspicious child interpreters, and beacon-like outbound traffic. Because
+  packing is also common in legitimate installers and protected commercial software, the playbook emphasizes
+  corroboration with prevalence, signer reputation, and host-role context to control false positives.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does any executable observed on endpoints or in transit match a known malicious packed-sample
+    hash or a packer-specific static signature (UPX, MPRESS, ASPack, Themida, VMProtect)?
+  context: 'This is the strongest, most deterministic starting signal for the Stealth tactic: adversaries
+    pack executables to change their file signature and defeat signature-based antivirus. Take file hashes
+    from Sysmon Event ID 11 (file create) and Zeek files.log and compare them against threat-intelligence
+    feeds for packed malware, then run packer-identification signatures (Detect It Easy, YARA, PEiD) looking
+    for characteristic section names (UPX0/UPX1, .aspack, .vmp), modified entry points, and sparse import
+    tables catalogued in the Awesome Executable Packing project. A positive hash match is high-confidence
+    malicious; a named-packer-only hit is suggestive and must be weighed against prevalence and signer.
+    Escalate immediately when the file lives in a user-writable path or sits on a high-value server, since
+    legitimate packed software rarely lands there unsigned.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "files = FROM Sysmon(EID=11) UNION Zeek_files\nALERT WHERE files.sha256 IN ti_packed_malware_hashes\n\
+      \   OR die_yara_peid_scan(files.path) MATCHES packer_sig IN [UPX,MPRESS,ASPack,Themida,VMProtect]\n\
+      ESCALATE WHERE files.path IN user_writable_paths OR host.role IN high_value_servers"
+- question: Do any executables exhibit deterministic PE structural anomalies (too few sections, writable+executable
+    sections, entry point outside the first code section, or fewer than ~10 resolved imports) that indicate
+    packing beyond what named-packer signatures catch?
+  context: 'Custom packers deliberately avoid the artifacts of well-known packers, so signature scanning
+    alone misses them. Applying PE-Probe-style structural rules catches them deterministically: flag binaries
+    with non-standard or fewer-than-three sections, any section marked both writable and executable, an
+    entry point that lands outside the first code section, import tables resolving fewer than roughly
+    ten functions, or sections whose raw size is zero but whose virtual size is large (a hallmark of code
+    that is decompressed at runtime). Under the Stealth tactic these structural tells reveal concealment
+    that blends with legitimate activity. A positive result warrants pulling the binary for deeper analysis;
+    corroborate with signer and prevalence to avoid flagging legitimately protected commercial software.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR each_pe IN new_executables:\n  ALERT IF section_count < 3\n     OR any(section.flags HAS\
+      \ WRITE AND EXECUTE)\n     OR entry_point NOT IN first_code_section\n     OR resolved_import_count\
+      \ < 10\n     OR any(section.raw_size == 0 AND section.virtual_size > LARGE)"
+- question: Which executables show whole-file or per-section Shannon entropy above a host-role-tuned baseline,
+    and where within the file are the high-entropy overlays located?
+  context: Compression and encryption raise entropy, so high entropy is a classic packing indicator supporting
+    the Stealth tactic. Compute whole-file and per-section Shannon entropy and flag sections above ~7.2
+    (the Lyda & Hamrock threshold for encrypted/compressed data), then use sliding-window entropy to localize
+    high-entropy overlays within the file. Rather than a single global cutoff, derive per-host-role and
+    per-file-type thresholds from a rolling 30-day baseline, and record the deviation magnitude (observed
+    entropy minus the baseline 95th percentile) as a volume metric so analysts can rank candidates. High
+    entropy alone is not malicious — installers and DRM-protected software score high too — so this question
+    identifies candidates for correlation, not standalone verdicts.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = PERCENTILE_95(entropy) BY host_role, file_type OVER last_30d\nFOR each_pe:\n  whole_e\
+      \ = shannon(file); sect_e = shannon_per_section(file)\n  overlay = sliding_window_entropy(file)\n\
+      \  ALERT WHERE max(sect_e) > 7.2 OR whole_e > baseline\n  EMIT volume = max(sect_e) - baseline"
+- question: Are there executables whose PE section names are rare or randomized for their host role, diverging
+    from expected compiler or publisher profiles?
+  context: Packers frequently rewrite or randomize section names, producing values that do not match any
+    normal compiler/publisher output. Extract PE section names and metadata for every executable, maintain
+    a 30-day baseline by host role, and alert when section-name patterns fall below the 5th percentile
+    of observed frequency or diverge from expected profiles. Score randomized or garbage section names
+    with KL divergence against the expected name distribution. In the Stealth context this surfaces binaries
+    that are deliberately obscuring their structure to avoid recognition. A rare or high-divergence name
+    set is a strong corroborator when combined with entropy or structural anomalies, but common packers
+    also use predictable names, so pair this with the prevalence and signer checks.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "name_dist = HIST(section_names) BY host_role OVER last_30d\nFOR each_pe:\n  freq = PERCENTILE_RANK(section_names,\
+      \ name_dist)\n  div = KL_DIVERGENCE(observed_name_dist, expected_compiler_dist)\n  ALERT WHERE freq\
+      \ < 5th_percentile OR div > threshold"
+- question: Has a previously signed or high-prevalence packed binary family suddenly appeared unsigned,
+    first-seen, or in a low-prevalence cohort while keeping similar naming and path patterns?
+  context: Signer and prevalence drift is one of the most reliable ways to separate malicious packing
+    from benign protected software. Baseline signer reputation and fleet prevalence/first-seen for packed
+    executables by host role using EMBER-style feature distributions, then raise a State signal when a
+    binary that used to be signed or widely deployed turns up unsigned, brand-new, or rare while still
+    mimicking the naming and path of the trusted family. Under the Stealth tactic this catches adversaries
+    masquerading a packed payload as a known-good tool. Treat the triad of unsigned + first-seen + packed
+    as high confidence; any one alone is weaker and should be corroborated.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = BASELINE(signer_rep, fleet_prevalence, first_seen) BY host_role, family\nFOR packed_binary:\n\
+      \  STATE_SIGNAL WHERE was_signed AND now_unsigned\n     OR first_seen=true OR prevalence_cohort=low\n\
+      \  high_conf IF unsigned AND first_seen AND packed"
+- question: Does a supervised classifier trained on static PE features score an executable as packed-and-malicious,
+    and which features drive that score?
+  context: When deterministic rules and statistics are ambiguous, a supervised model over static PE features
+    (section entropy, virtual/raw size ratios, import sparsity, resource anomalies, byte/entropy histograms,
+    signer reputation) can rank executables by maliciousness. Train on EMBER/EMBER2024 with a fast packed/non-packed
+    pre-filter (Perdisci-style) to keep cost low. Critically, train on BOTH packed-benign and packed-malicious
+    samples so the model learns maliciousness rather than merely recognizing the packer (the Aghakhani
+    pitfall). Surface the top-3 contributing features in the alert (e.g. '.text entropy=7.8, imports=6,
+    entry point outside .text') via TreeSHAP so the analyst can validate the verdict. This supports the
+    Stealth tactic by flagging concealed payloads that evade rules; treat its output as a prioritized
+    lead requiring corroboration.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Zeek files.log
+  - 'NAI: User endpoints, Application servers, File shares, Email gateways'
+  range: Last 90 days
+  queries:
+  - technology: ML/Static PE classifier pseudocode
+    query: 'model = TRAIN(EMBER+EMBER2024, labels=[packed_benign, packed_malicious])
+
+      prefilter = perdisci_packed_score(pe)
+
+      IF prefilter==packed: score = model.predict(static_pe_features(pe))
+
+      ALERT WHERE score > thr; EMIT top3 = TreeSHAP(model, pe)'
+- question: Do newly created or executed binaries resolve unusually few imports, land their entry point
+    in a writable/non-standard section, or contain known unpacking-stub artifacts?
+  context: Packed payloads typically resolve their real imports at runtime, so their static import table
+    is sparse, and their entry point often points into a section the unpacking stub will overwrite. Parse
+    each new executable's import address table (IAT) and headers and alert when the resolved import count
+    is unusually low (under ~10), the entry point lands in a writable or non-standard section, or known
+    unpacking-stub byte patterns appear, using PE-Probe and Awesome Executable Packing rules. Whitelist
+    your approved software inventory to bound false positives. Under the Stealth tactic this catches payload
+    staging where the on-disk file deliberately hides its true behavior until it executes. A match on
+    a binary that is not in inventory is a strong lead for runtime correlation.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: User endpoints, Development servers, Staging environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR new_exe NOT IN approved_inventory:\n  iat = parse_IAT(new_exe); hdr = parse_headers(new_exe)\n\
+      \  ALERT IF resolved_imports(iat) < 10\n     OR entry_point IN writable_or_nonstandard_section(hdr)\n\
+      \     OR matches_known_unpacking_stub(new_exe)"
+- question: Which newly written or executed binaries match a known packer/protector signature, and which
+    high-entropy binaries match NO known packer (suggesting a custom packer)?
+  context: 'Run Detect It Easy signatures over every newly written or executed binary and tag the specific
+    packer or protector identified (UPX, MPRESS, Themida, VMProtect). Known-packer hits give immediate
+    context and a triage path. More importantly, route binaries that are high-entropy yet match no known
+    packer to deeper analysis, because custom or bespoke packers are inherently higher-risk: adversaries
+    build them specifically to avoid the artifacts that signatures detect. This directly serves the Stealth
+    tactic, where the goal is to remain indistinguishable from benign software. A ''high entropy, no known
+    packer'' result on a non-inventory binary should be prioritized for sandboxing and memory analysis.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: User endpoints, Development servers, Staging environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR new_or_exec_binary:\n  pk = DIE_scan(binary)\n  IF pk != none: TAG packer=pk; TRIAGE\n\
+      \  ELIF shannon(binary) > 7.2: ROUTE deep_analysis (custom_packer_suspected)"
+- question: Do any new binaries sit above the 99th entropy percentile for their host role or show abrupt
+    entropy jumps (>1.5 bits/byte) between adjacent sections characteristic of packed overlays?
+  context: 'Beyond a fixed entropy threshold, the spatial pattern of entropy is revealing: a packed binary
+    often shows a sharp jump in entropy between a normal-looking section and a compressed/encrypted overlay.
+    Compute whole-file and per-section entropy, maintain host-role baselines, and flag binaries above
+    the 99th percentile or with adjacent-section entropy deltas above 1.5 bits/byte, using Lyda & Hamrock
+    thresholds and Kenyon-style locally-tuned cutoffs. Report the offending section, its entropy, and
+    the delta-from-baseline as a volume metric. In the Stealth context this localizes the concealed payload
+    region for an analyst. As with all entropy signals, corroborate against legitimate packed software
+    before alerting.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: User endpoints, Development servers, Staging environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = PERCENTILE_99(entropy) BY host_role OVER last_30d\nFOR new_exe:\n  sect_e = shannon_per_section(new_exe)\n\
+      \  jumps = max(abs(diff(adjacent_section_entropy)))\n  ALERT WHERE max(sect_e) > base OR jumps >\
+      \ 1.5\n  REPORT offending_section, entropy, delta_from_baseline"
+- question: Can a lightweight packer-agnostic feature set cheaply classify each new binary as packed or
+    non-packed to route it before expensive unpacking?
+  context: 'Not every binary warrants full unpacking analysis, so use the lightweight Perdisci-style feature
+    set (section and whole-file entropy, standard vs non-standard section counts, code/data section flags,
+    import ratios) to score every new binary as packed/non-packed at very low cost. This is a routing
+    stage, not a verdict: packed-scored binaries proceed to deeper structural, signature, and runtime
+    correlation, while non-packed ones are deprioritized. Supporting the Stealth tactic, this ensures
+    concealed executables are reliably funneled into deeper inspection at scale without overwhelming analysts.
+    A high packed score is a trigger for the more expensive checks elsewhere in this playbook.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: User endpoints, Development servers, Staging environments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR every new_binary:\n  feats = [whole_entropy, section_entropy, std_section_count,\n   \
+      \        nonstd_section_count, code_data_flags, import_ratio]\n  packed_score = perdisci_classify(feats)\n\
+      \  IF packed_score==packed: ROUTE to structural+signature+runtime checks"
+- question: Does unsupervised clustering of packing indicators isolate sparse clusters of binaries that
+    co-occur with suspicious execution ancestry?
+  context: When you lack labels, cluster binaries on entropy, import-table size, section flags, compile-timestamp
+    irregularity, and signer trust (EMBER feature recipe) to find rare, anomalous groupings. Prioritize
+    sparse clusters that co-occur with suspicious execution ancestry, and emit the top-3 distinguishing
+    features for each flagged cluster so analysts can understand why it stands out. To avoid the well-known
+    failure of clustering merely on the packer rather than on maliciousness (Aghakhani), require a behavioral
+    or prevalence corroborator before alerting. Under the Stealth tactic this surfaces novel packed families
+    that no signature or label covers yet. Output is a prioritized lead, validated by the corroborating
+    behavioral signals captured in the runtime questions below.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: User endpoints, Development servers, Staging environments'
+  range: Last 90 days
+  queries:
+  - technology: ML/Clustering pseudocode
+    query: "X = features[entropy, import_table_size, section_flags,\n             compile_ts_irregularity,\
+      \ signer_trust]\nclusters = UNSUPERVISED_CLUSTER(X)\nFOR c IN clusters WHERE sparse(c) AND suspicious_exec_ancestry(c):\n\
+      \  REQUIRE behavioral_or_prevalence_corroborator\n  ALERT; EMIT top3_distinguishing_features(c)"
+- question: Did a packed binary perform in-memory unpacking primitives — allocating or re-protecting memory
+    to RWX/executable (VirtualProtect/VirtualAllocEx, mprotect with PROT_EXEC, ES_EVENT_MMAP) and then
+    executing from non-image memory?
+  context: 'This is the deterministic runtime signature of unpacking and the single most confirmatory
+    behavior for this technique. Correlate static packed-binary detections with write-then-execute primitives:
+    VirtualProtect/VirtualAllocEx to RWX or mprotect(...PROT_EXEC) on freshly mapped regions (Sysmon Event
+    ID 10 process access / auditd mprotect / macOS ES_EVENT_MMAP), followed by execution transferring
+    into non-image memory. Because most packers decompress code in memory before running it, observing
+    this sequence right after a packed-file detection moves the case from suspicion to confirmation under
+    the Stealth tactic. A clear write-then-execute-from-non-image sequence on a flagged binary is high-confidence
+    malicious unpacking and should drive containment.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User endpoints, Domain Controllers, Internet gateways, DNS servers'
+  range: Last 90 days, with event-centered correlation in a short window (minutes) after the packed process
+    starts.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "mem = FROM Sysmon(EID=10) UNION auditd_mprotect UNION ES_EVENT_MMAP\nJOIN mem WITH packed_binary_detections\
+      \ ON pid\nALERT WHERE protect_to(RWX) OR mprotect(PROT_EXEC) ON fresh_region\n   FOLLOWED_BY execution_from_non_image_memory\
+      \ WITHIN minutes"
+- question: Did a packed parent process spawn script interpreters (cmd, powershell, wscript, sh) or contact
+    threat-intel-flagged or newly registered destinations within a short window of execution?
+  context: Once a packed payload unpacks, it typically acts — launching living-off-the-land interpreters
+    or reaching out to command-and-control. Correlate packed-parent detections with child process creation
+    (Sysmon Event ID 1), image/module loads (Event ID 7), memory-access events, and network sessions,
+    then alert when a packed parent launches cmd, powershell, wscript, or sh, or contacts TI-flagged or
+    newly registered domains/IPs within a short execution window. Under the Stealth tactic, defenders
+    expect the concealed payload to surface its true intent only after unpacking, so this temporal correlation
+    is what links concealment to action. A packed binary that immediately spawns an interpreter or beacons
+    out is a strong escalation trigger.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User endpoints, Domain Controllers, Internet gateways, DNS servers'
+  range: Last 90 days, correlating child/network events within a short window of the packed parent's start.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "parent = packed_binary_detections\nchild = FROM Sysmon(EID=1) WHERE ppid IN parent.pid\nnet\
+      \ = FROM Zeek_conn/dns WHERE pid IN parent.pid\nALERT WHERE child.image IN [cmd,powershell,wscript,sh]\n\
+      \   OR net.dest IN ti_flagged OR net.domain IN newly_registered\n   WITHIN short_window"
+- question: Do network flows from a packed process show low-jitter beaconing, destination-novelty spikes,
+    or elevated failure rates (NXDOMAIN, HTTP 404, RST/blocked) indicative of C2 staging?
+  context: 'Post-unpack payloads frequently establish C2, which shows up as statistically regular outbound
+    behavior. For packed-process network flows in Zeek conn/dns/http logs, compute interval jitter, payload
+    byte-count variance, destination novelty, and subdomain ratios, then flag low-jitter beacon-like patterns
+    and destination-diversity spikes above historical thresholds (frequency/volume metrics). Equally important,
+    profile failure signals: high NXDOMAIN, HTTP 404, or blocked/RST rates from a packed process are distinct
+    C2-staging indicators (an actor whose infrastructure is not yet live or has been taken down). Under
+    the Stealth tactic this catches the concealed payload''s communications even when its on-host actions
+    are subtle. Beacon-like timing plus a packed-process origin is a high-priority correlation.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User endpoints, Domain Controllers, Internet gateways, DNS servers'
+  range: Last 90 days, with event-centered analysis around the packed process's network activity.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'flows = Zeek_conn/dns/http WHERE pid IN packed_processes
+
+      jitter = stdev(interval); novelty = new_dest_ratio
+
+      subratio = subdomain_count/domain
+
+      ALERT WHERE jitter < thr (low) OR novelty > hist_thr
+
+      fail = rate(NXDOMAIN)+rate(http_404)+rate(RST/blocked)
+
+      ALERT WHERE fail > c2_staging_thr'
+  - technology: Zeek/pseudocode
+    query: 'conn |> group_by(id.orig_h,id.resp_h) |> intervals
+
+      beacon = intervals WHERE coef_var(delta_t) < 0.1
+
+      dns WHERE rcode_name=="NXDOMAIN" |> count_by(orig_pid)
+
+      http WHERE status_code==404 |> count_by(orig_pid)
+
+      EMIT beacon, failure_counts FOR pids IN packed_processes'
+- question: When memory regions written by a packed process are sampled, does entropy drop from high (>7.2,
+    packed) to native-code levels (~4.5-6.5), confirming in-memory unpacking?
+  context: 'Entropy provides a direct before/after confirmation of unpacking in memory. When memory regions
+    written by a packed process can be sampled, compute their entropy and compare pre- versus post-unpack:
+    a transition from high entropy (>7.2, indicating compressed/encrypted content) to lower entropy consistent
+    with native code (~4.5-6.5) confirms that the process decompressed its payload in memory (Lyda & Hamrock).
+    Record the entropy delta and timing as the State/Volume metric. Under the Stealth tactic this is decisive
+    evidence that the on-disk concealment has been undone at runtime to reveal executable code. A clear
+    high-to-low entropy transition tied to the flagged process strongly corroborates malicious unpacking.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User endpoints, Domain Controllers, Internet gateways, DNS servers'
+  range: Last 90 days, sampling memory around the packed process's runtime unpacking window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR region IN sampled_memory(packed_process):\n  e_pre = shannon(region @t0); e_post = shannon(region\
+      \ @t1)\n  CONFIRM_UNPACK WHERE e_pre > 7.2 AND e_post IN [4.5,6.5]\n  EMIT entropy_delta = e_pre\
+      \ - e_post, timing = t1-t0"
+- question: Does a sequential anomaly model over a packed process's process/module-load/memory-access/network
+    events produce a high anomaly score aligned with defense-evasion behavior?
+  context: Static packing rules tell you what a file is; a sequence model tells you whether its runtime
+    behavior is abnormal. Train a sequential anomaly model on process, module-load, memory-access, and
+    network events from benign software (EMBER feature lineage), then alert when a packed process's event
+    sequence scores highly anomalous and aligns with defense-evasion playbooks. Surface the top-3 contributing
+    events so analysts can interpret the score. Crucially, require this to corroborate static packing
+    rather than replace it (Aghakhani), since unusual sequences alone are not proof of malice. Under the
+    Stealth tactic this catches concealed payloads whose individual actions look benign but whose ordering
+    betrays evasion. A high sequence-anomaly score on an already-flagged packed process is a strong, explainable
+    escalation.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 10
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: User endpoints, Domain Controllers, Internet gateways, DNS servers'
+  range: Last 90 days, scoring the event sequence following the packed process's start.
+  queries:
+  - technology: ML/Sequence anomaly pseudocode
+    query: "model = TRAIN_SEQ(benign[process,module_load,mem_access,network])\nFOR packed_process:\n \
+      \ seq = event_sequence(packed_process)\n  score = model.anomaly(seq)\n  ALERT WHERE score > thr\
+      \ AND aligns(defense_evasion_playbook)\n        AND static_packing_corroborated\n  EMIT top3_contributing_events"
