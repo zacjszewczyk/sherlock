@@ -1,0 +1,531 @@
+name: 'T1037.005: Startup Items'
+id: cc952223-e3b7-4f8f-9df7-2b2a1626d0b2
+description: Investigate adversary abuse of macOS Startup Items (the deprecated SystemStarter mechanism
+  in `/Library/StartupItems/`) to establish persistence and to escalate privileges to root. Startup Items
+  execute during the final phase of the boot process and run as the elevated root user, so a planted item
+  gives an adversary both a durable foothold and a root-execution primitive. This playbook helps an analyst
+  hunt for executions of unsigned, rare, or known-malicious binaries from `/Library/StartupItems/`; unauthorized
+  file creation, modification, permission and ownership changes, and high-entropy or YARA-matching content
+  in that directory; malicious script behavior such as user creation, security-control tampering (spctl/csrutil),
+  setuid manipulation, and credential access; and outbound command-and-control traffic originating from
+  Startup Item processes. Because this path is deprecated and superseded by Launch Daemons, virtually
+  any boot-time activity here on a modern fleet is anomalous and warrants scrutiny.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any executable run from `/Library/StartupItems/` whose SHA-256 hash, cdhash, signing ID,
+    or team ID matches a threat-intelligence blocklist of known macOS malware?
+  context: 'This is the highest-confidence persistence signal: a boot-time binary in a deprecated directory
+    that is already known-bad. Use Apple Endpoint Security Framework ES_EVENT_TYPE_NOTIFY_EXEC, which
+    delivers sha256, cdhash, signing ID, and team ID directly from first-party telemetry, so no external
+    API call is needed at match time. Enumerate every auto-run binary the way KnockKnock inventories persistence
+    locations, then join those hashes/cdhashes against your TI feed. A positive match is an immediate,
+    actionable detection of an adversary maintaining persistence across reboots; a negative result does
+    not clear the host because novel malware will not be on any blocklist, so pair this with the unsigned
+    and rarity checks.'
+  answer_sources: &id001
+  - macOS Endpoint Security Framework (ESF) ES_EVENT_TYPE_NOTIFY_EXEC
+  - osquery (file_events)
+  - Threat Intelligence Feeds
+  - 'NAI: File systems on all macOS endpoints, specifically the `/Library/StartupItems/` directory.'
+  range: Last 90 days, correlate each exec to the most recent boot.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'exec = esf_exec where path startswith ''/Library/StartupItems/'';
+
+      alert when exec.sha256 in ti_hash_blocklist or exec.cdhash in ti_cdhash_blocklist;
+
+      output host, path, sha256, cdhash, signing_id, team_id, boot_time.'
+- question: Did a process execute from `/Library/StartupItems/` that is unsigned, carries an invalid or
+    revoked code signature, or is not an Apple platform binary (ESF `is_platform_binary`==false and missing
+    team ID)?
+  context: Startup Items run as root during the final boot phase, so code-signing validity is the single
+    most discriminating high-fidelity filter for malicious persistence. Alert when a binary executing
+    from this path is unsigned, has an invalid/revoked signature, or lacks both platform-binary status
+    and a team ID, excluding an explicit allowlist of legitimate-but-old installers. Adversaries rarely
+    possess valid, non-revoked Apple Developer signing for their persistence payloads, so an unsigned
+    root-level boot binary is strongly suspicious. A positive result indicates likely persistence; investigate
+    the binary's origin, parent installer, and first-seen time.
+  answer_sources: *id001
+  range: Last 90 days, correlate to boot-time execution.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "exec = esf_exec where path startswith '/Library/StartupItems/';\nalert when (exec.signing_status\
+      \ in ['unsigned','invalid','revoked'])\n  or (exec.is_platform_binary == false and exec.team_id\
+      \ is null);\nfilter out path in legit_old_installer_allowlist;\noutput host, path, signing_status,\
+      \ team_id, boot_time."
+- question: Has ANY successful execution occurred from `/Library/StartupItems/` on a macOS Sierra+ host,
+    given that this mechanism is deprecated and should normally never run on a modern fleet?
+  context: Because SystemStarter/StartupItems is deprecated and superseded by Launch Daemons, the expected
+    boot-time execution count from this path is effectively zero on the vast majority of modern endpoints.
+    Maintain a per-host baseline of expected exec count per boot (0 for most fleets) and alert on the
+    first non-zero boot-time execution. This state-based heuristic catches even validly-signed or not-yet-known-bad
+    binaries an adversary plants for persistence. A positive result means a deprecated persistence channel
+    is active and should be treated as anomalous until proven a legacy installer remnant.
+  answer_sources: *id001
+  range: Last 90 days, evaluate per boot cycle.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'baseline = per_host expected_exec_count(''/Library/StartupItems/'') per boot;
+
+      exec = esf_exec where path startswith ''/Library/StartupItems/'';
+
+      alert when count(exec) per boot > baseline (default 0);
+
+      output host, path, exec_count, boot_time.'
+- question: Which Startup Item executable hashes are present on fewer than 1% of endpoints across the
+    fleet, and which are being seen on the fleet for the very first time?
+  context: Prevalence is a robust filter because roughly 99.7% of real threats are rare across a population.
+    Compute the fleet-wide prevalence distribution of executable hashes observed in `/Library/StartupItems/`
+    and flag those on <1% of endpoints as rare, with first-seen-on-fleet binaries as the highest priority.
+    Derive the precise percentile threshold from your own environment's hash-prevalence distribution.
+    A rare or never-before-seen root boot binary is a strong persistence indicator; widely-deployed hashes
+    are likely legitimate fleet software.
+  answer_sources: *id001
+  range: Last 90 days for prevalence; flag first-seen immediately.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prev = count_distinct(host) per sha256 where path startswith ''/Library/StartupItems/'';
+
+      total = count_distinct(host all);
+
+      alert when prev/total < 0.01 or first_seen_fleet(sha256) within range;
+
+      output sha256, prevalence_pct, first_seen, hosts.'
+- question: Is there a spike in code-signature verification failures or ESF AUTH_EXEC denials for executables
+    under `/Library/StartupItems/` on any host?
+  context: Failed or denied executions are a distinct signal from successful ones and often reveal tampering
+    or an adversary iterating on a payload. Profile code-signature verification failures and ESF AUTH_EXEC
+    denials for this path separately from successful execs, tracking failed-exec count per minute per
+    host. A spike in invalid-signature or revoked-certificate exec attempts indicates someone is trying
+    to launch a boot-time payload that the OS is rejecting. A positive result warrants investigation of
+    what binary is repeatedly failing and why it is present.
+  answer_sources: *id001
+  range: Last 90 days, alert on short-window spikes.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = esf where path startswith '/Library/StartupItems/'\n  and (event=='AUTH_EXEC_DENY'\
+      \ or signature_check=='fail');\nrate = count(fails) per host per minute;\nalert when rate > baseline_spike_threshold;\n\
+      output host, path, fail_count, signing_status, window."
+- question: Does a supervised or anomaly-detection model score any new `/Library/StartupItems/` executable
+    above 0.90 malicious probability based on entropy, strings, signing status, and imports?
+  context: Static ML triage scores new boot binaries before they are known-bad. Train a Gradient Boosting/Random
+    Forest classifier or an Isolation Forest on features including Shannon entropy (packed/encrypted typically
+    >7.0-7.2 versus plaintext 5.0-6.5), embedded strings, signing status, and imported APIs, and alert
+    above 0.90 malicious probability. Use per-feature attribution and surface the top-3 contributing features
+    (e.g., 'unsigned', 'entropy=7.4', 'rare-hash') in the alert so an analyst can quickly validate. A
+    high score on a root-level boot binary is a strong persistence indicator even with no prior IOC.
+  answer_sources: *id001
+  range: Last 90 days, score on first appearance.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = extract(entropy, strings, signing_status, imports) for new exec in ''/Library/StartupItems/'';
+
+      score = model.predict_proba(feat);
+
+      alert when score > 0.90;
+
+      output path, score, top3_features.'
+- question: Do any newly created files under `/Library/StartupItems/` (the executable or `StartupParameters.plist`)
+    match YARA rules for suspicious strings or obfuscation?
+  context: Content-based detection catches malicious Startup Items regardless of hash novelty. Trigger
+    YARA scans from osquery/ESF file-create events so detection runs on first-party telemetry the moment
+    a file lands, scanning both the executable and its `StartupParameters.plist`. YARA rules should cover
+    known malware families, suspicious obfuscation, encoded payloads, and reverse-shell strings. A match
+    on a freshly written boot file is a high-confidence persistence indicator; a clean scan reduces but
+    does not eliminate suspicion for novel threats.
+  answer_sources: &id002
+  - macOS Endpoint Security Framework (ESF) ES_EVENT_TYPE_NOTIFY_EXEC
+  - osquery (file_events)
+  - YARA
+  - 'NAI: File systems on all macOS endpoints, specifically the `/Library/StartupItems/` directory.'
+  range: Last 90 days, scan on file-create.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on file_create where path startswith '/Library/StartupItems/':\n  run yara(ruleset_macos_persistence,\
+      \ file);\nalert when yara.match;\noutput host, file, rule_name, matched_strings."
+- question: Was any file created or modified in `/Library/StartupItems/` by a process other than an approved
+    installer (`installer`, `system_installd`, MDM/deployment agents)?
+  context: Legitimate Startup Items are written by installers and deployment tooling, not by interactive
+    or interpreter processes. Alert when the writer is anything other than an approved installer/deployment
+    agent; browsers, document readers, shells, and interpreters writing to this directory are high-fidelity
+    persistence indicators. Use full ESF/osquery process lineage to identify the responsible process.
+    A positive result strongly suggests an adversary is planting a boot-time persistence mechanism through
+    an unexpected vector.
+  answer_sources: *id002
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'w = file_create_or_modify where path startswith ''/Library/StartupItems/'';
+
+      allow = [''installer'',''system_installd'', mdm_agents...];
+
+      alert when w.writer_proc not in allow;
+
+      output host, file, writer_proc, parent_proc, signing_status.'
+- question: Do any file or directory names created under `/Library/StartupItems/` exhibit high Shannon
+    entropy (above mean+3σ or >3.0), or anomalous size/byte-count deltas versus the legitimate-installer
+    baseline?
+  context: Malware frequently uses randomized or obfuscated names and unusual file sizes. Compute Shannon
+    entropy of file/directory names in this path and flag those exceeding mean+3σ or an absolute threshold
+    of ~3.0, and additionally score file size and byte-count deltas (Volume) against the legitimate-installer
+    baseline. High name entropy combined with anomalous size is consistent with auto-generated malware
+    artifacts. A positive result prioritizes the item for deeper content and provenance review.
+  answer_sources: *id002
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "f = file_create where path startswith '/Library/StartupItems/';\nname_entropy = shannon(f.name);\n\
+      alert when name_entropy > max(mean+3*sigma, 3.0)\n  or abs(f.size - installer_baseline_size) > size_threshold;\n\
+      output host, file, name_entropy, size."
+- question: Is the per-host rate of file create/modify events in `/Library/StartupItems/` anomalous under
+    a MAD-based modified Z-score (>3.5), given that the expected rate is essentially zero?
+  context: Since `/Library/StartupItems/` is deprecated, the baseline create/modify rate is approximately
+    zero on modern hosts, so any non-zero write activity is anomalous. Model file create/modify counts
+    per host with a MAD-based modified Z-score and flag values above 3.5. The robust (median/MAD) statistic
+    avoids being skewed by rare legitimate installs. A positive result indicates unexpected write activity
+    to a dormant persistence path and should be correlated with the responsible writer process.
+  answer_sources: *id002
+  range: Last 90 days, evaluate per host over rolling windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'counts = file_writes(''/Library/StartupItems/'') per host per window;
+
+      mz = 0.6745*(count - median)/MAD;
+
+      alert when mz > 3.5;  # expected rate ~0
+
+      output host, count, modified_zscore, window.'
+- question: How rare is the causal process chain (writer → parent → grandparent) that created a new Startup
+    Item, scored with IDF-weighted path rarity and Local Outlier Factor?
+  context: Provenance scoring catches novel persistence by reasoning over the full causal chain rather
+    than a single process. Score the rarity of the writer process and its ancestry (parent, grandparent)
+    using IDF-weighted path rarity and Local Outlier Factor, and surface the top-3 rarest path edges in
+    the alert. Complement with streaming provenance-graph anomaly detection over the whole system. A rare
+    causal chain creating a root-level boot item is a strong persistence indicator even when each individual
+    binary looks benign.
+  answer_sources: *id002
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'chain = provenance(writer -> parent -> grandparent) for create in ''/Library/StartupItems/'';
+
+      score = LOF(idf_weighted_path_rarity(chain));
+
+      alert when score anomalous;
+
+      output host, chain, top3_rare_edges, lof_score.'
+- question: Did a process originating from `/Library/StartupItems/` establish an outbound connection to
+    a destination IP or domain on a threat-intelligence blocklist?
+  context: This links boot-time persistence to active command-and-control. Correlate processes whose exec
+    lineage originates in `/Library/StartupItems/` (ESF exec lineage) with their outbound connections
+    (ESF NOTIFY_CREATE_TCP/UDP, Zeek conn.log/dns.log) and alert when any destination matches a TI blocklist.
+    A positive result confirms an active C2 channel driven by a persistence mechanism — a high-priority
+    finding combining persistence with adversary control. Preserve the process path, destination, and
+    resolution chain for response.
+  answer_sources: &id003
+  - macOS Endpoint Security Framework (ESF) ES_EVENT_TYPE_NOTIFY_EXEC
+  - ESF (ES_EVENT_TYPE_NOTIFY_CREATE_TCP, ES_EVENT_TYPE_NOTIFY_CREATE_UDP)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: macOS endpoints, Network egress points, and DNS servers.'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'p = esf_exec where path startswith ''/Library/StartupItems/'';
+
+      conn = esf_net or zeek_conn where pid in p.pids;
+
+      alert when conn.dst_ip in ti_ip_blocklist or conn.dns_query in ti_domain_blocklist;
+
+      output host, proc_path, dst_ip, domain, ja3.'
+- question: Does a legitimate Startup Item process deviate from its baseline of normal destinations, ports,
+    protocols, and byte volume (new destinations or Volume/Frequency beyond mean+3σ)?
+  context: Even an item that is legitimate today can be hijacked or repurposed. Baseline each Startup
+    Item process's normal destinations, ports, protocols, and byte volume, then alert on new destinations
+    or Volume/Frequency deviations (bytes-out per connection, connections per minute) beyond mean+3σ.
+    This catches a compromised or trojanized boot process beginning to communicate abnormally. A positive
+    result warrants checking whether the binary or its configuration changed recently.
+  answer_sources: *id003
+  range: Last 90 days for baseline; alert on deviations.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = baseline(dst, port, proto, bytes_out, conn_rate) per startup_proc;
+
+      now = net_flows for startup_proc;
+
+      alert when now.dst new or now.metric > base.mean+3*base.sigma;
+
+      output host, proc, dst, bytes_out, conn_rate.'
+- question: Is a Startup Item process contacting a destination domain that is newly registered (age <60
+    days) or low-popularity, and is it generating NXDOMAIN or failed-connection errors?
+  context: Newly registered and unpopular domains are characteristic of adversary C2, and beaconing malware
+    often produces resolution and connection failures. Flag destination domains with registration age
+    <60 days and low popularity score, combined with NXDOMAIN/failed-connection profiling (Failure Mode).
+    A young, obscure domain contacted by a root boot process — especially with intermittent failures —
+    is a strong indicator of C2 infrastructure. Correlate with passive DNS and WHOIS enrichment.
+  answer_sources: *id003
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "dns = zeek_dns for startup_proc;\nalert when domain_age(dns.query) < 60d or popularity(dns.query)\
+      \ low\n  or dns.rcode == NXDOMAIN;\noutput host, proc, domain, domain_age, popularity, rcode."
+- question: Is a Startup Item process generating repeated failed/blocked connections or DNS NXDOMAIN responses
+    to rare hosts, consistent with C2 retry behavior?
+  context: 'Connection failures are a distinct, high-value signal: dead or rotating C2 infrastructure
+    leaves a trail of retries and NXDOMAINs. Track per-process counts of failed/blocked connections and
+    DNS NXDOMAIN responses separately from successful traffic. A Startup Item process repeatedly failing
+    to reach rare hosts indicates beacon retry behavior against unavailable infrastructure. A positive
+    result is strong evidence of an active (if currently broken) C2 channel and should escalate the host
+    for containment review.'
+  answer_sources: *id003
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'fails = (conn where state in [''REJ'',''S0''] or dns.rcode==NXDOMAIN) for startup_proc;
+
+      rate = count(fails) per proc per window;
+
+      alert when rate high and dst rare;
+
+      output host, proc, fail_count, rare_dst, window.'
+- question: Does an ML model score the TLS/connection profile (JA3/JA3S, version, cipher, certificate,
+    duration, byte ratios) of Startup Item traffic above 0.85 malicious probability?
+  context: Encrypted C2 can be triaged on metadata alone. Score JA3/JA3S fingerprints, TLS version, cipher
+    suite, certificate details, connection duration, and byte ratios with a classifier and alert above
+    0.85 malicious probability, surfacing the top-3 contributing features. Correlate the flagged network
+    node with the persistence node via whole-system provenance so the boot item and its C2 are linked
+    in one graph. A high score tying a root boot process to anomalous TLS strongly indicates an active,
+    evasive C2 channel.
+  answer_sources: *id003
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = extract(ja3, ja3s, tls_version, cipher, cert, duration, byte_ratio) for startup_proc
+      flows;
+
+      score = model.predict_proba(feat);
+
+      alert when score > 0.85;
+
+      correlate(network_node, persistence_node) via provenance;
+
+      output host, proc, dst, score, top3_features.'
+- question: Was a file created in `/Library/StartupItems/` by a non-installer process — especially a browser,
+    document reader, shell, or interpreter — running as an unprivileged user?
+  context: 'Because Startup Items execute as root at boot, an unprivileged user who plants one obtains
+    a root-execution primitive — a privilege-escalation path. Alert when a file is created here by a process
+    that is not `installer`, `system_installd`, or an approved deployment tool, using ESF NOTIFY_CREATE
+    with full process lineage, signing, and responsible UID. The responsible UID matters: a uid=501 (standard
+    user) process writing a future root-executed item is the escalation signal. A positive result indicates
+    an in-progress privilege-escalation setup.'
+  answer_sources: &id004
+  - Endpoint Security Framework (ES_EVENT_TYPE_NOTIFY_CREATE, with process signing/user context)
+  - osquery (file_events)
+  - 'NAI: File systems on all macOS endpoints, specifically the `/Library/StartupItems/` directory and
+    associated process user context.'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'c = esf_create where path startswith ''/Library/StartupItems/'';
+
+      allow = [''installer'',''system_installd'', deployment_tools...];
+
+      alert when c.writer not in allow and c.responsible_uid != 0;
+
+      output host, file, writer, responsible_uid, signing_status, lineage.'
+- question: Is the creating/parent process of a `/Library/StartupItems/` write in the bottom 1% of historical
+    frequencies for that path, and is the create-event rate per host anomalous?
+  context: Rare writers reveal escalation attempts that an allowlist might miss. Flag writes whose creating
+    or parent process is in the bottom 1% of historical frequencies for this path, and track create-event
+    count per minute per host (Frequency). A process that almost never writes to StartupItems suddenly
+    doing so — at boot-relevant timing — is suspicious because the resulting item runs as root. A positive
+    result prioritizes the writer's lineage and user context for escalation investigation.
+  answer_sources: *id004
+  range: Last 90 days for frequency baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prev = freq(parent_proc) for writes in ''/Library/StartupItems/'';
+
+      alert when percentile(prev) < 1;
+
+      also rate = count(creates) per host per minute; alert when rate anomalous;
+
+      output host, file, parent_proc, freq_pct, rate.'
+- question: Are there repeated permission-denied (EACCES) write attempts or ESF AUTH_CREATE denials on
+    `/Library/StartupItems/` by a non-root process?
+  context: Denied writes expose an escalation attempt in progress before it succeeds. Profile permission-denied
+    (EACCES) write attempts and ESF AUTH_CREATE denials on this path as a distinct signal from successful
+    writes. Repeated denied writes by a non-root process indicate someone is trying to plant a root-executed
+    item but lacks permission — a clear escalation attempt. A positive result is an early warning to investigate
+    the process and the user before they find a working vector.
+  answer_sources: *id004
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "deny = esf where path startswith '/Library/StartupItems/'\n  and (event=='AUTH_CREATE_DENY'\
+      \ or errno=='EACCES') and uid != 0;\nrate = count(deny) per proc per window;\nalert when rate high;\n\
+      output host, proc, uid, deny_count, window."
+- question: Does an ML classifier (Logistic Regression/Isolation Forest) flag a `/Library/StartupItems/`
+    write as a privilege-escalation event based on writer process, parent, UID, signing status, and command-line
+    args?
+  context: ML generalizes beyond static allowlists to catch novel escalation tradecraft. Train Logistic
+    Regression or Isolation Forest on writer process, parent, responsible UID, signing status, and command-line
+    arguments to classify privilege-escalation writes, surfacing the top-3 features (e.g., 'writer=bash',
+    'uid=501→target root', 'unsigned'). Also score the causal-chain rarity with a provenance model. A
+    positive classification on a write that will execute as root at boot is a strong escalation indicator
+    warranting immediate review.
+  answer_sources: *id004
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = extract(writer, parent, uid, signing_status, cmdline) for writes in ''/Library/StartupItems/'';
+
+      score = model.predict(feat);
+
+      alert when score == malicious;
+
+      output host, file, writer, uid, top3_features.'
+- question: Do new or modified scripts within `/Library/StartupItems/` subdirectories contain `dscl` (user
+    creation), `spctl`/`csrutil` (security-control tampering), `chmod +s`/setuid, or reverse-shell patterns?
+  context: Script content reveals escalation intent directly. Alert on YARA matches for `dscl` (user creation),
+    `spctl`/`csrutil` (Gatekeeper/SIP tampering), `chmod +s`/setuid manipulation, or reverse-shell patterns
+    in Startup Item scripts, scanning on file-create events. Because these scripts run as root at boot,
+    such commands let an adversary create privileged accounts, disable security controls, or grant setuid
+    — classic escalation. A match is a high-confidence escalation indicator; preserve the full script
+    for analysis.
+  answer_sources: &id005
+  - YARA
+  - osquery (file_events)
+  - ESF file events
+  - 'NAI: The contents of executable scripts within all subdirectories of `/Library/StartupItems/` on
+    all macOS endpoints.'
+  range: Last 90 days, scan on file-create.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on file_create where path startswith '/Library/StartupItems/' and is_script:\n  run yara(rules:\
+      \ dscl, spctl, csrutil, 'chmod +s', setuid, reverse_shell);\nalert when yara.match;\noutput host,\
+      \ file, rule_name, matched_strings."
+- question: Do Startup Item scripts contain commands present in fewer than 0.5% of all StartupItem scripts
+    across the fleet, or content entropy above 7.0 suggesting obfuscation/encoding?
+  context: Rare commands and high entropy distinguish malicious scripts from routine ones. Flag scripts
+    containing commands present in <0.5% of all StartupItem scripts fleet-wide, and additionally score
+    content entropy (>7.0 suggests obfuscation or base64/hex encoding). A boot-time root script using
+    rare commands or carrying obfuscated content is consistent with escalation or defense-evasion payloads.
+    A positive result prioritizes the script for decoding and YARA/classifier review.
+  answer_sources: *id005
+  range: Last 90 days for command-prevalence baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'cmds = tokenize(script_content) for scripts in ''/Library/StartupItems/'';
+
+      prev = fleet_prevalence(cmd);
+
+      alert when any(prev < 0.005) or shannon(script_content) > 7.0;
+
+      output host, file, rare_cmds, content_entropy.'
+- question: Does a content classifier (keyword/API counts, string entropy, presence of dscl/spctl/csrutil)
+    identify a Startup Item script designed for privilege escalation, user creation, or defense evasion?
+  context: An ML classifier scores intent across many weak signals. Train on script content features —
+    keyword/API counts, string entropy, and presence of dscl/spctl/csrutil — to identify scripts built
+    for privilege escalation, user creation, or defense evasion, and alert with the top-3 contributing
+    features surfaced. Optionally model the ESF/unified-log event sequence around boot with a sequence
+    model to flag anomalous execution chains. A high score on a root boot script is a strong escalation
+    indicator even with no single decisive keyword.
+  answer_sources: *id005
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = extract(keyword_counts, api_counts, entropy, has_dscl, has_spctl, has_csrutil) for
+      scripts;
+
+      score = model.predict_proba(feat);
+
+      alert when score high;
+
+      optional: seq_model(boot_event_sequence) flag anomalous;
+
+      output host, file, score, top3_features.'
+- question: Did a `/Library/StartupItems/` file gain group/other write (world-writable, e.g., chmod 777/666),
+    or was a `StartupParameters.plist` modified after its initial creation?
+  context: Startup Item files should be static after install, so permission loosening or post-creation
+    plist edits signal tampering for escalation. Alert when files gain group/other write (world-writable,
+    e.g., chmod 777/666) or when a `StartupParameters.plist` is modified after initial creation, using
+    ESF NOTIFY_SETMODE/NOTIFY_WRITE and osquery file_events mode fields. World-writable root-executed
+    files let any user alter what runs as root at boot — a direct escalation primitive. A positive result
+    warrants immediate review of who changed the file and to what.
+  answer_sources: &id006
+  - macOS Endpoint Security Framework (ESF) ES_EVENT_TYPE_NOTIFY_EXEC
+  - osquery (file_events)
+  - 'NAI: All files and subdirectories within the `/Library/StartupItems/` path on all macOS endpoints.'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "m = esf where path startswith '/Library/StartupItems/'\n  and (event=='NOTIFY_SETMODE' and\
+      \ new_mode has group/other write)\n  or (event=='NOTIFY_WRITE' and file endswith 'StartupParameters.plist'\
+      \ and post_create);\nalert; output host, file, old_mode, new_mode, proc."
+- question: Do `/Library/StartupItems/` file permissions deviate from the established norm (executables
+    755, configs 644), with per-host deviation counts flagged by a MAD-based modified Z-score (>3.5)?
+  context: Statistical deviation from expected permissions catches subtle tampering. Flag files whose
+    permissions deviate from the established norm (executables 755, configuration files 644) and count
+    deviation events per host with a MAD-based modified Z-score, flagging values above 3.5. The robust
+    median/MAD statistic resists skew from rare legitimate changes. A cluster of permission deviations
+    on root-executed boot files suggests an adversary preparing or maintaining an escalation foothold.
+  answer_sources: *id006
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'dev = files in ''/Library/StartupItems/'' where mode != expected(755 exec / 644 config);
+
+      count = count(dev) per host per window;
+
+      mz = 0.6745*(count - median)/MAD;
+
+      alert when mz > 3.5;
+
+      output host, file, mode, expected_mode, modified_zscore.'
+- question: Are there repeated failed/denied `chown`/`chmod` attempts (EPERM) on `/Library/StartupItems/`
+    by non-root processes?
+  context: Denied ownership/permission changes expose escalation attempts before they succeed. Track failed/denied
+    `chown`/`chmod` attempts (EPERM) on this path distinctly from successful ones. Repeated denied ownership
+    changes by non-root processes indicate an adversary trying to take control of a root-executed boot
+    item but lacking privilege — an escalation attempt in progress. A positive result is an early-warning
+    signal to investigate the process and user before they find a working path to root.
+  answer_sources: *id006
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "deny = esf where path startswith '/Library/StartupItems/'\n  and event in ['NOTIFY_SETOWNER','NOTIFY_SETMODE']\
+      \ and result=='EPERM' and uid != 0;\nrate = count(deny) per proc per window;\nalert when rate high;\n\
+      output host, proc, uid, file, deny_count."
+- question: Was a `/Library/StartupItems/` file `chown`ed to an unexpected user/uid after creation, as
+    flagged by a model of typical installer-created ownership?
+  context: Ownership changes after creation can hand control of a root-executed item to an adversary.
+    Model the typical ownership (user/group) of files created by legitimate installers and alert when
+    a file is `chown`ed to an unexpected user/uid after creation, surfacing the top-3 features (old/new
+    owner, changing process, signing). Correlate the ownership/permission change with downstream root
+    execution via provenance so the escalation chain is visible end to end. A positive result strongly
+    suggests manipulation of a boot item for privilege escalation.
+  answer_sources: *id006
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'base = model(owner, group) of installer-created files;
+
+      ch = esf NOTIFY_SETOWNER where path startswith ''/Library/StartupItems/'';
+
+      alert when ch.new_owner unexpected vs base;
+
+      correlate(ownership_change, downstream_root_exec) via provenance;
+
+      output host, file, old_owner, new_owner, proc, top3_features.'
