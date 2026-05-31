@@ -1,0 +1,422 @@
+name: 'D3-SDA: Session Duration Analysis'
+id: 94fc33f3-5d8f-4e39-a8f4-cb0513596d5e
+description: Investigate user logon session durations to detect unauthorized activity. This playbook helps
+  an analyst compare the duration and timing of user sessions against an established per-user, per-group,
+  or per-system baseline to surface statistically anomalous behavior. It correlates Windows logon/logoff
+  events by Logon ID (and Zeek connection durations) to compute session lengths, flags excessive dwell
+  times, concurrent overlapping sessions, off-hours starts, sub-second/failed-logon spikes, sustained
+  regime shifts in mean dwell time, and rare authentication-graph edges. It combines deterministic symbolic-logic
+  rules with robust statistical outlier tests (median/MAD modified Z-score, change-point detection) and
+  machine-learning approaches (time-series forecasting, Isolation Forest, sequence models, and peer-group
+  UEBA) so that hijacked, forgotten, or attacker-controlled sessions are caught while keeping false positives
+  manageable, and so detections can drive graduated automated remediation.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there any interactive user sessions whose total duration exceeds the environment's policy-defined
+    or 99th-percentile ceiling, indicating a hijacked, forgotten, or attacker-held session?
+  context: Correlate logon events (Windows Event ID 4624) with their matching logoff events (Windows Event
+    ID 4634/4647) by Logon ID to compute the duration of each session, the same correlation performed
+    by LogonTracer. Focus on interactive logons (Logon Type 2 console and Logon Type 10 RDP) because those
+    represent a human-at-keyboard session that should not persist indefinitely. Alert when a session exceeds
+    a policy threshold (for example 24 hours), but derive that ceiling per environment from the 99th percentile
+    of historical interactive durations rather than a fixed guess so the rule fits the local workforce.
+    In the Detect tactic, an excessively long interactive session can mean an adversary kept a stolen
+    or RDP-pivoted session alive, or that a workstation was left logged in and later abused; a positive
+    result is a session whose computed dwell time clears the ceiling and warrants review of what occurred
+    during the dwell.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      join EventID=4624 (logon) with EventID in (4634,4647) (logoff) on LogonId
+
+      | where LogonType in (2,10)
+
+      | eval duration = logoff_time - logon_time
+
+      | where duration > percentile99(historical_interactive_duration)  // or 24h policy floor
+
+      | table user, host, LogonId, LogonType, logon_time, logoff_time, duration'
+- question: Is any single user account holding active, simultaneous interactive sessions on more than
+    the per-role baseline number of distinct hosts at the same point in time?
+  context: 'Build session intervals from paired 4624/4634 events (by Logon ID) and look for a single account
+    whose logon/logoff intervals overlap in time across more than a threshold number of distinct hosts
+    (for example more than 3). Concurrent interactive sessions on many hosts is a strong pivot signal:
+    an attacker who has compromised credentials often opens sessions across multiple servers or workstations
+    to move laterally, and concurrent-host count is one of the per-user histogram features modeled in
+    the Exabeam UEBA patent. Tune the host-count threshold to each role''s 99th percentile, because some
+    administrators legitimately maintain several sessions. A positive result is a user with overlapping
+    active sessions on an unusually large set of hosts, which should be correlated with the duration anomalies
+    in this playbook.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      build intervals from 4624(start)/4634(end) per LogonId with host
+
+      | for each user, time window: count distinct hosts with overlapping active intervals
+
+      | eval concurrent_hosts = distinct_count(host)
+
+      | where concurrent_hosts > role_threshold_p99  // e.g. > 3
+
+      | table user, concurrent_hosts, hosts, window_start, window_end'
+- question: Did an interactive session both begin during an hour-of-day or day-of-week the user has never
+    previously used and then persist well beyond that user's median session duration?
+  context: Construct a per-user histogram of logon hour-of-day and day-of-week (a core feature set in
+    the Exabeam UEBA patent) to learn each user's normal working rhythm. Then alert when a session starts
+    in an hour bin the user has never used AND the same session runs longer than that user's median duration.
+    Combining an off-hours start with abnormally long dwell sharply reduces false positives from benign
+    late work, because either signal alone is common but the conjunction is rare. In the Detect tactic
+    this catches an adversary who logs in outside business hours and then lingers; a positive result is
+    a session whose start hour is novel for the user and whose duration exceeds their typical session
+    length.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      for each 4624 interactive logon: hour = hour_of_day(logon_time); dow = day_of_week(logon_time)
+
+      | lookup user_hour_histogram[user]
+
+      | where hour NOT in seen_hours[user]
+
+      | join logoff to compute duration
+
+      | where duration > median_duration[user]
+
+      | alert user, host, logon_time, hour, duration'
+- question: When a session's duration or timing risk crosses a deterministic threshold, has graduated
+    remediation (step-up authentication, privilege curtailment, session termination, or administrator
+    notification) been triggered?
+  context: 'This question drives response, not just detection. When the deterministic duration/timing
+    rules above fire above a defined risk threshold, trigger graduated remediation as described in the
+    Idaptive network-fraud patent: require step-up authentication, curtail the account''s privileges,
+    terminate the offending session, or notify an administrator. Keep this logic deterministic rather
+    than dependent on a model score alone, so that automated response is predictable and defensible during
+    an incident. For the Detect tactic, this ensures a confirmed anomalous session is contained quickly;
+    a positive result is a high-risk session that should have produced (or did produce) a remediation
+    action, and the analyst verifies the action occurred and reviews its outcome.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nif session_risk(duration_anomaly OR concurrent OR off_hours) >= risk_threshold:\n    action\
+      \ = case high -> terminate_session + notify_admin\n                  med  -> curtail_privileges\
+      \ + require_stepup_auth\n                  low  -> require_stepup_auth\n| log remediation_action,\
+      \ user, host, LogonId, trigger_rule"
+- question: Using a robust outlier test, does any new session have a duration whose modified Z-score against
+    the user's trailing-90-day median and Median Absolute Deviation exceeds 3.5?
+  context: For each user, compute the median and Median Absolute Deviation (MAD) of session durations
+    over a trailing 90-day window and flag any new session whose modified Z-score, 0.6745*(x-median)/MAD,
+    exceeds 3.5. Use median/MAD rather than mean/standard deviation because session-duration distributions
+    are heavily right-skewed and a few very long sessions would otherwise distort a mean-based test. Retain
+    a parallel deterministic floor of mean + 3*sigma over event-log aggregates per Dwyer & Truta as a
+    backstop. Apply the same robust test to per-service connection durations in Zeek conn.log for the
+    network view. In the Detect tactic, a high modified Z-score means the session is a statistical outlier
+    relative to that user's own history; a positive result is any session breaching the 3.5 threshold.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      per user over trailing 90d: med = median(duration); mad = median(|duration - med|)
+
+      | for new session: mz = 0.6745 * (duration - med) / mad
+
+      | where abs(mz) > 3.5
+
+      | also flag duration > mean(duration) + 3*stdev(duration)  // deterministic floor
+
+      | table user, host, duration, mz'
+  - technology: Zeek/pseudocode
+    query: '>-
+
+      conn.log: group by id.orig_h, service
+
+      | compute median+MAD of duration per service
+
+      | mz = 0.6745*(duration-med)/mad ; where abs(mz) > 3.5
+
+      | output uid, id.orig_h, id.resp_h, service, duration, mz'
+- question: Is there a spike in very short (sub-5-second) sessions or in failed logons (Windows Event
+    ID 4625) for any user or source host, suggesting automated password spraying or rapid scripted reconnaissance?
+  context: 'Monitor the per-user and per-source frequency (count per minute) of very short sessions (under
+    5 seconds) and of failed logons (Windows Event ID 4625), scoring each rate with a modified Z-score.
+    A burst of sub-second sessions or aborted/failed logons is a distinct failure-state signal that is
+    separate from the long-dwell anomaly: it typically indicates automated password spraying, credential
+    stuffing, or fast reconnaissance scripts that connect and disconnect rapidly. Alert on the failed-to-successful
+    logon ratio as well as the raw count, since the ratio normalizes for naturally busy accounts. In the
+    Detect tactic, a positive result is a minute-level rate of short sessions or failed logons that scores
+    well above the user''s or source''s baseline.'
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: 'Last 7 days (event-centered: pivot +/- 1 hour around a detected spike)'
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      short = sessions where duration < 5s ; fails = EventID 4625
+
+      | bin by 1 minute per user/source
+
+      | rate_short = count(short)/min ; rate_fail = count(fails)/min
+
+      | mz_short = modified_zscore(rate_short) ; mz_fail = modified_zscore(rate_fail)
+
+      | ratio = count(4625)/count(4624)
+
+      | where mz_short > 3.5 OR mz_fail > 3.5 OR ratio > baseline_ratio
+
+      | table user, source, rate_short, rate_fail, ratio'
+- question: Across a user's session-duration time series, is there a sustained upward shift in the mean
+    or variance of dwell time that indicates a persistent regime change rather than a single outlier?
+  context: Treat each user's session-duration series as a time series and apply sequential change-point
+    detection (CUSUM, PELT, or Bayesian online change-point detection) per Aminikhanghahi & Cook. Rather
+    than testing one session at a time, this looks for a persistent regime change, a sustained upward
+    shift in the mean or variance of dwell time that single-session percentile tests miss. Such a slow
+    drift captures attacker entrenchment, where sessions gradually get longer as an adversary establishes
+    persistence and routine access. In the Detect tactic, a positive result is a detected change point
+    after which the user's typical session duration is materially and durably higher than before, prompting
+    review of what changed at that point in time.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 180 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      per user: series = ordered session durations over time
+
+      | run change_point_detection(series, method=CUSUM|PELT|BOCPD)
+
+      | where detected change yields sustained increase in mean/variance
+
+      | report user, change_point_time, mean_before, mean_after'
+- question: Does an anomalous-duration or concurrent session coincide with first-seen or rare user-host
+    and host-host edges in the authentication graph, indicating sudden graph expansion?
+  context: Cross-reference an anomalous-duration or concurrent session against the user's authentication
+    graph and score the rarity of the user-host and host-host edges per Kent et al. Promote alerts where
+    a long or concurrent session coincides with first-seen or rare edges (a sudden expansion of the set
+    of hosts the user authenticates to), because that combination is far more suspicious than a long session
+    confined to the user's normal host set. Conversely, demote alerts where the activity stays within
+    the user's usual hosts, which cuts false positives. In the Detect tactic, a positive result is an
+    anomalous session that also traverses new or rarely-used authentication edges, signaling lateral movement
+    alongside the duration anomaly.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      build auth graph edges (user->host, host->host) from 4624 over 90d
+
+      | score edge_rarity = 1 / frequency(edge); first_seen = edge_count==1
+
+      | join to anomalous-duration / concurrent sessions
+
+      | where first_seen OR edge_rarity high
+
+      | promote alert; else demote
+
+      | table user, src_host, dst_host, edge_rarity, first_seen, session_duration'
+- question: Does the observed session duration for a user fall outside the prediction interval forecast
+    by a per-user time-series model (ARIMA or Prophet)?
+  context: Develop a per-user time-series forecasting model (ARIMA or Prophet) for session-duration patterns
+    and predict an expected range or prediction interval for the next session, as applied to security
+    telemetry by Cloud Intrusion Detection Using Time Series Forecasting. Alert when the observed duration
+    falls outside the interval, which detects both unusually short and unusually long sessions relative
+    to the user's learned temporal pattern, including weekly and seasonal cycles. Include the predicted
+    band and the residual (observed minus predicted) in the alert text so analysts can judge how far off
+    the session was. In the Detect tactic, a positive result is a session whose duration lands outside
+    its forecast interval, warranting investigation of why the user's pattern broke.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '>-
+
+      per user: fit ARIMA|Prophet on historical session duration series
+
+      | forecast next session -> (pred, lower, upper) interval
+
+      | observe actual duration
+
+      | where actual < lower OR actual > upper
+
+      | alert with pred_band=[lower,upper], residual=actual-pred'
+- question: When session feature vectors (duration, logon type, hour-of-day, distinct-host count, bytes
+    transferred, success/fail flag) are scored by an unsupervised Isolation Forest, which sessions are
+    flagged as anomalous, and what are the top contributing features?
+  context: Score multivariate session feature vectors (duration, logon type, hour-of-day, distinct-host
+    count, bytes transferred, success/fail flag) with an unsupervised Isolation Forest trained on a 90-day
+    baseline. Isolation Forest isolates anomalies efficiently in high-dimensional feature space and does
+    not need labeled attack data, which suits the Detect tactic where novel behavior must be surfaced.
+    Keep the deterministic rules in this playbook running in parallel as a floor so a model failure does
+    not blind the SOC. Surface the top-3 features contributing to the isolation/anomaly score in the alert
+    (for example duration, host-count, off-hours) so analysts can triage the reason rather than receiving
+    a bare score. A positive result is a session with a high anomaly score plus explanatory features.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '>-
+
+      features = [duration, logon_type, hour_of_day, distinct_host_count, bytes, success_fail]
+
+      | train IsolationForest on 90d baseline
+
+      | score current sessions; anomaly = score > threshold
+
+      | compute top3 contributing features per anomalous session
+
+      | where anomaly | table user, host, score, top3_features'
+- question: Do a user's logon/logoff event sequences or session durations deviate from a learned sequence
+    model (LSTM/DeepLog or attention-augmented RNN), and which fields drive the deviation?
+  context: Model per-user logon/logoff event sequences and numeric duration parameters with an LSTM as
+    in DeepLog, or an attention-augmented RNN as in Brown et al., trained on enterprise authentication
+    logs such as the LANL Unified Host and Network dataset. These models learn the normal ordering and
+    timing of authentication events for each user, so they can flag sessions whose event ordering or duration
+    deviates from the learned norm even when no single feature is individually extreme. Expose the attention-weighted
+    contributing fields (duration, source host, time) in the alert for explainability, and update the
+    model online to follow legitimate behavioral drift. In the Detect tactic, a positive result is a session
+    sequence the model assigns low likelihood, with the contributing fields identifying why.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '>-
+
+      sequence = ordered (event_type, duration, src_host, time) per user
+
+      | train LSTM(DeepLog) | attention-RNN on baseline auth logs
+
+      | predict next-event likelihood; anomaly if observed sequence/duration low-prob
+
+      | emit attention-weighted fields (duration, src_host, time)
+
+      | update model online for drift | alert user, session, likelihood, top_fields'
+- question: When each user is baselined against their peer group, do their session-duration and logon-time
+    deviations produce a high UEBA risk score, and what factors contribute?
+  context: Baseline each user against their peer group and score session-duration and logon-time deviations
+    with Microsoft Sentinel UEBA-style entity behavior analytics, mirroring the histogram/percentile risk
+    model of the Exabeam patent over roughly a 90-day training period. Peer-group comparison catches a
+    user who deviates not only from their own history but also from colleagues in the same role, which
+    helps when an individual baseline is thin or has been poisoned. Emit the contributing anomaly factors
+    with each score so the analyst understands the basis of the risk, and validate thresholds against
+    labeled scenarios in the CERT Insider Threat dataset. In the Detect tactic, a positive result is a
+    user whose session duration/timing risk score is elevated relative to their peer group, especially
+    relevant for insider-threat and compromised-account scenarios.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4625
+  - Windows Event ID 4672
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, Member Servers, User Workstations, and Network Egress/Ingress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '>-
+
+      assign each user to peer_group (role/dept)
+
+      | build per-entity histograms (session_duration, logon_hour) over ~90d
+
+      | score deviation vs self AND peer_group -> risk_score + factors
+
+      | where risk_score > threshold
+
+      | table user, peer_group, risk_score, contributing_factors'
