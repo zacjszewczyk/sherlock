@@ -1,0 +1,300 @@
+name: 'T1486.A003: RDS Data Encryption'
+id: 86197d82-1146-4535-8494-310bd15f30bd
+description: 'Investigate whether an adversary has caused impact in AWS by re-encrypting Amazon RDS DB
+  snapshots or DB cluster snapshots with unauthorized or attacker-controlled KMS keys, thereby denying
+  the organization a viable database-recovery path or setting up extortion. This playbook helps an analyst
+  hunt for the deterministic cloud-ransomware chain in which a principal creates or grants access to a
+  new KMS key, copies critical snapshots so they depend on that key, then deletes the original snapshots
+  and/or schedules deletion or disables the legitimate keys to make recovery permanently impossible. It
+  also covers the downstream impact phase: failed RestoreDBInstanceFromDBSnapshot/RestoreDBClusterFromSnapshot
+  attempts, KMSKeyNotAccessibleFault errors, shrinking approved-key recovery coverage, and abnormal restore
+  delays. Detection approaches span symbolic-logic CloudTrail rules keyed to an approved-recovery-key
+  allowlist, statistical baselining of per-principal snapshot-copy volume/frequency and API-sequence plausibility,
+  and machine-learning rare-function, sequence, and identity-graph models over RDS and KMS telemetry.'
+type: technique
+related:
+- tactic_id: TA0040
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any principal copy an RDS DB snapshot or DB cluster snapshot using a KMS key that is NOT
+    on the account's approved-recovery-key allowlist, especially for production or recovery-critical databases?
+  context: 'This is the core indicator of RDS Data Encryption for Impact. An adversary re-encrypts recovery
+    points by copying snapshots under a KMS key outside the organization''s approved restore path, so
+    the new copies depend on key material the org may not control. Maintain the approved-recovery-key
+    allowlist as first-party config (no external lookup). Alert on CloudTrail CopyDBSnapshot or CopyDBClusterSnapshot
+    (eventSource rds.amazonaws.com) whose requestParameters kmsKeyId references a key not in the allowlist.
+    A positive result for a production/recovery-critical snapshot is strong evidence of impact intent;
+    benign matches are usually planned migrations or new approved keys that should be added to the allowlist.
+    Also monitor rds:CopyDBSnapshot, rds:CopyDBClusterSnapshot and rds:DeleteDBSnapshot via Event history
+    and CloudWatch metric filters. Tie this to the Impact tactic: the goal is to deny availability of
+    regulated or customer-facing data by stranding its recovery points.'
+  answer_sources: &id001
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - Amazon RDS event subscriptions
+  - AWS Config configuration history
+  - 'NAI: RDS snapshot inventories for production databases, approved KMS keys for database recovery,
+    and control-plane histories for snapshot copy and key-use events in sensitive accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'eventSource=rds.amazonaws.com AND eventName IN (CopyDBSnapshot, CopyDBClusterSnapshot)
+
+      AND requestParameters.kmsKeyId NOT IN approved_recovery_key_allowlist
+
+      AND target_snapshot IN production_or_recovery_critical_inventory
+
+      => alert(high, principal=userIdentity.arn, key=requestParameters.kmsKeyId)'
+- question: Did a single principal perform the full cloud-ransomware chain of creating or granting a new
+    KMS key, copying snapshots to that key, and then deleting the originals and/or scheduling key deletion
+    or disabling keys?
+  context: This detects the deterministic re-encryption chain that makes RDS recovery impossible. Raise
+    high severity when one principal performs kms:CreateKey or kms:CreateGrant (new attacker-controlled
+    key) -> CopyDBSnapshot/CopyDBClusterSnapshot referencing that KmsKeyId -> rds:DeleteDBSnapshot of
+    the original AND/OR kms:ScheduleKeyDeletion/kms:DisableKey. The ScheduleKeyDeletion or DisableKey
+    step elevates to critical because it would make recovery permanently impossible. Correlate these events
+    by principal within a bounded window. A positive result is high-confidence impact activity; validate
+    the rule logic against ground-truth CloudTrail emitted by Stratus Red Team. This directly serves the
+    Impact tactic by destroying the organization's ability to restore its databases.
+  answer_sources: *id001
+  range: Last 90 days; correlate chain events within a 24-hour window per principal
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'group CloudTrail by userIdentity.arn over window=24h
+
+      WHERE has(kms:CreateKey OR kms:CreateGrant)
+
+      AND has(CopyDBSnapshot OR CopyDBClusterSnapshot using that KmsKeyId)
+
+      AND has(rds:DeleteDBSnapshot OR kms:ScheduleKeyDeletion OR kms:DisableKey)
+
+      => alert(high); IF ScheduleKeyDeletion OR DisableKey THEN severity=critical'
+- question: Did the same principal enumerate snapshots, modify KMS grants, then perform cross-region snapshot
+    copies before re-encrypting with an unapproved key?
+  context: 'Cross-region staging of recovery artifacts indicates deliberate takeover. Alert when one principal
+    calls DescribeDBSnapshots/DescribeDBClusterSnapshots (enumeration), changes KMS grants, then performs
+    cross-region snapshot copies before re-encrypting with an unapproved key. This workflow shows the
+    adversary scouting recovery points and relocating them under controlled keys/regions to evade local
+    restore. A positive result strengthens the impact hypothesis; legitimate DR replication should map
+    to approved keys and known automation roles. Tie to Impact: relocating and re-encrypting recovery
+    artifacts denies the organization a usable restore path.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'group CloudTrail by userIdentity.arn over window=6h
+
+      WHERE has(DescribeDBSnapshots OR DescribeDBClusterSnapshots)
+
+      AND has(kms:CreateGrant OR kms:RetireGrant)
+
+      AND has(CopyDBSnapshot/CopyDBClusterSnapshot with awsRegion != source region)
+
+      AND requestParameters.kmsKeyId NOT IN approved_recovery_key_allowlist
+
+      => alert(high)'
+- question: Was there a burst of AccessDenied or UnauthorizedOperation errors on rds:* and kms:* API calls
+    by a single principal in a short time window?
+  context: 'Permission-probing frequently precedes a successful re-encryption. Per Splunk AWS IAM AccessDenied
+    Discovery Events, treat a burst of CloudTrail errorCode=AccessDenied/Client.UnauthorizedOperation
+    on rds:* and kms:* by one principal within a short window (e.g., >=5 in 10 min; tune to your baseline)
+    as a failure-mode signal of an actor testing what they can do. A positive result is an early warning
+    that warrants checking whether the same principal later succeeded at CopyDBSnapshot or key operations.
+    Negative/low counts are normal noise. Tie to Impact: probing is reconnaissance for the destructive
+    re-encryption step.'
+  answer_sources: *id001
+  range: Last 90 days; evaluate in 10-minute sliding windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'filter eventSource IN (rds.amazonaws.com, kms.amazonaws.com)
+
+      AND errorCode IN (AccessDenied, Client.UnauthorizedOperation)
+
+      | bin window=10m | stats count by userIdentity.arn, window
+
+      | where count >= 5 => alert(medium, principal)'
+- question: Is a principal or role exhibiting first-ever use of snapshot-copy or KMS grant operations,
+    or snapshot-copy volume/frequency exceeding its historical baseline?
+  context: 'Baseline per-principal/per-role snapshot-copy frequency (copies/min), KMS key selection, regional
+    copy patterns, and actor behavior over a 30-90 day history. Flag first-ever use of CopyDBSnapshot/CopyDBClusterSnapshot
+    or kms:CreateGrant for a role (first-seen detection) and copy volume/frequency exceeding historical
+    confidence bands. Profile Volume (snapshots copied, bytes), Frequency (copies/min), and State (success
+    vs AccessDenied). A first-seen grant or copy by an identity that never performs backup administration
+    is a strong anomaly; established backup automation will sit inside its bands. Tie to Impact: novel
+    or high-volume copying of recovery artifacts signals takeover of the restore path.'
+  answer_sources: *id001
+  range: Last 90 days (train on 30-90 day history)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline per (userIdentity.arn) of {CopyDBSnapshot rate, kms:CreateGrant seen, regions, key
+      set} over 30-90d
+
+      | for new events: IF action first_seen_for_principal OR rate > mean+3*stddev
+
+      OR KmsKeyId not previously used => alert(anomaly, principal, top_features)'
+- question: Does a principal's ordered sequence of RDS/KMS API calls represent a low-probability transition
+    pattern (e.g., enumerate -> CreateGrant -> CopyDBSnapshot -> ScheduleKeyDeletion)?
+  context: 'Model the ordered API sequence per principal with a multi-order Markov chain and score sequences
+    such as enumerate -> CreateGrant -> CopyDBSnapshot -> ScheduleKeyDeletion as low-probability transitions
+    for that identity, rather than relying on counts alone. This catches the destructive chain even when
+    individual call volumes look normal. A low transition probability for a given identity is the alerting
+    signal; routine automation follows high-probability paths. Tie to Impact: the re-encryption-then-delete
+    ordering is the hallmark of denying database recovery.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'build per-principal multi-order Markov model of CloudTrail eventName transitions
+
+      | score new sequence S; P(S | principal_model)
+
+      | where P(S) < threshold AND S contains {CreateGrant, CopySnapshot, ScheduleKeyDeletion}
+
+      => alert(high, principal, sequence)'
+- question: Do unsupervised rare-function and sequence/parameter models over combined RDS+KMS CloudTrail
+    flag out-of-distribution event order or anomalous parameters such as an unexpected KmsKeyId?
+  context: 'Run unsupervised rare-function/population analysis over RDS+KMS CloudTrail and sequence/parameter
+    modeling (DeepLog-style, which flags out-of-distribution event order and anomalous parameter values
+    such as an unexpected KmsKeyId) in parallel with the deterministic rules. Score higher for coordinated
+    access to many recovery artifacts with actor behavior inconsistent with backup administration. Alerts
+    MUST surface the top-3 contributing features (principal/role, KmsKeyId, region/source-IP or action-sequence)
+    for analyst explainability. A high anomaly score with an unexpected key against many snapshots is
+    strong impact evidence. Tie to Impact: ML complements rules to catch novel re-encryption campaigns
+    against recoverability.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model A = rare_function_population(RDS+KMS CloudTrail by principal)
+
+      model B = DeepLog(event_sequence + parameters incl KmsKeyId)
+
+      score = combine(A,B); IF score > threshold => alert with top3_features(principal/role, KmsKeyId,
+      region/source-IP|action-sequence)'
+- question: Does an identity-graph model of principal->role->snapshot->KMS-key->action reveal anomalous
+    access chains, such as a benign identity suddenly issuing snapshot-copy, grant, and key-deletion edges
+    against production recovery artifacts?
+  context: 'Model principal->role->snapshot->KMS-key->action as a heterogeneous dynamic graph and score
+    anomalous chains with a GNN-based approach. This is especially useful for catching a normally benign
+    identity that suddenly issues snapshot-copy/grant/key-deletion edges against production recovery artifacts.
+    A high graph-anomaly score for an identity touching recovery-critical snapshots and KMS keys it never
+    interacts with is a strong indicator. Tie to Impact: the graph captures the relationship between an
+    identity and the recovery artifacts it is acting to deny.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'build heterogeneous dynamic graph: principal->role->snapshot->KMSkey->action from CloudTrail
+
+      | GNN anomaly_score(edges per identity per time)
+
+      | where score high AND edges include {CopySnapshot, CreateGrant, ScheduleKeyDeletion}
+
+      on production recovery artifacts => alert(principal, chain)'
+- question: Do recent snapshot copies using unapproved KMS keys correlate with failed RDS restore attempts
+    (e.g., KMSKeyNotAccessibleFault) or abnormal recovery delays?
+  context: 'This links the re-encryption to actual recovery denial. Correlate recent CopyDBSnapshot/CopyDBClusterSnapshot
+    using unapproved KMS keys with failed RestoreDBInstanceFromDBSnapshot/RestoreDBClusterFromSnapshot
+    attempts (CloudTrail errorCode set, e.g., KMSKeyNotAccessibleFault), abnormal recovery delays, or
+    discovery that approved snapshots were superseded by inaccessible copies. A positive correlation confirms
+    that the re-encryption actually impaired recovery, escalating the incident. Tie to Impact: confirmed
+    restore failure is realized denial of availability for regulated or customer-facing data.'
+  answer_sources: &id002
+  - AWS CloudTrail management events
+  - Amazon RDS event subscriptions
+  - Amazon CloudWatch metrics
+  - AWS KMS key usage logs
+  - 'NAI: Database recovery workflows, restore testing pipelines, and monitoring for restore failures
+    or delayed recovery tied to recently copied snapshots'
+  range: Last 90 days; correlate restore failures within days of suspicious copies
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'join recent (CopyDBSnapshot/CopyDBClusterSnapshot with kmsKeyId NOT IN allowlist)
+
+      with (RestoreDBInstanceFromDBSnapshot/RestoreDBClusterFromSnapshot WHERE errorCode set
+
+      e.g. KMSKeyNotAccessibleFault) by database/resource
+
+      => alert(high, database, KmsKeyId, errorCode)'
+- question: Did the latest available recovery points for a critical database shift from approved-KMS coverage
+    to unauthorized-key coverage, with automated restore validation then failing or being skipped?
+  context: 'Track approved-key coverage from first-party AWS Config snapshot inventory (no external lookup).
+    Alert when the latest available recovery points for a critical database shift from approved-KMS coverage
+    to unauthorized-key coverage and subsequent automated restore validation fails or is skipped for that
+    asset. This detects silent stranding of recovery points even without an explicit restore error. A
+    positive result means the organization''s newest restore points are no longer trustworthy. Tie to
+    Impact: loss of approved-key coverage is the mechanism by which recovery is denied.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from AWS Config snapshot inventory per critical_db:
+
+      IF latest_recovery_point.kmsKeyId NOT IN approved_recovery_key_allowlist
+
+      AND (restore_validation == failed OR restore_validation == skipped)
+
+      => alert(high, database)'
+- question: Is there a spike in restore-time KMS AccessDenied / KMSKeyNotAccessibleFault errors for critical
+    databases referencing recently-changed keys?
+  context: 'Profile restore-time KMS AccessDenied / KMSKeyNotAccessibleFault errors as a distinct signal.
+    A spike of failed restores referencing recently-changed keys for critical DBs is high-fidelity evidence
+    of recovery denial. This failure-mode detector watches the restore path itself rather than the copy.
+    A positive result (clustered restore failures tied to new keys) strongly supports an active impact
+    incident. Tie to Impact: the inability to restore is the adversary''s intended denial of availability.'
+  answer_sources: *id002
+  range: Last 90 days; evaluate clustering over hours
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'filter eventName IN (RestoreDBInstanceFromDBSnapshot, RestoreDBClusterFromSnapshot)
+
+      AND errorCode IN (AccessDenied, KMSKeyNotAccessibleFault)
+
+      | stats count by database, kmsKeyId, bin(1h)
+
+      | where count spikes AND kmsKeyId recently_changed => alert(high)'
+- question: Has the number of approved-key recovery points or the restore success rate for a critical
+    database dropped suddenly below its baseline?
+  context: 'Measure expected restorable snapshots per critical database, approved-key coverage, restore
+    success rate, and restore completion time; alert on sudden reductions in approved recovery points
+    or elevated restore-failure rates beyond each database''s baseline. Use band-based anomaly detection
+    over CloudTrail/CloudWatch metrics; profile Volume (count of approved-key snapshots), Frequency (restore
+    attempts/hr), and State (restore success/fail). A sudden drop in approved-key coverage or success
+    rate is a high-value early indicator of recovery degradation. Tie to Impact: shrinking recoverability
+    is the measurable outcome of the re-encryption attack.'
+  answer_sources: *id002
+  range: Last 90 days (baseline per database)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per critical_db track {approved_key_snapshot_count, restore_success_rate, restore_time}
+
+      | compute baseline bands over history
+
+      | where approved_key_snapshot_count drops below band OR restore_failure_rate above band
+
+      => alert(database, metric)'
+- question: Do multi-source and sequence ML models across snapshot, KMS, and restore telemetry indicate
+    a coordinated impact campaign targeting recoverability across multiple critical databases?
+  context: 'Use multi-source anomaly detection across snapshot, KMS, and restore telemetry plus sequence
+    modeling (DeepLog-style) to identify impact campaigns targeting recoverability. Score higher for coordinated
+    re-encryption, shrinking recovery coverage, and restore friction across multiple critical databases.
+    Surface top-3 contributing features (affected database, KmsKeyId, restore error code) in alert text
+    for explainability. A high campaign-level score spanning several critical databases is strong evidence
+    of organized impact activity. Tie to Impact: coordinated denial of recovery across many databases
+    is the worst-case extortion/destruction scenario this playbook defends against.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = multi_source_anomaly(snapshot + KMS + restore telemetry) + DeepLog(sequence)
+
+      | campaign_score boosted by {coordinated re-encryption, shrinking coverage, restore friction across
+      DBs}
+
+      | IF score > threshold => alert with top3_features(database, KmsKeyId, restore_error_code)'
