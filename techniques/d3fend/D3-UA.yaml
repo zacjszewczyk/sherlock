@@ -1,0 +1,317 @@
+name: 'D3-UA: URL Analysis'
+id: b06572b4-c217-464d-9fff-f3450f37cf4d
+description: Investigate whether URLs observed across the enterprise -- in HTTP requests, DNS queries,
+  email links, and process command lines -- are benign or malicious by analyzing the URL and its components.
+  This playbook helps an analyst hunt for URLs that match known-bad threat intelligence, lookalike/typosquatted
+  or homoglyph/IDN-confusable domains, high lexical entropy or DGA-like structure, anomalous structural
+  features, abnormal request volume/frequency or beaconing, elevated failure rates (NXDOMAIN, HTTP 4xx/5xx,
+  proxy-blocked), and mismatches between a declared resource and the content actually returned (e.g.,
+  a .pdf URL serving an executable). It layers deterministic blacklist/lexical rules beneath statistical
+  baselining and machine-learning scoring (lexical/host classifiers, character/word CNNs, and returned-content
+  drive-by classification) so analysts can detect both established-domain abuse and brand-new malicious
+  URLs, and assess current detection coverage and gaps for malicious URLs in network traffic.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Do any observed URLs or domains exactly match known-malicious indicators from current threat-intelligence
+    feeds?
+  context: 'This is the deterministic blacklist floor that sits beneath all statistical and ML scoring:
+    it is fast, high-confidence, and catches already-known threats. Correlate the host/uri fields from
+    Zeek http.log and the query field from Zeek dns.log against a real-time threat-intelligence feed of
+    known malicious domains/URLs, matching both the exact URL and the registered (effective second-level)
+    domain. In support of the Detect mission (assessing capability to spot malicious URLs in traffic),
+    any exact match is a high-priority alert and a strong pivot point. A positive result indicates a host
+    contacted a known-bad destination -- triage for compromise; a negative result does NOT mean clean,
+    only that the destination is not yet known-bad, so always run the entropy/lexical/ML layers in parallel.'
+  answer_sources: &id001
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek files.log
+  - Proxy/Web Gateway logs
+  - Windows Event ID 4688
+  - 'NAI: Internet Egress Points, Internal DNS Resolvers, Web Proxies, Email Gateways, Endpoint Devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=zeek (sourcetype=zeek_http OR sourcetype=zeek_dns)
+
+      | eval domain=coalesce(host, query)
+
+      | eval reg_domain=registered_domain(domain)
+
+      | lookup threat_intel_feed indicator AS domain OUTPUT verdict, source
+
+      | lookup threat_intel_feed indicator AS reg_domain OUTPUT verdict AS verdict2, source AS source2
+
+      | where verdict="malicious" OR verdict2="malicious"
+
+      | table _time, id.orig_h, domain, uri, reg_domain, source, source2'
+  - technology: Zeek/pseudocode
+    query: '# Intel framework exact + registered-domain match
+
+      redef Intel::read_files += { "/opt/zeek/intel/malicious_urls.dat" };
+
+      # Seen::Indicator on http.log host+uri and dns.log query -> Intel::match -> notice'
+- question: Are any hosts downloading risky file types from non-update sources, or fetching URLs whose
+    declared extension/Content-Type disagrees with the actual returned MIME type?
+  context: Attackers deliver payloads either by serving dangerous file types from unexpected hosts or
+    by disguising an executable behind an innocuous extension/Content-Type. Inspect Zeek http.log/files.log
+    for GET requests whose path ends in risky extensions (.exe,.scr,.ps1,.vbs,.hta,.jar,.iso) where the
+    Host is NOT a known software-update provider, and flag any case where the URL/declared extension or
+    HTTP Content-Type disagrees with the actual MIME of the returned file (e.g., a .pdf URL returning
+    an MZ/PE executable). The 'returns Y though it claims X' mismatch is a strong inline drive-by/malware-delivery
+    signal supporting the Detect mission. A positive result is a likely malicious download to investigate
+    on the endpoint; a clean match to a known update CDN lowers priority.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: '# Join http.log (declared) to files.log (actual MIME via content sniffing)
+
+      risky = /\.(exe|scr|ps1|vbs|hta|jar|iso)$/
+
+      alert if (uri matches risky AND host NOT in update_provider_allowlist)
+
+      alert if (declared_ext/Content-Type != files.log mime_type)  # e.g. .pdf -> application/x-dosexec
+      / MZ magic'
+  - technology: SIEM/Rule pseudocode
+    query: "index=zeek sourcetype=zeek_files\n| eval declared=mvindex(split(uri,\".\"),-1)\n| where (declared\
+      \ IN (\"exe\",\"scr\",\"ps1\",\"vbs\",\"hta\",\"jar\",\"iso\") AND NOT host IN update_allowlist)\n\
+      \   OR (declared=\"pdf\" AND mime_type=\"application/x-dosexec\")\n| table _time, id.orig_h, host,\
+      \ uri, declared, mime_type"
+- question: Are internal hosts resolving or requesting domains that are within a small edit distance of
+    our internal brands or critical external services (typosquats)?
+  context: Typosquatting and combosquatting domains impersonate trusted brands to harvest credentials
+    or deliver malware. Compare observed registered domains in Zeek dns.log/http.log against a curated
+    list of internal brands and critical external services using Damerau-Levenshtein distance, alerting
+    on domains within edit distance 1-2 (omission, insertion, substitution, transposition, and TLD-swap
+    variants) that are similar but not identical (e.g., 'g0ogle.com', 'micros0ft-login.com'). Surface
+    the matched legitimate brand in the alert so the analyst immediately sees what is being impersonated.
+    Supports the Detect mission by catching lookalike infrastructure before users are phished. A near-match
+    is suspicious; an exact match to a legitimate brand is benign.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)
+
+      | eval domain=registered_domain(coalesce(query,host))
+
+      | lookup brand_list  # protected brands/services
+
+      | eval dist=damerau_levenshtein(domain, brand)
+
+      | where dist>=1 AND dist<=2 AND domain!=brand
+
+      | table _time, id.orig_h, domain, brand, dist'
+- question: Are any observed domains using mixed Unicode scripts, punycode (xn--) prefixes, or confusable
+    characters that visually mimic a protected brand?
+  context: Homoglyph/IDN-confusable attacks use visually identical characters from different Unicode scripts
+    (e.g., Cyrillic 'a') or punycode encodings to spoof a legitimate domain in a way edit distance alone
+    misses. Flag domains containing mixed Unicode scripts, 'xn--' punycode prefixes, or confusable characters
+    that resolve to / impersonate a protected brand. For robust visual matching beyond edit distance,
+    embed rendered domain strings with a Siamese CNN and alert when an observed name is visually near
+    a legitimate one; name the nearest legitimate domain in the alert ('looks like <legit>'). Supports
+    the Detect mission against sophisticated phishing infrastructure. Positive = visual spoof to investigate;
+    negative = no confusable match.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)
+
+      | eval domain=coalesce(query,host)
+
+      | where match(domain,"xn--") OR mixed_unicode_scripts(domain)
+
+      | eval looks_like=nearest_brand_by_confusable(domain, brand_list)
+
+      | where isnotnull(looks_like)
+
+      | table _time, id.orig_h, domain, looks_like'
+  - technology: ML/pseudocode
+    query: '# Siamese CNN visual similarity
+
+      render(domain) -> embedding; render(brand) -> embedding
+
+      if cosine_distance(emb_domain, emb_brand) < tau: alert(domain, looks_like=brand)'
+- question: Which hostnames or URI tokens exhibit abnormally high lexical entropy or DGA-like structure
+    relative to the environment baseline?
+  context: 'Domain-generation algorithms and randomized URL paths produce names with high randomness that
+    deterministic blacklists miss. For hostnames and URI tokens in Zeek http.log/dns.log compute Shannon
+    entropy, length, digit ratio, and consonant-run length; prefer Kullback-Leibler divergence against
+    an English character distribution to reduce false positives on legitimately short names. Baseline
+    per-environment and alert above the 99th percentile (typical starting thresholds: hostname Shannon
+    entropy > 3.5-4.0 bits/char or high KL divergence, length > 50). Entropy/lexical features are primary
+    DGA discriminators. Supports the Detect mission by surfacing algorithmically generated C2 domains.
+    High entropy on a rare domain is suspicious; established high-entropy CDNs should be allowlisted to
+    control false positives.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)\n| eval domain=coalesce(query,host)\n\
+      | eval entropy=shannon_entropy(domain), kl=kl_divergence(domain, english_dist),\n       len=len(domain),\
+      \ digit_ratio=digit_ratio(domain), consonant_run=max_consonant_run(domain)\n| eventstats p99(entropy)\
+      \ AS e99\n| where (entropy>e99 OR entropy>3.8 OR len>50) AND NOT domain IN cdn_allowlist\n| table\
+      \ _time, id.orig_h, domain, entropy, kl, len, digit_ratio"
+- question: Which domains score as machine-generated when evaluated by character-transition (Markov) probability
+    against a known-good language/domain model?
+  context: A Markov model captures the likelihood of each character given the preceding two characters,
+    learned from a dictionary or list of legitimate domains; genuinely random/DGA names produce very low
+    joint probabilities. Score each domain by the product of its per-character transition probabilities
+    and alert when the domain likelihood falls below a tuned threshold, indicating a machine-generated
+    name (e.g., for 'google.com', P(g| start) x P(o|g) x P(o|go)...). This complements raw entropy by
+    modeling real language structure rather than just randomness. Supports the Detect mission by catching
+    DGA domains that are not in any blacklist. A below-threshold score is suspicious; common dictionary-like
+    domains score high and pass.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)
+
+      | eval domain=registered_domain(coalesce(query,host))
+
+      | eval markov_score=markov_logprob(domain, good_domain_bigram_model)
+
+      | where markov_score < threshold  # tuned per environment
+
+      | sort markov_score
+
+      | table _time, id.orig_h, domain, markov_score'
+- question: Which destinations are rare, newly seen, short-TTL, or fast-fluxing based on first-party passive
+    DNS from internal resolvers?
+  context: Malicious infrastructure tends to be rare across the enterprise, newly observed, short-lived
+    (low TTL), and resolving to many shifting IPs/ASNs (fast flux). From internal DNS resolver logs derive
+    per-domain prevalence (distinct internal clients), first-seen age, query regularity, average TTL,
+    number of TTL changes, and distinct resolved IPs/ASNs, then risk-score rare, newly-registered, short-TTL,
+    fast-fluxing destinations following the EXPOSURE 15-feature scheme. This requires no external API
+    lookup -- it is all first-party telemetry. Supports the Detect mission and closes coverage gaps for
+    low-reputation infrastructure. A domain that is rare + new + short-TTL + multi-ASN is high risk; ubiquitous,
+    long-lived, stable domains are low risk.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "index=zeek sourcetype=zeek_dns\n| stats dc(id.orig_h) AS prevalence, min(_time) AS first_seen,\
+      \ avg(TTL) AS avg_ttl,\n        dc(answers) AS distinct_ips, dc(asn) AS distinct_asn, count AS queries\
+      \ BY query\n| eval age_days=(now()-first_seen)/86400\n| where prevalence<5 AND age_days<7 AND avg_ttl<300\
+      \ AND distinct_asn>2\n| sort -distinct_asn\n| table query, prevalence, age_days, avg_ttl, distinct_ips,\
+      \ distinct_asn"
+- question: Which source hosts or domains show abnormal request volume, beacon-like regular timing, or
+    elevated failure rates (NXDOMAIN, HTTP 4xx/5xx, proxy-blocked)?
+  context: 'C2 channels and DGA activity manifest as regular beaconing, high request volume to rare domains,
+    and elevated failure rates as malware cycles through generated or dead infrastructure. Per source
+    host and per registered domain, baseline request VOLUME (bytes/requests), FREQUENCY (requests/min,
+    beacon-like regular inter-arrival), and STATE (success vs failure); treat elevated failure rates --
+    spikes in DNS NXDOMAIN, HTTP 4xx/5xx, or proxy-blocked counts to rare domains -- as a distinct C2/DGA
+    signal. Stateless per-query lexical+rate scoring with an Isolation Forest catches even low-throughput
+    abuse. Starting trigger: NXDOMAIN rate > 50/host/hour or > 30% of a host''s resolutions failing. Supports
+    the Detect mission against beaconing and tunneling. Sustained failures or rigid periodicity to rare
+    domains is suspicious.'
+  answer_sources: *id001
+  range: Last 90 days; for beacon detection compute inter-arrival regularity over rolling 24h windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)
+
+      | eval failed=if(rcode_name="NXDOMAIN" OR status_code>=400 OR proxy_action="blocked",1,0)
+
+      | bin _time span=1h
+
+      | stats count AS reqs, sum(failed) AS fails, dc(query) AS distinct_dom BY id.orig_h, _time
+
+      | eval fail_rate=fails/reqs
+
+      | where fails>50 OR fail_rate>0.30
+
+      | table _time, id.orig_h, reqs, fails, fail_rate, distinct_dom'
+  - technology: ML/pseudocode
+    query: '# Isolation Forest on per-query features
+
+      features = [qlen, entropy, subdomain_count, req_rate, interarrival_std, fail_rate]
+
+      model = IsolationForest().fit(baseline)
+
+      if model.decision_function(x) < cut: alert(host, domain, anomaly_score)'
+- question: When scored by a supervised classifier on lexical and host-based features, which URLs are
+    predicted malicious, and what features drove that verdict?
+  context: Many malicious URLs evade blacklists but share learnable structural traits. Train a supervised
+    classifier (Random Forest / gradient boosting) on canonical lexical features (URL length, token/dot
+    counts, special-character ratio, IP-as-host, hostname entropy, suspicious tokens, bag-of-words) and
+    host-based features (domain age, ASN, geo), then output a probability score AND the top-3 contributing
+    features (e.g., 'IP-as-host, entropy=4.2, length=87') in the alert for explainable triage. Run this
+    in PARALLEL with the deterministic rules above -- it augments, never replaces, them. Supports the
+    Detect mission by generalizing to novel malicious URLs. A high probability with strong features warrants
+    investigation; surfaced features let analysts validate quickly and tune the model.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "X = lexical_features(url) + host_features(url)  # len, tokens, dots, special_ratio, ip_as_host,\n\
+      \                                               #   entropy, suspicious_tokens, bow, domain_age,\
+      \ asn, geo\np, contribs = rf_model.predict_proba(X), top3_shap(X)\nif p > 0.8: alert(url, prob=p,\
+      \ top_features=contribs)"
+  - technology: SIEM/Rule pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | eval url=host.uri
+
+      | apply url_malice_classifier
+
+      | where predicted_prob>0.8
+
+      | table _time, id.orig_h, url, predicted_prob, top_features'
+- question: Do any raw URL strings score malicious under a character/word-level CNN, and which substrings
+    drive that verdict?
+  context: Where blacklists and shallow features miss novel URLs, a character- and word-level CNN (URLNet)
+    learns sequential and semantic patterns directly from the raw URL string and generalizes to unseen
+    tokens (AUC > 0.99). Score raw URL strings with such a model and use per-character saliency to surface
+    the substrings driving a malicious verdict, so analysts see WHY a URL was flagged rather than just
+    a score. Supports the Detect mission by catching obfuscated/novel malicious URLs that defeat rule-
+    and feature-based layers. A high CNN score with a salient malicious substring (e.g., a credential-phish
+    path) is high priority; saliency that highlights benign brand tokens helps rule out false positives.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '# URLNet character+word CNN
+
+      score = urlnet.predict(raw_url)
+
+      saliency = urlnet.char_saliency(raw_url)
+
+      if score > threshold: alert(raw_url, score, highlighted_substrings=saliency_topk)'
+- question: For high-risk fetches, does the content actually returned by the URL classify as a drive-by/malicious
+    payload even when the URL itself looked clean?
+  context: 'Compromised but otherwise reputable sites can serve malicious payloads, so the URL string
+    alone is insufficient. For high-risk fetches, classify the content RETURNED by the URL using static
+    q-gram lexical features of HTML/JS plus lightweight dynamic features with an SVM (Cujo: ~94% drive-by
+    detection at ~500ms/page) to catch malicious payloads served from unflagged URLs. This is a follow-on
+    analytic triggered by upstream suspicion (risky extension, high entropy, classifier score). Supports
+    the Detect mission by closing the gap where benign-looking URLs deliver exploit kits. A malicious-content
+    verdict on a fetched page is a strong compromise indicator; benign script content lowers priority.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: '# Cujo-style returned-content classifier
+
+      html_js = fetch_or_replay(url)  # triggered on high-risk fetches
+
+      feat = qgram_static(html_js) + dynamic_lightweight(html_js)
+
+      if svm.predict(feat)=="malicious": alert(url, content_verdict="drive-by")'
+  - technology: Zeek/pseudocode
+    query: "# Use files.log extracted HTML/JS as input to content classifier\nfor f in files.log where\
+      \ mime in (text/html, application/javascript) and source_url in high_risk_set:\n    classify_content(f)\
+      \ -> notice if malicious"
