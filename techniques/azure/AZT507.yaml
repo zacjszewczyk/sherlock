@@ -1,0 +1,468 @@
+name: 'AZT507: External Entity Access'
+id: ccf8d31b-46dc-48fd-8528-ff7e0c16e21f
+description: 'Investigate whether an adversary has established durable persistence in Azure/Entra ID by
+  granting an external tenant, partner, subscription owner, or identity provider a management path back
+  into the environment. This playbook helps an analyst hunt for: Azure Lighthouse / managed-services delegation
+  onboarding that lets an external tenant keep administering resources even after the original foothold
+  or credentials are remediated; partner-style delegated administration (GDAP) newly exercised by accounts
+  from domains not normally associated with the tenant; subscription tenant-association or billing-ownership
+  transfers that move a subscription and its resources outside the tenant''s control boundary; and newly
+  introduced federation, domain trusts, or pass-through authentication paths that allow externally controlled
+  identities to keep authenticating. For each vector it provides symbolic-logic rules, statistical baselining,
+  failure-state probing detection, and machine-learning/graph approaches across AzureActivity, AzureResourceGraph,
+  Azure Policy, SigninLogs, AuditLogs, and AzureADConnectHealth.'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has an Azure Lighthouse / managed-services delegation been onboarded (registrationDefinitions
+    or registrationAssignments written) that grants an external provider tenant a durable administrative
+    path, and are subsequent admin operations being performed by operators whose home tenant differs from
+    the victim tenant?
+  context: An external tenant onboarded through Azure Lighthouse can continue administering the environment
+    even after the original foothold is removed or tenant credentials are rotated, making it a powerful
+    Persistence mechanism. Alert on Microsoft.ManagedServices/registrationDefinitions/Write and Microsoft.ManagedServices/registrationAssignments/Write
+    in AzureActivity, enumerate the live delegations with AzureResourceGraph, and correlate later administrative
+    operations whose operator home tenant differs from the victim tenant. Escalate to high when the provider
+    tenant ID is NOT on the approved service-provider allowlist, the delegated scope is subscription-wide,
+    the assigned role is Owner/Contributor/User Access Administrator, or the delegation appeared less
+    than 24 hours before privileged actions. A positive result is an unsanctioned external tenant holding
+    standing admin rights.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - SigninLogs
+  - 'NAI: Managed services definitions and assignments, subscriptions onboarded to third-party management,
+    and sign-ins from principals in external tenants operating through delegated resource management'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "AzureActivity\n| where OperationNameValue in~ (\"Microsoft.ManagedServices/registrationDefinitions/write\"\
+      , \"Microsoft.ManagedServices/registrationAssignments/write\")\n| join kind=leftouter (ResourceGraph_Delegations)\
+      \ on subscriptionId\n| where providerTenantId !in (ApprovedServiceProviderAllowlist)\n    or delegatedScope\
+      \ == \"subscription\"\n    or assignedRole in (\"Owner\",\"Contributor\",\"User Access Administrator\"\
+      )\n| extend high = (delegationAge < 24h and followOnPrivilegedAction)\n| project TimeGenerated,\
+      \ Caller, providerTenantId, delegatedScope, assignedRole, high"
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity
+
+      | where Caller_homeTenantId != victimTenantId
+
+      | where OperationNameValue startswith "Microsoft.Authorization" or isAdministrativeOperation
+
+      | summarize ops=count() by Caller, Caller_homeTenantId, bin(TimeGenerated, 1h)'
+- question: Are the tenant's delegation metrics (delegation count, distinct delegated scopes, distinct
+    provider tenant IDs, and follow-on delegated admin actions per hour) statistically anomalous versus
+    their 60-90 day baseline, or has a first-seen provider tenant ID appeared?
+  context: Statistical baselining catches stealthy delegation persistence that does not trip a static
+    rule. Baseline per-tenant delegation count, distinct delegated scopes, distinct provider tenant IDs,
+    and follow-on delegated admin actions/hour, then flag any value beyond the robust modified Z-score
+    cutoff 0.6745*(x-median)/MAD > 3.5. Treat a first-seen provider tenant ID as a primary signal and
+    use CUSUM/PELT change-point detection to catch step increases in delegated-operation rate. Derive
+    thresholds per tenant from 60-90 days of AzureActivity. A positive result is a sudden expansion in
+    external delegation footprint that signals attacker-installed persistence.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - SigninLogs
+  - 'NAI: Managed services definitions and assignments, subscriptions onboarded to third-party management,
+    and sign-ins from principals in external tenants operating through delegated resource management'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'AzureActivity
+
+      | where OperationNameValue startswith "Microsoft.ManagedServices"
+
+      | summarize delegations=count(), scopes=dcount(delegatedScope), providers=dcount(providerTenantId),
+      adminOps=count() by tenantId, bin(TimeGenerated, 1h)
+
+      | extend mz = 0.6745*(value - median)/MAD
+
+      | where abs(mz) > 3.5 or providerTenantId !in (KnownProviderTenants)'
+  - technology: SIEM/Stats pseudocode
+    query: '// CUSUM/PELT change-point detection on delegated-operation rate per tenant
+
+      series = AzureActivity | make-series ops=count() default=0 on TimeGenerated step 1h by tenantId
+
+      | extend changePoints = series_pelt(ops)
+
+      | where array_length(changePoints) > 0'
+- question: Did a burst of denied/failed ManagedServices or Microsoft.Authorization operations precede
+    a successful registrationAssignment write, indicating an actor probing permissions before installing
+    a delegation?
+  context: 'Adversaries often probe what they can do before committing the action that establishes persistence.
+    Profile the failure state explicitly: count AzureActivity entries with non-success status/errorCode
+    (e.g., authorization failures) on Microsoft.ManagedServices and Microsoft.Authorization operations
+    per principal in a rolling 1h window, and alert when >=5 denied attempts precede a successful registrationAssignment
+    write. The failed-then-success pattern is a strong indicator of permission reconnaissance immediately
+    ahead of an external-delegation persistence action.'
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - SigninLogs
+  - 'NAI: Managed services definitions and assignments, subscriptions onboarded to third-party management,
+    and sign-ins from principals in external tenants operating through delegated resource management'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity
+
+      | where OperationNameValue startswith "Microsoft.ManagedServices" or OperationNameValue startswith
+      "Microsoft.Authorization"
+
+      | extend failed = ActivityStatusValue !in~ ("Success","Succeeded")
+
+      | summarize denied=countif(failed), success=countif(OperationNameValue has "registrationAssignments/write"
+      and not failed) by Caller, bin(TimeGenerated, 1h)
+
+      | where denied >= 5 and success > 0'
+- question: Do graph/sequence models flag an improbable external-operator -> delegated-scope -> action
+    path (high provider novelty, broad scope, anomalous source geography, unusual downstream admin sequences)
+    consistent with cross-tenant persistence?
+  context: Machine learning surfaces multi-step cross-tenant persistence that evades single-event rules.
+    Model IAM/audit activity as a heterogeneous dynamic graph and score improbable external-operator ->
+    delegated-scope -> action edges using delegation age, provider novelty, scope breadth, source geography,
+    and downstream admin sequences; complement with an LSTM sequence anomaly model on the audit workflow.
+    Alerts MUST surface the top-3 contributing features (e.g., provider-tenant novelty, scope breadth,
+    post-delegation action burst), not just a score, so an analyst can triage whether a legitimate provider
+    or an attacker established the delegated path.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - SigninLogs
+  - 'NAI: Managed services definitions and assignments, subscriptions onboarded to third-party management,
+    and sign-ins from principals in external tenants operating through delegated resource management'
+  range: Last 90 days; pivot to a tight window around the delegation creation event
+  queries:
+  - technology: ML/Graph pseudocode
+    query: 'build_heterogeneous_graph(nodes=[operator,tenant,scope,action], edges=AzureActivity+SigninLogs)
+
+      score = gnn_edge_anomaly(features=[delegation_age, provider_novelty, scope_breadth, src_geo, downstream_admin_seq])
+
+      lstm = deeplog_sequence_anomaly(audit_workflow)
+
+      alert if score > threshold or lstm.anomalous, emit top_3_features'
+- question: Has a partner relationship been created, or a directory role (e.g., Global Administrator,
+    Privileged Role Administrator) assigned, originating from a partner/external tenant, and are privileged
+    sign-ins occurring from domains not owned or approved by the tenant?
+  context: Partner-style delegated administration (GDAP) gives an external identity continuing administrative
+    reach, a durable Persistence foothold. In AuditLogs/SigninLogs, alert on partner-relationship creation
+    and directory-role assignment originating from a partner/external tenant, and on privileged sign-ins
+    from domains not owned or approved by the tenant. Raise severity when a delegated-admin identity immediately
+    changes users, applications, subscriptions, federation, or security settings. A positive result is
+    an external partner identity wielding privileged control that the tenant did not intend to grant.
+  answer_sources:
+  - SigninLogs
+  - AuditLogs
+  - 'NAI: Partner and delegated admin relationships, sign-ins from external domains, and privileged actions
+    taken by accounts whose home domain is not owned or approved by the tenant'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AuditLogs
+
+      | where ActivityDisplayName has_any ("Add partner","Create partner relationship","Add member to
+      role")
+
+      | where TargetRole in ("Global Administrator","Privileged Role Administrator") or InitiatedBy_homeTenant
+      != victimTenant
+
+      | join kind=inner (SigninLogs | where UserPrincipalName_domain !in (OwnedOrApprovedDomains) and
+      isPrivileged) on UserId
+
+      | extend high = followedBy(changeUsers or changeApps or changeSubscriptions or changeFederation
+      or changeSecurity)'
+- question: Are external-domain administrator sign-ins, partner tenant domains, sign-in hours/geographies,
+    or privileged-action volume anomalous, including a first-seen partner domain or a session whose action
+    count exceeds the 95th percentile / modified Z-score |z|>3.5 for a known partner?
+  context: Statistical baselining detects abuse of legitimate or newly added partner relationships. Baseline
+    external-domain administrator sign-ins, partner tenant domains, sign-in hours/geographies, and privileged-action
+    volume; flag first-seen partner domains and any privileged session whose action count exceeds the
+    trailing 95th percentile or the modified Z-score |z|>3.5 for known partners. Peer-group/UEBA baselining
+    helps distinguish a normal partner workload from a compromised or attacker-controlled delegated-admin
+    identity used for persistence.
+  answer_sources:
+  - SigninLogs
+  - AuditLogs
+  - 'NAI: Partner and delegated admin relationships, sign-ins from external domains, and privileged actions
+    taken by accounts whose home domain is not owned or approved by the tenant'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SigninLogs
+
+      | where isPrivileged and UserPrincipalName_domain in (ExternalPartnerDomains)
+
+      | summarize actions=count(), hours=make_set(hourofday), geos=make_set(country) by partnerDomain,
+      sessionId
+
+      | extend mz = 0.6745*(actions - median)/MAD
+
+      | where partnerDomain !in (KnownPartnerDomains) or abs(mz) > 3.5 or actions > p95'
+- question: Did a burst of failed partner/external-domain sign-ins or AccessDenied AuditLog operations
+    (>=5/hour) precede a successful privileged action, indicating credential or permission probing through
+    the delegated relationship?
+  context: 'Profile the failure state for partner identities: count failed SigninLogs events (error/result
+    codes) and AccessDenied AuditLog operations for partner/external-domain identities per hour, alerting
+    on bursts (>=5) that precede a successful privileged action. This failed-then-success pattern indicates
+    credential stuffing or permission probing through the delegated relationship just before an attacker
+    exercises the persistent admin path.'
+  answer_sources:
+  - SigninLogs
+  - AuditLogs
+  - 'NAI: Partner and delegated admin relationships, sign-ins from external domains, and privileged actions
+    taken by accounts whose home domain is not owned or approved by the tenant'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'union SigninLogs, AuditLogs
+
+      | where UserPrincipalName_domain in (ExternalPartnerDomains)
+
+      | extend failed = (ResultType != 0) or (ResultReason has "AccessDenied")
+
+      | summarize denied=countif(failed), success=countif(isPrivileged and not failed) by Identity, bin(TimeGenerated,
+      1h)
+
+      | where denied >= 5 and success > 0'
+- question: Do causal/graph models flag a delegated-admin session in which an external/partner sign-in
+    leads to privileged tenant operations via a credential switch and atypical-target rarity, with new
+    partner domain, off-hours, or rare action mix as top drivers?
+  context: Machine learning reconstructs the causal action path from external/partner sign-in to privileged
+    tenant operations and scores credential-switch + atypical-target rarity at low alert volume; a graph
+    model trained on delegated-admin sessions uses external-domain, prior-relationship-history, action-mix,
+    and source-novelty features. Alert text MUST list the top-3 drivers (e.g., new partner domain, off-hours,
+    rare action mix) so an analyst can confirm whether a partner identity has been weaponized for persistence.
+  answer_sources:
+  - SigninLogs
+  - AuditLogs
+  - 'NAI: Partner and delegated admin relationships, sign-ins from external domains, and privileged actions
+    taken by accounts whose home domain is not owned or approved by the tenant'
+  range: Last 90 days; pivot to the partner session window
+  queries:
+  - technology: ML/Graph pseudocode
+    query: 'paths = hopper_causal_paths(SigninLogs -> AuditLogs, detect=credential_switch + atypical_target_rarity)
+
+      gmodel = gnn_session_score(features=[external_domain, prior_relationship_history, action_mix, source_novelty])
+
+      alert low_volume if paths.suspicious or gmodel.score > threshold, emit top_3_drivers'
+- question: Has a subscription tenant-association change or billing-ownership transfer been accepted (Microsoft.Subscription
+    / billing transfer operations), or has an Azure Policy that restricts subscription transfers been
+    removed, followed by loss of expected tenant-side RBAC/visibility?
+  context: Transferring a subscription to an attacker-controlled tenant lets the adversary retain administrative
+    ownership of the subscription and its resources outside the original tenant's control boundary, a
+    severe Persistence outcome. Alert on subscription tenant-association change and billing-ownership
+    transfer acceptance in AzureActivity, and on Azure Policy changes that remove subscription-transfer
+    restrictions, then correlate with loss of expected tenant-side RBAC/visibility. Escalate when the
+    affected subscription hosts crown-jewel workloads or the change follows a rare/external privileged
+    session.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - Azure Policy
+  - 'NAI: Subscriptions with ownership transfer capability, billing and policy configurations that govern
+    transfers, and inventory views showing tenant association changes for high-value subscriptions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity
+
+      | where OperationNameValue has_any ("Microsoft.Subscription","billing/transfers","transferBillingSubscription")
+      and ActivityStatusValue =~ "Succeeded"
+
+      | union (AzureActivity | where OperationNameValue has "Microsoft.Authorization/policyAssignments/delete"
+      and PolicyRestrictsTransfer)
+
+      | join kind=leftouter (ResourceGraph_TenantMapping_diff) on subscriptionId
+
+      | extend high = subscriptionHostsCrownJewels or precededByRareExternalSession'
+- question: Does the subscription->tenant mapping deviate from its established AzureResourceGraph baseline
+    (which should be constant), or do change-point detections reveal clustered preparatory policy-exemption
+    / ownership-change activity or rare per-identity transfer operations?
+  context: Treat the subscription->tenant mapping as normally constant; flag ANY deviation from the established
+    AzureResourceGraph mapping as anomalous, and use change-point detection on policy-exemption and ownership-change
+    counts to surface clustered preparatory changes. Score rare transfer-related operations per identity
+    with first-seen logic. Because a legitimate tenant mapping almost never changes, any drift is a high-confidence
+    signal of subscription-transfer persistence preparation or execution.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - Azure Policy
+  - 'NAI: Subscriptions with ownership transfer capability, billing and policy configurations that govern
+    transfers, and inventory views showing tenant association changes for high-value subscriptions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'current = AzureResourceGraph | project subscriptionId, tenantId
+
+      baseline = stored_baseline_mapping
+
+      alert if current.tenantId != baseline.tenantId  // mapping should be constant
+
+      change = make-series cnt=count() on TimeGenerated by op in ("policyExemption","ownershipChange")
+      | series_pelt(cnt)
+
+      rare = AzureActivity | where transferRelated | summarize by Caller | where firstSeen'
+- question: Did failed/denied billing-transfer or Microsoft.Subscription operations per principal precede
+    a successful tenant-association change, indicating an actor testing transfer capability before executing
+    it?
+  context: 'Profile the failure state: count failed/denied billing-transfer and Microsoft.Subscription
+    operations per principal, alerting when denied attempts precede a successful tenant-association change.
+    This indicates an actor testing whether they can move a subscription before actually executing the
+    transfer that would establish persistence outside the tenant boundary.'
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - Azure Policy
+  - 'NAI: Subscriptions with ownership transfer capability, billing and policy configurations that govern
+    transfers, and inventory views showing tenant association changes for high-value subscriptions'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AzureActivity
+
+      | where OperationNameValue has_any ("Microsoft.Subscription","billing/transfers")
+
+      | extend failed = ActivityStatusValue !in~ ("Success","Succeeded")
+
+      | summarize denied=countif(failed), success=countif(OperationNameValue has "tenant" and not failed)
+      by Caller, bin(TimeGenerated, 1h)
+
+      | where denied > 0 and success > 0'
+- question: Do configuration-snapshot and activity models (AzureResourceGraph diffs + AzureActivity) score
+    a management sequence culminating in tenant separation as an improbable graph path or forecast-residual
+    time-series outlier, with ownership change after rare admin behavior, removed transfer policy, or
+    a new target tenant as top features?
+  context: Machine learning ties together the multi-step preparation for a subscription tenant escape.
+    Use configuration-snapshot and activity features (AzureResourceGraph diffs + AzureActivity) to score
+    management sequences culminating in tenant separation, modeling them as improbable graph paths and
+    forecast-residual time-series outliers. Surface the top-3 contributing features (e.g., ownership change
+    after rare admin behavior, removed transfer policy, new target tenant) so an analyst can confirm a
+    deliberate persistence-by-transfer campaign.
+  answer_sources:
+  - AzureActivity
+  - AzureResourceGraph
+  - Azure Policy
+  - 'NAI: Subscriptions with ownership transfer capability, billing and policy configurations that govern
+    transfers, and inventory views showing tenant association changes for high-value subscriptions'
+  range: Last 90 days
+  queries:
+  - technology: ML/Graph pseudocode
+    query: 'features = join(AzureResourceGraph_diffs, AzureActivity)
+
+      gpath = gnn_path_score(sequence -> tenant_separation)
+
+      ts = timeseries_forecast_residual(ownership_change_rate)
+
+      alert if gpath.improbable or ts.outlier, emit top_3_features'
+- question: Was a federation/domain authentication setting changed ("Set federation settings on domain"
+    / "Set domain authentication"), a new verified or federated domain added, or a pass-through-authentication/Connect
+    change made, followed by sign-ins authenticating through the affected path?
+  context: Adding an identity provider, domain trust, or pass-through authentication path lets identities
+    controlled outside the tenant keep authenticating after the original access is removed, a classic
+    federation backdoor for Persistence. Alert on AuditLog ActivityDisplayName "Set federation settings
+    on domain" / "Set domain authentication", new verified or federated domains, and pass-through-authentication/Connect
+    changes, then correlate with subsequent SigninLogs authentications through the affected path. Raise
+    severity when the new trust enables privileged accounts or occurs outside approved identity-architecture
+    change windows.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - AzureADConnectHealth
+  - 'NAI: Federation and pass-through authentication settings, verified domain changes, Entra ID trust
+    relationships, and sign-ins that begin authenticating through newly introduced external identity paths'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'AuditLogs
+
+      | where ActivityDisplayName in ("Set federation settings on domain","Set domain authentication","Add
+      verified domain","Add unverified domain") or ActivityDisplayName has "pass-through"
+
+      | join kind=inner (SigninLogs | where AuthMethod has_any ("Federated","PassThrough")) on $left.DomainName
+      == $right.UserDomain
+
+      | extend high = enablesPrivilegedAccounts or outsideApprovedChangeWindow'
+- question: Are there first-seen trust paths, verified domains, or authentication methods, or domain-backed
+    sign-in volume beyond the modified Z-score |z|>3.5 or trailing 95th percentile for that domain/IdP,
+    versus a tenant-wide baseline?
+  context: Statistical baselining detects newly introduced or abused identity paths. Baseline verified
+    domains, trust relationships, and authentication-method usage tenant-wide; flag first-seen trust paths/domains
+    and domain-backed sign-in volume beyond the modified Z-score |z|>3.5 or trailing 95th percentile for
+    that domain/IdP. A first-seen federated domain or a spike of authentications through a new IdP is
+    a strong indicator of a federation persistence path being stood up and exercised.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - AzureADConnectHealth
+  - 'NAI: Federation and pass-through authentication settings, verified domain changes, Entra ID trust
+    relationships, and sign-ins that begin authenticating through newly introduced external identity paths'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SigninLogs
+
+      | summarize signins=count() by UserDomain, AuthMethod, bin(TimeGenerated, 1h)
+
+      | extend mz = 0.6745*(signins - median)/MAD
+
+      | where UserDomain !in (KnownVerifiedDomains) or AuthMethod !in (KnownAuthMethods) or abs(mz) >
+      3.5 or signins > p95'
+- question: Did failed federated/pass-through sign-ins (by result code) per newly introduced domain or
+    IdP show a failed-then-success pattern, indicating a backdoor identity path being exercised after
+    a trust change?
+  context: 'Profile the failure state: count failed federated/pass-through SigninLogs events (result codes)
+    per newly introduced domain or IdP, alerting on failed-then-success patterns. After a trust modification,
+    a sequence of failed authentications followed by success on the new path indicates an attacker tuning
+    and then successfully exercising a federation backdoor identity for persistence.'
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - AzureADConnectHealth
+  - 'NAI: Federation and pass-through authentication settings, verified domain changes, Entra ID trust
+    relationships, and sign-ins that begin authenticating through newly introduced external identity paths'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'SigninLogs
+
+      | where AuthMethod has_any ("Federated","PassThrough") and UserDomain in (NewlyIntroducedDomains)
+
+      | extend failed = ResultType != 0
+
+      | summarize denied=countif(failed), success=countif(not failed) by UserDomain, bin(TimeGenerated,
+      1h)
+
+      | where denied > 0 and success > 0'
+- question: Do sequence/graph models flag a deviant Entra audit/sign-in pattern such as sign-in -> set-federation
+    -> privileged access, especially a trust modification quickly followed by privileged access from an
+    identity not previously seen on that path?
+  context: Machine learning learns normal Entra audit/sign-in sequences and flags deviant ones such as
+    sign-in -> set-federation -> privileged access with an LSTM log model, and scores improbable identity-path
+    edges via graph AI. Prioritize trust modifications quickly followed by privileged access from identities
+    not previously seen on that path; the alert MUST list the top-3 contributing features so an analyst
+    can confirm a federation-backdoor persistence sequence rather than a sanctioned identity-architecture
+    change.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - AzureADConnectHealth
+  - 'NAI: Federation and pass-through authentication settings, verified domain changes, Entra ID trust
+    relationships, and sign-ins that begin authenticating through newly introduced external identity paths'
+  range: Last 90 days; pivot to the trust-change event window
+  queries:
+  - technology: ML/Graph pseudocode
+    query: 'lstm = deeplog_sequence_anomaly(EntraAudit+SigninLogs, watch=[signin, set_federation, privileged_access])
+
+      gmodel = gnn_edge_anomaly(identity_path_edges)
+
+      alert if lstm.anomalous or gmodel.improbable, prioritize trust_change_then_privileged_by_new_identity,
+      emit top_3_features'
