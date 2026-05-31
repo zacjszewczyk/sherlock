@@ -1,0 +1,457 @@
+name: 'T1213.A013: RDS Instance Manipulation'
+id: b1758b74-3490-408f-8128-5d3109ce8161
+description: Investigate whether an adversary collected or staged data for exfiltration in AWS by manipulating
+  Amazon RDS instances, clusters, snapshots, or related database configuration. This playbook helps an
+  analyst determine if a principal opened a new path to read or export sensitive data, such as toggling
+  PubliclyAccessible, widening security-group ingress to 0.0.0.0/0, changing the DB subnet group, rotating
+  the master password, creating or copying snapshots, sharing snapshots with external/public accounts,
+  or exporting snapshots to S3. It then determines whether database activity shifted into collection behavior
+  inconsistent with the workload baseline, such as broad table enumeration, high-volume reads of sensitive
+  schemas, SELECT ... INTO OUTFILE / UNLOAD-style exports, snapshot-driven extraction, and bulk egress
+  from the RDS subnet to external IPs. The playbook correlates CloudTrail management events, AWS Config
+  configuration history, RDS database audit logs (MySQL audit log, PostgreSQL pgaudit), VPC Flow Logs,
+  and GuardDuty findings, joining control-plane changes with the subsequent read-heavy or export activity
+  that they enable. Methods span symbolic-logic detections, statistical baselining, and machine-learning
+  models so the SOC has granular, defensible coverage of the RDS -> snapshot -> S3/external-share collection
+  chain.
+type: technique
+related:
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a principal outside the small allow-list of database administrators or automation roles
+    make an RDS control-plane change that opens a new data-collection path, such as calling ModifyDBInstance/ModifyDBCluster
+    with PubliclyAccessible=true, expanding an RDS/EC2 security-group ingress to 0.0.0.0/0 or a new wide
+    CIDR, modifying the DB subnet group, changing the master password, or calling CreateDBSnapshot/CopyDBSnapshot/StartExportTask/RestoreDBInstanceFromDBSnapshot?
+  context: In the Collection tactic, an adversary first reconfigures RDS so the data becomes reachable
+    or portable before reading or exporting it. Control-plane changes that increase reachability (public
+    accessibility, wide security-group ingress, altered subnet group), create a portable copy (snapshot
+    create/copy/export/restore), or weaken secure access (master-password change) are the enabling step.
+    On CloudTrail management events, alert when ModifyDBInstance/ModifyDBCluster sets PubliclyAccessible=true,
+    ingress expands to 0.0.0.0/0 or a new broad CIDR, the DB subnet group changes, the master password
+    is rotated, or any of CreateDBSnapshot/CopyDBSnapshot/StartExportTask/RestoreDBInstanceFromDBSnapshot
+    fire. Scope the rule to the known allow-list of identities and automation roles that normally administer
+    the database (per CISA AA24-038A and the SigmaHQ/Panther CloudTrail rule templates) and treat any
+    other principal as suspicious. A positive result means an unexpected identity just widened reachability,
+    created a portable copy, or weakened access; a negative result is routine administration by an approved
+    role.
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "source=cloudtrail eventSource=\"rds.amazonaws.com\"\n| where eventName in (\"ModifyDBInstance\"\
+      ,\"ModifyDBCluster\",\"CreateDBSnapshot\",\"CopyDBSnapshot\",\"StartExportTask\",\"RestoreDBInstanceFromDBSnapshot\"\
+      ,\"ModifyDBSubnetGroup\")\n   OR (eventName in (\"AuthorizeSecurityGroupIngress\") AND requestParameters.cidrIp\
+      \ in (\"0.0.0.0/0\"))\n| eval opens_path=case(requestParameters.publiclyAccessible==\"true\",1,\
+      \ requestParameters.cidrIp==\"0.0.0.0/0\",1, eventName in (\"CreateDBSnapshot\",\"CopyDBSnapshot\"\
+      ,\"StartExportTask\",\"RestoreDBInstanceFromDBSnapshot\",\"ModifyDBSubnetGroup\"),1, isnotnull(requestParameters.masterUserPassword),1,\
+      \ 1=1,0)\n| where opens_path==1 AND NOT userIdentity.arn in (db_admin_allowlist)\n| alert"
+- question: Did a principal call ModifyDBSnapshotAttribute to share an RDS snapshot for restore with an
+    AWS account ID not on the organization allow-list, or set the snapshot fully public by adding ["all"]
+    to the restore attribute?
+  context: 'Sharing or publicizing a snapshot is the single highest-fidelity RDS exfiltration signal in
+    the Collection tactic: the adversary makes a portable copy of the database available to an account
+    it controls (or to the entire internet) without ever touching the production instance again. On CloudTrail,
+    alert on ModifyDBSnapshotAttribute where requestParameters.attributeName == restore and requestParameters.valuesToAdd
+    contains an AWS account ID not on the org allow-list, or contains ["all"]. Validate the rule against
+    raw detonation logs from DataDog Stratus Red Team (aws.exfiltration.rds-share-snapshot). A positive
+    result is near-certain data theft staging and warrants immediate containment (revoke the share, audit
+    the recipient account); a negative result means only allow-listed accounts received share grants.'
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" eventName="ModifyDBSnapshotAttribute"
+
+      | where requestParameters.attributeName=="restore"
+
+      | eval public_share=if(mvfind(requestParameters.valuesToAdd,"all")>=0,1,0)
+
+      | eval external_share=if(any(requestParameters.valuesToAdd NOT in (org_account_allowlist)),1,0)
+
+      | where public_share==1 OR external_share==1
+
+      | alert severity=critical'
+- question: Did an exposure-enabling change (PubliclyAccessible toggle, security-group ingress expansion,
+    parameter-group change, or Secrets Manager GetSecretValue on the DB secret) precede a CreateDBSnapshot,
+    CopyDBSnapshot, ModifyDBSnapshotAttribute, or StartExportTask on the same instance/cluster within
+    24 hours by the same or a related principal?
+  context: Isolated control-plane changes can be benign, but the sequence of first enabling access and
+    then creating or exporting a portable copy is the classic RDS collection chain. Temporally join exposure-enabling
+    actions (public-accessibility toggle, ingress expansion, parameter-group change, Secrets Manager GetSecretValue
+    on the DB secret) with a subsequent snapshot/export action on the same resource within 24 hours by
+    the same or related principal, and present both legs in one alert per the correlation guidance in
+    CISA AA24-038A. A positive result shows a deliberate setup-then-extract pattern; a negative result
+    is a lone change with no follow-on extraction.
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days (correlate the two legs within a 24-hour window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=cloudtrail (eventSource="rds.amazonaws.com" OR eventSource="secretsmanager.amazonaws.com")
+
+      | transaction dbResourceId maxspan=24h
+
+      | eval enable=match(eventName,"ModifyDBInstance|ModifyDBCluster|AuthorizeSecurityGroupIngress|ModifyDBParameterGroup|GetSecretValue")
+
+      | eval extract=match(eventName,"CreateDBSnapshot|CopyDBSnapshot|ModifyDBSnapshotAttribute|StartExportTask")
+
+      | where enable AND extract
+
+      | table dbResourceId userIdentity.arn enable_event extract_event | alert'
+- question: Is a principal performing an RDS control-plane action (such as ModifyDBSnapshotAttribute,
+    CopyDBSnapshot, or StartExportTask) or targeting an instance/cluster it has never touched before,
+    compared to its own 30-90 day CloudTrail baseline of rds:* actions and resources?
+  context: 'First-seen behavior is a low-noise collection indicator: an actor with stolen or misused credentials
+    often performs snapshot/export actions or touches databases the identity has never interacted with.
+    Maintain a per-principal Athena baseline of rds:* actions and resources over a 30-90 day lookback
+    (using the first-seen approach of the Netflix CloudTrail Anomaly Detector) and alert when a principal
+    performs a control-plane action it has never used, or targets an instance/cluster it has never touched.
+    A positive result flags behavior the identity has never exhibited and warrants triage; a negative
+    result confirms activity consistent with the principal''s history.'
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days (lookback baseline 30-90 days; evaluate per event)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-90d
+
+      | inputlookup append=t principal_rds_baseline.csv
+
+      | eval first_seen_action=if(NOT [userIdentity.arn,eventName] in baseline_actions,1,0)
+
+      | eval first_seen_resource=if(NOT [userIdentity.arn,dbResourceId] in baseline_resources,1,0)
+
+      | where (first_seen_action==1 AND eventName in ("ModifyDBSnapshotAttribute","CopyDBSnapshot","StartExportTask"))
+      OR first_seen_resource==1
+
+      | alert'
+- question: Is a principal's rate of RDS modifications, snapshot creation, and export tasks a statistical
+    outlier (MAD-based modified Z-score |z|>3.5) versus its own 30-day baseline, and is its AccessDenied
+    / failed-share rate on rds:* actions elevated, signalling probing?
+  context: Collection often shows up as a spike in modification/snapshot/export velocity beyond what batch
+    maintenance jobs produce. Baseline the normal frequency of RDS modifications, snapshot creation, and
+    export tasks per principal/database, compute a MAD-based modified Z-score, and flag when modifications/min
+    or snapshot+export count exceed |z|>3.5 (a threshold robust to batch jobs, per Detection Engineering
+    Weekly), deriving the per-environment threshold from 30 days of CloudTrail history. Track AccessDenied/failed-share
+    counts on rds:* as a distinct failure-rate feature that signals enumeration or permission probing.
+    A positive result indicates abnormally intense admin or export activity, or repeated failed shares;
+    a negative result reflects normal cadence.
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days (baseline 30 days; evaluate per principal/window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-30d
+
+      | bin _time span=1m
+
+      | stats count(eval(match(eventName,"Modify"))) as mods count(eval(match(eventName,"Snapshot|ExportTask")))
+      as snap_export count(eval(errorCode="AccessDenied")) as denied by userIdentity.arn, _time
+
+      | eventstats median(mods) as med_m median(snap_export) as med_s by userIdentity.arn
+
+      | eval mz_m=0.6745*(mods-med_m)/`mad(mods)`, mz_s=0.6745*(snap_export-med_s)/`mad(snap_export)`
+
+      | where abs(mz_m)>3.5 OR abs(mz_s)>3.5 OR denied>5
+
+      | alert'
+- question: When scored by an access-enablement risk model, do any sessions accumulate several small reachability-widening
+    changes against a sensitive database that quickly precede a read-heavy or export event, breaching
+    the Prophet-forecast upper bound for that principal's API volume?
+  context: Sophisticated actors avoid single high-severity actions, instead chaining several minor changes
+    into a complete collection path. Score each session by (number of control-plane changes that widen
+    reachability) x (sensitivity of the targeted database) x (persistence of the change) / (elapsed time
+    to the next read-heavy or export event), and forecast expected per-principal API volume with Prophet
+    confidence bounds (per Cloud Intrusion Detection Using Time Series Forecasting). Prioritize sessions
+    that breach the upper bound while combining several small deviations into a realistic collection path
+    against high-value data. A positive result surfaces a session whose cumulative, fast-converging changes
+    look engineered for extraction; a negative result reflects low-risk, slow-moving, or non-sensitive
+    changes.
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days (forecast baseline 30-90 days; score per session)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=cloudtrail eventSource="rds.amazonaws.com" earliest=-90d
+
+      | stats sum(reachability_widening_changes) as widen max(db_sensitivity) as sens max(change_persistence)
+      as persist min(time_to_read_or_export) as dt by userIdentity.arn, session_id
+
+      | eval risk=(widen*sens*persist)/dt
+
+      | prophet_forecast(api_volume) -> yhat_upper
+
+      | where api_volume > yhat_upper OR risk > risk_threshold
+
+      | table userIdentity.arn session_id risk | alert'
+- question: Does an unsupervised rare-function/population model plus a cross-service graph model over
+    CloudTrail flag a principal's activity as the RDS -> snapshot -> S3 -> external-share collection chain,
+    using features such as principal novelty, reachability change, snapshot recipient account, export
+    destination, region/IP novelty, and Secrets Manager reads?
+  context: Machine learning captures the full collection chain that evades single-event rules. Train an
+    unsupervised rare-function/population model over CloudTrail (per Elastic's CloudTrail ML work) plus
+    a dynamic cross-service graph model (CS-GAD) using features including principal novelty, reachability
+    change, snapshot recipient account, export destination, region/IP novelty, and Secrets Manager reads
+    to identify the RDS -> snapshot -> S3 -> external-share sequence. Emit the top-3 contributing features
+    per alert via SHAP attribution so analysts can tie the score to concrete evidence. A positive result
+    highlights a structurally improbable, multi-service collection path; explainable features point triage
+    at the specific anomalies (e.g., novel recipient account).
+  answer_sources:
+  - CloudTrail management events
+  - AWS Config
+  - RDS database audit logs
+  - GuardDuty findings
+  - 'NAI: RDS instances containing sensitive business data, configuration history for database networking
+    and snapshot settings, and audit coverage for database administration and query activity'
+  range: Last 90 days (train on 30-90 days; score continuously)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Rare-function/population model + cross-service graph over CloudTrail
+
+      ml rare_function(field=eventName, population=userIdentity.arn) -> rare_score
+
+      build_graph(nodes=[principal, rds_resource, snapshot, s3_bucket, account], edges=action, window=90d)
+
+      | score cs_gad(session) features=[principal_novelty, reachability_change, snapshot_recipient_account,
+      export_destination, region_ip_novelty, secrets_reads] -> chain_score, shap_top3
+
+      | where rare_score>thr OR chain_score>thr
+
+      | emit userIdentity.arn, chain_score, shap_top3'
+- question: After a recent RDS configuration, snapshot, or export change, do the RDS database audit logs
+    show sessions that enumerate many tables, read sensitive schemas, or return unusually large result
+    sets, especially when the session identity, source path, or secret matches the actor/access enabled
+    by the earlier manipulation?
+  context: Once an adversary has opened a path, collection appears as in-database read behavior that deviates
+    from the application baseline. Correlate recent RDS configuration/snapshot/export changes with database
+    sessions in the RDS audit logs (MySQL audit log, PostgreSQL pgaudit) that enumerate many tables, read
+    sensitive schemas, or return unusually large result sets. Raise severity when the session identity,
+    source IP/path, or secret used matches the actor or access enabled by the earlier control-plane manipulation
+    (per CISA AA24-038A correlation guidance). A positive result links an enabling change to actual broad
+    harvesting; a negative result shows normal query patterns after the change.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (correlate reads within 24-72 hours of the control-plane change)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=rds_audit (mysql_audit OR pgaudit)
+
+      | join type=inner dbResourceId [ search source=cloudtrail eventSource="rds.amazonaws.com" eventName
+      IN ("ModifyDBInstance","CreateDBSnapshot","StartExportTask","AuthorizeSecurityGroupIngress") earliest=-72h
+      ]
+
+      | stats dc(table_name) as tables_touched sum(rows_returned) as rows values(schema) as schemas by
+      db_user, source_ip, session_id
+
+      | where tables_touched > baseline_tables OR rows > baseline_rows OR schemas in (sensitive_schemas)
+
+      | eval escalate=if(db_user in (manipulation_actor) OR source_ip in (enabled_path),1,0)
+
+      | alert'
+- question: Do the RDS audit logs show SELECT ... INTO OUTFILE, large UNLOAD/COPY-style behavior, or sustained
+    read-heavy sessions shortly after the instance was made more accessible or its snapshot state changed,
+    or does StartExportTask write the snapshot to S3?
+  context: Explicit export primitives executed right after an enabling change are direct evidence of collection/exfiltration
+    staging. Alert when RDS audit logs show SELECT ... INTO OUTFILE, large UNLOAD/COPY-style behavior,
+    or sustained read-heavy sessions soon after the instance was made more accessible or its snapshot
+    state changed, or when StartExportTask writes to S3, and present the control-plane action and the
+    extraction behavior together. Validate the snapshot-export path with Stratus Red Team. A positive
+    result is strong evidence of data being staged out of the database; a negative result shows no export-style
+    activity following the change.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (correlate export behavior within 24-72 hours of the change)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=rds_audit (mysql_audit OR pgaudit)
+
+      | eval export_query=if(match(query,"(?i)INTO OUTFILE|UNLOAD|COPY .* TO"),1,0)
+
+      | append [ search source=cloudtrail eventSource="rds.amazonaws.com" eventName="StartExportTask"
+      ]
+
+      | join type=inner dbResourceId [ search source=cloudtrail eventName IN ("ModifyDBInstance","CreateDBSnapshot","CopyDBSnapshot")
+      earliest=-72h ]
+
+      | where export_query==1 OR eventName=="StartExportTask"
+
+      | table dbResourceId db_user query export_target enabling_event | alert'
+- question: After an RDS change, are query count, rows returned, bytes transferred (VPC Flow Logs), sensitive-schema
+    touch rate, or export activity statistical outliers (MAD-based |z|>3.5) versus the instance's pre-change
+    baseline, and is there an elevated rate of blocked/failed connection attempts from the RDS subnet?
+  context: Collection manifests as a measurable jump in data movement after the enabling change. Compare
+    query count, rows returned, bytes transferred (from VPC Flow Logs), sensitive-schema touch rate, and
+    export activity after an RDS change against the instance's pre-change baseline, flagging with a MAD-based
+    modified Z-score (|z|>3.5, per Detection Engineering Weekly). Profile blocked/failed connection attempts
+    from the RDS subnet as a distinct failure-rate signal that can indicate probing or brute access following
+    exposure. A positive result indicates post-change volume inconsistent with the workload; a negative
+    result shows steady-state data movement.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (pre-change baseline vs post-change window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=rds_audit OR source=vpcflow earliest=-90d
+
+      | eval phase=if(_time>change_time,"post","pre")
+
+      | stats count as queries sum(rows_returned) as rows sum(bytes) as bytes count(eval(schema in sensitive_schemas))
+      as sens_touch count(eval(action="REJECT")) as failed by dbResourceId, phase
+
+      | eventstats median(rows) as med_rows by dbResourceId
+
+      | eval mz=0.6745*(rows-med_rows)/`mad(rows)`
+
+      | where phase="post" AND (abs(mz)>3.5 OR queries>baseline OR bytes>baseline OR failed>baseline)
+
+      | alert'
+- question: After a control-plane change, how many databases, schemas, and tables does the workload touch
+    compared to its trailing baseline, and does the Prophet-forecast confidence bound flag an abrupt expansion
+    from a narrow application pattern to broad harvesting across previously untouched objects?
+  context: Legitimate applications touch a narrow, stable set of objects; collection broadens coverage
+    to harvest everything of value. Measure how many databases, schemas, and tables are touched after
+    the control-plane change versus the workload's trailing baseline, and forecast expected query/read
+    volume with Prophet confidence bounds (per Cloud Intrusion Detection Using Time Series Forecasting).
+    Highlight abrupt expansion from a narrow application pattern to broad harvesting across previously
+    untouched objects. A positive result shows the workload suddenly reaching into objects it never normally
+    accesses; a negative result reflects coverage consistent with the application's history.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (trailing baseline 30-90 days; evaluate post-change)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source=rds_audit earliest=-90d
+
+      | stats dc(database) as dbs dc(schema) as schemas dc(table_name) as tables values(table_name) as
+      touched by dbResourceId, bin(_time,1h)
+
+      | prophet_forecast(tables) -> yhat_upper
+
+      | eval new_objects=count(touched NOT in baseline_objects)
+
+      | where tables > yhat_upper OR new_objects > expansion_threshold
+
+      | table dbResourceId dbs schemas tables new_objects | alert'
+- question: Does an unsupervised online autoencoder ensemble (Kitsune/KitNET) over VPC Flow Logs detect
+    anomalous bulk transfer (for example sustained >20MB) from RDS subnet IP ranges to external/public
+    IPs shortly after a control-plane change?
+  context: Exfiltration of harvested data leaves a network footprint of unusual bulk egress from the RDS
+    subnet. Apply the unsupervised online autoencoder ensemble Kitsune/KitNET to VPC Flow Logs to detect
+    anomalous bulk transfer (e.g., >20MB sustained) from RDS subnet IP ranges to external/public IPs shortly
+    after a control-plane change, using flow volume and timing features without labels. Surface the top
+    contributing flow features in the alert. A positive result indicates data leaving the database subnet
+    toward untrusted destinations following an enabling change; a negative result shows egress consistent
+    with normal east-west or approved patterns.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (train online; score continuously, pivot around change events)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Kitsune/KitNET autoencoder ensemble over VPC Flow Logs
+
+      source=vpcflow srcAddr in (rds_subnet_cidrs) dstAddr NOT in (internal_cidrs)
+
+      | featurize flow: [bytes, packets, duration, dst_entropy, post_change_delta]
+
+      | score kitnet(flow) -> rmse_score, top_features
+
+      | where rmse_score > anomaly_threshold AND bytes_out > 20MB
+
+      | emit srcAddr, dstAddr, bytes_out, top_features'
+- question: Does a time-series/sequence model over RDS audit logs detect a shift from normal application
+    queries to collection-oriented behavior after a control-plane change, prioritizing abrupt expansion
+    in schema coverage, rows-returned volume, export staging, and coordination with snapshot/network-exposure
+    changes?
+  context: The strongest signal is the temporal pattern of normal application traffic transitioning into
+    harvesting once a path is opened. Use time-series and sequence modeling over RDS audit logs to detect
+    shifts from normal application queries to collection-oriented behavior after a control-plane change,
+    prioritizing abrupt expansion in schema coverage, rows-returned volume, export staging, and coordination
+    with snapshot/network-exposure changes. Emit the top-3 contributing features per alert via SHAP attribution.
+    A positive result flags a session whose query behavior structurally departs from the learned application
+    profile in a way that aligns with the earlier manipulation; explainable features tie the score back
+    to concrete evidence for analysts.
+  answer_sources:
+  - RDS database audit logs
+  - CloudTrail management events
+  - VPC Flow Logs
+  - AWS Config
+  - 'NAI: Database audit streams for production RDS instances, schemas containing regulated or high-value
+    data, and network paths associated with administrative or export operations against manipulated instances'
+  range: Last 90 days (train on 30-90 days of sessions; score per session)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: '// Sequence/time-series model over RDS audit log query streams
+
+      model seq_model(sequence=ordered_query_type by db_user, dbResourceId)
+
+      | featurize session: [schema_coverage_delta, rows_returned, export_staging, snapshot_net_coordination]
+
+      | score -> harvest_score, shap_top3
+
+      | where harvest_score > threshold AND post_control_plane_change==1
+
+      | emit db_user, dbResourceId, harvest_score, shap_top3'
