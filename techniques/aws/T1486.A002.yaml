@@ -1,0 +1,327 @@
+name: 'T1486.A002: EC2/EBS Data Encryption'
+id: 8129f9e1-5851-4ca4-8c57-77d1438176f9
+description: Investigate whether an adversary has caused impact in AWS by encrypting EBS-backed data with
+  unauthorized KMS keys or replacement volumes that deny normal workload access. This playbook helps an
+  analyst (1) detect a principal creating encrypted EBS snapshots, copied snapshots, or replacement volumes
+  under unapproved or adversary-controlled KMS keys and then staging detach/attach or block-device-mapping
+  changes so production instances depend on unauthorized key material; and (2) confirm downstream impact
+  when affected EC2 workloads exhibit boot failures, filesystem mount errors, degraded or failed instance
+  status checks, or loss of application data because the active storage path now relies on snapshots or
+  volumes encrypted outside the organization's approved recovery design. It combines symbolic-logic detections
+  over CloudTrail/KMS/Config/EC2 telemetry, statistical baselining (first-seen APIs, k-sigma and CUSUM
+  rate anomalies, KMS failure-state profiling, entropy of host writes), and machine-learning anomaly scoring
+  to surface the discovery-to-impact ransom chain characteristic of cloud extortion campaigns.
+type: technique
+related:
+- tactic_id: TA0040
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did an IAM principal create or modify encrypted EBS snapshots, copied snapshots, or volumes
+    (CreateSnapshot, CopySnapshot, CreateVolume with Encrypted=true and a KmsKeyId, ModifyEbsDefaultKmsKeyId,
+    Enable/DisableEbsEncryptionByDefault, ModifySnapshotAttribute, or attachment-modification events)
+    using a KMS key that is NOT on the per-workload approved-key allowlist for volumes tied to critical
+    instances, and did the same session then proceed to detach volumes, alter block-device mappings, or
+    call kms:ScheduleKeyDeletion / kms:CreateGrant on the new key?
+  context: This is the core symbolic-logic detection for EC2/EBS data encryption used for Impact. An adversary
+    re-keys storage under a KMS key they control (or one not approved for that workload) so the organization
+    loses access without the adversary's key material. Alert when any of the AWS-catalogued EBS/KMS encryption
+    events reference a KMS key outside the approved allowlist for a critical workload. Escalate to high
+    severity when the SAME CloudTrail session (shared userIdentity/accessKeyId within ~30 minutes) then
+    issues DetachVolume, alters block-device mappings, or invokes kms:ScheduleKeyDeletion / kms:CreateGrant
+    on the newly used key — this is the ransom lever that converts re-encryption into denial of access.
+    A positive result (unapproved key + staging of detach/attach/key deletion) is a strong impact indicator;
+    a negative result (approved key, routine maintenance) is expected operational churn. Validate rule
+    coverage with Stratus Red Team detonations.
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days; correlate detach/attach and KMS calls within a 30-minute session window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM cloudtrail WHERE eventName IN (CreateSnapshot, CopySnapshot, CreateVolume, ModifyEbsDefaultKmsKeyId,\
+      \ EnableEbsEncryptionByDefault, DisableEbsEncryptionByDefault, ModifySnapshotAttribute, ModifyInstanceAttribute,\
+      \ AttachVolume)\n  AND requestParameters.encrypted == true\n  AND requestParameters.kmsKeyId NOT\
+      \ IN approved_key_allowlist[workload]\n  AND volume/instance IN critical_assets\nALERT severity=medium\n\
+      // escalate when same session stages the ransom lever\nJOIN cloudtrail s2 ON s2.userIdentity.accessKeyId\
+      \ == accessKeyId\n  WHERE s2.eventName IN (DetachVolume, ModifyInstanceAttribute(blockDeviceMapping),\
+      \ ScheduleKeyDeletion, CreateGrant) AND s2.eventTime - eventTime <= 30m\nTHEN severity=high"
+- question: Does the EBS encryption activity involve newly shared snapshots (ModifySnapshotAttribute adding
+    an external account or 'all'), cross-account KMS key policy or grant changes, or copied snapshots
+    landing in regions the workload does not normally use — and was it preceded by discovery activity
+    (GetCallerIdentity, List*/Describe*)?
+  context: 'Cross-account sharing and out-of-region snapshot copies create adversary-controlled recovery
+    paths: even if the victim retains some access, the attacker holds an exfiltrated or externally accessible
+    copy and can leverage it for extortion. Raise high severity when EBS encryption coincides with snapshot
+    sharing to external/all accounts, KMS key policy/grant changes that grant external principals, or
+    copies into unusual regions. Reuse the exact CloudTrail request-parameter field logic from the Elastic
+    detection-rule corpus and the EBS default-encryption tamper rule from SigmaHQ. Weight the alert when
+    the discovery-to-impact ordering (GetCallerIdentity / List* before encryption) seen in Unit 42''s
+    large-scale cloud extortion case is present. A positive result indicates deliberate staging of an
+    adversary recovery path; benign cross-account sharing should be on a known allowlist of partner accounts/regions.'
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM cloudtrail WHERE\n  (eventName == ModifySnapshotAttribute AND requestParameters.createVolumePermission\
+      \ ADDS external_account OR 'all')\n  OR (eventName IN (PutKeyPolicy, CreateGrant) AND grantee/principal\
+      \ NOT IN org_accounts)\n  OR (eventName == CopySnapshot AND destinationRegion NOT IN workload_regions)\n\
+      ALERT severity=high\nBOOST IF prior 24h same principal ran GetCallerIdentity OR List*/Describe*\
+      \ (discovery->impact)"
+- question: Is this the FIRST time, within a trailing 90-day lookback, that this IAM principal has invoked
+    any EBS/KMS encryption action (CopySnapshot, CreateVolume with a KmsKeyId, ModifyEbsDefaultKmsKeyId,
+    GenerateDataKeyWithoutPlaintext)?
+  context: A per-principal first-seen baseline over CloudTrail (e.g., in Athena, as implemented by Netflix
+    cloudtrail-anomaly) is a strong first-party signal that requires no external intelligence. A long-lived
+    service role or human principal that has never re-encrypted storage suddenly performing encryption
+    actions is anomalous and frequently indicates credential compromise or abuse. Build the baseline from
+    the trailing 90 days of CloudTrail, key on principalId/roleSessionName, and flag the first observed
+    encryption API per principal. A positive result (never-before-seen encryption behavior for that principal)
+    warrants investigation; established maintenance principals that routinely re-encrypt will not fire.
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days (trailing first-seen baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = FROM cloudtrail EARLIEST=-90d\n  WHERE eventName IN (CopySnapshot, CreateVolume[kmsKeyId],\
+      \ ModifyEbsDefaultKmsKeyId, GenerateDataKeyWithoutPlaintext)\n  GROUP BY userIdentity.principalId\
+      \ -> first_seen_time\nALERT WHERE event.principalId encryption-API AND no prior occurrence in baseline\
+      \ window"
+- question: Does a session exceed the per-workload / per-operations-principal baseline for KMS key set,
+    snapshot-copy frequency, volume-creation rate, replacement-volume ratio (new encrypted volumes / existing
+    volumes), or attachment-change timing — either via a sharp spike (mean + 3 sigma) or a slow sustained
+    drift detectable only by cumulative-sum?
+  context: Statistical baselining catches both fast and slow encryption campaigns. For each workload and
+    operations principal, learn the normal KMS key set, snapshot-copy count/hour, volume-creation rate,
+    replacement-volume ratio, and attachment-change timing from each team's trailing 30-90-day maintenance
+    history. Use k-sigma aggregation (Dwyer & Truta) to flag sessions exceeding mean + 3 sigma, and a
+    stateful CUSUM (Urbina et al.) over the rolling encryption-API rate to catch slow campaigns that individually
+    stay under per-event thresholds. Operationalize bands and alarms via CloudWatch ML over CloudTrail
+    metrics. A positive result is a statistically abnormal burst or drift in encryption operations; a
+    negative result is activity within learned maintenance norms.
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days (30-90 day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'metrics per (workload, principal): kms_key_set, copysnapshot_per_hr, createvolume_rate, replacement_ratio
+      = new_encrypted_vol / existing_vol, attach_change_timing
+
+      baseline mean,std over trailing 30-90d
+
+      ALERT k-sigma WHERE metric > mean + 3*std
+
+      ALERT cusum: S_t = max(0, S_{t-1} + (rate_t - mean - k)); fire WHERE S_t > h'
+- question: Is there a burst of KMS AccessDenied / KMSAccessDeniedException or DisabledException errors
+    (failed GenerateDataKey/Encrypt probing) per principal, or any ScheduleKeyDeletion on a newly used
+    key above baseline?
+  context: KMS failure states are distinct, high-value signals. A burst of denied GenerateDataKey or Encrypt
+    calls indicates an adversary probing for usable key material (failed key probing), while a ScheduleKeyDeletion
+    on a key that was only just used to encrypt storage indicates execution of the ransom path described
+    by Invictus IR — destroying the key so the data is unrecoverable. Track AccessDenied/DisabledException
+    rates and ScheduleKeyDeletion counts per principal as separate metrics rather than folding them into
+    a generic error rate. A positive result (denial spike or key-deletion on a fresh key) is a strong
+    indicator of probing toward or execution of impact.
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM kms_cloudtrail GROUP BY userIdentity.principalId, bin(1h)\n  denied = count(errorCode\
+      \ IN (AccessDenied, KMSAccessDeniedException, DisabledException) AND eventName IN (GenerateDataKey,\
+      \ Encrypt, GenerateDataKeyWithoutPlaintext))\n  sched_del = count(eventName == ScheduleKeyDeletion\
+      \ AND keyId IN newly_used_keys)\nALERT WHERE denied > baseline_mean+3*std OR sched_del >= 1"
+- question: When unsupervised anomaly scoring is run over CloudTrail, does this encryption sequence score
+    as rare — rare API-for-principal, unusual region, rare user-command pair, never-before-seen KMS key
+    — and do unusual KMS usage, attachment churn, and workload criticality combine into a likely denial-of-access
+    pattern?
+  context: An unsupervised rare-function / population-analysis model over CloudTrail (per Elastic's CloudTrail
+    ML approach) scores anomalous encryption sequences using features such as rare-API-for-principal,
+    unusual region, rare user-command pair, and never-before-seen KMS key. Prioritize cases where unusual
+    KMS usage, attachment churn, and workload criticality co-occur, which together describe a likely denial-of-access
+    (ransom) pattern. Train and validate on labeled Stratus Red Team detonations. The alert MUST surface
+    the top-3 contributing features (e.g., principal/accessKeyId, KMS key id, encryption-API rate, region,
+    instance criticality) so analysts can triage. A high anomaly score combined with criticality is a
+    priority lead; low scores reflect routine behavior.
+  answer_sources:
+  - AWS CloudTrail management events
+  - AWS KMS key usage logs
+  - AWS Config configuration history
+  - Amazon EC2 state-change notifications
+  - 'NAI: EBS volumes attached to critical EC2 workloads, KMS keys approved for storage encryption, and
+    configuration history for snapshot, volume, and attachment changes in production accounts'
+  range: Last 90 days (model training); score in near-real-time
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = unsupervised_rare_population(cloudtrail, features=[api_for_principal_rarity, region_rarity,
+      user_command_pair_rarity, kms_key_novelty, attachment_churn, instance_criticality])
+
+      score = model.anomaly_score(session)
+
+      ALERT WHERE score > threshold; EMIT top_3_contributing_features'
+- question: Following a recent volume/snapshot encryption change using an unapproved key, did the same
+    EC2 workloads exhibit boot failures, filesystem mount errors, impaired or failed instance status checks
+    (StatusCheckFailed*), or unusual detach->attach sequences within a 1-2 hour window?
+  context: This symbolic-logic correlation confirms that suspicious re-encryption actually caused denial
+    of access rather than being benign maintenance. Join the CloudTrail EBS/KMS encryption events (referencing
+    unapproved keys, per the AWS Threat Technique Catalog) to EC2 state-change notifications and CloudWatch
+    status checks for the SAME instances within a 1-2 hour window, looking for boot failures, mount errors,
+    StatusCheckFailed_Instance / StatusCheckFailed_System, or detach->attach churn. A positive correlation
+    (encryption then failure on the same asset) is strong evidence of impact; encryption with no downstream
+    failure suggests legitimate change or pre-staging that has not yet triggered outage.
+  answer_sources:
+  - Amazon EC2 state-change notifications
+  - Amazon CloudWatch metrics
+  - System logs
+  - AWS CloudTrail management events
+  - 'NAI: Critical EC2 instances, workload monitoring for storage-related health degradation, and boot
+    or mount telemetry associated with recent volume and snapshot changes'
+  range: Last 90 days; correlation window 1-2 hours after encryption change
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'enc = FROM cloudtrail WHERE eventName IN (CreateVolume, CopySnapshot, ModifySnapshotAttribute)
+      AND kmsKeyId NOT IN approved_allowlist AND target IN critical_assets
+
+      fail = FROM ec2_state_change|cloudwatch WHERE metric IN (StatusCheckFailed_Instance, StatusCheckFailed_System)
+      OR state IN (boot_fail, mount_error) OR detach->attach
+
+      ALERT WHERE enc.instanceId == fail.instanceId AND 0 < fail.time - enc.time <= 2h'
+- question: After a recent EBS replacement or re-encryption, did the workload show failed auto-recovery,
+    failed snapshot-restore tests, repeated Stop/Start cycles on the same critical asset, or AWS Config
+    encrypted-volumes / key-compliance state flipping for production volumes?
+  context: 'Recovery-path failure is a direct symptom of impact: if a replaced/re-encrypted volume cannot
+    be restored or auto-recovered, the organization''s approved recovery design has been subverted. Alert
+    when recent EBS replacement/re-encryption is followed by failed auto-recovery, failed snapshot-restore
+    tests, repeated instance Stop/Start cycles for the same critical asset, or AWS Config rules (encrypted-volumes
+    / key-compliance) flipping state for production volumes. These map to the config-state monitoring
+    and least-privilege controls recommended in the AWS Threat Technique Catalog. A positive result indicates
+    the recovery design is compromised; stable recovery tests reduce concern.'
+  answer_sources:
+  - Amazon EC2 state-change notifications
+  - Amazon CloudWatch metrics
+  - System logs
+  - AWS CloudTrail management events
+  - 'NAI: Critical EC2 instances, workload monitoring for storage-related health degradation, and boot
+    or mount telemetry associated with recent volume and snapshot changes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM (ec2_state_change UNION cloudtrail UNION aws_config) WHERE asset IN critical_assets\n\
+      \  AND recent_event(EBS replace/re-encrypt) within 24h\n  AND ( failed_auto_recovery OR failed_snapshot_restore\
+      \ OR count(Stop/Start)>=3 OR config_rule(encrypted-volumes|key-compliance) state CHANGES )\nALERT\
+      \ severity=high"
+- question: Do critical instances show restart failures, recovery time, EBS disk errors / VolumeQueueLength,
+    status-check failure rate, or storage-alarm frequency exceeding their baseline (mean + 3 sigma), or
+    a gradual degradation detectable only by cumulative-sum, after suspicious encryption changes?
+  context: Baseline per critical instance the normal restart-success rate, volume-attachment stability,
+    EBS disk-error / VolumeQueueLength metrics, status-check failure rate, and storage-alarm frequency.
+    Flag workloads whose restart failures or recovery time exceed mean + 3 sigma after suspicious encryption
+    changes using k-sigma aggregation (Dwyer & Truta), and use a stateful CUSUM over per-volume health
+    residuals (Urbina et al.) to catch gradual degradation that stays under any single-sample threshold.
+    Importantly, profile the boot/mount FAILURE rate as a distinct signal rather than only tracking averages.
+    A positive result is abnormal storage-health degradation aligned with encryption activity; normal
+    health rules out impact.
+  answer_sources:
+  - Amazon EC2 state-change notifications
+  - Amazon CloudWatch metrics
+  - System logs
+  - AWS CloudTrail management events
+  - 'NAI: Critical EC2 instances, workload monitoring for storage-related health degradation, and boot
+    or mount telemetry associated with recent volume and snapshot changes'
+  range: Last 90 days (per-instance rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'metrics per instance: restart_success_rate, attach_stability, ebs_disk_errors, VolumeQueueLength,
+      status_check_fail_rate, storage_alarm_freq, boot_mount_fail_rate
+
+      baseline mean,std over trailing window
+
+      ALERT k-sigma WHERE metric > mean + 3*std AFTER suspicious_encryption_change
+
+      ALERT cusum over per-volume health residuals: S_t = max(0, S_{t-1}+(resid-k)); fire WHERE S_t>h'
+- question: Where host-level telemetry exists on affected workloads (Sysmon EventCode 11/2 or auditd write/rename),
+    do written files show sustained high Shannon entropy (>7.0-7.2) consistent with genuine encryption
+    rather than plaintext (5.0-6.5)?
+  context: Shannon-entropy analysis of written file content distinguishes true encryption impact from
+    benign configuration changes. Where instance-level telemetry exists (Sysmon EventCode 11 file creation
+    / EventCode 2 file modification, or auditd write/rename syscalls), compute the entropy of written
+    content; sustained high-entropy writes (entropy > 7.0-7.2 vs plaintext 5.0-6.5, per Lyda & Hamrock)
+    confirm that data is actually being encrypted on the host, reducing false positives from cloud-side
+    metadata changes. A positive result (high-entropy write bursts on affected hosts) confirms genuine
+    encryption; entropy in the plaintext range argues for a benign cause.
+  answer_sources:
+  - Amazon EC2 state-change notifications
+  - Amazon CloudWatch metrics
+  - System logs
+  - AWS CloudTrail management events
+  - 'NAI: Critical EC2 instances, workload monitoring for storage-related health degradation, and boot
+    or mount telemetry associated with recent volume and snapshot changes'
+  range: Last 90 days; focus on windows around encryption changes
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM (sysmon EventCode IN (11,2)) OR (auditd SYSCALL IN (write, rename, openat)) WHERE host
+      IN affected_workloads
+
+      compute shannon_entropy(written_bytes)
+
+      ALERT WHERE entropy > 7.0 sustained AND write_burst (distinguish from plaintext 5.0-6.5)'
+- question: Does anomaly detection across EC2 state transitions, storage events, and operational metrics
+    identify a campaign where unauthorized encryption disrupts workload access — weighting instance criticality,
+    simultaneous impact scope, recurrence of the same KMS key across affected assets, and high-rate read->encrypted-write
+    host sequences?
+  context: This ML detector identifies coordinated denial-of-access campaigns rather than isolated events.
+    Run anomaly detection across EC2 state transitions, storage events, and operational metrics, weighting
+    instance criticality, simultaneous impact scope, and recurrence of the same KMS key across affected
+    assets (Urbina et al. residual modeling; the discovery->impact chain in Unit 42). Complement with
+    host behavioral classification of high-rate read->encrypted-write action sequences using mutual-information-selected
+    features per EldeRan (Sgandurra et al.). Alerts MUST list the top-3 contributing features (affected
+    instance ids/criticality, shared KMS key id, failure metric). A strong detection with shared-key recurrence
+    across multiple critical assets indicates an active extortion campaign; isolated low-criticality anomalies
+    are lower priority.
+  answer_sources:
+  - Amazon EC2 state-change notifications
+  - Amazon CloudWatch metrics
+  - System logs
+  - AWS CloudTrail management events
+  - 'NAI: Critical EC2 instances, workload monitoring for storage-related health degradation, and boot
+    or mount telemetry associated with recent volume and snapshot changes'
+  range: Last 90 days (model training); score in near-real-time
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = anomaly_detect(features=[ec2_state_transitions, storage_events, op_metrics, instance_criticality,
+      impact_scope, shared_kms_key_recurrence])
+
+      host_clf = eldERan(read->encrypted_write sequences, mutual_information_selected_features)
+
+      ALERT WHERE model.score > threshold OR host_clf == ransomware; EMIT top_3_features (instance_ids/criticality,
+      shared_kms_key_id, failure_metric)'
