@@ -1,0 +1,510 @@
+name: 'T1027.001: Obfuscated Files or Information: Binary Padding'
+id: 6f8acbc8-c513-4af1-8a73-45cc3da98ac2
+description: >-
+  Investigate whether an adversary is using binary padding to evade static, file-based defenses by appending
+  junk data or inflating PE overlays to change a file's on-disk representation, defeat hash-based blocklists
+  and static signatures, and push file sizes beyond what size-limited scanners, sandboxes, and public
+  scanning services can handle. This playbook helps an analyst hunt for executables transferred or written
+  to disk that match binary-padding threat intelligence (pivoting on imphash and fuzzy hashes since per-victim
+  padding changes the SHA256), PE files in network telemetry with extreme overlay sizes or anomalous overlay
+  entropy, endpoint process creation from binaries whose size or structure deviates from the historical
+  baseline for that image path, and padded processes that exhibit suspicious post-execution behavior such
+  as discovery or credential-access child processes and beacon-like outbound C2. It combines symbolic-logic
+  rules, statistical baselining of size/overlay/entropy/prevalence, and machine-learning classifiers and
+  outlier detection across Windows (Sysmon), Linux (auditd/osquery), macOS (unified log), and network
+  (Zeek) data sources.
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Do any executables seen in Zeek files.log or written to disk (Sysmon Event ID 11) match binary-padding
+    threat intelligence not only by SHA256 but also by import hash (imphash) and fuzzy hash (ssdeep/TLSH),
+    and if so what is their execution context?
+  context: >-
+    Binary padding changes the SHA256 of an otherwise identical payload on a per-victim basis, so matching
+    only on full-file hashes will miss the same family delivered with different padding. Match observed
+    file hashes against binary-padding TI feeds, then pivot on imphash and fuzzy hashes (ssdeep/TLSH)
+    and family-level indicators to catch padded variants. This supports the Stealth tactic because the
+    adversary is deliberately altering the file's on-disk representation to blend in and defeat hash-based
+    blocklists. Prioritize files that both match TI and execute from user-writable or unusual locations,
+    and explicitly track as a distinct state files that match TI but whose execution is blocked or fails
+    (a near-miss worth investigating).
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - 'NAI: Network egress points, Proxy server logs, Mail gateway logs, Endpoint file systems'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      files = file_creation(Sysmon EID 11) UNION network_files(Zeek files.log);
+
+      for f in files: enrich(imphash, ssdeep, tlss);
+
+      match = f.sha256 in TI.padding OR f.imphash in TI.padding OR fuzzy_match(f.ssdeep, TI.padding) >
+      80;
+
+      exec = join process_creation on image=f.path;
+
+      alert when match AND (exec.path in user_writable OR unusual_location);
+
+      tag state = blocked/failed_execution as distinct near-miss; output path, hashes, signer, exec_context.
+- question: >-
+    Are there large executables whose PE overlay (bytes after the last section's raw data) exceeds an
+    org-specific 99th-percentile size threshold while the overlay's Shannon entropy is either very low
+    (<1.0, null/repeated junk) or very high (>7.2, random junk)?
+  context: >-
+    Adversaries inflate file size past scanner and upload limits by appending an overlay of junk data.
+    Compute the PE overlay region and its Shannon entropy: legitimate code sections sit in a 4.5-6.0 entropy
+    band, so an overlay that is near-zero entropy (repeated/null padding) or near-maximal entropy (random
+    padding) is anomalous. Alert when overlay volume exceeds the org-specific 99th percentile (e.g., >1
+    MB) AND overlay entropy is <1.0 or >7.2. This is a Stealth indicator: the padding does not change
+    functionality but changes the on-disk footprint to evade static scanning. A positive result is a strong
+    padding candidate for deeper triage.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - 'NAI: Network egress points, Proxy server logs, Mail gateway logs, Endpoint file systems'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      for f in pe_files: overlay = bytes_after_last_section_rawend(f); ovsize = len(overlay);
+
+      ovent = shannon_entropy(overlay);
+
+      thr = percentile(org.overlay_sizes, 99);
+
+      alert when ovsize > max(thr, 1MB) AND (ovent < 1.0 OR ovent > 7.2);
+
+      output path, ovsize, ovent, file_size.
+- question: >-
+    Which executable writes have top-95th-percentile per-section/overlay byte-entropy combined with a
+    first-seen publisher/path on critical hosts and low fleet prevalence, and do they have corroborating
+    suspicious context beyond entropy alone?
+  context: >-
+    Baseline file content entropy using byte-entropy histogram features, plus path distribution and signer
+    prevalence for executable writes. Flag files in the top 95th percentile of entropy together with first-seen
+    publisher/path combinations on critical hosts, and weight rare (low fleet-prevalence) files higher.
+    Because benign packers also raise entropy, entropy alone is not enough; require corroborating context
+    (unusual path, unsigned/new signer, rarity) before escalating. This serves the Stealth tactic by surfacing
+    padded/packed payloads attempting to blend in, while controlling false positives from legitimate packed
+    software.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - 'NAI: Network egress points, Proxy server logs, Mail gateway logs, Endpoint file systems'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      baseline entropy_hist, signer_prevalence, path_dist over fleet (90d);
+
+      for w in executable_writes: score = pct_rank(entropy(w)) ;
+
+      rare = fleet_prevalence(w.hash) low; first_seen = (w.signer,w.path) not in baseline;
+
+      flag when score >= 95th AND first_seen AND host in critical AND corroborating_context(rare OR unsigned);
+
+      rank by rarity; output path, entropy, signer, prevalence.
+- question: >-
+    When a gradient-boosted classifier (LightGBM/XGBoost) scores candidate files over static PE features
+    (overlay size, total file size, section raw-vs-virtual mismatches, byte-entropy histogram, signer
+    trust), which files score high-risk and what top-3 features drive each score?
+  context: >-
+    Score candidate executables with a gradient-boosted tree model over interpretable static PE features
+    as in EMBER-style detection: overlay size, total file size, section raw-vs-virtual size mismatches,
+    byte-entropy histogram, and signer trust. Surface the top-3 contributing features (e.g., overlay_size,
+    file_size, section_entropy) in the alert text rather than only a numeric score so an analyst can judge
+    whether padding is driving the decision. This supports Stealth detection by catching padded payloads
+    whose structural anomalies betray the concealment even when hashes are unknown. A high score with
+    overlay/size as a top feature is a strong padding indicator.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - 'NAI: Network egress points, Proxy server logs, Mail gateway logs, Endpoint file systems'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = gbdt(LightGBM, features=[overlay_size,file_size,raw_vs_virtual,byte_entropy_hist,signer_trust]);
+
+      for f in candidate_files: score, contribs = model.predict_explain(static_features(f));
+
+      alert when score >= threshold; output score, top3(contribs), path, signer.
+- question: >-
+    Can a padded-binary write be linked to an upstream delivery artifact (email attachment retrieval,
+    browser download, SMB transfer, or script-based dropper) on the same host within a short interval
+    (e.g., under 10 minutes)?
+  context: >-
+    Padding is a delivery-stage evasion: the same family arrives with differing hashes per victim, so
+    linking the padded write back to how it arrived is high value. Correlate padded-binary writes with
+    upstream delivery artifacts—mail gateway attachment retrieval, browser download paths, SMB file transfers,
+    or script-based droppers—and escalate when delivery and execution occur within a tight interval on
+    the same host. This serves the Stealth tactic by exposing the full delivery-to-execution chain that
+    the per-victim hash changes are meant to hide. A tight delivery->write->execute sequence is strong
+    evidence of an active intrusion.
+  answer_sources:
+  - Zeek files.log
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - 'NAI: Network egress points, Proxy server logs, Mail gateway logs, Endpoint file systems'
+  range: Last 90 days, with event-centered correlation within a short interval (e.g., 10 minutes) of the
+    padded write/first execution.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "pad = padded_binary_writes; \ndeliv = mail_attachment UNION browser_download UNION smb_transfer\
+      \ UNION script_dropper;\njoin on host where 0 < (pad.ts - deliv.ts) < 10m;\nescalate; output delivery_channel,\
+      \ source, file, host, timeline."
+- question: >-
+    Do PE files reconstructed from network telemetry (Zeek pe.log) have an overlay size above an absolute
+    threshold (e.g., >5 MB) or a total file size that approaches/exceeds the static scanner or sandbox
+    upload limit, and is the transfer complete rather than truncated?
+  context: >-
+    Compute PE overlay size/offset from Zeek pe.log and alert when the overlay exceeds an absolute threshold
+    (e.g., >5 MB) or total file size approaches/exceeds the scanner or sandbox upload limit (commonly
+    tens to hundreds of MB)—conditions specifically engineered to defeat size-limited static scanning.
+    The overlay/file-size relationship is a standard static feature. Track completed vs partial/failed
+    transfers as a distinct state so truncated downloads are not miscounted as oversized payloads. This
+    supports Stealth detection at the network gateway, catching evasion before the file lands. A complete
+    oversized transfer is a high-priority padding candidate.
+  answer_sources:
+  - Zeek pe.log
+  - Zeek files.log
+  - 'NAI: Network monitoring sensors (e.g., Zeek) at internet gateways, VPN termination points, and data
+    center ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: >-
+      for pe in zeek.pe_log: overlay = pe.file_size - pe.last_section_rawend;
+
+      complete = join files.log on fuid where missing_bytes==0;
+
+      alert when complete AND (overlay > 5MB OR pe.file_size >= scanner_limit);
+
+      output uid, fuid, overlay, file_size, src, dst, transfer_state.
+- question: >-
+    Grouped by filename, which PE files exceed the 99th-percentile overlay size for their group (or an
+    absolute threshold for new filenames), and do their overlay-to-code-size and raw-vs-virtual section
+    ratios deviate from the norm?
+  context: >-
+    Group PE files by filename, build historical overlay-size baselines, and flag files exceeding the
+    99th percentile for their group or an absolute threshold (e.g., >2 MB) for never-before-seen filenames.
+    Also baseline overlay-to-code-size and raw-vs-virtual section-size ratios, whose deviation indicates
+    packing/padding. This serves the Stealth tactic by detecting when a familiar-looking filename suddenly
+    carries far more appended data than its peers—a hallmark of per-victim padding. A filename whose overlay
+    jumps well past its historical distribution warrants investigation.
+  answer_sources:
+  - Zeek pe.log
+  - Zeek files.log
+  - 'NAI: Network monitoring sensors (e.g., Zeek) at internet gateways, VPN termination points, and data
+    center ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      baseline = percentile(overlay_size by filename, 99) over 90d;
+
+      for pe in pe_files: grp = pe.filename;
+
+      flag when pe.overlay > baseline[grp] OR (grp not in baseline AND pe.overlay > 2MB);
+
+      also flag overlay_to_code ratio or raw_vs_virtual ratio deviation;
+
+      output filename, overlay, ratios, baseline.
+- question: >-
+    Does the byte-entropy histogram of a PE file's overlay region show a low-entropy mass (<1.0, null/repeated
+    padding) or a saturated high-entropy mass (>7.2, random padding) that diverges from the legitimate
+    code-section entropy band of 4.5-6.0?
+  context: >-
+    Compute the byte-entropy histogram of the overlay region and flag a low-entropy mass (<1.0, indicating
+    null or repeated padding) or a saturated high-entropy mass (>7.2, indicating random padding) that
+    diverges from the 4.5-6.0 entropy band typical of legitimate code sections. Profiling the distribution
+    (not just a single entropy value) makes the signal robust to mixed content. This supports Stealth
+    detection because both kinds of junk overlay are used to inflate size and evade scanning while leaving
+    code intact. An overlay dominated by either extreme is a strong padding indicator.
+  answer_sources:
+  - Zeek pe.log
+  - Zeek files.log
+  - 'NAI: Network monitoring sensors (e.g., Zeek) at internet gateways, VPN termination points, and data
+    center ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for pe in pe_files: ov = overlay(pe); hist = byte_entropy_histogram(ov);
+
+      low_mass = fraction(hist, entropy<1.0); high_mass = fraction(hist, entropy>7.2);
+
+      flag when low_mass > t OR high_mass > t (outside 4.5-6.0 code band);
+
+      output filename, low_mass, high_mass, overlay_size.
+- question: >-
+    Applying Seasonal Hybrid ESD (or comparable anomaly detection) to the hourly average overlay size
+    of new executables, are there sudden spikes that correlate with threat intelligence hits or concurrent
+    alerts?
+  context: >-
+    Apply Seasonal Hybrid ESD or comparable time-series anomaly detection to the hourly average overlay
+    size of newly observed executables, then correlate any sudden spikes with threat intelligence or concurrent
+    alerts. A campaign that begins pushing padded binaries will shift the aggregate overlay distribution
+    even if individual files slip past per-file rules. This serves the Stealth tactic by catching the
+    population-level signature of a padding campaign. A spike that aligns with TI or other alerts strongly
+    suggests coordinated padded delivery.
+  answer_sources:
+  - Zeek pe.log
+  - Zeek files.log
+  - 'NAI: Network monitoring sensors (e.g., Zeek) at internet gateways, VPN termination points, and data
+    center ingress/egress points.'
+  range: Last 90 days, evaluated as an hourly time series to expose campaign-level spikes.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      series = hourly_avg(overlay_size) for new_executables over 90d;
+
+      anomalies = SeasonalHybridESD(series);
+
+      for a in anomalies: correlate with TI hits AND concurrent_alerts in window;
+
+      alert on corroborated spikes; output hour, avg_overlay, corroboration.
+- question: >-
+    Running Extended Isolation Forest on per-file vectors (overlay size, file size, section count, raw-vs-virtual
+    ratios, per-section entropy), which unlabeled files surface as outliers consistent with padding, and
+    what top-3 features drive each anomaly score?
+  context: >-
+    Run Extended Isolation Forest over per-file feature vectors—overlay size, file size, section count,
+    raw-vs-virtual ratios, and per-section entropy—to surface unlabeled outliers consistent with padding
+    without needing prior labels. Decompose each anomaly score into its top-3 contributing features for
+    the alert so an analyst can see whether overlay or size dominates. This supports Stealth detection
+    by finding novel padded samples that signature and threshold rules miss. A high anomaly score driven
+    by overlay/size features is a strong padding candidate.
+  answer_sources:
+  - Zeek pe.log
+  - Zeek files.log
+  - 'NAI: Network monitoring sensors (e.g., Zeek) at internet gateways, VPN termination points, and data
+    center ingress/egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      X = vectors[overlay_size,file_size,section_count,raw_vs_virtual,section_entropy] for pe_files;
+
+      model = ExtendedIsolationForest(); scores = model.fit_predict(X);
+
+      for f in top_anomalies(scores): contribs = feature_attribution(f);
+
+      alert; output score, top3(contribs), filename.
+- question: >-
+    For watchlisted critical executable paths, does a newly executed binary diverge from the expected
+    size/SHA256/imphash/signer combination for that path—especially size growth with an unchanged or absent
+    signature?
+  context: >-
+    Maintain watchlists for critical executable paths (e.g., key system, server, and admin tool binaries)
+    and alert when a newly executed binary diverges from the expected size/SHA256/imphash/signer combination
+    for that path. Because padding changes the SHA256 while leaving functionality intact, treat any size
+    growth with an unchanged or absent signature as high-risk—the binary has been altered on disk but
+    still runs. This serves the Stealth tactic by catching padded-binary substitution or update abuse
+    against trusted paths. A size jump on a critical path with a broken/missing signature is a high-priority
+    lead.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: Critical servers (Domain Controllers, database servers), developer workstations, standard user
+    endpoints, and systems within the DMZ.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "watch = critical_executable_paths;\nfor p in process_creation where image in watch:\n  exp\
+      \ = expected(image); \n  alert when p.size!=exp.size OR p.sha256!=exp.sha256 OR p.imphash!=exp.imphash\
+      \ OR p.signer!=exp.signer;\n  flag high-risk when p.size>exp.size AND (p.signer==exp.signer OR p.signer==none);\n\
+      \  output image, observed vs expected, host."
+- question: >-
+    Tracking the mean/standard deviation and robust median/MAD of FileSize per Image path in Sysmon Event
+    ID 1, which new processes exceed 3 standard deviations (or >3.5 MAD) from the historical baseline
+    for that path?
+  context: >-
+    Track the mean and standard deviation (and the robust median/MAD) of FileSize per Image path from
+    Sysmon Event ID 1, and alert when a newly executed process exceeds 3 standard deviations (or >3.5
+    MAD) from its historical baseline. FileSize and overlay are standard static features for detecting
+    padding-driven size growth. Using a robust MAD estimator alongside the mean/stddev limits distortion
+    from a few large legitimate outliers. This supports the Stealth tactic by flagging when a known image
+    path suddenly executes a much larger binary, consistent with padded substitution.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: Critical servers (Domain Controllers, database servers), developer workstations, standard user
+    endpoints, and systems within the DMZ.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      baseline mean,std,median,mad of FileSize by Image over 90d (Sysmon EID1);
+
+      for p in new_process: z=(p.size-mean[p.image])/std[p.image]; m=abs(p.size-median[p.image])/mad[p.image];
+
+      alert when z>3 OR m>3.5; output image, size, baseline_stats, host.
+- question: >-
+    Running unsupervised Extended Isolation Forest (or DBSCAN) over endpoint file metadata (file size,
+    overlay size, byte/section entropy, PE section count, path depth), which files cluster as anomalies
+    consistent with padding, and what top-3 features drive each?
+  context: >-
+    Run unsupervised Extended Isolation Forest (or DBSCAN) over endpoint file metadata—file size, overlay
+    size, byte/section entropy, PE section count, and path depth—to flag anomalous files consistent with
+    padding without labeled training data. List the top-3 features driving each anomaly in the alert so
+    the analyst can confirm overlay/size involvement. This serves the Stealth tactic by surfacing padded
+    binaries on endpoints that deviate structurally from the local norm, even when their hashes are unknown.
+    Clustering as a sparse outlier with overlay-driven features is a strong padding indicator.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - 'NAI: Critical servers (Domain Controllers, database servers), developer workstations, standard user
+    endpoints, and systems within the DMZ.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      X = endpoint_file_metadata[file_size,overlay_size,byte_entropy,section_entropy,section_count,path_depth];
+
+      model = ExtendedIsolationForest() or DBSCAN(); labels/scores = model.fit(X);
+
+      for f in outliers: contribs = feature_attribution(f);
+
+      alert; output top3(contribs), path, host.
+- question: >-
+    After a suspected padded binary executes, does it spawn high-risk child processes—discovery, credential
+    access, or remote-admin utilities—shortly after first execution?
+  context: >-
+    Correlate padded-binary detections with high-risk child command execution (discovery commands, credential-access
+    tools, remote admin utilities) and escalate when such chains occur shortly after the binary's first
+    execution. Padding is concealment for delivery; what follows execution reveals intent. This bridges
+    the Stealth tactic to subsequent adversary objectives, confirming that a flagged padded file is operationally
+    malicious rather than a benign packed program. A padded parent rapidly spawning discovery or credential-access
+    children is strong evidence of an active intrusion.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Endpoint process and network monitoring agents, DNS resolvers, Network egress points, and SIEM
+    correlation engines.'
+  range: Last 90 days, with event-centered correlation within a short interval (e.g., 10 minutes) of the
+    padded write/first execution.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      pad = suspected_padded_processes;
+
+      children = process_creation where parent in pad;
+
+      highrisk = children.image in {discovery, cred_access, remote_admin};
+
+      escalate when highrisk AND (child.ts - pad.first_exec) < short_window;
+
+      output parent, child_cmds, host, timeline.
+- question: >-
+    For suspected padded binaries, is the standard deviation of the time delta between outbound connections
+    to the same destination (Sysmon Event ID 3, Zeek conn.log) below 1.5 seconds, indicating low-jitter
+    beaconing?
+  context: >-
+    For suspected padded binaries, compute the time delta between successive outbound connections to the
+    same destination from Sysmon Event ID 3 and Zeek conn.log, and flag cases where the standard deviation
+    of those deltas is below 1.5 seconds—a signature of regular, low-jitter beaconing. Automated C2 callbacks
+    are far more periodic than human-driven traffic. This extends Stealth-stage detection into command-and-control:
+    a padded file that beacons with metronome regularity is almost certainly malware. Low inter-connection
+    jitter to a single destination is a strong C2 indicator.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Endpoint process and network monitoring agents, DNS resolvers, Network egress points, and SIEM
+    correlation engines.'
+  range: Last 90 days, with event-centered correlation in tight windows around each suspected execution
+    and its outbound connections.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for b in padded_binaries: conns = outbound(b) group by dst (Sysmon EID3, Zeek conn.log);
+
+      deltas = diff(sorted(conns.ts)); jitter = stddev(deltas);
+
+      flag when jitter < 1.5s AND count(conns) >= N; output binary, dst, period, jitter.
+- question: >-
+    For suspected padded binaries, what are the outbound connection attempts per minute and the ratio
+    of failed/blocked connections and NXDOMAIN responses to successful sessions, and does the pattern
+    look like live low-jitter C2 or contact with dead infrastructure?
+  context: >-
+    For suspected padded binaries, count outbound connection attempts per minute (frequency) and the ratio
+    of failed/blocked connections and NXDOMAIN responses to successful sessions (failure-mode state) from
+    Sysmon Event ID 3 and Zeek conn.log/dns.log. Persistent low-jitter beaconing with steady per-request
+    byte volume indicates live C2, while bursts of failures and NXDOMAINs indicate dead infrastructure
+    still being contacted. This serves Stealth-to-C2 detection by distinguishing active channels from
+    abandoned ones and confirming automated behavior. High failure/NXDOMAIN ratios with regular retries
+    strongly suggest malware reaching for offline C2.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Endpoint process and network monitoring agents, DNS resolvers, Network egress points, and SIEM
+    correlation engines.'
+  range: Last 90 days, with event-centered correlation in tight windows around each suspected execution
+    and its outbound connections.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for b in padded_binaries: rate = count(conns)/minute;
+
+      fail_ratio = (blocked+refused+NXDOMAIN)/successful (Zeek conn.log/dns.log, Sysmon EID3);
+
+      vol = avg_bytes_per_request;
+
+      flag live_c2 when low_jitter AND steady vol; flag dead_infra when fail_ratio high AND steady retries;
+
+      output binary, rate, fail_ratio, vol, verdict.
+- question: >-
+    Does a robust ensemble combining the deterministic overlay/size floor with static (gradient-boosted
+    EMBER-feature) and byte-level (MalConv) classifiers—enriched with auxiliary models like a DGA classifier
+    on Zeek dns.log—elevate a padded binary's risk, and what top-3 features/indicators drive the elevation?
+  context: >-
+    Combine the deterministic overlay/size floor with an ensemble of static (gradient-boosted EMBER-feature)
+    and byte-level (MalConv) classifiers, recognizing that a single byte-level model can be evaded by
+    appended padding bytes. Enrich with auxiliary models such as a DGA classifier on Zeek dns.log, and
+    surface the top-3 contributing features/indicators in the elevated alert. Using a diverse ensemble
+    plus a hard overlay/size floor defeats adversarial padding designed to fool any one model. This serves
+    the Stealth tactic by raising confidence that a padded binary is malicious through multiple independent
+    signals, with explainable drivers for the analyst.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - 'NAI: Endpoint process and network monitoring agents, DNS resolvers, Network egress points, and SIEM
+    correlation engines.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      floor = (overlay_size>thr OR file_size>=scanner_limit);
+
+      s_static = gbdt_ember(static_features); s_byte = malconv(raw_bytes); s_dga = dga_clf(zeek.dns);
+
+      risk = ensemble(floor, s_static, s_byte, s_dga);
+
+      elevate when risk >= threshold; output risk, top3(contributing_features_indicators), binary, host.
