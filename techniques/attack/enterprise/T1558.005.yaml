@@ -1,0 +1,788 @@
+name: 'T1558.005: Ccache Files'
+id: 70ab0acf-a6bb-4e56-adc7-a74a8b46ac12
+description: 'This playbook helps an analyst investigate whether an adversary is stealing or misusing
+  Kerberos credential cache (ccache) files to gain credential access on Linux and macOS, and to detect
+  downstream reuse of that stolen ticket material on Windows Active Directory infrastructure. Ccache files
+  hold a user''s active Kerberos session tickets (the TGT and service tickets) so services can be accessed
+  without re-entering a password; on Linux they live as FILE caches such as /tmp/krb5cc_%UID% or krb5.ccache
+  (and as DIR/KEYRING/KCM caches) governed by /etc/krb5.conf and the KRB5CCNAME environment variable,
+  while on macOS they default to an in-memory API:{uuid} cache. An adversary who reads, copies, modifies,
+  or exports another user''s ccache can perform Pass-the-Ticket, impersonate privileged users, and pivot
+  laterally -- often converting Linux/macOS ccache material into Windows .kirbi format with tooling such
+  as Kekeo, Rubeus, Mimikatz ports, or impacket. The playbook guides the analyst across several complementary
+  angles: auditing non-owner and non-standard process reads of ccache files via auditd watches and osquery
+  FIM; monitoring macOS Endpoint Security / unified logs for non-standard processes that link the GSS/Heimdal
+  Kerberos framework (the Bifrost technique); baselining the processes and volume of ccache access; hunting
+  process command lines and argv for ccache/ticket manipulation keywords and base64-encoded ticket blobs;
+  detecting anomalous network transfer of files matching ccache naming conventions across Zeek files/ftp/smb
+  logs; correlating suspicious Windows NewCredentials (Logon Type 9) logons and credential-tool process
+  creation with follow-on Kerberos activity (4768/4769/4672); stateful and N-gram sequence detection over
+  klist/kinit -> compression/encoding -> outbound transfer chains; and profiling Kerberos service-ticket
+  requests (4769 / Zeek kerberos.log) for stolen-ticket misuse such as TGS-REQ without a preceding TGT,
+  RC4 downgrade in an AES domain, excessive ticket lifetimes, and anomalous source/SPN/time. Detection
+  methods combine symbolic-logic rules, statistical baselining, and machine-learning models (sequence/LSTM,
+  isolation forest/VAE, and graph anomaly detection) applied to Linux auditd, osquery file_events, macOS
+  unified logs and Endpoint Security, Windows Security events, and Zeek network logs, supporting the Credential
+  Access tactic.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: '[Credential Access] Audit non-owner reads of ccache files via auditd watch -- using the ''Symbolic
+    Logic'' approach. Specifically: can you determine whether on Linux/macOS, a Kerberos credential cache
+    is read, copied, modified, or exported by a process that is not the owning user (acting auid/uid !=
+    cache owner) or is not a standard Kerberos/SSSD component. Covers FILE caches (/tmp/krb5cc_%UID%,
+    krb5.ccache), DIR/KEYRING/KCM caches, the macOS in-memory API:{uuid} cache, and setting/relocating
+    KRB5CCNAME.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: On Linux/macOS, a Kerberos credential cache is read, copied, modified, or exported
+    by a process that is not the owning user (acting auid/uid != cache owner) or is not a standard Kerberos/SSSD
+    component. Covers FILE caches (/tmp/krb5cc_%UID%, krb5.ccache), DIR/KEYRING/KCM caches, the macOS
+    in-memory API:{uuid} cache, and setting/relocating KRB5CCNAME. The Symbolic Logic approach works as
+    follows: Configure Linux audit watches on the cache namespace (`auditctl -w /tmp -p rwa -k krb5ccache`)
+    and syscall rules on open/openat for paths matching `krb5cc_*`, `krb5.ccache`, the directories named
+    by `default_ccache_name` in `/etc/krb5.conf`, and `/etc/krb5.conf` itself ([auditctl(8)](https://man7.org/linux/man-pages/man8/auditctl.8.html),
+    [MIT Kerberos Credential Cache](https://web.mit.edu/kerberos/krb5-latest/doc/basic/ccache_def.html)).
+    Alert when the audit record''s `auid`/`uid` differs from the file owner''s UID embedded in `krb5cc_%UID%`,
+    or when `exe=` is not on an allowlist of Kerberos/SSSD components (kinit, klist, sssd, sssd_kcm, gssproxy,
+    sshd) ([Linux Audit Documentation](https://github.com/linux-audit/audit-documentation/wiki/SPEC-Audit-Event-Enrichment)).
+    Additionally alert on `cp`/`tar`/`base64`/scp of any krb5cc path and on conversion tooling (impacket,
+    Kekeo) per known Linux red-team tradecraft ([Kerberos Tickets on Linux Red Teams](https://www.binarydefense.com/resources/blog/kerberos-tickets-on-linux-red-teams/)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - osquery file_events
+  - macos:unifiedlog
+  - macos:endpointsecurity
+  - 'NAI: Linux servers and developer workstations realm-joined via SSSD, bastion/jump hosts, macOS endpoints
+    with Kerberos SSO, /tmp and custom KRB5CCNAME directories'
+  range: Last 90 days
+  queries:
+  - technology: auditd/pseudocode
+    query: "WATCH /tmp -p rwa -k krb5ccache AND syscall open|openat path=~/krb5cc_*|krb5.ccache|/etc/krb5.conf\n\
+      FROM auditd:SYSCALL WHERE key='krb5ccache'\nLET owner_uid = parse_uid(path /krb5cc_(%UID%)/)\nALERT\
+      \ IF auid != owner_uid OR uid != owner_uid\n      OR exe NOT IN allowlist[kinit,klist,sssd,sssd_kcm,gssproxy,sshd]\n\
+      \      OR exe IN [cp,tar,base64,scp,impacket,kekeo]"
+- question: '[Credential Access] Detect macOS in-memory cache access by non-standard processes -- using
+    the ''Symbolic Logic'' approach. Specifically: can you determine whether on Linux/macOS, a Kerberos
+    credential cache is read, copied, modified, or exported by a process that is not the owning user (acting
+    auid/uid != cache owner) or is not a standard Kerberos/SSSD component. Covers FILE caches (/tmp/krb5cc_%UID%,
+    krb5.ccache), DIR/KEYRING/KCM caches, the macOS in-memory API:{uuid} cache, and setting/relocating
+    KRB5CCNAME.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: On Linux/macOS, a Kerberos credential cache is read, copied, modified, or exported
+    by a process that is not the owning user (acting auid/uid != cache owner) or is not a standard Kerberos/SSSD
+    component. Covers FILE caches (/tmp/krb5cc_%UID%, krb5.ccache), DIR/KEYRING/KCM caches, the macOS
+    in-memory API:{uuid} cache, and setting/relocating KRB5CCNAME. The Symbolic Logic approach works as
+    follows: On macOS the cache is usually `API:{uuid}` in memory and never touches disk, so monitor Endpoint
+    Security / unified log for non-Apple-signed or non-standard processes that link the GSS/Heimdal Kerberos
+    framework and enumerate or extract tickets via lower-level APIs (the Bifrost technique), and for unexpected
+    processes setting `KRB5CCNAME` ([When Kirbi Walks the Bifrost](https://posts.specterops.io/when-kirbi-walks-the-bifrost-4c727af7a8e8),
+    [MIT Kerberos Credential Cache](https://web.mit.edu/kerberos/krb5-latest/doc/basic/ccache_def.html)).
+    Cross-platform, deploy osquery `file_events` (inotify/auditd on Linux, FSEvents on macOS) to capture
+    ccache create/modify/access with hash and acting process ([osquery FIM](https://osquery.readthedocs.io/en/stable/deployment/file-integrity-monitoring/)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - osquery file_events
+  - macos:unifiedlog
+  - macos:endpointsecurity
+  - 'NAI: Linux servers and developer workstations realm-joined via SSSD, bastion/jump hosts, macOS endpoints
+    with Kerberos SSO, /tmp and custom KRB5CCNAME directories'
+  range: Last 90 days
+  queries:
+  - technology: macOS-EndpointSecurity/pseudocode
+    query: "FROM macos:endpointsecurity, macos:unifiedlog\nWHERE process links GSS/Heimdal Kerberos framework\n\
+      \  AND (signing_id NOT codesigned-apple OR exe NOT IN standard_kerberos_binaries)\n  AND (enumerates|extracts\
+      \ API:{uuid} ticket OR sets KRB5CCNAME)\nALERT // Bifrost-style in-memory ccache access"
+- question: '[Credential Access] Baseline ccache-accessing processes and volume -- using the ''Statistical
+    Method'' approach. Specifically: can you determine whether on Linux/macOS, a Kerberos credential cache
+    is read, copied, modified, or exported by a process that is not the owning user (acting auid/uid !=
+    cache owner) or is not a standard Kerberos/SSSD component. Covers FILE caches (/tmp/krb5cc_%UID%,
+    krb5.ccache), DIR/KEYRING/KCM caches, the macOS in-memory API:{uuid} cache, and setting/relocating
+    KRB5CCNAME.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: On Linux/macOS, a Kerberos credential cache is read, copied, modified, or exported
+    by a process that is not the owning user (acting auid/uid != cache owner) or is not a standard Kerberos/SSSD
+    component. Covers FILE caches (/tmp/krb5cc_%UID%, krb5.ccache), DIR/KEYRING/KCM caches, the macOS
+    in-memory API:{uuid} cache, and setting/relocating KRB5CCNAME. The Statistical Method approach works
+    as follows: Per host, build a frequency table of `exe=` values that legitimately open ccache files
+    (sshd, sssd, sssd_kcm, gssproxy) over a 30-day window and capture Volume metrics (distinct caches
+    opened per process per hour, bytes read). Alert when a process in the bottom 1st percentile of rarity
+    opens a cache, or when any process reads a distinct-cache count >3 standard deviations above its own
+    baseline (mass harvesting). Profile the State signal: a spike in EACCES/permission-denied opens on
+    krb5cc paths indicates enumeration/brute-force of other users'' caches ([osquery FIM](https://osquery.readthedocs.io/en/stable/deployment/file-integrity-monitoring/),
+    [Linux Audit Documentation](https://github.com/linux-audit/audit-documentation/wiki/SPEC-Audit-Event-Enrichment)).
+    Surface the top-3 contributors (rare exe, distinct-cache count, denied-open count) in the alert. A
+    positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - osquery file_events
+  - macos:unifiedlog
+  - macos:endpointsecurity
+  - 'NAI: Linux servers and developer workstations realm-joined via SSSD, bastion/jump hosts, macOS endpoints
+    with Kerberos SSO, /tmp and custom KRB5CCNAME directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "BASELINE 30d per host: freq_table(exe) opening krb5cc + volume(distinct_caches/hr, bytes)\n\
+      ALERT IF exe in bottom 1st percentile rarity\n      OR distinct_cache_count(exe) > mean+3*std(exe)\n\
+      \      OR spike in EACCES denied opens on krb5cc paths\nREPORT top-3 (rare_exe, distinct_count,\
+      \ denied_count)"
+- question: '[Credential Access] Sequence model over ccache access and execve events -- using the ''Machine
+    Learning'' approach. Specifically: can you determine whether on Linux/macOS, a Kerberos credential
+    cache is read, copied, modified, or exported by a process that is not the owning user (acting auid/uid
+    != cache owner) or is not a standard Kerberos/SSSD component. Covers FILE caches (/tmp/krb5cc_%UID%,
+    krb5.ccache), DIR/KEYRING/KCM caches, the macOS in-memory API:{uuid} cache, and setting/relocating
+    KRB5CCNAME.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: On Linux/macOS, a Kerberos credential cache is read, copied, modified, or exported
+    by a process that is not the owning user (acting auid/uid != cache owner) or is not a standard Kerberos/SSSD
+    component. Covers FILE caches (/tmp/krb5cc_%UID%, krb5.ccache), DIR/KEYRING/KCM caches, the macOS
+    in-memory API:{uuid} cache, and setting/relocating KRB5CCNAME. The Machine Learning approach works
+    as follows: Train an LSTM next-event model (DeepLog-style) on per-host sequences of auditd log keys
+    (open/openat on krb5cc, execve of kinit/klist, follow-on network syscalls) and flag low-probability,
+    out-of-context events such as a ccache read by an atypical parent process followed by compression/exfil,
+    with per-event diagnosis identifying the offending step for explainability ([DeepLog](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)).
+    Train/validate on labeled enterprise telemetry ([LANL Cyber-Security Events](https://csr.lanl.gov/data/cyber1/)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - osquery file_events
+  - macos:unifiedlog
+  - macos:endpointsecurity
+  - 'NAI: Linux servers and developer workstations realm-joined via SSSD, bastion/jump hosts, macOS endpoints
+    with Kerberos SSO, /tmp and custom KRB5CCNAME directories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL DeepLog LSTM next-event on per-host auditd key sequences\n  (open/openat krb5cc, execve\
+      \ kinit/klist, follow-on network syscalls)\nFLAG low-probability out-of-context events (ccache read\
+      \ by atypical parent -> compress/exfil)\nOUTPUT per-event diagnosis of offending step"
+- question: '[Credential Access] Monitor for Windows Event ID 4688 (Process Creation) where the process
+    name or original filename matches a -- using the ''Symbolic Logic'' approach. Specifically: can you
+    determine whether a logon session (Windows Event ID 4624, Logon Type 9) is initiated by a process
+    known to be associated with credential theft tools or by a process not typically associated with creating
+    new logon sessions, suggesting ccache material is being staged or accessed through a stolen-token
+    path.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A logon session (Windows Event ID 4624, Logon Type 9) is initiated by a process
+    known to be associated with credential theft tools or by a process not typically associated with creating
+    new logon sessions, suggesting ccache material is being staged or accessed through a stolen-token
+    path. The Symbolic Logic approach works as follows: Monitor for Windows Event ID 4688 (Process Creation)
+    where the process name or original filename matches a watchlist of known credential access / ticket
+    tools (e.g., `kekeo.exe`, `Rubeus.exe`, `mimikatz.exe`). Correlate the `ProcessGuid` from the 4688
+    event with the `TargetLogonId` in a subsequent Windows Event ID 4624 (Logon) event where `LogonType`
+    is 9 (NewCredentials). Because ccache material stolen from Linux/macOS is often converted to Windows
+    `.kirbi` and reused via Pass-the-Ticket, also correlate the resulting Logon ID with follow-on 4768/4769/4672
+    on the same session ([Detecting Lateral Movement through Tracking Event Logs](https://www.jpcert.or.jp/english/pub/sr/20170612ac-ir_research_en.pdf)).
+    Generate a high-severity alert upon this correlation. A positive result indicates probable theft,
+    staging, conversion, or replay of Kerberos ticket material -- pivot to the responsible process and
+    its parent lineage, the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination
+    of any transfer, and any follow-on Kerberos authentication or logon on that session. A negative result
+    helps rule out this specific vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Linux auditd logs
+  - Zeek files.log
+  - 'NAI: Privileged access workstations, member servers, domain controllers, Tier 0 assets'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM win:4688 WHERE NewProcessName|OriginalFileName IN watchlist[kekeo.exe,Rubeus.exe,mimikatz.exe]
+
+      JOIN win:4624 ON 4688.ProcessGuid -> 4624.TargetLogonId WHERE LogonType=9
+
+      JOIN win:4768|4769|4672 ON same TargetLogonId
+
+      ALERT severity=high // credential tool -> NewCredentials logon -> Kerberos reuse'
+- question: '[Credential Access] Ingest Windows Event ID 4624 logs where `LogonType` is 9 -- using the
+    ''Statistical Method'' approach. Specifically: can you determine whether a logon session (Windows
+    Event ID 4624, Logon Type 9) is initiated by a process known to be associated with credential theft
+    tools or by a process not typically associated with creating new logon sessions, suggesting ccache
+    material is being staged or accessed through a stolen-token path.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A logon session (Windows Event ID 4624, Logon Type 9) is initiated by a process
+    known to be associated with credential theft tools or by a process not typically associated with creating
+    new logon sessions, suggesting ccache material is being staged or accessed through a stolen-token
+    path. The Statistical Method approach works as follows: Ingest Windows Event ID 4624 logs where `LogonType`
+    is 9. For each event, identify the parent process that initiated the logon. Maintain a historical
+    frequency table of parent process names that trigger Logon Type 9 events across the enterprise, and
+    track the count per source host per hour (Frequency) and the failed/success ratio (State, 4625/4768
+    errors). Flag any event where the parent process falls into the bottom 1st percentile of rarity (e.g.,
+    `cscript.exe`, a custom script, or a non-standard administrative tool) or where a single host produces
+    a burst of Type 9 logons exceeding 3 standard deviations above its baseline ([Detecting Forged Kerberos
+    Tickets in an Active Directory Environment](https://arxiv.org/abs/2301.00044)). Include the top-3
+    deviating features in the alert. A positive result indicates probable theft, staging, conversion,
+    or replay of Kerberos ticket material -- pivot to the responsible process and its parent lineage,
+    the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination of any transfer,
+    and any follow-on Kerberos authentication or logon on that session. A negative result helps rule out
+    this specific vector but should be corroborated with the other questions in this playbook, since a
+    single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Linux auditd logs
+  - Zeek files.log
+  - 'NAI: Privileged access workstations, member servers, domain controllers, Tier 0 assets'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM win:4624 WHERE LogonType=9
+
+      BASELINE freq_table(parent_process) enterprise-wide; count/host/hr; fail_success_ratio(4625/4768)
+
+      ALERT IF parent in bottom 1st percentile OR host Type9 burst > mean+3*std
+
+      REPORT top-3 deviating features'
+- question: '[Credential Access] Develop a supervised classification model (e.g., Random Forest, Gradient
+    Boosting) using features extracted -- using the ''Machine Learning'' approach. Specifically: can you
+    determine whether a logon session (Windows Event ID 4624, Logon Type 9) is initiated by a process
+    known to be associated with credential theft tools or by a process not typically associated with creating
+    new logon sessions, suggesting ccache material is being staged or accessed through a stolen-token
+    path.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A logon session (Windows Event ID 4624, Logon Type 9) is initiated by a process
+    known to be associated with credential theft tools or by a process not typically associated with creating
+    new logon sessions, suggesting ccache material is being staged or accessed through a stolen-token
+    path. The Machine Learning approach works as follows: Develop a supervised classification model (e.g.,
+    Random Forest, Gradient Boosting) using features extracted from correlated Windows Event ID 4688 and
+    4624 events. Engineer features such as process name, parent process name, command-line argument count
+    and entropy, user account context, logon type, and source workstation. Train the model on labeled
+    data, where known-benign activity (e.g., `runas.exe /netonly`) is one class and known-malicious or
+    simulated attacks are the other; report SHAP/feature-importance top-3 in the alert for explainability.
+    Deploy the model to score new correlated events in real-time, alerting on those classified as suspicious
+    with high confidence ([DeepLog](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)). A positive
+    result indicates probable theft, staging, conversion, or replay of Kerberos ticket material -- pivot
+    to the responsible process and its parent lineage, the owning versus acting user, the targeted ccache
+    (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication or
+    logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4624
+  - Linux auditd logs
+  - Zeek files.log
+  - 'NAI: Privileged access workstations, member servers, domain controllers, Tier 0 assets'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'MODEL supervised RF/GBT on correlated win:4688+4624 features
+
+      FEATURES: proc, parent, argc, cmdline_entropy, user_ctx, logon_type, src_workstation
+
+      CLASSES: benign(runas /netonly) vs malicious/simulated
+
+      SCORE realtime; ALERT high-confidence suspicious; REPORT SHAP top-3'
+- question: '[Credential Access] From process creation logs (Windows Event ID 4688), create a detection
+    rule that uses regular expressions -- using the ''Symbolic Logic'' approach. Specifically: can you
+    determine whether a process is executed with command-line arguments containing keywords, file paths,
+    or encoded strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket
+    usage.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A process is executed with command-line arguments containing keywords, file paths,
+    or encoded strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket
+    usage. The Symbolic Logic approach works as follows: From process creation logs (Windows Event ID
+    4688 and Linux auditd EXECVE), create a detection rule that uses regular expressions to search the
+    `CommandLine`/argv for patterns associated with ccache interaction and ticket manipulation. Include
+    `ptt /ticket:`, `tgs::ask`, `tgt::ask`, `klist -c`, `kinit -kt`, `KRB5CCNAME=`, `convert /ccache`,
+    references to `krb5cc_` paths, and base64-encoded ticket blobs (`[a-zA-Z0-9+/=]{100,}`) ([MIT Kerberos
+    Credential Cache](https://web.mit.edu/kerberos/krb5-latest/doc/basic/ccache_def.html), [Kerberos Tickets
+    on Linux Red Teams](https://www.binarydefense.com/resources/blog/kerberos-tickets-on-linux-red-teams/)).
+    Generate an alert on any match, especially if the parent process is non-standard (e.g., not `cmd.exe`/`powershell.exe`/a
+    login shell run interactively). A positive result indicates probable theft, staging, conversion, or
+    replay of Kerberos ticket material -- pivot to the responsible process and its parent lineage, the
+    owning versus acting user, the targeted ccache (path or API:{uuid}), the destination of any transfer,
+    and any follow-on Kerberos authentication or logon on that session. A negative result helps rule out
+    this specific vector but should be corroborated with the other questions in this playbook, since a
+    single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: Linux/macOS systems with command-line logging, Windows systems used for ticket conversion, domain
+    controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM win:4688, auditd:EXECVE
+
+      WHERE CommandLine|argv MATCHES /ptt \/ticket:|tgs::ask|tgt::ask|klist -c|kinit -kt|KRB5CCNAME=|convert
+      \/ccache|krb5cc_|[A-Za-z0-9+\/=]{100,}/
+
+      ALERT (escalate IF parent NOT IN [cmd.exe,powershell.exe,interactive-shell])'
+- question: '[Credential Access] Continuously analyze the command-line arguments from process creation
+    logs (Windows Event ID 4688) -- using the ''Statistical Method'' approach. Specifically: can you determine
+    whether a process is executed with command-line arguments containing keywords, file paths, or encoded
+    strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket usage.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A process is executed with command-line arguments containing keywords, file paths,
+    or encoded strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket
+    usage. The Statistical Method approach works as follows: Continuously analyze the command-line arguments
+    from process creation logs (Windows Event ID 4688 and Linux auditd EXECVE). For each command, calculate
+    the Shannon entropy and byte-length (Volume) of the argument string. Establish a baseline distribution
+    over a 30-day window and flag commands whose argument entropy or length exceeds the 98th percentile,
+    indicating a long encoded Kerberos ticket string passed as an argument ([Detecting Forged Kerberos
+    Tickets in an Active Directory Environment](https://arxiv.org/abs/2301.00044)). Report the entropy,
+    length, and matched keyword as the top-3 contributors. A positive result indicates probable theft,
+    staging, conversion, or replay of Kerberos ticket material -- pivot to the responsible process and
+    its parent lineage, the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination
+    of any transfer, and any follow-on Kerberos authentication or logon on that session. A negative result
+    helps rule out this specific vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: Linux/macOS systems with command-line logging, Windows systems used for ticket conversion, domain
+    controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM win:4688, auditd:EXECVE
+
+      COMPUTE shannon_entropy(argv), byte_length(argv)
+
+      BASELINE 30d distribution; ALERT IF entropy>98pct OR length>98pct
+
+      REPORT entropy, length, matched_keyword (top-3)'
+- question: '[Credential Access] Implement an unsupervised anomaly detection model, such as an Isolation
+    Forest or a Variational -- using the ''Machine Learning'' approach. Specifically: can you determine
+    whether a process is executed with command-line arguments containing keywords, file paths, or encoded
+    strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket usage.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A process is executed with command-line arguments containing keywords, file paths,
+    or encoded strings indicative of Kerberos ccache file interaction, ticket conversion, or pass-the-ticket
+    usage. The Machine Learning approach works as follows: Implement an unsupervised anomaly detection
+    model, such as an Isolation Forest or a Variational Autoencoder, to profile command-line executions.
+    Use features like command-line length, argument count, special character frequency, and entropy. Train
+    the model on a large corpus of historical command-line data. The model will learn normal patterns
+    and can then score new, unseen commands, flagging those with high anomaly scores that deviate significantly
+    from learned baselines, thus detecting novel or obfuscated attack variations. A positive result indicates
+    probable theft, staging, conversion, or replay of Kerberos ticket material -- pivot to the responsible
+    process and its parent lineage, the owning versus acting user, the targeted ccache (path or API:{uuid}),
+    the destination of any transfer, and any follow-on Kerberos authentication or logon on that session.
+    A negative result helps rule out this specific vector but should be corroborated with the other questions
+    in this playbook, since a single method can miss stealthy, living-off-the-land, or in-memory ccache
+    abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: Linux/macOS systems with command-line logging, Windows systems used for ticket conversion, domain
+    controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'MODEL supervised RF/GBT on correlated win:4688+4624 features
+
+      FEATURES: proc, parent, argc, cmdline_entropy, user_ctx, logon_type, src_workstation
+
+      CLASSES: benign(runas /netonly) vs malicious/simulated
+
+      SCORE realtime; ALERT high-confidence suspicious; REPORT SHAP top-3'
+- question: '[Credential Access] Monitor Zeek `files.log`, `ftp.log`, and `smb_files.log` for any file
+    transfer where the filename matches -- using the ''Symbolic Logic'' approach. Specifically: can you
+    determine whether anomalous network transfer or local access of a file matching Kerberos ccache naming
+    conventions (`krb5cc_*`, `krb5.ccache`) is observed.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: Anomalous network transfer or local access of a file matching Kerberos ccache naming
+    conventions (`krb5cc_*`, `krb5.ccache`) is observed. The Symbolic Logic approach works as follows:
+    Monitor Zeek `files.log`, `ftp.log`, and `smb_files.log` for any file transfer where the filename
+    matches the regular expression `(krb5cc_|krb5\.ccache)` ([MIT Kerberos Credential Cache](https://web.mit.edu/kerberos/krb5-latest/doc/basic/ccache_def.html)).
+    Correlate the transaction `uid` with `conn.log` to get source/destination IPs and the transferred
+    byte count (Volume). Generate a high-severity alert if the destination is an external IP or an internal
+    host not on a pre-defined allowlist of backup/file servers ([Kerberos Tickets on Linux Red Teams](https://www.binarydefense.com/resources/blog/kerberos-tickets-on-linux-red-teams/)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek ftp.log
+  - Zeek smb_files.log
+  - 'NAI: File servers hosting Linux user home directories, network egress points, Linux developer workstations'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'FROM zeek:files.log|ftp.log|smb_files.log WHERE filename MATCHES /(krb5cc_|krb5\.ccache)/
+
+      JOIN zeek:conn.log ON uid -> src_ip,dst_ip,bytes
+
+      ALERT severity=high IF dst_ip is external OR dst_ip NOT IN allowlist[backup,file_servers]'
+- question: '[Credential Access] On file servers hosting ccache files, use file access auditing (Windows
+    Event ID 4663) to build a baseline -- using the ''Statistical Method'' approach. Specifically: can
+    you determine whether anomalous network transfer or local access of a file matching Kerberos ccache
+    naming conventions (`krb5cc_*`, `krb5.ccache`) is observed.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: Anomalous network transfer or local access of a file matching Kerberos ccache naming
+    conventions (`krb5cc_*`, `krb5.ccache`) is observed. The Statistical Method approach works as follows:
+    On hosts/file servers holding ccache files, use file access auditing (Linux auditd open/openat keyed
+    `krb5ccache`, or Windows Event ID 4663) to build a baseline of processes that normally access these
+    files (e.g., `sshd`, `sssd_kcm`, `gssproxy`, `smbd`, `nfsd`). Create a frequency distribution of accessing
+    processes; flag access from any process in the bottom 5th percentile of frequency or a newly seen
+    binary. Add Volume/State signals: alert if a known process accesses a distinct-ccache count > 3 standard
+    deviations above its own baseline, or if permission-denied (EACCES) opens on others'' krb5cc files
+    spike ([auditctl(8)](https://man7.org/linux/man-pages/man8/auditctl.8.html), [An Unsupervised Multi-Detector
+    Approach for Identifying Malicious Lateral Movement](https://mnoureddine.com/files/17BOH01.pdf)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek ftp.log
+  - Zeek smb_files.log
+  - 'NAI: File servers hosting Linux user home directories, network egress points, Linux developer workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM auditd open|openat key=krb5ccache, win:4663\nBASELINE freq_table(process) accessing ccache\
+      \ [sshd,sssd_kcm,gssproxy,smbd,nfsd]\nALERT IF process in bottom 5th percentile OR new binary\n\
+      \      OR distinct_ccache(process) > mean+3*std OR EACCES spike"
+- question: '[Credential Access] Construct a graph database where nodes represent users, processes, files,
+    and destination IPs, and edges -- using the ''Machine Learning'' approach. Specifically: can you determine
+    whether anomalous network transfer or local access of a file matching Kerberos ccache naming conventions
+    (`krb5cc_*`, `krb5.ccache`) is observed.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: Anomalous network transfer or local access of a file matching Kerberos ccache naming
+    conventions (`krb5cc_*`, `krb5.ccache`) is observed. The Machine Learning approach works as follows:
+    Construct a graph where nodes represent users, processes, files, and destination IPs and edges represent
+    actions (''executed'',''accessed'',''transferred_to''), ingesting file access (auditd / Event ID 4663)
+    and network logs (Zeek). Apply unsupervised graph anomaly detection (node2vec embeddings + link-prediction,
+    community detection) to surface improbable paths such as a standard user''s process reading a privileged
+    user''s ccache then transferring it externally, with link-level explanations for triage ([Detecting
+    Lateral Movement in Enterprise Computer Networks with Unsupervised Graph AI](https://www2.seas.gwu.edu/~howie/publications/CyberGraph-RAID20.pdf),
+    [Euler](https://dev.ndss-symposium.org/wp-content/uploads/2022-107A-paper.pdf)). A positive result
+    indicates probable theft, staging, conversion, or replay of Kerberos ticket material -- pivot to the
+    responsible process and its parent lineage, the owning versus acting user, the targeted ccache (path
+    or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication or logon
+    on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Linux auditd logs
+  - Windows Event ID 4663
+  - Zeek files.log
+  - Zeek conn.log
+  - Zeek ftp.log
+  - Zeek smb_files.log
+  - 'NAI: File servers hosting Linux user home directories, network egress points, Linux developer workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'MODEL supervised RF/GBT on correlated win:4688+4624 features
+
+      FEATURES: proc, parent, argc, cmdline_entropy, user_ctx, logon_type, src_workstation
+
+      CLASSES: benign(runas /netonly) vs malicious/simulated
+
+      SCORE realtime; ALERT high-confidence suspicious; REPORT SHAP top-3'
+- question: '[Credential Access] Create a stateful detection rule that triggers on a specific sequence
+    of events within a short time window -- using the ''Symbolic Logic'' approach. Specifically: can you
+    determine whether a user or system process executes a sequence of commands involving Kerberos utilities
+    (e.g., `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that deviates
+    from established behavioral norms for that entity.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A user or system process executes a sequence of commands involving Kerberos utilities
+    (e.g., `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that deviates
+    from established behavioral norms for that entity. The Symbolic Logic approach works as follows: Create
+    a stateful detection rule that triggers on a sequence within a short window (e.g., 5 minutes) on one
+    host: (1) execution of `klist`/`kinit` or a read of a `krb5cc_*` file by a non-owner (auditd / Event
+    ID 4663/4688); (2) execution of a compression (`tar`,`zip`) or encoding (`base64`) utility; (3) an
+    outbound network connection to an external IP (Zeek `conn.log`) ([Detecting Lateral Movement through
+    Tracking Event Logs](https://www.jpcert.or.jp/english/pub/sr/20170612ac-ir_research_en.pdf), [Kerberos
+    Tickets on Linux Red Teams](https://www.binarydefense.com/resources/blog/kerberos-tickets-on-linux-red-teams/)).
+    Alert on completion of the sequence. A positive result indicates probable theft, staging, conversion,
+    or replay of Kerberos ticket material -- pivot to the responsible process and its parent lineage,
+    the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination of any transfer,
+    and any follow-on Kerberos authentication or logon on that session. A negative result helps rule out
+    this specific vector but should be corroborated with the other questions in this playbook, since a
+    single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: User workstations, bastion hosts, servers with interactive logins'
+  range: Last 90 days (correlate sequence events within a 5-minute sliding window per host)
+  queries:
+  - technology: SIEM/Correlation pseudocode
+    query: "WITHIN 5m ON same host SEQUENCE:\n  (1) exec klist|kinit OR non-owner read krb5cc_* (auditd|4663|4688)\n\
+      \  (2) exec tar|zip|base64\n  (3) outbound conn to external IP (zeek:conn.log)\nALERT on sequence\
+      \ completion"
+- question: '[Credential Access] For each user, model their command execution sequences using N-grams
+    (e.g., bigrams, trigrams) from process -- using the ''Statistical Method'' approach. Specifically:
+    can you determine whether a user or system process executes a sequence of commands involving Kerberos
+    utilities (e.g., `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that
+    deviates from established behavioral norms for that entity.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A user or system process executes a sequence of commands involving Kerberos utilities
+    (e.g., `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that deviates
+    from established behavioral norms for that entity. The Statistical Method approach works as follows:
+    For each user, model command execution sequences using N-grams (bigrams/trigrams) from process creation
+    logs (Event ID 4688 / auditd EXECVE). Estimate each N-gram''s probability from historical data and
+    flag sequences below the 1st percentile, such as `klist`/ccache-read -> `base64`/`powershell -enc`
+    -> outbound connection ([An Unsupervised Multi-Detector Approach for Identifying Malicious Lateral
+    Movement](https://mnoureddine.com/files/17BOH01.pdf)). Report the low-probability transition as the
+    top contributing feature. A positive result indicates probable theft, staging, conversion, or replay
+    of Kerberos ticket material -- pivot to the responsible process and its parent lineage, the owning
+    versus acting user, the targeted ccache (path or API:{uuid}), the destination of any transfer, and
+    any follow-on Kerberos authentication or logon on that session. A negative result helps rule out this
+    specific vector but should be corroborated with the other questions in this playbook, since a single
+    method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: User workstations, bastion hosts, servers with interactive logins'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'PER user: model bigram/trigram of process sequences (4688/auditd EXECVE)
+
+      ESTIMATE P(ngram) from history
+
+      ALERT IF sequence prob < 1st percentile e.g. klist/ccache-read -> base64|powershell -enc -> outbound
+
+      REPORT lowest-probability transition'
+- question: '[Credential Access] Employ a sequence-based deep learning model, such as an LSTM autoencoder,
+    trained on sequences of events -- using the ''Machine Learning'' approach. Specifically: can you determine
+    whether a user or system process executes a sequence of commands involving Kerberos utilities (e.g.,
+    `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that deviates from
+    established behavioral norms for that entity.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A user or system process executes a sequence of commands involving Kerberos utilities
+    (e.g., `klist`) and file access/transfer utilities (e.g., `tar`, `scp`, `powershell`) that deviates
+    from established behavioral norms for that entity. The Machine Learning approach works as follows:
+    Employ a sequence-based model (LSTM next-event / autoencoder) trained on per-user/host sequences of
+    process creation, file access, and network events. Flag sequences with high reconstruction error or
+    low next-event probability — e.g., `klist`/ccache read by an unusual parent at an unusual time followed
+    by an outbound connection — and surface the specific anomalous event for analyst triage ([DeepLog](https://www.cs.utah.edu/~lifeifei/papers/deeplog.pdf)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 4663
+  - Linux auditd logs
+  - Zeek conn.log
+  - 'NAI: User workstations, bastion hosts, servers with interactive logins'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "MODEL LSTM next-event/autoencoder on per-user/host sequences\n  (process creation, file access,\
+      \ network events)\nFLAG high reconstruction error / low next-event prob\n  e.g. klist/ccache read\
+      \ by unusual parent at unusual time -> outbound conn\nSURFACE specific anomalous event"
+- question: '[Credential Access] Monitor Windows Event ID 4769 (A Kerberos service ticket was requested)
+    -- using the ''Symbolic Logic'' approach. Specifically: can you determine whether a Kerberos service
+    ticket request (Windows Event ID 4769) or subsequent logon (Windows Event ID 4624) occurs from a source
+    IP, to a destination service, or at a time that is anomalous for the associated user account, suggesting
+    a stolen ticket is being used.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A Kerberos service ticket request (Windows Event ID 4769) or subsequent logon (Windows
+    Event ID 4624) occurs from a source IP, to a destination service, or at a time that is anomalous for
+    the associated user account, suggesting a stolen ticket is being used. The Symbolic Logic approach
+    works as follows: Monitor Kerberos authentication for misuse of stolen ccache tickets. Alert on a
+    TGS-REQ (Event ID 4769 / Zeek `kerberos.log`) with no preceding TGT (4768) for the account, on RC4-HMAC
+    (0x17) encryption-type downgrade in an AES domain, on ticket lifetimes exceeding domain policy, and
+    on `krbtgt` service requests whose `Client Address` is not a Domain Controller ([Detecting Forged
+    Kerberos Tickets in an Active Directory Environment](https://arxiv.org/abs/2301.00044), [Detecting
+    Lateral Movement through Tracking Event Logs](https://www.jpcert.or.jp/english/pub/sr/20170612ac-ir_research_en.pdf)).
+    A positive result indicates probable theft, staging, conversion, or replay of Kerberos ticket material
+    -- pivot to the responsible process and its parent lineage, the owning versus acting user, the targeted
+    ccache (path or API:{uuid}), the destination of any transfer, and any follow-on Kerberos authentication
+    or logon on that session. A negative result helps rule out this specific vector but should be corroborated
+    with the other questions in this playbook, since a single method can miss stealthy, living-off-the-land,
+    or in-memory ccache abuse.'
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Windows Event ID 4769
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM win:4769, zeek:kerberos.log\nALERT IF TGS-REQ(4769) without preceding TGT(4768) for account\n\
+      \      OR enc_type=RC4-HMAC(0x17) in AES-domain\n      OR ticket_lifetime > domain_policy\n    \
+      \  OR service=krbtgt AND ClientAddress NOT IN domain_controllers"
+- question: '[Credential Access] From Kerberos authentication logs (Zeek `kerberos.log` or Windows Event
+    ID 4769), build a historical -- using the ''Statistical Method'' approach. Specifically: can you determine
+    whether a Kerberos service ticket request (Windows Event ID 4769) or subsequent logon (Windows Event
+    ID 4624) occurs from a source IP, to a destination service, or at a time that is anomalous for the
+    associated user account, suggesting a stolen ticket is being used.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A Kerberos service ticket request (Windows Event ID 4769) or subsequent logon (Windows
+    Event ID 4624) occurs from a source IP, to a destination service, or at a time that is anomalous for
+    the associated user account, suggesting a stolen ticket is being used. The Statistical Method approach
+    works as follows: From Kerberos logs (Zeek `kerberos.log` / Event ID 4769), build a per-account profile
+    of typical source subnets, destination SPNs, and time-of-day/day-of-week windows. Score each new authentication
+    by additive deviations (new country/subnet, first-seen SPN, off-hours) and alert above a threshold.
+    Add a State signal by profiling Kerberos failure codes and 4771/4625 failure rates per account, since
+    ticket replay and enumeration elevate failures ([Detecting Forged Kerberos Tickets in an Active Directory
+    Environment](https://arxiv.org/abs/2301.00044), [Hopper: Modeling and Detecting Lateral Movement](https://www.usenix.org/system/files/sec21-ho.pdf)).
+    Emit the top-3 deviating attributes in the alert. A positive result indicates probable theft, staging,
+    conversion, or replay of Kerberos ticket material -- pivot to the responsible process and its parent
+    lineage, the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination
+    of any transfer, and any follow-on Kerberos authentication or logon on that session. A negative result
+    helps rule out this specific vector but should be corroborated with the other questions in this playbook,
+    since a single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Windows Event ID 4769
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM zeek:kerberos.log, win:4769
+
+      PER account profile: typical src_subnets, dst_SPNs, time-of-day/day-of-week
+
+      SCORE each auth by additive deviation(new_country/subnet, first_seen_SPN, off_hours)
+
+      ADD state: failure_code, 4771/4625 rate per account
+
+      ALERT above threshold; REPORT top-3 deviating attributes'
+- question: '[Credential Access] Apply an unsupervised clustering algorithm like DBSCAN or HDBSCAN to
+    authentication data (Windows Event ID -- using the ''Machine Learning'' approach. Specifically: can
+    you determine whether a Kerberos service ticket request (Windows Event ID 4769) or subsequent logon
+    (Windows Event ID 4624) occurs from a source IP, to a destination service, or at a time that is anomalous
+    for the associated user account, suggesting a stolen ticket is being used.'
+  context: 'Why this matters: Under the Credential Access tactic (TA0006), adversaries steal or misuse
+    Kerberos credential cache (ccache) files -- which hold active TGTs and service tickets -- to authenticate
+    as another user without their password, enabling Pass-the-Ticket, privilege escalation, and lateral
+    movement (including converting Linux/macOS ccache material to Windows .kirbi). This evidence focuses
+    on the condition: A Kerberos service ticket request (Windows Event ID 4769) or subsequent logon (Windows
+    Event ID 4624) occurs from a source IP, to a destination service, or at a time that is anomalous for
+    the associated user account, suggesting a stolen ticket is being used. The Machine Learning approach
+    works as follows: Treat ticket reuse as anomalous-edge detection on the authentication graph. Score
+    first-time (user, destination/SPN) edges and credential switches with rarity-based path scoring ([Hopper:
+    Modeling and Detecting Lateral Movement](https://www.usenix.org/system/files/sec21-ho.pdf)), node2vec
+    + logistic-regression link prediction with link-level explanations ([Detecting Lateral Movement in
+    Enterprise Computer Networks with Unsupervised Graph AI](https://www2.seas.gwu.edu/~howie/publications/CyberGraph-RAID20.pdf)),
+    or GNN+recurrent temporal link prediction over graph snapshots ([Euler](https://dev.ndss-symposium.org/wp-content/uploads/2022-107A-paper.pdf));
+    train/validate on labeled enterprise auth data ([LANL Cyber-Security Events](https://csr.lanl.gov/data/cyber1/)).
+    Alternatively cluster (HDBSCAN) over user/source-IP(GeoIP,ASN)/SPN/cyclical-time features and treat
+    noise points as anomalous logons. A positive result indicates probable theft, staging, conversion,
+    or replay of Kerberos ticket material -- pivot to the responsible process and its parent lineage,
+    the owning versus acting user, the targeted ccache (path or API:{uuid}), the destination of any transfer,
+    and any follow-on Kerberos authentication or logon on that session. A negative result helps rule out
+    this specific vector but should be corroborated with the other questions in this playbook, since a
+    single method can miss stealthy, living-off-the-land, or in-memory ccache abuse.'
+  answer_sources:
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Windows Event ID 4769
+  - Windows Event ID 4624
+  - 'NAI: Domain Controllers, Critical Application Servers, Standard User Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'MODEL supervised RF/GBT on correlated win:4688+4624 features
+
+      FEATURES: proc, parent, argc, cmdline_entropy, user_ctx, logon_type, src_workstation
+
+      CLASSES: benign(runas /netonly) vs malicious/simulated
+
+      SCORE realtime; ALERT high-confidence suspicious; REPORT SHAP top-3'
