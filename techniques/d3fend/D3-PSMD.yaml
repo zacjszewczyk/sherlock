@@ -1,0 +1,444 @@
+name: 'D3-PSMD: Process Self-Modification Detection'
+id: 1e7c864e-3478-4597-a76a-058f60abf463
+description: 'Investigate evidence that a process is modifying, replacing, or injecting its own (or another
+  process''s) executable code at runtime — the core behavior behind process hollowing, reflective DLL/shellcode
+  injection, and runtime unpacking. This playbook helps an analyst hunt for and confirm self-modification
+  across Windows endpoints by: (1) alerting on direct memory-tampering telemetry (Sysmon Event ID 25 ProcessTampering)
+  and the canonical ordered, address-linked API chain allocate -> write -> protect-to-RWX -> execute within
+  a single source process; (2) inspecting suspicious cross-process access masks (PROCESS_VM_WRITE / PROCESS_VM_OPERATION
+  / PROCESS_CREATE_THREAD) and unbacked CallTrace return frames that indicate code executing from memory
+  not backed by any file on disk; (3) flagging high-frequency memory-protection changes, high-entropy
+  RWX segments from runtime unpacking, anomalous executable-memory growth, and hollowed processes (empty/zero-length
+  command lines, broken lineage such as lsass.exe spawning children) that begin making network connections;
+  and (4) layering statistical baselining and machine-learning sequence models with explainable feature
+  attribution OVER, never replacing, the deterministic Sysmon/ETW-TI detection floor. Named areas of interest
+  are critical servers (domain controllers, database servers) and privileged-user workstations.'
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any host log a Sysmon Event ID 25 ProcessTampering event ('Image is replaced' or 'Image
+    is locked for access'), and what parent process and command line spawned the tampered image?
+  context: Under the Detect (D3-D) tactic, Sysmon Event ID 25 (ProcessTampering) is the single most direct
+    signal that a process has had its on-disk image replaced or its memory hollowed at runtime — the canonical
+    fingerprint of process hollowing and self-modification. Generate a high-severity alert on every occurrence,
+    then immediately enrich the offending PID/Image by joining to Windows Event ID 4688 (or Sysmon Event
+    ID 1) on the same process to recover the parent process and full command line, which reveals the origin
+    of the tampering. A true positive is a normally-static system or user binary being replaced; the main
+    benign cause is signed software that self-decompresses or self-patches (installers, some packers),
+    so build a small suppression allowlist of verified known-good signers rather than disabling the rule.
+    Because this is deterministic host telemetry, treat it as the detection floor that all statistical/ML
+    methods sit on top of.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'event.code==25 AND event.provider==''Microsoft-Windows-Sysmon''
+
+      | where Type in (''Image is replaced'',''Image is locked for access'')
+
+      | join (event.code==4688 OR sysmon==1) on ProcessGuid/ProcessId
+
+      | eval severity=''high''
+
+      | where NOT (Image_Signer in known_good_packers)
+
+      | table _time, host, Image, ProcessId, ParentImage, CommandLine, Type'
+- question: Within a single source process, did the ordered, same-base-address API chain allocate -> write
+    -> protect-to-RWX -> execute occur (e.g., VirtualAllocEx -> WriteProcessMemory -> VirtualProtectEx
+    to PAGE_EXECUTE_READWRITE -> CreateRemoteThread/QueueUserAPC/SetThreadContext)?
+  context: For the Detect (D3-D) tactic, no single memory API is malicious on its own; the high-fidelity
+    signal is the ordered, memory-address-linked sequence allocate (VirtualAllocEx/NtAllocateVirtualMemory)
+    -> write (WriteProcessMemory/NtWriteVirtualMemory) -> protect to RWX (VirtualProtectEx/NtProtectVirtualMemory
+    to PAGE_EXECUTE_READWRITE) -> execute (CreateRemoteThread/QueueUserAPC/SetThreadContext), all referencing
+    the SAME base address from one source process. Requiring this temporal+address correlation sharply
+    cuts false positives versus single-API rules. The classic malware-exclusive DLL-injection chain (OpenProcess
+    -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread) can additionally be matched with noise-tolerant
+    Smith-Waterman local sequence alignment so that interleaved benign calls do not break detection. A
+    positive result is a completed injection primitive; pursue it by pivoting to the target process and
+    checking for unbacked execution and network activity.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days; correlate API events within a 60-second window per source process
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from etw_ti OR sysmon_api\n| where SourceProcessGuid==X\n| sequence by SourceProcessGuid,\
+      \ BaseAddress maxspan=60s\n  [api in (VirtualAllocEx,NtAllocateVirtualMemory)]\n  [api in (WriteProcessMemory,NtWriteVirtualMemory)]\n\
+      \  [api in (VirtualProtectEx,NtProtectVirtualMemory) AND prot==PAGE_EXECUTE_READWRITE]\n  [api in\
+      \ (CreateRemoteThread,QueueUserAPC,SetThreadContext)]\n| eval detection='ordered_inject_chain'"
+  - technology: SIEM/Stats pseudocode
+    query: '// noise-tolerant match of OpenProcess->VirtualAllocEx->WriteProcessMemory->CreateRemoteThread
+
+      seq = api_calls_by_process(SourceProcessGuid)
+
+      score = smith_waterman(seq, pattern=[''OpenProcess'',''VirtualAllocEx'',''WriteProcessMemory'',''CreateRemoteThread''])
+
+      where score >= alignment_threshold'
+- question: Which Sysmon Event ID 10 ProcessAccess events show write/inject GrantedAccess masks (PROCESS_VM_WRITE|PROCESS_VM_OPERATION|PROCESS_CREATE_THREAD,
+    e.g., 0x1F0FFF, 0x1FFFFF, 0x143A) into sensitive targets, and do their CallTrace frames resolve to
+    unbacked (non-image) memory?
+  context: 'In the Detect (D3-D) tactic, cross-process injection is visible in Sysmon Event ID 10 (ProcessAccess).
+    Filter for GrantedAccess masks that grant the rights needed to write into and start code in another
+    process — PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_CREATE_THREAD (common composite masks include
+    0x1F0FFF, 0x1FFFFF, 0x143A) — especially when the target is a sensitive process (lsass.exe, a domain-controller
+    service). Then inspect the CallTrace: return frames that resolve to UNBACKED memory (addresses not
+    backed by any image/module on disk) indicate the calling code itself is injected shellcode, a strong
+    corroborator. Where the Microsoft-Windows-Threat-Intelligence ETW provider is available, require executable
+    + unbacked + recently-modified memory before alerting to keep fidelity high. Baseline and suppress
+    known-good cross-process access pairs (e.g., EDR or backup agents) so the alert focuses on novel source->target
+    relationships.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "event.code==10 (Sysmon ProcessAccess)\n| where GrantedAccess in (0x1F0FFF,0x1FFFFF,0x143A)\n\
+      \  OR (GrantedAccess & (PROCESS_VM_WRITE|PROCESS_VM_OPERATION|PROCESS_CREATE_THREAD))\n| where TargetImage\
+      \ in sensitive_targets (lsass.exe, lsm.exe, services.exe, *DC services*)\n| where CallTrace matches\
+      \ 'UNKNOWN(' OR frame_module=='unbacked'\n| where NOT (SourceImage,TargetImage) in known_good_pairs"
+  - technology: ETW/pseudocode
+    query: '>-
+
+      from microsoft-windows-threat-intelligence
+
+      where mem.executable AND mem.unbacked AND mem.recently_modified
+
+      alert on source_pid accessing target_pid'
+- question: Did any single process make rapid, repeated memory-protection changes to executable protection
+    (e.g., more than 5 VirtualProtect/VirtualProtectEx transitions to executable within 10 seconds), consistent
+    with shellcode staging?
+  context: For the Detect (D3-D) tactic, shellcode loaders frequently toggle page protections many times
+    in quick succession while staging and decrypting payloads. Monitor Sysmon Event ID 10 (ProcessAccess),
+    Event ID 8 (CreateRemoteThread), and ETW-TI API logs for bursts of calls to memory-protection functions
+    (VirtualProtect/VirtualProtectEx) that transition pages to executable protection — a useful starting
+    threshold is more than 5 such transitions within 10 seconds in one process. Because legitimate JITs
+    (browsers, .NET, Java) also change protections often, derive the per-environment threshold from the
+    99th percentile of the protection-change rate per process family rather than a global constant. A
+    positive finding is a non-JIT process spiking executable-protection changes; pivot to entropy, unbacked-execution,
+    and network checks to confirm.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days; evaluate in 10-second sliding windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from etw_ti OR sysmon(8,10)
+
+      | where api in (VirtualProtect,VirtualProtectEx) AND new_prot has EXECUTE
+
+      | bin _time span=10s
+
+      | stats count as protchg by ProcessGuid, Image, _time_bin
+
+      | eval thr = pctl99(protchg) by ImageFamily
+
+      | where protchg > max(5, thr) AND ImageFamily NOT in jit_engines'
+- question: Are there native/system processes violating durable lineage rules (lsass.exe spawning children,
+    svchost.exe with a non-services.exe parent, rundll32/regsvr32 with no arguments) or processes with
+    a zero-length command line that nonetheless make outbound network connections?
+  context: 'Within the Detect (D3-D) tactic, process hollowing often leaves two telltale artifacts: broken
+    parent/child lineage and missing command-line arguments. Apply durable lineage rules — lsass.exe must
+    never spawn child processes; svchost.exe must be spawned by services.exe; rundll32.exe and regsvr32.exe
+    running with NO command-line arguments are high-fidelity injection/hollowing indicators. Separately,
+    flag native/system processes (Sysmon Event ID 1) that have a ZERO-LENGTH command line yet make outbound
+    network connections (Sysmon Event ID 3): a hollowed process started suspended and rewritten in memory
+    typically lacks the original binary''s arguments, so an empty command line plus beaconing is strongly
+    anomalous. A positive result is a system binary acting as a network client without its normal arguments
+    — corroborate with ProcessTampering, unbacked execution, and the network baseline below.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '// lineage rules
+
+      (ParentImage==''lsass.exe'')
+
+      OR (Image==''svchost.exe'' AND ParentImage!=''services.exe'')
+
+      OR (Image in (''rundll32.exe'',''regsvr32.exe'') AND CommandLine~=''^\S+$'')  // no args'
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      proc = sysmon1 where Image in system_binaries AND len(trim(CommandLine_args))==0
+
+      net  = sysmon3 (network connect)
+
+      join proc,net on ProcessGuid
+
+      where net.direction==''outbound''
+
+      table host, Image, ParentImage, DestinationIp, DestinationPort'
+- question: Do any running processes have executable memory segments whose Shannon entropy exceeds ~7.0
+    (or the per-process 99th percentile), indicating packed/encrypted code unpacked at runtime into a
+    newly-allocated or RWX region?
+  context: 'In the Detect (D3-D) tactic, runtime unpacking of encrypted/packed payloads leaves a measurable
+    statistical fingerprint: high entropy in executable memory. For each running process, compute the
+    Shannon entropy of its executable memory segments. As a rule of thumb native code scores ~4.7-5.5,
+    packed code ~6.7+, and encrypted code ~7.2-8.0. Alert when a newly-allocated or RWX segment exceeds
+    ~7.0, or when it exceeds the per-process 99th percentile of historical entropy — both indicate injected
+    or freshly-decrypted executable content. Because some legitimate software ships compressed resources,
+    focus on entropy in EXECUTABLE+writable regions rather than data sections, and combine with the RWX/protection-change
+    and unbacked-execution signals to confirm. A positive result is high-entropy executable memory with
+    no corresponding high-entropy section on disk.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days; periodic/triggered memory scans
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for proc in running_processes:\n  for seg in proc.memory_segments where seg.protection has\
+      \ EXECUTE:\n    H = shannon_entropy(seg.bytes)\n    base = pctl99(historical_entropy[proc.image])\n\
+      \    if H > max(7.0, base): alert(proc, seg.base, H)"
+- question: Which processes show anomalous growth in executable/private bytes or an excess of RWX allocations
+    compared with the baseline for their process family?
+  context: For the Detect (D3-D) tactic, injection and self-modification inflate a process's executable
+    footprint. Baseline executable/private byte growth and the count of RWX (PAGE_EXECUTE_READWRITE) allocations
+    per process family, then alert on sustained anomalous growth or an excess of RWX allocations that
+    diverge from established business-software profiles. Combining this volume feature (RWX allocation
+    count) with frequency (protection changes) and state features feeds a low-false-positive detector
+    reported at 99.93% accuracy / 0.068% FP on ETW memory telemetry. RWX allocations are inherently rare
+    in well-behaved software, so even a modest excess is meaningful. A positive result is a process whose
+    executable memory or RWX-allocation rate departs sharply from its peers and history; pivot to entropy
+    and unbacked execution to confirm injected code.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from etw_ti memory_alloc
+
+      | stats sum(exec_bytes) as growth, count(eval(prot==RWX)) as rwx_allocs by ProcessGuid, ImageFamily,
+      day
+
+      | eventstats avg(growth) as mu, stdev(growth) as sd, avg(rwx_allocs) as rmu, stdev(rwx_allocs) as
+      rsd by ImageFamily
+
+      | where growth > mu+3*sd OR rwx_allocs > rmu+3*rsd'
+- question: For each source process, what is the ratio of successful versus failed cross-process operations
+    (OpenProcess/WriteProcessMemory/VirtualProtectEx) — i.e., a burst of successful writes followed by
+    remote-thread creation (completed injection) versus many access-denied failures (probing)?
+  context: Under the Detect (D3-D) tactic, the success/failure state of cross-process operations distinguishes
+    completed injection from early-stage probing. Track, per source process, the ratio of SUCCESSFUL vs
+    FAILED OpenProcess/WriteProcessMemory/VirtualProtectEx operations. A burst of successful writes followed
+    by remote-thread creation indicates a completed injection into a target. In contrast, many FAILED
+    OpenProcess/WriteProcessMemory attempts (STATUS_ACCESS_DENIED) signal a process probing for an injectable
+    target without sufficient rights — common in early-stage activity or against protected processes.
+    Alert on BOTH as distinct signals and rank by success state so completed injections are prioritized.
+    This is especially valuable around protected/sensitive targets where failed access attempts themselves
+    are noteworthy.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from etw_ti OR sysmon10
+
+      | where api in (OpenProcess,WriteProcessMemory,VirtualProtectEx)
+
+      | stats count(eval(status==''SUCCESS'')) as ok, count(eval(status==''ACCESS_DENIED'')) as fail by
+      SourceProcessGuid
+
+      | eval signal = case(ok>0 AND followed_by(CreateRemoteThread),''completed_injection'', fail>=N,''probing'')
+
+      | where isnotnull(signal)'
+- question: Which normally network-quiet processes (e.g., notepad.exe, conhost.exe, or a hollowed svchost)
+    began making outbound connections, or generated bursts of failed/blocked outbound connections, that
+    deviate from the fleet-wide baseline of expected network behavior?
+  context: 'Within the Detect (D3-D) tactic, injection frequently gives a quiet host process new network
+    behavior. Build a fleet-wide baseline of which processes normally make network connections (Sysmon
+    Event ID 3), then flag normally-silent system/user processes (notepad.exe, conhost.exe, a hollowed
+    svchost) that begin beaconing after injection — using prevalence filtering (how common is THIS process
+    making THIS kind of connection across the fleet) to suppress false positives. Also profile FAILED/blocked
+    outbound connections as a distinct command-and-control-attempt signal, since malware often retries
+    unreachable C2. This is an out-of-band corroboration for the memory-based signals: a process flagged
+    by ProcessTampering or the API chain that ALSO starts beaconing is a high-confidence true positive.
+    A positive result is a process making connections it never makes in baseline.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = stats values(DestinationPort), dc(host) as prevalence by Image from sysmon3 over
+      90d
+
+      now = sysmon3 last 24h
+
+      | lookup baseline by Image
+
+      | where Image NOT in baseline.network_makers OR DestinationPort NOT in baseline.ports
+
+      | where prevalence < rare_threshold
+
+      | append [ sysmon3 where status in (''blocked'',''failed'') | stats count by Image,DestinationIp
+      ]'
+- question: Do ordered memory-related API-call sequences (VirtualAllocEx, VirtualProtectEx, WriteProcessMemory,
+    CreateRemoteThread, NtMapViewOfSection) produce high reconstruction error or a malicious classification
+    from a trained sequence model (LSTM autoencoder/classifier)?
+  context: 'For the Detect (D3-D) tactic, sequence machine-learning generalizes beyond hand-written rules
+    to catch novel injection variants. Train an LSTM autoencoder or classifier on ordered memory-related
+    API calls (VirtualAllocEx, VirtualProtectEx, WriteProcessMemory, CreateRemoteThread, NtMapViewOfSection)
+    and flag sequences with high reconstruction error or a malicious classification — the approach reaches
+    ~95% accuracy and 0.83 F1 on the Mal-API-2019 benchmark (7,107 samples). Critically, run this in PARALLEL
+    with the deterministic Sysmon Event ID 25/10 floor, NEVER replacing it: the ML layer is a sensitivity
+    booster for unseen tradecraft, while the deterministic rules guarantee a defensible baseline. A positive
+    result is an API sequence the model deems anomalous/malicious; triage it against the ordered-chain
+    rule, entropy, and network signals before escalating.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = ordered_api_calls(ProcessGuid, fields=[VirtualAllocEx,VirtualProtectEx,WriteProcessMemory,CreateRemoteThread,NtMapViewOfSection])
+
+      score = lstm_autoencoder.reconstruction_error(seq)   // or classifier.predict_proba(seq)
+
+      where score > anomaly_threshold OR class==''malicious''
+
+      // run alongside, never replacing, Sysmon EID 25/10 rules'
+- question: Based only on the FIRST API calls of a newly-started process, does a transformer + attention-guided
+    RNN predict that the process will exhibit malicious injection/self-modification behavior before RWX
+    execution occurs?
+  context: 'Within the Detect (D3-D) tactic, early prediction enables intervention before the payload
+    runs. Use a transformer with an attention-guided RNN (EarlyMalDetect-style) to predict malicious behavior
+    from the FIRST API calls a process makes, catching the onset of an injection/self-modification chain
+    BEFORE the protect-to-RWX/execute stage completes. The value is time: an alert at the first few API
+    calls allows containment (suspend/kill, isolate host) before code executes from injected memory. Because
+    the model fires on partial sequences, pair it with confidence thresholds and the deterministic downstream
+    signals (ProcessTampering, unbacked execution) so a high-confidence early prediction can be auto-contained
+    while lower-confidence predictions are queued for analyst review. A positive result is an early malicious
+    prediction on a process still in its opening API sequence.'
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days; scored at process start on first-N API calls
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "on process_start:\n  prefix = first_N_api_calls(ProcessGuid, N=window)\n  p = early_maldetect.predict(prefix)\
+      \   // transformer + attention RNN\n  if p > high_conf: contain(ProcessGuid)\n  elif p > review_conf:\
+      \ queue_for_analyst(ProcessGuid)"
+- question: For every model-generated self-modification verdict, does the alert surface the top-3 contributing
+    features (via SHAP/LIME) so an analyst can see WHY it fired (e.g., VirtualAllocEx, WriteProcessMemory,
+    CreateRemoteThread) rather than a bare score?
+  context: Under the Detect (D3-D) tactic, explainability turns an ML score into an actionable, defensible
+    alert. Apply SHAP/LIME attribution to the classifier so every alert surfaces the TOP-3 contributing
+    features in the alert text rather than an opaque probability. Published CNN-GRU work (99.37% accuracy)
+    confirms VirtualAllocEx, WriteProcessMemory, and CreateRemoteThread are the dominant drivers of a
+    self-modification verdict, so the attribution typically points an analyst straight at the injection
+    primitive responsible. This both speeds triage (the analyst immediately sees which API behaviors drove
+    the score) and supports tuning (if a benign feature dominates, the model/allowlist can be adjusted).
+    A positive, well-formed result is an alert that names its top-3 features and matches them against
+    the known injection APIs; a verdict driven by unexpected features warrants extra scrutiny before action.
+  answer_sources:
+  - Sysmon Event ID 25
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Microsoft-Windows-Threat-Intelligence ETW provider
+  - 'NAI: Critical servers (e.g., domain controllers, database servers) and user workstations, particularly
+    those of privileged users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'verdict = cnn_gru.predict(features)
+
+      attr = shap_or_lime.explain(model, features)
+
+      top3 = topk(attr, 3)
+
+      emit_alert(verdict, score, top3_features=top3)  // e.g., VirtualAllocEx, WriteProcessMemory, CreateRemoteThread'
