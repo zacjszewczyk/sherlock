@@ -1,0 +1,382 @@
+name: 'AZT602: Steal Service Principal Certificate'
+id: 086ee234-a214-4221-aa34-f21e1042b7db
+description: Investigate whether an adversary has exposed, exported, or reused an Azure Automation Run
+  As (service principal) certificate to obtain credential material for follow-on authentication. This
+  playbook helps an analyst examine Automation runbooks bound to legacy Run As accounts that are created,
+  modified, published, or executed in ways that surface certificate material — thumbprints, PFX/PKCS blobs,
+  certificate-retrieval cmdlets, or base64-encoded key data — in job output, then trace that material
+  into downstream Entra service principal sign-ins. It correlates the canonical create -> modify -> publish
+  -> run -> certificate-export -> sign-in tradecraft, baselines normal runbook authors and execution patterns,
+  applies first-seen and geo/velocity outlier logic to credential reuse, and uses graph and content-based
+  machine-learning models to flag rare authentication paths and likely certificate-harvesting runbook
+  content. Because Run As accounts were retired on 2023-09-30 in favor of non-exportable managed identities,
+  any surviving Run As usage is itself treated as elevated risk.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any Azure Automation job output, JobStream, or JobLog contain a certificate thumbprint
+    or certificate-handling token (for example Get-AutomationCertificate, Get-AutomationConnection, Export,
+    PfxData, ConvertTo-SecureString, X509Certificate, or a base64-encoded blob) on an Automation Account
+    that still uses Run As authentication?
+  context: 'This is the canonical Azure Threat Research Matrix detection for AZT602 extended to a broader
+    set of certificate-handling indicators. A runbook that emits a thumbprint or calls certificate-retrieval
+    cmdlets and then exports or converts that material is exposing the Run As service principal certificate,
+    which an adversary can reuse to authenticate as that principal. Legitimate automation almost never
+    exports its own signing certificate, so even a single occurrence is meaningful. A positive result
+    is a job whose output reveals certificate material; a negative result is routine automation that references
+    no certificate tokens. Tie this to Credential Access: the adversary''s goal is to steal the certificate
+    and the credential it represents.'
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'thumbprint = AzureDiagnostics where ResourceProvider==''MICROSOFT.AUTOMATION'' and ResultDescription
+      has ''Thumbprint'';
+
+      tokens = JobStreams or JobLogs where text matches any of [''Get-AutomationCertificate'',''Get-AutomationConnection'',''Export'',''PfxData'',''ConvertTo-SecureString'',''X509Certificate'',
+      base64_blob_regex];
+
+      scope to accounts where run_as_enabled=true;
+
+      alert on any single occurrence; output automation_account, runbook, job_id, matched_token, author.'
+- question: Do AzureActivity write, publish, and run operations on a Run As-enabled Automation Account
+    cluster together in time and lead to a job whose output contains certificate material?
+  context: This correlates the documented create -> modify -> publish -> run -> export tradecraft for
+    Automation Account attack paths. Look for runbooks/draft/write, runbooks/publish/action, runbooks/write,
+    and jobs/write performed by the same author within a short window, immediately followed by a job that
+    emits certificate tokens. Seeing the full lifecycle in one tight sequence is far more suspicious than
+    any single operation, because it mirrors an operator editing a runbook specifically to extract and
+    export the Run As certificate. A positive result is a same-author lifecycle chain ending in certificate
+    output; a negative result is normal, spaced-out runbook maintenance. This supports Credential Access
+    by exposing the act of weaponizing a runbook to steal the certificate.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with same-author correlation windows of 30 minutes.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'ops = AzureActivity where OperationName in [''Microsoft.Automation/automationAccounts/runbooks/draft/write'',''Microsoft.Automation/automationAccounts/runbooks/publish/action'',''Microsoft.Automation/automationAccounts/runbooks/write'',''Microsoft.Automation/automationAccounts/jobs/write'']
+      and run_as_enabled=true;
+
+      chain = group ops by author where span(events) <= 30m;
+
+      cert_job = jobs where output has certificate_material and ts within 30m after chain;
+
+      alert when chain followed_by cert_job; output author, automation_account, runbook, operation_sequence,
+      job_id.'
+- question: Is any runbook still authenticating through a Run As connection at all, given that Run As
+    accounts were retired on 2023-09-30 in favor of non-exportable managed identities?
+  context: The existence and use of any Run As account is elevated risk because Run As certificates are
+    exportable, unlike managed identities. After the 2023-09-30 retirement, no runbook should depend on
+    a Run As connection, so any runbook that calls Get-AutomationConnection for a Run As connection asset
+    is both a remediation target and a potential theft target. A positive result is a runbook or job that
+    authenticates via a Run As connection; a negative result is exclusive use of managed identities. For
+    Credential Access this flags the standing exposure an adversary would exploit to steal exportable
+    credential material.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'connections = JobStreams or runbook_content where call has ''Get-AutomationConnection'' and
+      connection_type==''AzureServicePrincipal'';
+
+      run_as_accounts = AutomationAccounts where run_as_connection exists;
+
+      alert when runbook authenticates via run_as_connection; prioritize for migration; output automation_account,
+      runbook, connection_name, last_used.'
+- question: After a runbook on a Run As account was created, modified, or executed, did the same Run As
+    service principal sign in to Entra from a new IP, ASN, device, or geography shortly afterward?
+  context: 'This correlation links the certificate-extraction event to its reuse. If a Run As service
+    principal signs in from infrastructure it has never used right after a relevant runbook job completes,
+    it strongly suggests the certificate was extracted and is now being used from attacker-controlled
+    infrastructure. Compare the sign-in''s IP, ASN, device, and geography against the principal''s history.
+    A positive result is a fresh sign-in context that closely follows a runbook job; a negative result
+    is continued sign-ins from known automation infrastructure. This is the Credential Access-to-reuse
+    pivot: it shows the stolen certificate being exercised.'
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with event-centered correlation in the hours after a runbook job completes.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'jobs = Automation jobs on run_as_accounts where edited_or_run=true;
+
+      signins = Entra ServicePrincipalSignIns for the same Run As principal;
+
+      baseline = known_ip_asn_device_geo(principal, trailing_90d);
+
+      alert when signin.context not_in baseline and signin.ts within hours_after job.ts;
+
+      output principal, job_id, signin_ip, signin_asn, signin_geo, target_resource.'
+- question: Are there bursts of failed Automation jobs for a single runbook or bursts of failed service
+    principal sign-ins for a single Run As principal?
+  context: Failure is a distinct and valuable signal. A flurry of failed Automation jobs for one runbook
+    (more than 5 in 15 minutes) suggests an operator iterating on certificate-extraction code, while a
+    burst of failed service principal sign-ins (more than 10 AADSTS errors in 10 minutes for one principal)
+    suggests probing or misuse of a stolen credential. Profiling failures catches attacker activity that
+    never produces a clean success. A positive result is a tight cluster of failures tied to one runbook
+    or principal; a negative result is the occasional isolated failure. This supports Credential Access
+    by surfacing the trial-and-error phase of certificate theft and reuse.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with 10-15 minute burst windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'failed_jobs = Automation jobs where status==''Failed'';
+
+      alert when count(failed_jobs by runbook, 15m) > 5;
+
+      failed_signins = Entra ServicePrincipalSignIns where status has AADSTS_error;
+
+      alert when count(failed_signins by principal, 10m) > 10;
+
+      output runbook_or_principal, failure_count, window, error_codes.'
+- question: For each Automation Account, are there runbook authors, execution windows, certificate-token
+    frequencies, or post-job sign-ins that are statistical outliers against that account's own history?
+  context: This baselines normal behavior per Automation Account and flags rare authors, first-seen runbooks,
+    and jobs whose runtime or certificate-output volume exceeds the account's established pattern. Using
+    a robust median-absolute-deviation / modified Z-score (flag when the modified Z-score exceeds 3.5)
+    prevents scheduled jobs from distorting thresholds. A positive result is a job or author that deviates
+    sharply from the trailing 30-day distribution; a negative result is activity within the account's
+    normal envelope. For Credential Access this surfaces anomalous handling of certificate material that
+    signature rules might miss.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with per-account thresholds derived from the trailing 30-day distribution.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per_account_distribution(authors, exec_windows, cert_token_freq, post_job_signins,
+      trailing_30d);
+
+      for each job/author: m = modified_z_score(value, baseline_median, baseline_mad);
+
+      alert when abs(m) > 3.5 or author is rare or runbook first_seen=true;
+
+      output automation_account, author, runbook, metric, modified_z.'
+- question: Is this the first time an Automation Account has emitted a thumbprint, PFX, or certificate
+    cmdlet, or the first time a Run As service principal has signed in from a given IP, ASN, or resource?
+  context: First-seen logic over a lookback window is a high-signal way to catch certificate theft and
+    reuse. The first time an account ever produces certificate material, or the first time a Run As principal
+    authenticates from a particular IP/ASN/resource, is inherently noteworthy because both events break
+    with established behavior. A positive result is a never-before-seen certificate-handling event or
+    sign-in context; a negative result is repetition of previously observed behavior. This supports Credential
+    Access by prioritizing novel certificate handling and novel credential-use context as the leading
+    edge of an attack.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with first-seen tracking over a trailing baseline window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'seen_cert = set of (account -> emitted certificate_token);
+
+      seen_ctx = set of (principal -> ip/asn/resource);
+
+      alert when account emits certificate_token not_in seen_cert or principal signs_in from context not_in
+      seen_ctx;
+
+      treat as high priority; output entity, first_seen_value, first_seen_ts.'
+- question: Does per-account runbook job volume or per-principal service principal sign-in volume exceed
+    its forecasted confidence band, and does the lifecycle sequence look implausible?
+  context: Time-series forecasting (Prophet-style) of runbook job volume and sign-in volume alerts when
+    counts exceed the predicted band, catching surges driven by automated certificate-extraction attempts
+    or credential reuse. Pair this with a sequence plausibility score over the lifecycle (draft-write
+    -> publish -> job-run -> cert-output -> SP sign-in) using variable-order Markov chains so that improbable
+    orderings are flagged even when raw volumes look normal. A positive result is a volume breakout or
+    a low-probability lifecycle sequence; a negative result is expected volume following a familiar sequence.
+    This supports Credential Access by modeling both the scale and the order of the theft tradecraft.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with forecast retraining and confidence-band scoring.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = count(jobs by account, window) and count(signins by principal, window);
+
+      forecast = prophet(series); alert when observed > upper_confidence_band;
+
+      seq_prob = variable_order_markov([''draft_write'',''publish'',''job_run'',''cert_output'',''sp_signin'']);
+
+      alert when seq_prob < low_threshold; output entity, observed, forecast, sequence, seq_prob.'
+- question: After a certificate-handling job, do the Run As service principal's sign-ins show impossible
+    travel, activity from infrequent countries, or anonymous/Tor source IPs?
+  context: Once a certificate is suspected stolen, the principal's subsequent sign-ins should be evaluated
+    for geo/velocity anomalies that indicate reuse from attacker infrastructure. Impossible travel between
+    sign-ins, authentication from countries the principal never normally uses, and sign-ins from anonymizing
+    proxies or Tor exit nodes are all strong reuse indicators. A positive result is a post-job sign-in
+    with anomalous geo/velocity or anonymized source; a negative result is continued sign-ins consistent
+    with the principal's normal locations. This supports Credential Access by directly surfacing reuse
+    of the stolen certificate.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days, with evaluation focused on the period after a cert-handling job.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'cert_jobs = jobs where output has certificate_material;
+
+      signins = Entra ServicePrincipalSignIns for principal after cert_jobs;
+
+      alert when impossible_travel(signins) or country in infrequent_countries(principal) or source_ip
+      in anonymizer_or_tor_list;
+
+      output principal, signin_ip, signin_geo, velocity_kmh, anonymizer_flag.'
+- question: Does an authentication-path link-prediction model flag a rare new access path where the Run
+    As service principal suddenly reaches a previously unseen resource?
+  context: Modeling authentication relationships as a graph lets the analyst detect the rare new edge
+    created when a stolen credential is used to reach a resource the principal has never touched. Causal
+    login-path scoring (as in Hopper) and improbable new-edge detection (as in CyberGraph) highlight credential
+    switches and new access paths that indicate lateral movement enabled by the stolen certificate. The
+    alert should surface the top-3 contributing features (new resource, credential switch, new source).
+    A positive result is a low-probability new authentication edge; a negative result is access confined
+    to the principal's established resources. This supports Credential Access by exposing the downstream
+    use of the stolen certificate.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days for graph construction and path scoring.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = build_auth_graph(principal -> resource edges, trailing_90d);
+
+      score = login_path_model(new_edge) using causal_path + improbable_new_edge;
+
+      explain = top3_features(new_resource, credential_switch, new_source);
+
+      alert when path_score indicates rare_new_path; output principal, new_resource, score, explain.'
+- question: Does an identity-graph anomaly model flag unusual principal-role-resource-action structure
+    or cross-service fan-out (for example Automation reaching Key Vault or Storage) for the Run As principal?
+  context: Representing user -> automation-account -> runbook -> service-principal -> resource relationships
+    as a heterogeneous, dynamic graph lets a GNN score anomalous structure and cross-service fan-out.
+    After a certificate is stolen, the principal may suddenly fan out from Automation into Key Vault or
+    Storage, creating an anomalous principal-role-resource-action pattern. CS-GAD-style tripartite user/service/activity
+    graphs and GNNs over cloud IAM logs report the top contributing edges/features. A positive result
+    is anomalous graph structure or unexpected fan-out; a negative result is interaction confined to the
+    principal's normal service set. This supports Credential Access by revealing the broadened blast radius
+    of a stolen certificate.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days for graph training and scoring.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = heterogeneous(user, automation_account, runbook, service_principal, resource);
+
+      score = gnn_anomaly(graph) + cs_gad(tripartite user/service/activity);
+
+      alert when anomalous principal_role_resource_action or cross_service_fanout (Automation->KeyVault/Storage);
+
+      output principal, anomalous_edges, top_features, score.'
+- question: Does a rare-operation model over AzureActivity and service principal sign-ins flag unusual
+    Automation operations, user-agents, or sign-in geographies for this principal?
+  context: An unsupervised rare-population / rare-operation approach over AzureActivity and service principal
+    sign-ins flags Automation operations, user-agents, and sign-in geographies that are unusual for each
+    principal. This Elastic-style CloudTrail ML method surfaces low-frequency feature values that deviate
+    from a principal's norm, such as an Automation operation rarely performed by that identity or a sign-in
+    from a rare user-agent. The model should emit the rare feature values driving each alert. A positive
+    result is a rare operation/user-agent/geo combination; a negative result is activity drawn from the
+    principal's common feature values. This supports Credential Access by catching subtle anomalies in
+    how the certificate and principal are used.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days for rarity modeling.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'events = AzureActivity + ServicePrincipalSignIns per principal;
+
+      model = rare_operation_population_model(operation, user_agent, geo);
+
+      alert when feature_value rarity_score high; emit driving_feature_values;
+
+      output principal, rare_operation, rare_user_agent, rare_geo, rarity_score.'
+- question: Does a supervised content classifier rate a runbook as likely certificate-harvesting based
+    on its text, cmdlet usage, JobStream output tokens, and execution lineage?
+  context: Training a classifier on benign automation content versus credential-harvesting scripts lets
+    the analyst identify runbooks that are likely service principal certificate-disclosure workflows.
+    Features include runbook text, cmdlet usage (Get-AutomationCertificate, Export, ConvertTo-SecureString),
+    JobStream output tokens, and execution lineage, baselined against the legitimate uses documented in
+    the Automation security overview. The classifier should surface the top-3 contributing features so
+    the analyst can judge whether the runbook genuinely harvests credentials. A positive result is a runbook
+    scored as likely certificate theft; a negative result is content consistent with sanctioned automation.
+    This supports Credential Access by pinpointing the tooling that performs the theft.
+  answer_sources:
+  - AzureActivity
+  - AzureDiagnostics
+  - JobLogs
+  - JobStreams
+  - Entra Service Principal Sign-in Logs
+  - 'NAI: Automation Accounts using Run As accounts, hybrid workers, and privileged infrastructure subscriptions'
+  range: Last 90 days for scoring, with periodic retraining on labeled content.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = featurize(runbook_text, cmdlet_usage[Get-AutomationCertificate, Export, ConvertTo-SecureString],
+      jobstream_tokens, execution_lineage);
+
+      score = cert_theft_classifier.predict_proba(features);
+
+      explain = top3_features(features);
+
+      alert when score > threshold; output automation_account, runbook, score, explain.'
