@@ -1,0 +1,254 @@
+name: 'T1422.001: Internet Connection Discovery'
+id: 73bfe737-759a-4b2b-8f3a-2ba6de76cc32
+description: 'Investigate whether an adversary is performing Internet connection discovery on a compromised
+  mobile device (Android or iOS) as part of post-compromise Discovery. Adversaries check for Internet
+  connectivity to determine whether a device can reach adversary-owned C2 infrastructure before attempting
+  to connect, and to identify routes, redirectors, and proxy servers. This playbook helps an analyst hunt
+  for two complementary evidence sets: (1) on-device signals — execution of network diagnostic commands
+  (netstat, ping, ifconfig, getprop) or invocation of connectivity-discovery APIs from unauthorized parents,
+  remote ADB shells, or non-system apps requesting privileged permissions such as READ_PRIVILEGED_PHONE_STATE;
+  and (2) network-side signals — bursts of short-lived connections, queries to many high-availability/connectivity-check
+  domains, low data transfer per connection, and elevated NXDOMAIN/failed-connection rates consistent
+  with automated probing rather than human browsing. It combines deterministic symbolic-logic rules, statistical
+  baselining, and machine-learning anomaly detection across mobile EDR, ADB logs, iOS unified logs, application
+  vetting, MDM inventory, and Zeek conn/dns telemetry.'
+type: technique
+related:
+- tactic_id: TA0032
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are network diagnostic commands such as netstat, ping, ifconfig, or getprop being executed
+    on managed mobile devices by a parent process that is not on the allowlist of authorized tools (system_server,
+    zygote, approved MDM clients), and do they correlate with an active remote shell session (e.g., Android
+    Debug Bridge) or occur outside maintenance windows?
+  context: 'During Discovery, an adversary orienting on a freshly compromised mobile device commonly runs
+    built-in network diagnostic utilities to confirm Internet reachability before contacting C2. This
+    question applies deterministic app-vetting/command-matching criteria (NIST SP 800-163r1): match command-line
+    arguments against the known diagnostic command set, then verify the parent process is unexpected.
+    Correlating with ADB session logs confirms a remote origin, and checking against maintenance windows
+    reduces benign administrative noise. A positive result — an unallowlisted parent spawning these commands,
+    especially via a remote shell at an odd hour — is strong evidence of hands-on-keyboard or automated
+    network discovery; a negative result (approved MDM client during a maintenance window) is likely benign.'
+  answer_sources: &id001
+  - Mobile EDR process execution telemetry
+  - Android Debug Bridge (ADB) logs
+  - iOS Unified logs
+  - Application Vetting reports (permissions, API usage)
+  - MDM application inventory
+  - 'NAI: Corporate-managed mobile devices (Android, iOS), Mobile Device Management (MDM) servers, Endpoint
+    Detection and Response (EDR) platform consoles'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'process_exec where cmdline matches /(netstat|ping|ifconfig|getprop)/
+
+      AND parent_process NOT IN (system_server, zygote, approved_mdm_clients)
+
+      | join adb_session_logs on device_id, time_window=5m
+
+      | where adb_session = present OR hour NOT IN maintenance_window
+
+      | alert'
+- question: Do any non-system apps on the fleet request or hold the READ_PRIVILEGED_PHONE_STATE permission,
+    or invoke restricted connectivity APIs / embed network addresses that are inconsistent with their
+    stated function, as observed during application vetting and in the MDM application inventory?
+  context: Privileged phone/network-state permissions held by ordinary apps are a classic indicator of
+    an app trying to access connectivity information it should not need — the basis of MITRE analytics
+    AN1831/AN1832. This deterministic check, modeled on the static indicator extraction used by Drebin,
+    flags any non-system app that requests READ_PRIVILEGED_PHONE_STATE, calls restricted connectivity
+    APIs, or contains hardcoded network addresses that do not match its declared purpose. A positive finding
+    indicates a potentially malicious or repackaged app capable of performing Internet connection discovery;
+    legitimate system apps and apps whose function genuinely requires network state are excluded.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: App Vetting/Rule pseudocode
+    query: "for app in mdm_inventory + vetting_reports:\n  if app.is_system == False AND (\n     'READ_PRIVILEGED_PHONE_STATE'\
+      \ in app.permissions\n     OR app.invokes_restricted_connectivity_api\n     OR app.embedded_network_addrs\
+      \ inconsistent_with app.declared_function):\n    flag(app)"
+- question: Is any app reading connectivity/network state or device/network identifiers and then transmitting
+    that data or opening an outbound connection within the same execution flow, while benign single connectivity
+    checks without follow-on egress are excluded?
+  context: 'This question implements the dynamic taint-tracking rule from TaintDroid: tag connectivity/network-state
+    reads (and device/network identifiers) as a taint source and alert when that tainted data flows to
+    a network sink (transmit or outbound connect) within the same flow. In a Discovery context this read-then-egress
+    pattern indicates the app is not merely checking connectivity for its own UX but is reporting reachability
+    or identifiers outward — consistent with probing for C2 viability. A positive result is a completed
+    source-to-sink flow; a benign single connectivity check with no follow-on egress is a negative and
+    should be filtered out to control false positives.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: Mobile EDR/Taint-flow pseudocode
+    query: 'taint_source = read(connectivity_state | network_info | device_id | network_id)
+
+      taint_sink   = network_transmit | socket_connect
+
+      alert when taint_source --reaches--> taint_sink within same_flow
+
+      exclude single_connectivity_check with no follow_on_egress'
+- question: Against a 30-day per-device and fleet-wide baseline, is a network discovery command or connectivity-API
+    call rare (top 5% rarity) while its daily execution count exceeds the device's 99th percentile, and
+    are there distinct bursts of failed/blocked invocations (permission-denied or error returns)?
+  context: Statistical baselining catches discovery activity that evades static rules. Maintain a 30-day
+    baseline of command/connectivity-API execution per device and compute fleet-wide rarity, following
+    the on-device counter baselining of Andromaly. Alert when a discovery command is both rare across
+    the fleet (top 5%) and unusually frequent on the device (above its 99th percentile). Separately track
+    failed or blocked invocations (permission-denied, error returns) as their own burst signal, because
+    a probe that fails still leaves a measurable spike. A positive result is a rarity+volume anomaly or
+    a failure-counter burst; steady-state, common usage within baseline is negative.
+  answer_sources: *id001
+  range: Last 90 days (30-day rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = per_device_30d(command_exec, connectivity_api)
+
+      rarity = fleetwide_rarity(command)
+
+      alert if rarity in top_5pct AND daily_count > device.p99
+
+      also alert if failed_or_blocked_invocations > device.p99_failure_burst'
+- question: When scored by a supervised classifier (Random Forest/XGBoost) over process/API events using
+    tokenized command-line arguments, parent process, requested permissions, privileges, hour of day,
+    and remote-shell indicators, do any events exceed a malicious probability of 0.90, and what are the
+    top-3 contributing features?
+  context: A supervised, explainable model captures combinations of weak signals that individual rules
+    miss. Train a Random Forest/XGBoost classifier on labeled process/API events using tokenized command-line
+    args, parent process, requested permissions, privilege level, hour of day, and remote-shell indicators,
+    following the explainable feature-importance approach of the Mal-API-2019 evaluation and the package-level
+    API abstraction of MaMaDroid. Alert when malicious probability exceeds 0.90 and emit the top-3 contributing
+    features so the analyst can triage quickly. A high-probability alert with intuitive contributing features
+    (remote shell + privileged permission + rare command) is strong evidence of network discovery; low-probability
+    or features driven by benign context warrant deprioritization.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "features = [tokenized_cmdline, parent_process, permissions, privileges, hour, remote_shell]\n\
+      score = rf_xgb_model.predict_proba(features)\nif score > 0.90:\n  alert(event, top3_features = explain(model,\
+      \ features))"
+- question: Do per-app Markov-chain models of package/family-level API-call sequences show transitions
+    into connectivity-probe APIs (getActiveNetwork, NetworkInfo, socket connect) that deviate from each
+    app's established behavioral baseline?
+  context: Beyond single events, the order in which an app calls APIs reveals intent. Build per-app Markov-chain
+    models of package/family-level API-call sequences (per MaMaDroid) and flag transitions that lead into
+    connectivity-probe APIs but deviate from the app's normal behavior. In a Discovery context, an app
+    that suddenly begins sequencing into getActiveNetwork/NetworkInfo/socket connect outside its learned
+    pattern may be performing Internet connection discovery on behalf of an adversary. Surface the top
+    deviating transitions for triage. A positive result is a low-probability transition into probe APIs;
+    sequences consistent with the app's baseline are negative.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "model = per_app_markov_chain(api_call_sequences, level=package_family)\nfor transition in\
+      \ app.recent_sequences:\n  if transition.target in {getActiveNetwork, NetworkInfo, socket_connect}\n\
+      \     AND model.prob(transition) < baseline_threshold:\n    alert(app, top_deviating_transitions)"
+- question: Are outbound connections from mobile IP ranges matching high-confidence C2 indicators during
+    connectivity-probing bursts, and can they be enriched with associated Zeek dns.log queries and the
+    device owner from MDM, while maintaining a deny/allow list of known connectivity-check endpoints?
+  context: 'This deterministic floor catches the highest-fidelity case: a probing burst that actually
+    reaches known-bad infrastructure. Alert when outbound connections from mobile IP ranges match high-confidence
+    C2 indicators, then enrich with the associated DNS queries from Zeek dns.log and the device owner
+    from MDM to accelerate response. Maintaining a deny/allow list distinguishing legitimate captive-portal/connectivity-check
+    domains from unknown destinations keeps this rule deterministic and low-noise. A positive result is
+    a mobile device contacting a C2 indicator during a burst — a likely confirmed compromise; matches
+    only against allowlisted connectivity endpoints are benign.'
+  answer_sources: &id002
+  - Zeek conn.log
+  - Zeek dns.log
+  - Threat intelligence indicators
+  - On-device network byte/packet counters (MDM/EDR)
+  - 'NAI: Network egress points, corporate Wi-Fi controllers, VPN concentrators, Internal DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'conn.log where id.orig_h in mobile_ip_ranges
+
+      AND id.resp_h in high_confidence_c2_indicators
+
+      | join dns.log on uid/query | enrich device_owner from mdm
+
+      | exclude resp in connectivity_check_allowlist
+
+      | alert'
+- question: Within 1-minute per-device windows, do two or more network metrics — destination-IP/domain
+    entropy, count of distinct high-availability domains, short-lived-connection ratio, mean bytes per
+    connection, or NXDOMAIN/failed-connection rate — exceed three standard deviations from the device's
+    baseline, indicating automated probing rather than human browsing?
+  context: Automated connectivity probing has a distinctive statistical fingerprint that separates it
+    from human browsing. Aggregate Zeek conn.log and dns.log into 1-minute windows per device and compute
+    destination-IP/domain entropy, unique high-availability domain count, short-lived-connection ratio,
+    mean bytes/connection, and NXDOMAIN/failed-connection rate, following the flow features and automated-vs-human
+    timing separation of Conti et al. and the compact feature set of CorrNetDroid. Alert when two or more
+    metrics exceed three standard deviations from the device baseline. A positive result — many short,
+    tiny connections to many connectivity domains in one minute — strongly indicates Internet connection
+    discovery; normal browsing stays within baseline.
+  answer_sources: *id002
+  range: Last 90 days (per-device baseline)
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "window = 1m per device from conn.log + dns.log\nmetrics = [dest_entropy, distinct_ha_domains,\
+      \ shortlived_ratio,\n           mean_bytes_per_conn, nxdomain_failed_rate]\nalert if count(m for\
+      \ m in metrics if m > device.baseline_mean + 3*std) >= 2"
+- question: Are per-device rates of NXDOMAIN responses, connection resets/timeouts, and blocked egress
+    spiking above the device's 99th-percentile failure rate over a 14-30 day window, even when little
+    or no data is being exchanged?
+  context: Probes that fail reachability tests still leave a measurable signal in failure counters — a
+    key insight from CorrNetDroid. Track per-device rates of NXDOMAIN, connection resets/timeouts, and
+    blocked egress, and derive thresholds from each device's 99th-percentile failure rate over a 14-30
+    day window. This catches a device whose attempts to reach C2 or connectivity-check endpoints are being
+    blocked or are resolving to nonexistent domains, producing a failure spike without meaningful data
+    transfer. A positive result is a distinct failure-counter burst above the device's historical 99th
+    percentile; stable, low failure rates are negative and treat the device as healthy.
+  answer_sources: *id002
+  range: Last 30 days (14-30 day failure baseline)
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'per_device failure_rate = count(NXDOMAIN, conn_reset, timeout, blocked_egress) / window
+
+      threshold = device.p99_failure_rate(window=14_to_30d)
+
+      alert if current_failure_rate > threshold'
+- question: When one-class anomaly models (Isolation Forest, autoencoder, OC-SVM) are trained on benign
+    1-minute feature windows per device — connection count, bytes, TCP/UDP ratio, destination-port entropy,
+    distinct ASNs, short-lived ratio, and failure rate — do any windows score as significant outliers,
+    and what are the top-3 contributing features?
+  context: When labeled malicious data is scarce, train-on-known-good one-class models detect novel probing
+    behavior. Following the one-class IoT detection approach, train Isolation Forest, autoencoder, or
+    OC-SVM models on benign 1-minute feature windows per device using connection count, bytes, TCP/UDP
+    ratio, destination-port entropy, distinct ASN count, short-lived ratio, and failure rate. Investigate
+    significant outliers and surface the top-3 contributing features in the alert for triage. A strong
+    outlier driven by high short-lived ratio, many distinct ASNs, or elevated failure rate is consistent
+    with Internet connection discovery; windows resembling the benign baseline are negative.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: ML/Pseudocode
+    query: "features = [conn_count, bytes, tcp_udp_ratio, dport_entropy,\n            distinct_asns, shortlived_ratio,\
+      \ failure_rate]\nmodel = one_class(IsolationForest|Autoencoder|OCSVM).fit(benign_windows_per_device)\n\
+      if model.score(window) is significant_outlier:\n  alert(window, top3_features)"
+- question: Do on-device sent/received packet and byte counters from MDM/EDR diverge from the device's
+    behavioral baseline at the same time as a network-side connection burst, providing corroborating host-
+    and network-side evidence?
+  context: 'Correlating host-based counters with network-side bursts raises confidence and reduces false
+    positives, per the host-based counter monitoring of Andromaly. Pull on-device sent/received packet
+    and byte counters from MDM/EDR and align them with network-side burst detection. Alert when both the
+    on-device counters and the network observations diverge from the device''s behavioral baseline simultaneously.
+    This dual-source agreement is powerful: a network burst that is also reflected in on-device counters
+    confirms the activity originated on the device rather than from spoofing or shared-IP noise. A positive
+    result is simultaneous host+network divergence; divergence on only one side is weaker and warrants
+    further correlation.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "device_counters = mdm_edr(sent_recv_packets, sent_recv_bytes)\nnetwork_burst = detect_conn_burst(zeek_conn_log,\
+      \ device_ip)\nalert if device_counters > device.baseline AND network_burst present\n         within\
+      \ same_time_window"
