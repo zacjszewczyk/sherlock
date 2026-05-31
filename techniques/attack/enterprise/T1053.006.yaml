@@ -1,0 +1,1073 @@
+name: 'T1053.006: Systemd Timers'
+id: d9c9f6c7-6b3b-471c-b86a-98a6cf674823
+description: >-
+  Investigate suspected abuse of systemd timers (T1053.006) on Linux hosts, where adversaries create or
+  modify .timer/.service unit files to schedule initial or recurring execution of malicious code for execution,
+  persistence at user or root level, and privilege escalation. This playbook helps an analyst hunt for:
+  processes spawned directly by systemd (PPID 1) running known-bad, rare, or world-writable binaries;
+  systemd-run/systemctl download-and-execute and Base64-encoded commands; PPID-1 beaconing or rare/known-bad
+  egress destinations; unit files written to privileged or user systemd directories by unexpected processes
+  (web daemons, shells) or non-root (euid!=0) accounts; service definitions lacking 'User=' that point
+  ExecStart at world-writable payloads; user-level timers created by service or out-of-pattern accounts;
+  and root systemd children modifying critical auth files such as /etc/passwd, /etc/shadow, and /etc/sudoers.d/.
+  It combines deterministic rules, statistical baselining, and machine-learning methods across auditd,
+  Zeek, and osquery telemetry.
+type: technique
+related:
+- tactic_id: TA0002
+  tactic_name: Execution
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there any processes whose parent process ID is 1 (i.e., spawned directly by systemd) whose
+    executable hash, image path, or full command line matches a current threat-intelligence watchlist,
+    or that were launched from a newly created .timer/.service unit in /etc/systemd/system, /usr/lib/systemd/system,
+    or ~/.config/systemd/user?
+  context: >-
+    For the Execution tactic the core question is whether adversary-controlled code is actually running,
+    and systemd timers fire their payloads as direct children of PID 1. Pivot on auditd EXECVE events
+    where PPID==1, then compare the binary hash, image path, and argv against your current IOC feed; also
+    cross-reference any unit file recently written to the system or user systemd directories. PPID-1 children
+    that fall outside the known systemd-managed service set are the primary ATT&CK signal for T1053.006.
+    Where auditd lineage is incomplete, eBPF execve/lineage hooks give reliable PPID-1 attribution. A
+    direct hash/path/cmdline match to known-bad is a high-confidence true positive; a clean match against
+    the IOC feed does not exonerate the host (use the prevalence and ML methods below).
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Linux auditd PATH
+  - 'NAI: All Linux servers and workstations, particularly those hosting critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | eval ioc = (sha256 IN threat_intel_hashes)
+            OR (exe IN threat_intel_paths)
+            OR match(cmdline, threat_intel_cmd_regex)
+      | join exe [ search source=auditd type=PATH
+           path IN ("/etc/systemd/system/*","/usr/lib/systemd/system/*","*/.config/systemd/user/*")
+           recently_created=true ]
+      | where ioc OR unit_recently_created
+
+      | table host,_time,ppid,pid,euid,exe,sha256,cmdline,unit_file
+- question: Do any systemd-spawned (PPID 1) processes show repeated failed execution attempts — non-zero
+    exit codes, segfaults, or permission-denied (EACCES) execve results — before eventually running successfully,
+    which is a common fingerprint of a freshly dropped or misconfigured timer payload?
+  context: >-
+    Failed executions are themselves a signal. A newly installed malicious timer/service often misfires
+    before it works: wrong interpreter, missing library, bad permissions on a dropped binary. Treat non-zero
+    exit codes, SIGSEGV, and EACCES execve returns for PID 1 children as a distinct state signal and alert
+    when a newly created unit produces three or more failed exec attempts within ten minutes followed
+    by a success. Instrument execve return codes via auditd or eBPF. A burst of failures localized to
+    one new unit on one host is suspicious; sustained failures across many hosts usually indicate a benign
+    packaging/config issue worth tuning out.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Linux auditd PATH
+  - 'NAI: All Linux servers and workstations, particularly those hosting critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=(SYSCALL OR EXECVE) ppid=1
+
+      | eval failed = (exit!=0 OR signal="SIGSEGV" OR exit_str="EACCES")
+
+      | bin _time span=10m
+
+      | stats count(eval(failed)) as fails count(eval(NOT failed)) as oks
+              values(unit_file) as unit by host, exe, _time
+      | where fails>=3 AND oks>=1
+- question: Across the enterprise, which binaries launched by PID 1 are rare — present on fewer than ~1%
+    of endpoints — especially those executing from unusual paths or running low-and-slow, and how do their
+    execution frequency and data volume compare to the fleet baseline?
+  context: >-
+    Sophisticated actors avoid known-bad IOCs, so prevalence is the better lens. Build a fleet-wide baseline
+    of binaries (hash + image path) spawned by PID 1 and flag those in the lowest prevalence band (<1%
+    of endpoints), prioritizing ones that also run from atypical paths. Fold in execution frequency (executions/min)
+    and volume (bytes spawned/read) so that infrequent, quiet timer runs still surface rather than hiding
+    under thresholds tuned for noisy malware. Use one-class/prevalence scoring (isolation forest / OCSVM
+    style). Rarity plus an odd path is a strong lead for the Execution question; ubiquitous, signed system
+    binaries are expected and can be deprioritized.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Linux auditd PATH
+  - 'NAI: All Linux servers and workstations, particularly those hosting critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | stats dc(host) as host_count avg(exec_per_min) as freq sum(bytes) as vol by sha256, exe
+
+      | eval prevalence = host_count / total_hosts
+
+      | where prevalence < 0.01
+
+      | sort prevalence, -freq
+- question: When a new process is spawned by systemd, can a supervised classifier — using features like
+    user/euid, executable path, command-line tokens, parent unit, hash rarity, and child-process fan-out
+    — score it as likely malicious, and can the alert name the top contributing features?
+  context: >-
+    This generalizes detection beyond static rules. Train a supervised model on labeled PID-1 execution
+    features (euid, exe path, argv tokens, parent unit, hash rarity, fan-out of child processes) and score
+    each new systemd child, alerting above a tuned probability threshold. Surface the top-3 contributing
+    features (e.g., rare path, encoded args, a non-root-to-root transition) using LIME/SHAP-style attribution
+    so analysts can triage quickly, and corroborate causal lineage with provenance-graph node scoring.
+    For the Execution tactic this catches novel payloads that evade IOC and simple prevalence checks;
+    a high score with a root transition from an odd path is a priority investigation.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Linux auditd PATH
+  - 'NAI: All Linux servers and workstations, particularly those hosting critical services.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = load("systemd_child_classifier")
+
+      for e in execve where ppid==1:
+          feats = [e.euid, e.exe_path, tokens(e.cmdline), e.parent_unit,
+                   hash_rarity(e.sha256), child_fanout(e.pid)]
+          p = model.predict_proba(feats)
+          if p >= THRESHOLD:
+              alert(e, score=p, top_features=shap(model, feats, k=3))
+- question: Are there systemd-run or systemctl invocations that chain curl or wget into sh/bash, decode
+    Base64 (base64 -d, echo ... | base64), or call an interpreter with -c/-e — and do those commands correlate
+    with outbound DNS/connections in Zeek logs?
+  context: >-
+    systemd-run lets an adversary schedule arbitrary commands on the fly, and download-and-execute one-liners
+    are a hallmark of staging. Apply regexes to auditd EXECVE for systemd-run/systemctl command lines
+    that pipe curl/wget into a shell, decode Base64, or run interpreters with inline code, then correlate
+    with Zeek dns.log and conn.log to confirm the egress actually occurred. This mirrors path-pinned scheduler-abuse
+    and impostor-process Sigma patterns. A regex hit confirmed by a matching outbound fetch is a strong
+    Execution lead; a regex hit with no egress may be a dry run or benign automation and warrants lighter
+    triage.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints, Network egress gateways, DNS resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE (exe="*systemd-run" OR exe="*systemctl")
+
+      | where match(cmdline,"(curl|wget).*(\\||sh|bash)")
+             OR match(cmdline,"base64\\s+-d|base64 --decode|echo .*\\| ?base64")
+             OR match(cmdline,"-(c|e)\\s")
+      | join host [search source=zeek_conn OR source=zeek_dns]
+
+      | table host,_time,exe,cmdline,dest_ip,query
+  - technology: Zeek/pseudocode
+    query: >-
+      # confirm egress tied to the host that ran systemd-run
+
+      dns.log | where host==suspect | table ts,query,rcode
+
+      conn.log | where host==suspect | table ts,id.resp_h,id.resp_p,orig_bytes,resp_bytes
+- question: For commands initiated by systemd-run, are there clusters of failed network retrievals — NXDOMAIN
+    responses, connections to blocked/closed ports, or HTTP 4xx/5xx — that suggest covert or automated
+    download attempts (e.g., five or more NXDOMAIN or repeated blocked connections in a short window)?
+  context: >-
+    Blocked or failed egress is signal, not noise. Profile failure modes for systemd-run-initiated network
+    activity: count NXDOMAIN responses (Zeek dns.log rcode), connection attempts to blocked/closed ports,
+    and HTTP 4xx/5xx, and alert when one systemd-run command triggers >=5 NXDOMAIN or repeated blocked
+    connections in a short window. This pattern is consistent with covert/automated retrieval and resilient
+    C2 staging characterized in beaconing research. For the Execution tactic this catches a payload that
+    is trying — but failing — to pull its next stage; a tight burst of failures from a single timer-driven
+    command is a priority lead.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints, Network egress gateways, DNS resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE exe="*systemd-run"
+
+      | join host,_time [search source=zeek_dns OR source=zeek_conn OR source=http]
+
+      | eval fail = (rcode="NXDOMAIN") OR (conn_state IN ("S0","REJ")) OR (status>=400)
+
+      | bin _time span=5m
+
+      | stats sum(eval(fail)) as failures by host, cmdline, _time
+
+      | where failures>=5
+- question: Do any systemd-run command lines deviate sharply from a given user's historical norms — argument
+    length more than three standard deviations above their mean, or unusually high Shannon entropy / token
+    n-gram improbability — indicating obfuscated or encoded execution?
+  context: >-
+    Per-user behavioral baselines catch obfuscation that static rules miss. Build per-user baselines for
+    systemd-run argument length, token entropy, and shell syntax, then flag commands exceeding the user's
+    historical mean length by >=3 standard deviations or showing high Shannon entropy, and score token
+    n-gram deviation from natural-language/command baselines. Long, high-entropy command lines typically
+    mean Base64/packed payloads. For the Execution tactic, a normally terse admin suddenly issuing a 4KB
+    high-entropy systemd-run command is a strong anomaly; tune for power users and automation that legitimately
+    use long arguments.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints, Network egress gateways, DNS resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=EXECVE exe="*systemd-run"
+
+      | eval arglen=len(cmdline), ent=shannon_entropy(cmdline)
+
+      | stats mean(arglen) as mu stdev(arglen) as sd avg(ent) as ent_mu by user
+
+      | where arglen > mu + 3*sd OR ent > 4.5
+
+      | table host,user,arglen,ent,cmdline
+- question: Can an unsupervised model that embeds systemd-run/ExecStart command lines (e.g., BERT-style
+    embeddings scored with Isolation Forest, COPOD, or an autoencoder) surface top-percentile outliers,
+    list the most anomalous tokens, and prioritize those paired with rare network destinations?
+  context: >-
+    For novel or obfuscated commands that no signature or per-user threshold catches, embed systemd-run/ExecStart
+    command lines with BERT-style representations and score them with unsupervised outlier detectors (Isolation
+    Forest, COPOD, autoencoder reconstruction error). Escalate top-percentile outliers, list the top-3
+    anomalous tokens in the alert, and raise priority when the command is paired with a rare destination
+    from Zeek logs. This addresses the Execution question for commodity-to-sophisticated actors alike:
+    it learns what 'normal' command structure looks like and flags structurally weird ones regardless
+    of specific keywords.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd SYSCALL
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints, Network egress gateways, DNS resolvers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      emb = bert_embed(execve.cmdline where exe~="systemd-run|systemctl")
+
+      score = isolation_forest.decision_function(emb)  # or COPOD / autoencoder error
+
+      if score in top_percentile(1):
+          alert(cmdline, anomalous_tokens=top_tokens(emb,3),
+                rare_dest=join_zeek_rare_destination(host))
+- question: Do any PID-1-spawned processes initiate outbound connections whose destination IP or resolved
+    domain matches a known-bad / high-confidence C2 watchlist — and do any of those egress events immediately
+    follow an inbound SSH session (consistent with remote timer activation via systemctl)?
+  context: >-
+    Timer payloads frequently call home. Join auditd PID-1 execution events with Zeek conn.log/dns.log
+    and test whether the destination IP or resolved domain matches a known-bad/C2 watchlist. Because timers
+    can be activated remotely over SSH via systemctl, also flag PID-1 egress that immediately follows
+    an inbound SSH connection. For the Execution tactic this ties a running timer payload to actual command-and-control.
+    A watchlist match is high confidence; the SSH-then-egress sequence is a useful behavioral corroborator
+    even when the destination is not yet known-bad.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress gateways, DNS resolvers, All Linux endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | join host,pid [search source=zeek_conn OR source=zeek_dns]
+
+      | eval bad = (dest_ip IN c2_ip_watchlist) OR (query IN c2_domain_watchlist)
+
+      | join host [search source=zeek_conn id.resp_p=22 dir=inbound earlier_than=egress_time]
+
+      | where bad OR inbound_ssh_preceded
+
+      | table host,_time,exe,dest_ip,query,prior_ssh_src
+- question: For each PID-1 process/destination pair, is there a dominant periodic signal in the connection
+    timing — confirmed by FFT plus autocorrelation — that indicates beaconing, after filtering known software-update
+    domains and tuning jitter/duty-cycle against benign periodic baselines?
+  context: >-
+    Beaconing is the network fingerprint of scheduled C2, and a timer is literally a scheduler. For each
+    PID-1 process/destination pair, extract the dominant period via FFT and confirm it with autocorrelation,
+    filtering known-update domains to cut false positives, and tune jitter/duty-cycle thresholds from
+    benign periodic baselines to separate legitimate scheduled polling from timer-driven C2. For the Execution
+    tactic, a regular, low-jitter callback from a PID-1 process to an unfamiliar destination is a hallmark
+    of an active implant on a timer.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress gateways, DNS resolvers, All Linux endpoints.'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | join host,pid [search source=zeek_conn]
+
+      | stats list(_time) as ts by host, pid, exe, dest_ip
+
+      | eval period = fft_dominant_period(ts), ac = autocorr_peak(ts)
+
+      | where ac > 0.7 AND NOT (dest_ip IN known_update_domains)
+
+      | where jitter(ts) < jitter_threshold
+
+      | table host,exe,dest_ip,period,ac
+- question: Which destinations (IPs, domains, ASNs) contacted by systemd-spawned processes fall in the
+    lowest enterprise-wide frequency band, or have high subdomain entropy / DGA-style naming, and what
+    are the associated outbound byte volume and connection frequency?
+  context: >-
+    Rare destinations and algorithmically-generated domains betray fresh C2. Baseline destination IPs,
+    domains, and ASNs for systemd-spawned processes and alert on those in the lowest frequency band fleet-wide,
+    plus domains with high subdomain entropy or DGA-style naming scored via character n-gram deviation.
+    Report outbound volume (bytes out) and frequency (conns/min) in the alert so analysts can gauge exfil
+    vs. heartbeat. For the Execution tactic this surfaces never-before-seen C2 endpoints reached by timer
+    payloads even when no watchlist entry or clean beacon period exists.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress gateways, DNS resolvers, All Linux endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | join host,pid [search source=zeek_conn OR source=zeek_dns]
+
+      | stats dc(host) as hc sum(orig_bytes) as bytes_out count as conns by dest_ip, query, asn
+
+      | eval prevalence = hc/total_hosts, dga = ngram_improbability(query)
+
+      | where prevalence < 0.01 OR dga > 0.8
+
+      | sort prevalence, -bytes_out
+- question: Does the outbound byte/connection volume per systemd-spawned process per host diverge from
+    a provenance-aware forecast — the kind of jump that signals a newly activated timer or payload — and
+    can the model attribute the anomalous flow back to its originating unit?
+  context: >-
+    Forecasting catches activation. Model outbound bytes and connection counts per systemd-spawned process
+    per host with a provenance-aware anomaly model and flag divergence from the forecast that indicates
+    a newly activated timer/payload. Use whole-system provenance temporal autoencoding to attribute the
+    anomalous flow to its originating unit, surfacing the top-3 contributing edges/features for triage.
+    For the Execution tactic this is especially useful for slow exfil or staged downloads that only appear
+    once a dormant timer fires; a sudden, unforecast volume spike traced to a recently created unit is
+    a high-value lead.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Network egress gateways, DNS resolvers, All Linux endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      for (host,proc) in systemd_spawned:
+          forecast = temporal_autoencoder.predict(bytes_out_series[host,proc])
+          actual = observed_bytes_out[host,proc]
+          if abs(actual - forecast) > band:
+              unit = provenance_attribute(host, proc)  # KAIROS-style
+              alert(host, proc, unit, top_edges=3)
+- question: Are there any PID-1-spawned processes whose executable path is in a deny-listed, world-writable
+    location (/tmp, /var/tmp, /dev/shm) or a hidden directory, and can the originating .timer/.service
+    unit be identified to confirm the source?
+  context: >-
+    Legitimate system services almost never run binaries out of world-writable or hidden directories.
+    Alert when an auditd EXECVE has PPID==1 and the executable path matches deny-listed locations (^/(tmp|var/tmp|dev/shm)/
+    or hidden /\.), then correlate with the parent unit/timer name to confirm the origin is a hidden or
+    rogue service. Apply path-pinning logic and lean on eBPF execve visibility where auditd is thin. For
+    the Execution tactic this is a high-fidelity indicator: a PID-1 child running from /dev/shm is rarely
+    benign and the linked unit file usually reveals the persistence mechanism.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd PATH
+  - 'NAI: File systems on all Linux servers and workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | where match(exe,"^/(tmp|var/tmp|dev/shm)/") OR match(exe,"/\\.[^/]+/")
+
+      | lookup unit_by_pid pid OUTPUT parent_unit
+
+      | table host,_time,euid,exe,cmdline,parent_unit
+- question: Among PID-1 processes, which executable paths are first-seen or below the 1% frequency threshold
+    across the fleet, and do any have filenames with high entropy / n-gram improbability suggesting randomly
+    generated names dropped into writable directories?
+  context: >-
+    Path prevalence plus filename randomness catches dropped payloads that avoid the obvious world-writable
+    deny-list. Maintain a frequency distribution of executable paths for PID-1 processes and alert on
+    first-seen paths or those below the 1% frequency threshold, and additionally score filename entropy/n-gram
+    improbability to catch randomized names. For the Execution tactic, a brand-new, fleet-unique path
+    running under systemd — particularly with a gibberish filename — is a strong indicator of malicious
+    scheduled execution even if the directory itself is not on a deny-list.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd PATH
+  - 'NAI: File systems on all Linux servers and workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1
+
+      | stats dc(host) as hc earliest(_time) as first_seen by exe
+
+      | eval prevalence = hc/total_hosts, rnd = ngram_improbability(basename(exe))
+
+      | where prevalence < 0.01 OR first_seen > now()-7d OR rnd > 0.8
+
+      | sort prevalence
+- question: Can clustering PID-1 process features (executable path, user context, command-line tokens)
+    with DBSCAN isolate noise/outlier processes as anomalous, and does provenance-graph node scoring corroborate
+    which ones are part of a malicious causal chain?
+  context: >-
+    Unsupervised clustering finds the odd ones out without labels. Cluster PID-1 process features (exe
+    path, user context, argv tokens) with DBSCAN, treat noise points as anomalous, and prioritize them,
+    surfacing the defining outlier features in the alert. Complement with node-level provenance graph
+    anomaly scoring and drift-tolerant graph representation learning to confirm whether the outlier sits
+    in a suspicious causal chain. For the Execution tactic this catches malicious systemd children that
+    do not match any single rule but stand apart from the dense clusters of normal services.
+  answer_sources:
+  - Linux auditd EXECVE
+  - Linux auditd PATH
+  - 'NAI: File systems on all Linux servers and workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      X = features(execve where ppid==1)  # exe, user/euid, cmdline tokens
+
+      labels = DBSCAN(eps, min_samples).fit_predict(X)
+
+      for i where labels[i]==-1:        # noise = anomalous
+          alert(X[i], defining_features=outlier_features(X[i]),
+                graph_score=provenance_node_score(X[i].pid))
+- question: Are there file write/create events for files ending in '.timer' or '.service' in any systemd
+    directory, and on detection, does a YARA content scan reveal known malicious service definitions,
+    C2 domains, or suspicious commands (e.g., 'ExecStart=/tmp/kdevtmpfsi')?
+  context: >-
+    Persistence via systemd starts with a unit file landing in a systemd directory, so this is the foundational
+    detection. Monitor auditd PATH CREATE/write events for files ending in '.timer'/'.service' in the
+    canonical systemd directories, and on detection scan the content with YARA for known malicious service
+    definitions, C2 domains, or suspicious commands. /etc/systemd/system, /usr/lib/systemd/system, and
+    ~/.config/systemd/user are the documented persistence paths. For the Persistence tactic, any unit
+    file write paired with a YARA match is a high-confidence finding; even a clean write to these paths
+    is worth baselining against expected package activity.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/, ~/.config/systemd/user/)
+    on all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH (op=CREATE OR op=WRITE)
+
+      | where match(name,"\\.(timer|service)$")
+         AND match(name,"/etc/systemd/system/|/usr/lib/systemd/system/|/\\.config/systemd/user/")
+      | eval yara = yara_scan(name, rules="malicious_systemd_units")
+
+      | where isnotnull(yara)
+
+      | table host,_time,exe,pid,name,yara
+- question: When a .service file is created or modified, is its [Service]-section length a statistical
+    outlier (>3 standard deviations from the known-good mean) or does it reference a rare/first-seen ExecStart
+    path, with high character n-gram improbability or command entropy indicating an encoded payload?
+  context: >-
+    Malicious unit files often look structurally different from packaged ones. Profile known-good '.service'
+    files for [Service]-section length and ExecStart path frequency, then flag new/modified files whose
+    content length is a >3-sigma outlier or that reference a rare/first-seen ExecStart path. Add character
+    n-gram improbability scoring and high-entropy command detection to catch encoded payloads. For the
+    Persistence tactic this catches hand-crafted or generated units that deviate from the tight distribution
+    of vendor-supplied service files, even when no known IOC is present.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/, ~/.config/systemd/user/)
+    on all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service" (op=CREATE OR op=WRITE)
+
+      | eval seclen = service_section_len(content), ent = entropy(execstart),
+              rare_exec = (execstart_path NOT IN known_execstart_paths)
+      | stats mean(seclen) as mu stdev(seclen) as sd  # from known-good corpus
+
+      | where seclen > mu+3*sd OR rare_exec OR ngram_improbability(content) > 0.8 OR ent > 4.5
+- question: Can a text classifier (Naive Bayes/TF-IDF, or BERT-style embeddings with an outlier detector)
+    trained on benign vs. malicious unit-file content classify a newly created/modified unit as malicious
+    with high confidence, and name the top contributing tokens for triage?
+  context: >-
+    This generalizes content inspection beyond fixed YARA/regex. Train a text classifier on the full content
+    of benign vs. malicious systemd unit files (Naive Bayes/TF-IDF or BERT-style embeddings with an outlier
+    detector), classify newly created/modified units, and alert on high-confidence malicious predictions
+    while surfacing the top-3 contributing tokens/features. For the Persistence tactic this catches novel
+    malicious units whose structure resembles known bad ones even without exact IOC matches; pair high-confidence
+    alerts with the symbolic file-write detection for context.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/, ~/.config/systemd/user/)
+    on all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = load("systemd_unit_text_classifier")  # NB/TF-IDF or BERT+outlier
+
+      for f in new_or_modified_units:
+          p = model.predict_proba(f.content)
+          if p_malicious >= THRESHOLD:
+              alert(f.path, score=p, top_tokens=explain(model, f.content, 3))
+- question: When a .service file is created or modified, does parsing its ExecStart directive reveal a
+    value pointing to a suspicious path such as ^/(tmp|dev/shm|var/tmp)/.* or a hidden /\..* location?
+  context: >-
+    Pointing a service at a world-writable or hidden executable is a classic persistence-and-stage move.
+    Trigger when a '.service' file is created/modified, parse the ExecStart value, and alert if it matches
+    suspicious paths like '^/(tmp|dev/shm|var/tmp)/.*' or '/\..*'. This extends the systemd-path watch
+    with content parsing for the world-writable-payload pattern. For the Persistence tactic, a service
+    configured to launch a binary from /tmp or /dev/shm is rarely legitimate and strongly implies an attacker-controlled,
+    easily-replaced payload that runs at boot or on schedule.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories and world-writable directories (/tmp, /dev/shm, /var/tmp) on all
+    Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service" (op=CREATE OR op=WRITE)
+
+      | eval execstart = parse_execstart(content)
+
+      | where match(execstart,"^/(tmp|dev/shm|var/tmp)/") OR match(execstart,"/\\.[^/]+/")
+
+      | table host,_time,exe,name,execstart
+- question: Across the environment, when a new service specifies an ExecStart path whose parent directory
+    is in the lowest 5th percentile of frequency (or is first-seen), should that be flagged as an anomalous
+    persistence location?
+  context: >-
+    Directory prevalence reveals abnormal install locations even when they are not explicitly world-writable.
+    Maintain a frequency distribution of ExecStart parent directories across the environment and alert
+    when a new service specifies an ExecStart path from a directory in the lowest 5th percentile of frequency,
+    recording first-seen status as a distinct signal. For the Persistence tactic this catches adversaries
+    who tuck payloads into unusual but technically valid directories; a first-ever ExecStart directory
+    appearing on a single host is a meaningful behavioral change worth investigating.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories and world-writable directories (/tmp, /dev/shm, /var/tmp) on all
+    Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service"
+
+      | eval dir = parent_dir(parse_execstart(content))
+
+      | stats count as freq earliest(_time) as first by dir
+
+      | eval pct = percentile_rank(freq)
+
+      | where pct <= 5 OR first > now()-7d
+- question: Modeling systemd units, ExecStart paths, and filesystem properties (writability, location)
+    as a provenance graph, can graph anomaly detection surface anomalous new structures — such as a new
+    service node edged to a world-writable executable node — and report the offending nodes/edges?
+  context: >-
+    A graph view captures relationships a flat rule misses. Model systemd units, ExecStart paths, and
+    filesystem properties (writability, location) as a provenance graph and apply graph anomaly detection
+    (embedding+outlier and masked graph representation learning) to find anomalous new structures, e.g.,
+    a new service node connected to a world-writable executable node, reporting the anomalous nodes/edges
+    as explanation. For the Persistence tactic this detects structurally unusual unit-to-binary relationships
+    indicative of attacker-installed services, even when each individual attribute looks unremarkable.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories and world-writable directories (/tmp, /dev/shm, /var/tmp) on all
+    Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      G = build_graph(nodes=[units, execstart_paths, files],
+                      edges=[(unit,execstart),(execstart,file_props)])
+      emb = prographer_embed(G)
+
+      for n in new_nodes(G):
+          if outlier(emb[n]):
+              alert(node=n, anomalous_edges=explain_subgraph(G,n))
+- question: Did a file write in a systemd directory originate from a parent process on a deny-list of
+    non-standard modifiers — nginx, apache2, httpd, sshd, php-fpm — indicating a web server or shell,
+    rather than a package manager, is creating unit files?
+  context: >-
+    Web daemons and PHP workers have no business writing systemd unit files; when they do, it usually
+    means post-exploitation. Alert when a file write in a systemd directory has a parent process on a
+    deny-list of non-standard modifiers ('nginx','apache2','httpd','sshd','php-fpm'). Use eBPF lineage
+    for reliable parent attribution so the process field cannot be easily spoofed. For the Persistence
+    tactic this directly ties a compromised internet-facing service to the installation of a persistence
+    mechanism — among the highest-fidelity signals in this playbook.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories on all Linux hosts, especially web servers and multi-user systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH (op=CREATE OR op=WRITE)
+
+      | where match(name,"/etc/systemd/system/|/usr/lib/systemd/system/")
+         AND parent_comm IN ("nginx","apache2","httpd","sshd","php-fpm")
+      | table host,_time,parent_comm,exe,euid,name
+- question: For each host, when a process that is off the allow-list of legitimate unit-file modifiers
+    (yum, apt, dnf, systemctl) — especially a zero-frequency / never-seen process — modifies a systemd
+    unit file, should that be flagged as anomalous?
+  context: >-
+    An allow-list baseline inverts the deny-list and catches unexpected modifiers you did not anticipate.
+    Per host, build an allow-list baseline of processes that legitimately modify unit files ('yum','apt','dnf','systemctl')
+    with frequency counts, then alert when an off-baseline or historically rare process modifies a unit
+    file, treating zero frequency as maximum anomaly. For the Persistence tactic this surfaces any unusual
+    installer of persistence regardless of whether it is on a curated deny-list; the rarer the modifying
+    process, the higher the priority.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories on all Linux hosts, especially web servers and multi-user systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service" OR name="*.timer" (op=CREATE OR op=WRITE)
+
+      | stats count as freq by host, exe
+
+      | eval allow = exe IN ("*/yum","*/apt","*/dnf","*/systemctl")
+
+      | where NOT allow AND freq <= rare_threshold   # freq==0 historically = max anomaly
+- question: Can a One-Class SVM trained on features of legitimate unit-file modification events (parent
+    process, user/euid, command line) flag outlier modifications, with the top deviating features surfaced
+    for each alert?
+  context: >-
+    A one-class model learns the shape of legitimate unit-file edits and flags anything outside it. Train
+    a One-Class SVM on features of legitimate unit-file modification events (parent process, user/euid,
+    command line) and flag outliers; OCSVM is robust under adversarial/poisoning conditions and supports
+    LIME explanations, so surface the top-3 deviating features per alert. For the Persistence tactic this
+    catches subtle, novel modification patterns — an unusual combination of parent, user, and command
+    — that neither the deny-list nor the prevalence baseline would isolate on their own.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Systemd unit file directories on all Linux hosts, especially web servers and multi-user systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = OneClassSVM().fit(legit_unit_mod_features)
+
+      for e in unit_modifications:
+          feats = [e.parent_comm, e.euid, tokens(e.cmdline)]
+          if model.predict(feats) == -1:   # outlier
+              alert(e, top_features=lime(model, feats, 3))
+- question: Was a file created in any ~/.config/systemd/user/ directory by an account whose UID is below
+    1000 (system/service range) or whose name matches a known service-account list — an account that should
+    not be installing interactive user-level timers?
+  context: >-
+    Service accounts establishing user-level systemd persistence is highly abnormal. Alert on any file
+    creation in '~/.config/systemd/user/' where the account UID is below 1000 or matches a known service-account
+    list. User-level timers are an ATT&CK-documented user-persistence vector, and the user-path branch
+    is covered by the systemd creation rule. For the Persistence tactic this catches an attacker who has
+    compromised a daemon/service identity and is using it to persist without touching privileged paths
+    or tripping root-write rules.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: User home directories, specifically `~/.config/systemd/user/` paths, on all multi-user Linux
+    systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH op=CREATE
+
+      | where match(name,"/\\.config/systemd/user/")
+         AND (uid < 1000 OR user IN known_service_accounts)
+      | table host,_time,uid,user,exe,name
+- question: For each interactive user, is this the first-ever creation of a user-level timer or service
+    by that account — a first-occurrence event that represents a significant behavioral change?
+  context: >-
+    First occurrences mark behavioral inflection points. For each interactive user, track creation of
+    user-level unit files and alert on the first-ever creation of a timer/service by that user, scoring
+    it as a zero-frequency (maximum-anomaly) event. For the Persistence tactic, a user who has never used
+    systemd user units suddenly creating one — particularly outside a deployment/admin context — is a
+    meaningful change that may indicate account compromise and user-level persistence; benign first uses
+    by developers can be tuned out over time.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: User home directories, specifically `~/.config/systemd/user/` paths, on all multi-user Linux
+    systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH op=CREATE name="*/.config/systemd/user/*"
+
+      | stats earliest(_time) as first count as n by user
+
+      | where first > lookback_start   # no prior history => first-ever creation
+
+      | table host,user,first,name
+- question: Using peer-group analysis that clusters users by role/activity (developers, admins, service
+    accounts), did a user create a user-level timer that peers in their cluster do not exhibit — a deviation
+    from their behavioral cohort?
+  context: >-
+    Peer-group analysis judges behavior relative to similar users, not the whole fleet. Cluster users
+    into peer groups by role/activity (developers, admins, service accounts); if a user creates a user-level
+    timer that peers in their cluster do not exhibit, flag the deviation, and adapt baselines to evolving
+    behavior with drift-tolerant graph representation learning, reporting the peer group and deviating
+    features as the explanation. For the Persistence tactic this catches a compromised account behaving
+    unlike its cohort — e.g., a service account or non-technical user adopting developer-style timer usage.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: User home directories, specifically `~/.config/systemd/user/` paths, on all multi-user Linux
+    systems.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      clusters = peer_group_cluster(users, features=[role, activity_profile])
+
+      for u in users where created_user_timer(u):
+          if rate_in_cluster(clusters[u], "user_timer") ~ 0:
+              alert(u, peer_group=clusters[u], deviating_features=explain(u))
+- question: Are there writes to .service files in privileged systemd paths whose ExecStart lines contain
+    privilege-escalation tool keywords — pspy, linpeas.sh, dirtyc0w, or known GTFOBins binaries?
+  context: >-
+    Privileged paths are the root-persistence and escalation vector. Monitor writes to '.service' files
+    in privileged systemd paths and scan ExecStart lines for curated privilege-escalation tool keywords
+    ('pspy','linpeas.sh','dirtyc0w','GTFOBins' binaries), alerting on a match. /etc/systemd/system and
+    /usr/lib/systemd/system grant root execution context. For the Privilege Escalation tactic, a root-context
+    service configured to run a known escalation/enumeration tool is a strong indicator that an attacker
+    is leveraging systemd to gain or confirm elevated access.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service" (op=CREATE OR op=WRITE)
+
+      | where match(name,"/etc/systemd/system/|/usr/lib/systemd/system/")
+         AND match(parse_execstart(content),"pspy|linpeas\\.sh|dirtyc0w|(^|/)(nmap|find|vim|python)\\b")
+      | table host,_time,euid,exe,name,execstart
+- question: Across root-level service ExecStart lines, which command tokens/arguments are low-frequency
+    n-grams associated with interpreters or suspicious flags ('bash -c', 'python -c', '-i'), or show high
+    command entropy indicative of encoded payloads?
+  context: >-
+    Statistical analysis of root service commands surfaces escalation tradecraft without keyword lists.
+    Compute n-gram frequency of command tokens/arguments across root-level service ExecStart lines and
+    alert on low-frequency n-grams associated with interpreters or suspicious flags ('bash -c','python
+    -c','-i'), adding high-entropy command detection. For the Privilege Escalation tactic, interactive-shell
+    or inline-code patterns in a root-level service ExecStart are unusual for legitimate daemons and frequently
+    indicate an attacker arranging code execution as root.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH name="*.service"
+
+      | eval es = parse_execstart(content), grams = ngrams(tokens(es), 2)
+
+      | eval rare = any(g in grams: ngram_freq(g) < rare_threshold)
+
+      | where rare OR match(es,"(bash|sh|python|perl) +-(c|e|i)\\b") OR entropy(es) > 4.5
+
+      | table host,name,es
+- question: Can a text classifier trained on privilege-escalation service-file content — using features
+    like the ExecStart command, presence/absence of 'User=', and parameters — predict abuse and surface
+    the top contributing features, including for novel/obfuscated payloads?
+  context: >-
+    A targeted classifier learns the signature of escalation-oriented units. Train a classifier on privilege-escalation
+    service-file content with features including ExecStart command, presence/absence of 'User=', and parameters;
+    predict abuse and surface the top-3 contributing features, using BERT-style command embeddings with
+    outlier scoring to generalize to novel/obfuscated payloads. For the Privilege Escalation tactic this
+    catches root-context services structured for escalation even when they avoid known tool names, complementing
+    the keyword and n-gram methods.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = load("privesc_service_classifier")  # + BERT embeddings for novel
+
+      for f in new_or_modified_units(path~privileged):
+          feats = [parse_execstart(f), has_user_directive(f), params(f)]
+          p = model.predict_proba(feats)
+          if p_abuse >= THRESHOLD:
+              alert(f.path, score=p, top_features=explain(model, feats, 3))
+- question: Is there a new or modified .service file in /etc/systemd/system/ that simultaneously (1) lacks
+    a 'User=' directive (defaulting to root), (2) has an ExecStart pointing to a world-writable path like
+    /tmp/.* or /dev/shm/.*, and (3) targets an executable that is writable by non-root users?
+  context: >-
+    The combination of these three conditions is a near-textbook local privilege escalation setup. Create
+    a high-fidelity rule firing when a new/modified '.service' in '/etc/systemd/system/' lacks 'User='
+    (so it runs as root), has ExecStart in a world-writable path, and the target executable is non-root-writable.
+    This composes the privileged-path and world-writable-payload conditions on unit-creation events. For
+    the Privilege Escalation tactic this is among the strongest signals available: any non-root user can
+    overwrite the executable that systemd will later run as root.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit directories and world-writable directories (/tmp, /dev/shm) on all Linux
+    hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH name="/etc/systemd/system/*.service" (op=CREATE OR op=WRITE)
+
+      | eval no_user = NOT match(content,"(?m)^User=")
+
+      | eval es = parse_execstart(content)
+
+      | eval ww_path = match(es,"^/(tmp|dev/shm)/")
+
+      | eval ww_file = file_mode_world_writable(es)
+
+      | where no_user AND ww_path AND ww_file
+
+      | table host,_time,name,es
+- question: For each new privileged service file, does a weighted risk score — 'User=' absent (+10), ExecStart
+    in /tmp or /dev/shm (+5), executable world-writable (+10) — exceed the alerting threshold of 20, accounting
+    for first-seen attribute combinations?
+  context: >-
+    Risk scoring lets weaker individual indicators combine into a confident verdict and tolerates partial
+    matches. Score new privileged service files: 'User=' absent (+10), ExecStart in /tmp or /dev/shm (+5),
+    executable world-writable (+10); alert when the cumulative score exceeds 20, calibrating weights/threshold
+    from environment base rates and treating first-seen attribute combinations as additional risk. For
+    the Privilege Escalation tactic this captures services that exhibit two of three escalation traits
+    — still dangerous — that a strict all-conditions rule would miss.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit directories and world-writable directories (/tmp, /dev/shm) on all Linux
+    hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH name="/etc/systemd/system/*.service" (op=CREATE OR op=WRITE)
+
+      | eval es = parse_execstart(content)
+
+      | eval score = if(NOT match(content,"(?m)^User="),10,0)
+                    + if(match(es,"^/(tmp|dev/shm)/"),5,0)
+                    + if(file_mode_world_writable(es),10,0)
+                    + if(first_seen_combo,5,0)
+      | where score > 20
+
+      | table host,name,es,score
+- question: Can a decision-tree / gradient-boosted classifier over boolean features (Is 'User=' present?
+    Is ExecStart world-writable? Is the executable world-writable?) learn this escalation vector, alert
+    on it, and expose its decision path as the explanation?
+  context: >-
+    Tree models are both effective and inherently explainable for this structured problem. Use a decision-tree/gradient-boosted
+    classifier on boolean features (Is 'User=' present? Is ExecStart world-writable? Is the executable
+    world-writable?) to learn the escalation vector and alert, with the decision path serving as the top-feature
+    explanation, corroborated by provenance node scoring. For the Privilege Escalation tactic this learns
+    the interaction between conditions from data — including weightings the hand-tuned risk score might
+    get wrong — and gives analysts a transparent rationale.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit directories and world-writable directories (/tmp, /dev/shm) on all Linux
+    hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = GradientBoostedTrees().fit(labeled_privileged_units)
+
+      for f in new_privileged_units:
+          feats = {user_present: has_user(f),
+                   es_ww: execstart_world_writable(f),
+                   file_ww: target_world_writable(f)}
+          if model.predict(feats)==MALICIOUS:
+              alert(f.path, decision_path=model.explain(feats),
+                    graph=provenance_node_score(f))
+- question: Is there any file write or create event in /etc/systemd/system/ or /usr/lib/systemd/system/
+    where the writing process's effective UID is not 0 — a non-root process creating a root-level service?
+  context: >-
+    A non-root process writing to a root-owned systemd directory is a direct escalation indicator. Implement
+    a critical-severity rule alerting on any write/create in '/etc/systemd/system/' or '/usr/lib/systemd/system/'
+    where the writing process euid is not 0. Use eBPF for reliable euid/lineage attribution that resists
+    field spoofing. For the Privilege Escalation tactic this is high fidelity: legitimate privileged unit
+    installs occur as root (uid 0), so a non-zero euid write almost always means an unprivileged actor
+    is planting a service to later execute as root.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=PATH (op=CREATE OR op=WRITE)
+
+      | where match(name,"/etc/systemd/system/|/usr/lib/systemd/system/")
+         AND euid != 0
+      | table host,_time,uid,euid,exe,parent_comm,name  severity=critical
+- question: In the euid distribution of processes writing to privileged systemd directories, does a non-zero
+    euid write appear — a zero-frequency / maximum-anomaly event that validates the symbolic rule and
+    should raise host risk?
+  context: >-
+    Statistical corroboration strengthens and contextualizes the symbolic euid rule. Maintain euid statistics
+    for processes writing to privileged systemd directories; a non-zero euid write is a zero-frequency
+    (maximum-anomaly) event that validates the symbolic alert and raises the host risk score. For the
+    Privilege Escalation tactic this turns a binary rule into a graded risk signal and helps prioritize
+    among multiple hosts: the more consistently a directory has only ever seen euid-0 writes, the more
+    alarming the first non-zero write becomes.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH (op=CREATE OR op=WRITE)
+        (name="/etc/systemd/system/*" OR name="/usr/lib/systemd/system/*")
+      | stats count as n by host, euid
+
+      | eventstats sum(n) as total by host
+
+      | eval freq = n/total
+
+      | where euid != 0   # zero historical frequency => maximum anomaly
+
+      | eval host_risk = host_risk + 50
+- question: Can an Isolation Forest trained on process/file event features (euid, target file path, parent
+    process name) isolate non-root writes to privileged systemd paths as highly anomalous, with LIME/SHAP
+    attribution naming the top contributing features?
+  context: >-
+    An isolation-forest model learns the joint normal of who writes what, where. Train it on process/file
+    features (euid, target path, parent process) so it learns that non-root writes to privileged systemd
+    paths are highly anomalous and isolates them, with LIME/SHAP attribution surfacing the top-3 features.
+    For the Privilege Escalation tactic this catches escalation attempts that combine an unusual euid
+    with an unusual parent or path in ways a single-condition rule would miss, and the feature attribution
+    speeds analyst triage.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: Privileged systemd unit file directories (/etc/systemd/system/, /usr/lib/systemd/system/) on
+    all Linux hosts.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      model = IsolationForest().fit(priv_dir_write_features)
+
+      for e in writes(path~"/etc/systemd/system|/usr/lib/systemd/system"):
+          feats = [e.euid, e.target_path, e.parent_comm]
+          if model.decision_function(feats) < anomaly_cut:
+              alert(e, top_features=shap(model, feats, 3))
+- question: Can you correlate execution of a PID-1, euid-0 (root) process with subsequent file writes
+    from that same PID, and trigger high severity when the write target is a monitored authentication
+    file like /etc/passwd, /etc/shadow, /etc/sudoers, or /etc/sudoers.d/*?
+  context: >-
+    Linking a root systemd child to edits of authentication files exposes escalation in action. Correlate
+    execution logs (ppid=1, euid=0) with subsequent file writes from the same pid and trigger high severity
+    when the write target is on a monitored list ('/etc/passwd','/etc/shadow','/etc/sudoers','/etc/sudoers.d/*').
+    eBPF pid/lineage tracking preserves the parent-child link across exec. For the Privilege Escalation
+    tactic this catches a timer-spawned root process adding accounts or sudo rules — a concrete escalation/backdoor
+    action rather than mere setup.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: All Linux hosts, focusing on directories containing critical authentication and configuration
+    files (e.g., /etc/, /etc/sudoers.d/).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      source=auditd type=EXECVE ppid=1 euid=0
+
+      | join pid [search source=auditd type=PATH op=WRITE
+           name IN ("/etc/passwd","/etc/shadow","/etc/sudoers","/etc/sudoers.d/*")]
+      | table host,_time,pid,exe,name  severity=high
+- question: For each critical system file, is the modifying process off its baseline of legitimate editors
+    (useradd, passwd, visudo) — particularly a PID-1-spawned process not on the baseline, which would
+    be a high-confidence zero-frequency outlier?
+  context: >-
+    Baselining the legitimate editors of each sensitive file isolates illegitimate ones. For each critical
+    file, baseline legitimate modifying processes ('useradd','passwd','visudo') and flag any modification
+    by a PID-1 process not on the baseline as a high-confidence outlier (zero frequency = maximum anomaly).
+    For the Privilege Escalation tactic this catches a systemd-spawned payload tampering with authentication
+    files via an unexpected tool or direct write, even if it does not match the specific correlation rule
+    above.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: All Linux hosts, focusing on directories containing critical authentication and configuration
+    files (e.g., /etc/, /etc/sudoers.d/).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      source=auditd type=PATH op=WRITE name IN (critical_files)
+
+      | eval ppid1 = (ppid==1)
+
+      | stats count as n by name, exe
+
+      | eval legit = exe IN baseline_editors[name]
+
+      | where NOT legit AND ppid1   # off-baseline PID-1 editor = max anomaly
+- question: Can a sequence model (RNN/HMM/CNN-LSTM) trained on legitimate admin workflows flag deviant
+    event chains — such as timer creation -> service execution -> direct edit of /etc/passwd — that do
+    not match normal administrative sequences?
+  context: >-
+    Escalation often manifests as an abnormal sequence rather than any single event. Model event chains
+    (timer creation -> service execution -> file modification) with a sequence model (RNN/HMM/CNN-LSTM)
+    trained on legitimate admin workflows and flag deviations, such as a timer-spawned process directly
+    editing /etc/passwd, with whole-system provenance autoencoding attributing and explaining the anomalous
+    chain. For the Privilege Escalation tactic this captures the full kill-chain of timer-based escalation
+    end to end, catching attacks whose individual steps each look borderline-acceptable but whose ordering
+    is anomalous.
+  answer_sources:
+  - Linux audit.log (syscall=open, openat)
+  - 'NAI: All Linux hosts, focusing on directories containing critical authentication and configuration
+    files (e.g., /etc/, /etc/sudoers.d/).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      seqs = build_event_sequences(per_pid_lineage)
+
+      model = SequenceModel(RNN_or_HMM).fit(legitimate_admin_workflows)
+
+      for s in seqs:  # e.g. timer_create -> service_exec -> file_mod
+          if model.anomaly_score(s) > THRESHOLD:
+              alert(s, attribution=kairos_provenance_explain(s))
