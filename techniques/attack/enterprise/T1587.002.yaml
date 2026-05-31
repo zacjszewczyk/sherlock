@@ -1,0 +1,438 @@
+name: 'T1587.002: Code Signing Certificates'
+id: 80dd1494-cf0b-4696-9ccb-5e999353ce2f
+description: 'Investigate adversary development and operational use of self-signed or otherwise suspicious
+  code signing certificates (MITRE ATT&CK T1587.002, Resource Development). Because the actual creation
+  of these certificates happens off-network and outside enterprise visibility, this playbook focuses on
+  detectable follow-on behavior: binaries executed under thumbprints that match threat-intelligence or
+  Microsoft vulnerable-driver blocklists, Authenticode signatures that fail verification (Bad Digest,
+  Expired, Revoked), certutil/PowerShell adding certificates to trusted Root or TrustedPublisher stores,
+  certificate metadata indicative of abuse (random or empty subjects, multi-decade validity, weak MD5/SHA-1
+  algorithms, self-signed issuer==subject), low-prevalence or brand-new issuers, surges of unique self-signed
+  certificates, and reuse of one thumbprint to both sign a local binary and serve an outbound TLS session
+  to low-reputation infrastructure. It combines symbolic-logic rules, statistical baselining/anomaly scoring,
+  and machine-learning models across Sysmon, Windows Event Logs, and Zeek (pe.log, ssl.log, x509.log,
+  conn.log) so a SOC analyst can triage likely malicious code-signing activity and its C2 linkage.'
+type: technique
+related:
+- tactic_id: TA0042
+  tactic_name: Resource Development
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Do any certificate thumbprints or serials observed in executed binaries or TLS sessions match
+    known-malicious code-signing certificates in CTI feeds or Microsoft's App Control Vulnerable Driver
+    Blocklist?
+  context: 'This is the highest-fidelity check for T1587.002: an adversary-developed certificate that
+    has already been catalogued as malicious. Correlate the cryptographic thumbprint/serial seen in Sysmon
+    Event ID 1, Zeek pe.log, and Zeek x509.log/ssl.log against curated CTI feeds and Microsoft''s Vulnerable
+    Driver Blocklist (which enumerates certificates used to sign malware). Match on the thumbprint, NEVER
+    the displayed subject/issuer string, because metadata is trivially forged and presence of metadata
+    is not trust. A match is an immediate, high-priority incident; absence does not clear the host because
+    freshly minted adversary certificates will not yet be in any feed.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek pe.log
+  - 'NAI: SIEM/Data Lake aggregating endpoint and network telemetry, Network sensors at internet egress
+    points, All endpoints with process and signature monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_x509, zeek_ssl)\n  | eval tp=lower(cert_thumbprint)\n\
+      \  | lookup cti_malicious_certs thumbprint AS tp OUTPUT verdict\n  | lookup ms_vuln_driver_blocklist\
+      \ thumbprint AS tp OUTPUT blocked\n  | where verdict=\"malicious\" OR blocked=\"true\"\n  | alert\
+      \ priority=critical"
+  - technology: Zeek/pseudocode
+    query: ">-\n  x509.log: extract certificate.serial, fingerprint(SHA1)\n  | join ssl.log on cert_chain_fps\n\
+      \  | match against intel set MALICIOUS_CERT_FP\n  | log notice CodeSigningCertHit"
+- question: Among executed signed binaries, which fail Authenticode verification (Bad Digest 0x80096010),
+    or are Expired or Revoked, while still presenting issuer metadata?
+  context: Improperly signed malware overwhelmingly fails cryptographic verification (>74% with Bad Digest)
+    yet still shows plausible issuer metadata to fool users and tools; revocation in the Windows code-signing
+    PKI is frequently late or never applied, so a 'valid' status must not be assumed benign. Evaluate
+    SignatureStatus for every observed signed binary and treat Invalid, Expired, and Revoked as three
+    DISTINCT high-fidelity signals. A Bad Digest result means the file was altered after signing or the
+    signature was stolen/grafted; Revoked means the issuing authority has disowned the certificate. Pivot
+    from any hit to process lineage and network activity.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek pe.log
+  - 'NAI: SIEM/Data Lake aggregating endpoint and network telemetry, Network sensors at internet egress
+    points, All endpoints with process and signature monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source=sysmon_id1 Signed=true\n  | eval status=authenticode_status\n  | where status\
+      \ IN (\"Invalid\",\"BadDigest\",\"Expired\",\"Revoked\") OR error=0x80096010\n  | stats count by\
+      \ status, Image, Hashes, cert_thumbprint, Computer, User\n  | alert priority=high"
+- question: When a certificate matches CTI/blocklist, is its issuer a low-prevalence or very recently
+    first-seen issuer in our environment?
+  context: Abusive publishers churn through short-lived, freshly issued certificates. After any CTI/blocklist
+    match, compute the trailing 90-day prevalence of the issuer and its first-seen date. Escalate when
+    the issuer falls in the bottom 1st percentile of all known issuers or was first observed less than
+    30 days ago. This statistical context separates a one-off reused certificate from an active campaign
+    using a brand-new signing identity, and helps prioritize triage when multiple matches occur.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek pe.log
+  - 'NAI: SIEM/Data Lake aggregating endpoint and network telemetry, Network sensors at internet egress
+    points, All endpoints with process and signature monitoring.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_x509)\n  | stats count AS hits, min(_time) AS first_seen\
+      \ by cert_issuer\n  | eventstats perc1(hits) AS p1\n  | where hits<=p1 OR first_seen > relative_time(now(),\"\
+      -30d\")\n  | alert priority=high label=\"low-prevalence issuer\""
+- question: Is there an abnormal daily surge in the number of certificate matches against CTI feeds that
+    would indicate an active campaign?
+  context: 'A sudden rise in certificate IOC matches signals a coordinated campaign rather than isolated
+    noise. Apply a time-series anomaly detector (e.g., ARIMA) to the daily count of CTI certificate matches
+    and flag excursions above the 99th percentile of the forecast. Crucially, the alert must be explainable:
+    surface the top-3 contributing features (matched issuer, host, destination ASN) via SHAP attribution
+    rather than a bare anomaly score, so the analyst can immediately see what is driving the spike and
+    where to focus.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek pe.log
+  - 'NAI: SIEM/Data Lake aggregating endpoint and network telemetry, Network sensors at internet egress
+    points, All endpoints with process and signature monitoring.'
+  range: Last 90 days (model on >=180 days history for seasonality)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  series = daily_count(cti_cert_matches)\n  | model = ARIMA.fit(series[-180d])\n  | forecast\
+      \ = model.predict()\n  | where today > forecast.p99\n  | explain via SHAP -> top3(issuer, host,\
+      \ dest_asn)\n  | alert priority=high"
+- question: Did any host run certutil.exe or PowerShell to add a certificate to the Root or TrustedPublisher
+    store, or write directly to the SystemCertificates registry keys?
+  context: This is the T1553.004 follow-on that makes an adversary-developed self-signed certificate trusted
+    system-wide, so any unsigned/untrusted code it later signs is silently accepted. Match Sysmon Event
+    ID 1 / Windows Event ID 4688 command lines and Windows Event ID 4104 script blocks for 'certutil -addstore
+    Root', 'certutil -addstore TrustedPublisher', or 'Import-Certificate ... Cert:\LocalMachine\Root',
+    and additionally fire on registry writes to SystemCertificates\Root\Certificates or AuthRoot\Certificates.
+    On Domain Controllers, PKI servers, and developer workstations this is especially significant. Correlate
+    the actor and timing against change-management records.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Windows endpoints and servers, especially Domain Controllers, Public Key Infrastructure (PKI)
+    servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  (source IN (sysmon_id1, win_4688) AND CommandLine MATCHES /certutil.*-addstore\\s+(Root|TrustedPublisher)|Import-Certificate.*Cert:\\\
+      \\LocalMachine\\\\Root/i)\n  OR (source=win_4104 ScriptBlockText MATCHES /Import-Certificate.*LocalMachine\\\
+      \\Root/i)\n  OR (source=sysmon_id13 TargetObject MATCHES /SystemCertificates\\\\(Root|AuthRoot)\\\
+      \\Certificates/)\n  | alert priority=high"
+- question: What is the per-host/per-user rate of successful versus failed certificate-store modifications,
+    and is any actor showing a burst of successes or repeated blocked attempts?
+  context: Both a burst of successful store writes by an atypical actor and a run of failed/blocked attempts
+    (Access Denied) are distinct signals. Track per host/user the hourly rate of successful versus failed
+    certificate-store modifications and compare against benign-admin baselines to suppress routine PKI
+    operations. A spike of successes by a non-PKI user suggests trust-store tampering; repeated failures
+    suggest an adversary probing without sufficient privilege. Negative result (only known PKI admins
+    at normal cadence) lowers concern.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Windows endpoints and servers, especially Domain Controllers, Public Key Infrastructure (PKI)
+    servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, win_4688) action=cert_store_modify\n  | eval outcome=if(status=0,\"\
+      success\",\"fail\")\n  | bin _time span=1h | stats count by _time, Computer, User, outcome\n  |\
+      \ join baseline_pki_admins\n  | where (outcome=\"success\" AND User NOT IN baseline) OR (outcome=\"\
+      fail\" AND count>3)\n  | alert priority=medium"
+- question: Which hosts or users modifying certificate stores are outside the normal population that performs
+    this activity, or have never done so before?
+  context: Certificate-store modification is a rare, privileged operation performed by a small, stable
+    set of admins/systems. Baseline the hosts and users that normally modify certificate stores and flag
+    events performed by actors outside the top 5% of this activity or never previously seen modifying
+    a store. A brand-new modifier is a strong anomaly worth manual review even if the command itself looks
+    routine, because adversaries reuse legitimate tooling (living off the land) from atypical accounts.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Windows endpoints and servers, especially Domain Controllers, Public Key Infrastructure (PKI)
+    servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, win_4688, win_4104) action=cert_store_modify\n  | stats count\
+      \ AS n, earliest(_time) AS first by User, Computer\n  | eventstats perc95(n) AS p95\n  | where n\
+      \ < (perc5 of population) OR first > relative_time(now(),\"-1d\") OR User NOT IN historical_modifiers\n\
+      \  | alert priority=medium label=\"rare cert-store modifier\""
+- question: Can a classifier distinguish legitimate certificate administration from suspicious store modifications
+    based on command-line and context features?
+  context: Simple keyword rules miss obfuscated or novel variants. Train a logistic-regression classifier
+    on command-line features (flags, keywords, length, entropy) plus user/host context to separate legitimate
+    administration from suspicious store modifications, reusing static feature-engineering practice from
+    PE-malware ML datasets. Alert above the tuned probability threshold and surface the top-3 driving
+    features in the alert text for explainability. This catches obfuscated certutil/PowerShell invocations
+    and unusual actor/context combinations that evade literal string matches.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - Windows Event ID 4104
+  - 'NAI: Windows endpoints and servers, especially Domain Controllers, Public Key Infrastructure (PKI)
+    servers, and developer workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = extract(CommandLine: flags, keywords, length, shannon_entropy) + context(User,Computer,parent)\n\
+      \  | p = logreg.predict_proba(features)\n  | where p > threshold\n  | explain via SHAP -> top3 features\n\
+      \  | alert priority=medium"
+- question: Are any executed binaries signed by certificates whose metadata matches malware-associated
+    patterns (suspicious subject/issuer strings, multi-decade validity, weak MD5/SHA-1 algorithms, tool-generated
+    RDN structures)?
+  context: Adversary-generated self-signed certificates often carry tell-tale metadata. Run signature
+    rules (YARA over PE certificate tables, JA4X fingerprints over Zeek x509.log) to flag suspicious issuer/subject
+    strings, validity periods over ~20 years, weak/deprecated signature algorithms (MD5/SHA-1), and tool-generated
+    certificate RDN structures. Remember metadata presence is not authenticity. A hit indicates a certificate
+    likely crafted by an attacker toolkit rather than a real CA; pivot to the signing binary's prevalence
+    and execution context.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: Endpoints and servers where binaries are executed; Network chokepoints where files are transferred
+    (e.g., web proxies, email gateways); Centralized file repositories and shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_x509)\n  | where cert_validity_years>20 OR cert_sig_algo\
+      \ IN (\"md5RSA\",\"sha1RSA\")\n       OR yara_pe_cert_match=true OR ja4x IN suspicious_ja4x_set\n\
+      \       OR regex_match(cert_subject, tool_generated_rdn)\n  | alert priority=high"
+- question: Do certificate subject/issuer fields show anomalous entropy (random/DGA-like or generic/empty),
+    especially when self-signed?
+  context: Malware code-signing/TLS certificates disproportionately use low-entropy generic names or high-entropy
+    random/DGA-like names. Compute the Shannon entropy of certificate subject and issuer fields and flag
+    values in the top 5th percentile (random) or bottom 5th percentile (generic/empty), weighting higher
+    when the certificate is self-signed. This statistical guardrail catches both throwaway randomized
+    identities and lazily generated placeholder identities that human-written allowlists tend to miss.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: Endpoints and servers where binaries are executed; Network chokepoints where files are transferred
+    (e.g., web proxies, email gateways); Centralized file repositories and shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_x509)\n  | eval H_subj=shannon(cert_subject), H_iss=shannon(cert_issuer)\n\
+      \  | eventstats perc5(H_subj) AS lo, perc95(H_subj) AS hi\n  | where H_subj>=hi OR H_subj<=lo OR\
+      \ cert_subject=\"\"\n  | eval w=if(self_signed=true,2,1)\n  | alert priority=medium"
+- question: Does an unsupervised model flag certificate metadata vectors as anomalous relative to legitimate
+    certificates?
+  context: Abused certificates exhibit distinct attribute distributions. Score certificate metadata vectors
+    (validity duration, key length, signature algorithm, subject/issuer entropy, self-signed flag) with
+    an Isolation Forest or autoencoder trained on known-good distributions, escalating high anomaly scores.
+    Report the top-3 contributing attributes per alert for explainability. This catches novel combinations
+    of suspicious attributes that no single rule encodes, e.g., a short key length plus moderate validity
+    plus a self-signed flag.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: Endpoints and servers where binaries are executed; Network chokepoints where files are transferred
+    (e.g., web proxies, email gateways); Centralized file repositories and shares.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = vec(validity_days, key_len, sig_algo_code, H_subject, H_issuer, self_signed)\n \
+      \ | model = IsolationForest.fit(known_good_certs)\n  | score = model.anomaly(X)\n  | where score\
+      \ > threshold\n  | explain top3 attributes\n  | alert priority=medium"
+- question: Are binaries executing that are signed by self-signed certificates (Issuer equals Subject)
+    or carry self-signed JA4X structures, particularly with generic/empty common names?
+  context: Self-signed status strongly correlates with malicious signing because no third party vouches
+    for the identity. Alert when an executed binary (Sysmon Event ID 1 / Zeek pe.log) is signed by a certificate
+    whose Issuer equals Subject, or whose JA4X-fingerprinted issuer structure is self-signed, particularly
+    when the common name contains generic keywords (Test, Developer, Example) or is empty. Legitimate
+    enterprise self-signed certs do exist (internal tooling), so combine with prevalence and execution
+    context to avoid false positives.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: All managed endpoints and servers; Network egress points monitoring file transfers; Software
+    distribution points (e.g., SCCM, Intune).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_x509)\n  | where cert_issuer==cert_subject OR ja4x_self_signed=true\n\
+      \  | eval generic=regex_match(cert_cn,/(?i)test|developer|example)/) OR cert_cn==\"\"\n  | where\
+      \ self_signed=true\n  | alert priority=high (raise if generic)"
+- question: Is a binary signed by a brand-new or very rare certificate issuer not previously seen in the
+    environment?
+  context: Abusive publishers churn certificates rapidly. Track every certificate issuer's first/last-seen
+    timestamps and prevalence; raise risk when a binary uses a brand-new issuer or one in the bottom 5th
+    percentile of prevalence. A first-ever issuer signing an executable is a meaningful anomaly even when
+    the certificate is otherwise well-formed, since legitimate software is usually signed by a small set
+    of recurring, well-established issuers.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: All managed endpoints and servers; Network egress points monitoring file transfers; Software
+    distribution points (e.g., SCCM, Intune).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe)\n  | stats count AS n, min(_time) AS first, max(_time)\
+      \ AS last by cert_issuer\n  | eventstats perc5(n) AS p5\n  | where n<=p5 OR first>relative_time(now(),\"\
+      -7d\")\n  | alert priority=medium label=\"rare/new issuer\""
+- question: Does a one-class model flag a signing certificate as falling outside the known-good certificate
+    manifold?
+  context: Train a one-class SVM on known-good certificate vectors (issuer, subject, validity, key usage,
+    entropy) and flag outliers, with the alert enumerating the top-3 features that pushed the certificate
+    outside the known-good manifold. This complements explicit self-signed and rare-issuer rules by detecting
+    certificates that deviate across several attributes simultaneously without matching any single hand-written
+    signature.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - 'NAI: All managed endpoints and servers; Network egress points monitoring file transfers; Software
+    distribution points (e.g., SCCM, Intune).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = vec(issuer_emb, subject_emb, validity, key_usage, entropy)\n  | model = OneClassSVM.fit(known_good_certs)\n\
+      \  | where model.predict(X) == outlier\n  | explain top3 features\n  | alert priority=medium"
+- question: Did any single host observe more than five unique self-signed certificate thumbprints in executions
+    or TLS sessions within a rolling one-hour window?
+  context: A rapid burst of distinct self-signed certificates on one host suggests automated generation
+    or staging of signing material. Alert when a host observes more than five unique self-signed certificate
+    thumbprints in executions or TLS sessions within a rolling 1-hour window; tune the per-environment
+    threshold from the benign self-signed rate that tools like RITA report from Zeek ssl.log/x509.log.
+    This catches tooling that mints throwaway certificates per session or per payload.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - Zeek ssl.log
+  - 'NAI: Enterprise-wide SIEM or data lake aggregating host and network logs.'
+  range: Last 90 days (1-hour rolling window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_ssl) self_signed=true\n  | bin _time span=1h\n\
+      \  | stats dc(cert_thumbprint) AS uniq by _time, host\n  | where uniq>5\n  | alert priority=high"
+- question: Is the hourly count of new self-signed certificates statistically elevated (mean + 3 sigma)
+    per-host or enterprise-wide?
+  context: Count new self-signed certificates hourly, compute the 30-day mean and standard deviation,
+    and alert when the current count exceeds mean + 3 sigma. Track BOTH a per-host and an enterprise-wide
+    series so a single noisy host does not mask a fleet-wide surge and vice-versa. A statistically significant
+    spike indicates a coordinated rollout of signing material that warrants investigation beyond what
+    fixed thresholds detect.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - Zeek ssl.log
+  - 'NAI: Enterprise-wide SIEM or data lake aggregating host and network logs.'
+  range: Last 90 days (30-day baseline window)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_pe, zeek_ssl) self_signed=true new_cert=true\n  | timechart\
+      \ span=1h count AS c by host\n  | eventstats avg(c) AS mu, stdev(c) AS sd over 30d\n  | where c\
+      \ > mu + 3*sd\n  | also compute enterprise-wide series\n  | alert priority=high"
+- question: Does a seasonality-aware anomaly model flag statistically significant spikes in new self-signed
+    certificates not explained by normal periodicity?
+  context: Fixed thresholds and simple z-scores can misfire on daily/weekly seasonality. Model the hourly
+    count of new self-signed certificates with Seasonal-Hybrid ESD to flag statistically significant spikes
+    not explained by seasonality, and present the contributing hosts/issuers (top-3) with each flagged
+    interval. This reduces false positives from regular business-cycle variation while still catching
+    genuine surges.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek pe.log
+  - Zeek ssl.log
+  - 'NAI: Enterprise-wide SIEM or data lake aggregating host and network logs.'
+  range: Last 90 days (model >=30 days for seasonality)
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  series = hourly_count(new_self_signed_certs)\n  | anomalies = SeasonalHybridESD(series,\
+      \ period=24)\n  | for each flagged interval: top3(host, issuer)\n  | alert priority=medium"
+- question: Is the same certificate thumbprint used to both sign a locally executed binary and serve an
+    outbound TLS session to an external, low-reputation destination?
+  context: Reuse of one self-signed certificate for both code signing and C2 TLS is a strong indicator
+    that an adversary is operating a self-contained toolkit. Join Sysmon Event ID 1 execution events with
+    Zeek ssl.log/x509.log within a 5-minute window and alert when one certificate thumbprint both signs
+    a locally executed binary and serves an outbound TLS session whose Zeek conn.log destination is external
+    and low-reputation. A positive result tightly links a suspicious binary to its command-and-control
+    channel and should trigger host isolation review.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: SIEM or data lake capable of correlating host-based process execution data with network session
+    data.'
+  range: Last 90 days (5-minute correlation window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  exec = source=sysmon_id1 | fields host, cert_thumbprint, _time\n  | join cert_thumbprint\
+      \ [ ssl = source=zeek_ssl | fields host, cert_thumbprint, dest_ip, _time ]\n  | where abs(exec._time\
+      \ - ssl._time) < 5m AND same_host\n  | lookup geo_rep dest_ip OUTPUT reputation, is_external\n \
+      \ | where is_external=true AND reputation=\"low\"\n  | alert priority=critical"
+  - technology: Zeek/pseudocode
+    query: ">-\n  correlate pe.log(cert_fp) with ssl.log(cert_fp) per host within 300s\n  | filter conn.log\
+      \ dest external AND rep low\n  | log notice SignAndC2CertReuse"
+- question: Are there rising failed/rejected outbound TLS attempts (conn_state S0/REJ/RSTO) to external
+    destinations carrying the reused self-signed certificate?
+  context: Beyond successful sessions, count failed/rejected outbound TLS attempts (Zeek conn.log conn_state
+    S0/REJ/RSTO) to the same external destinations. A rise in blocked or half-open connections carrying
+    the reused self-signed certificate is a distinct signal of C2 setup, beaconing to dead infrastructure,
+    or a sinkholed domain. These failures often precede or accompany successful C2 and reveal infrastructure
+    even when the final channel is blocked.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: SIEM or data lake capable of correlating host-based process execution data with network session
+    data.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log: where conn_state IN (\"S0\",\"REJ\",\"RSTO\") AND local_orig=true\n  | join\
+      \ ssl.log on uid where cert self_signed AND cert_fp IN reused_signing_fps\n  | stats count by orig_host,\
+      \ resp_ip, resp_asn\n  | trend over time -> alert on rise"
+- question: Are newly observed (process, signing issuer, destination ASN) tuples appearing in the bottom
+    1st percentile of historical prevalence?
+  context: Baseline (process, signing issuer, destination ASN) tuples and flag newly observed combinations
+    in the bottom 1st percentile of historical prevalence. A never-before-seen linkage between a specific
+    process, a particular signing identity, and an external network destination is a rare-event signal
+    that surfaces stealthy C2 even when each element individually looks unremarkable. Use it to prioritize
+    triage of the correlated certificate-reuse alerts.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: SIEM or data lake capable of correlating host-based process execution data with network session
+    data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  source IN (sysmon_id1, zeek_ssl, zeek_conn)\n  | eval tuple=process.\":\".cert_issuer.\"\
+      :\".dest_asn\n  | stats count AS n by tuple\n  | eventstats perc1(n) AS p1\n  | where n<=p1 OR isnew(tuple)\n\
+      \  | alert priority=medium"
+- question: Does graph community detection reveal small, new clusters linking self-signed certificates
+    to external IPs across processes and destinations?
+  context: Build a graph of processes, certificates, and destinations and use community detection (e.g.,
+    Louvain) to highlight small, new clusters linking self-signed certificates to external IPs; emit the
+    top-3 nodes/edges driving each flagged community for analyst triage. C2 infrastructure tends to form
+    tight, isolated subgraphs distinct from the dense legitimate activity; detecting these emergent communities
+    reveals coordinated campaigns that pairwise rules miss.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Zeek ssl.log
+  - Zeek conn.log
+  - 'NAI: SIEM or data lake capable of correlating host-based process execution data with network session
+    data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  G = graph(nodes={process,cert,dest_ip}, edges=observed_links)\n  | communities = Louvain(G)\n\
+      \  | flag communities where size_small AND age_new AND contains(self_signed_cert, external_ip)\n\
+      \  | explain top3 nodes/edges\n  | alert priority=medium"
