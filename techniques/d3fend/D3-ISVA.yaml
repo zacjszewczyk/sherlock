@@ -1,0 +1,337 @@
+name: 'D3-ISVA: Inbound Session Volume Analysis'
+id: 19b74fce-bf7b-4c15-8625-efff00e06532
+description: Investigate abnormal inbound network session-volume conditions across our internet-facing
+  perimeter so an analyst can determine whether exposed services are under reconnaissance, resource-exhaustion,
+  or volumetric/distributed denial-of-service (DoS/DDoS) attack. This playbook helps establish per-service
+  baselines for inbound connection telemetry (Zeek conn.log, firewall logs, Suricata/IDS alerts) and then
+  hunt for sudden surges, sustained excess traffic, coordinated activity from suspicious or known-bad
+  source sets, asymmetric inbound/outbound volume ratios, concurrent-connection saturation, and abnormal
+  connection-state or failed-handshake mixes (SYN-only S0, REJ, RST) versus expected behavior. It layers
+  deterministic symbolic-logic rules (threat-intel matching, per-source rate thresholds, connection-state
+  ratios, asymmetric volume ratios, concurrency ceilings), statistical baselining (sigma/MAD/percentile
+  surge detection, ARIMA/Prophet forecasting, CUSUM/change-point onset detection, entropy and wavelet
+  signal analysis), and explainable machine-learning scoring (Isolation Forest, online autoencoder reconstruction,
+  PCA subspace residuals, supervised flow classification) to catch both high-volume floods and low-and-slow
+  resource-exhaustion attacks like Slowloris. Use it to detect flood onset early, attribute the targeted
+  service, and triage suspect source clusters before availability is lost.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which inbound sessions to our internet-exposed assets originated from source IPs that match
+    high-confidence threat intelligence or our prior firewall block history, and which of those completed
+    a successful TCP handshake (Zeek conn_state SF, S1, S2, or S3)?
+  context: Under the Detect tactic, a confirmed-bad source that not only reaches but successfully connects
+    to an exposed service is an immediate triage priority, because it can signal the start of an intrusion
+    or a participating node in a coordinated flood. Join inbound source IPs in Zeek conn.log against curated
+    high-confidence threat-intel feeds and the firewall's historical block list, and alert when the connection
+    state shows a completed handshake (SF/S1/S2/S3) to an exposed asset rather than a dropped or reset
+    attempt. Enrich each hit with the destination service, how often the source has recurred, and any
+    prior block history so an analyst can decide instantly whether to escalate. A positive result (known-bad
+    source with a successful session) warrants containment; repeated or multi-source hits to the same
+    service follow vendor DoS-identification practice of confirmed-bad-source escalation and multi-stage
+    thresholding.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM conn.log\nWHERE local_orig == false AND id.resp_h IN exposed_assets\n  AND conn_state\
+      \ IN (\"SF\",\"S1\",\"S2\",\"S3\")\nLOOKUP id.orig_h IN threat_intel_high_conf OR id.orig_h IN firewall_block_history\n\
+      STATS sessions=count(), services=set(id.resp_p), recurrence=count_days(id.orig_h)\n  BY id.orig_h,\
+      \ id.resp_h\n| WHERE matched == true\n| ALERT severity=high WITH dst_service, recurrence, prior_block=true"
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM conn_events JOIN ti_indicators ON src_ip = ti_indicators.ip
+
+      WHERE dst_ip IN exposed_assets AND conn_state IN ("SF","S1","S2","S3")
+
+      | EVAL prior_block = src_ip IN block_history
+
+      | STATS c=count() BY src_ip, dst_ip, dst_port, prior_block
+
+      | ALERT "known-bad source completed session to exposed asset"'
+- question: Did any single source IP open more than N new inbound sessions or send more than N SYNs to
+    a given destination service within T seconds, exceeding the deterministic per-source rate floor tuned
+    for that service?
+  context: Under the Detect tactic, deterministic count-per-window rules are the hard floor that always
+    fires regardless of model drift, giving SOC analysts a reliable trip-wire for abusive sources and
+    the early stage of floods. Apply count-per-window rules over Zeek conn.log and Suricata keyed by_src
+    and by_dst (e.g., alert if a source opens more than N new inbound sessions or SYNs to a destination
+    service within T seconds), then tune N and T per service from the observed 99th percentile of legitimate
+    traffic. These rules should remain as immovable thresholds while statistical and ML detections run
+    in parallel; do not replace them. A positive result identifies a source generating volumetrically
+    abnormal connection rates and supports rate-limiting or blocking; tune carefully to avoid false positives
+    from NAT gateways and legitimate high-volume clients.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: Suricata/pseudocode
+    query: "# rate_filter / global threshold style\nthreshold gen_id 1, sig_id <flood_sig>, type both,\
+      \ track by_src,\n  count N, seconds T\n# alert when new inbound sessions/SYNs from one src to a\
+      \ dst service exceed N within T"
+  - technology: Zeek/pseudocode
+    query: 'FROM conn.log WHERE local_orig == false AND id.resp_h IN exposed_assets
+
+      | BUCKET ts SPAN=T seconds
+
+      | STATS new_sessions=count() BY bucket, id.orig_h, id.resp_h, id.resp_p
+
+      | WHERE new_sessions > N_for_service(id.resp_p)
+
+      | ALERT "per-source rate threshold exceeded"'
+- question: For each exposed service and source cluster, what fraction of inbound connection attempts
+    are SYN-only (S0), reset-heavy (RST), or rejected/failed handshakes (REJ, RSTOS0, SH), and does that
+    failed/blocked ratio exceed the service-specific floor (e.g., S0+REJ greater than 70% of attempts)?
+  context: 'Under the Detect tactic, the mix of TCP connection states is a powerful discriminator: a high
+    proportion of half-open (S0), rejected (REJ), or reset (RST/RSTOS0/SH) attempts indicates probable
+    SYN flooding, port scanning, or degraded filtering rather than legitimate use. Compute per-service
+    and per-source-cluster ratios from Zeek conn.log, treat the failed/blocked-connection ratio as a distinct
+    state signal, and escalate when it exceeds a service-specific floor (for example, S0+REJ greater than
+    70% of attempts). A positive result distinguishes a resource-exhaustion SYN flood (mostly S0) from
+    scanning (mixed REJ/RST) and from filtering problems, mapping to the DDoS attack-class taxonomy. A
+    negative result (states dominated by SF) suggests normal completed traffic even if volume is high.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM conn.log WHERE local_orig == false AND id.resp_h IN exposed_assets\n| BUCKET ts SPAN=5min\n\
+      | STATS total=count(),\n        s0=count(conn_state==\"S0\"), rej=count(conn_state==\"REJ\"),\n\
+      \        rst=count(conn_state IN (\"RSTOS0\",\"SH\",\"RSTO\"))\n  BY id.resp_h, id.resp_p, src_cluster(id.orig_h)\n\
+      | EVAL fail_ratio = (s0+rej+rst)/total\n| WHERE fail_ratio > floor_for_service(id.resp_p)\n| ALERT\
+      \ \"suspicious connection-state mix (SYN flood/scan)\""
+- question: For each external source prefix and destination service, does the inbound-to-outbound packet/byte
+    ratio over the window exceed the normal band, indicating a one-way flood signature that raw inbound
+    counts would miss?
+  context: 'Under the Detect tactic, bandwidth-exhaustion floods often present as highly asymmetric traffic:
+    large inbound volume with little or no corresponding outbound response. Compute the inbound:outbound
+    packet and byte ratio per external source prefix and destination service over a sliding window and
+    alert when it leaves the normal band. This deterministic ratio rule, inspired by MULTOPS-style bandwidth-attack
+    detection, catches floods that volumetric counts alone can miss because a server may be saturated
+    by one-way traffic well before raw connection counts look anomalous. A positive result (sustained
+    high inbound:outbound ratio) is a strong one-way-flood indicator and identifies the offending source
+    prefix; legitimate asymmetric services (e.g., large uploads) should be baselined out.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM conn.log WHERE id.resp_h IN exposed_assets\n| BUCKET ts SPAN=5min\n| STATS in_bytes=sum(orig_bytes),\
+      \ out_bytes=sum(resp_bytes),\n        in_pkts=sum(orig_pkts), out_pkts=sum(resp_pkts)\n  BY prefix(id.orig_h),\
+      \ id.resp_p\n| EVAL ratio = in_bytes / max(out_bytes,1)\n| WHERE ratio > normal_band_high(id.resp_p)\n\
+      | ALERT \"asymmetric inbound/outbound volume (one-way flood)\""
+- question: How many simultaneously active established connections exist per service port, and is that
+    concurrency approaching or exceeding the server's safety threshold (e.g., 80% of max_connections),
+    as seen with slow resource-exhaustion attacks like Slowloris?
+  context: Under the Detect tactic, low-and-slow resource-exhaustion attacks such as Slowloris do not
+    generate high connection rates or bandwidth; instead they hold many connections open to exhaust the
+    server's connection pool. Track the number of concurrently established connections per service port
+    from Zeek conn.log and alert preemptively when it crosses a predefined safety threshold (for example
+    80% of the server's configured max_connections). A positive result warns of impending or active connection-pool
+    exhaustion before the service fails, even when per-source rate and volumetric rules stay quiet. Pair
+    the alert with per-source concurrency counts to find slow-attack clients that each hold a few long-lived
+    sessions.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FROM conn.log WHERE id.resp_h IN exposed_assets AND conn_state IN (\"S1\",\"SF\",\"S2\",\"\
+      S3\")\n| COMPUTE active_concurrent = overlapping_sessions(ts, duration)\n  BY id.resp_h, id.resp_p\n\
+      | WHERE active_concurrent > 0.8 * max_connections(id.resp_h, id.resp_p)\n| ALERT \"concurrent connection\
+      \ saturation (Slowloris/resource exhaustion)\""
+- question: When aggregated into 5-minute buckets per externally exposed service, do inbound session counts
+    exceed 3 sigma, the modified z-score (median/MAD), or the historical 99th percentile relative to day-of-week
+    and hour-of-day baselines?
+  context: Under the Detect tactic, volumetric anomalies are best caught against a seasonal baseline rather
+    than a flat threshold, because legitimate traffic varies by time of day and day of week. Aggregate
+    inbound sessions into 5-minute buckets per exposed service and compare each bucket against baselines
+    derived from 30-90 days of history, alerting when the value exceeds 3 sigma, a robust modified z-score
+    (median/MAD, resistant to outliers), or the historical 99th percentile. Derive thresholds per service
+    so a busy public site and a rarely used admin portal are judged on their own norms. A positive result
+    flags a statistically significant surge consistent with the onset of a volumetric flood or a flash
+    crowd; correlate with connection-state and source-diversity signals to separate attack from legitimate
+    spike.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM conn_events WHERE dst IN exposed_services
+
+      | BUCKET ts SPAN=5min
+
+      | STATS sessions=count() BY bucket, service
+
+      | JOIN baseline ON service, dow(bucket), hour(bucket)
+
+      | EVAL mod_z = 0.6745*(sessions - median)/mad
+
+      | WHERE sessions > p99 OR mod_z > 3.5 OR sessions > mean + 3*stddev
+
+      | ALERT "inbound session surge above baseline"'
+- question: Does observed inbound session volume per service remain above the upper confidence bound of
+    a seasonal forecast model (SARIMA/ARIMA or Prophet) for multiple consecutive intervals, accounting
+    for diurnal and weekly seasonality?
+  context: Under the Detect tactic, forecasting models capture seasonality more faithfully than static
+    baselines and reduce false positives by requiring sustained deviation. Train SARIMA/ARIMA or Prophet
+    models per service on 60-90 days of Zeek conn.log volume data and trigger an incident when observed
+    volume stays above the model's upper confidence bound for several consecutive intervals, honoring
+    daily and weekly patterns. Requiring multiple consecutive breaches distinguishes a genuine sustained
+    flood from a single noisy spike. A positive result indicates volume that the seasonal model considers
+    implausible for the current time window, strongly suggesting an ongoing volumetric attack; retrain
+    periodically and exclude prior incident windows so the model does not learn attack traffic as normal.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "# per-service forecast (SARIMA/Prophet) trained on 60-90d, 5-min volume\nFOR each service:\n\
+      \  forecast, upper_ci = model.predict(now, season=daily+weekly)\n  observed = count(inbound_sessions,\
+      \ 5min)\n  IF observed > upper_ci FOR >= K consecutive intervals:\n     RAISE incident \"inbound\
+      \ load above forecast upper bound\""
+- question: Does CUSUM (or Bayesian online change-point / PELT) on the per-service SYN-rate and new-connection-rate
+    time series detect an abrupt onset that exceeds the tuned drift/threshold pair, while tolerating gradual
+    diurnal drift?
+  context: Under the Detect tactic, change-point detection excels at catching the abrupt onset of a flood
+    early, before cumulative volume looks extreme, while tolerating the slow drift of normal traffic.
+    Run CUSUM (or Bayesian online change-point detection / PELT) over the per-service SYN-rate and new-connection-rate
+    time series and alarm when the cumulative deviation exceeds a tuned drift/threshold pair. CUSUM accumulates
+    small persistent increases, so it reacts quickly to a step change in connection rate that point-in-time
+    thresholds might smooth over. A positive result pinpoints the moment a flood began, which aids both
+    rapid response and post-incident timeline reconstruction; tune the drift parameter so normal diurnal
+    ramp-up does not trip the alarm.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "# CUSUM on per-service SYN/new-connection rate\nFOR each service:\n  x_t = syn_rate or new_conn_rate\
+      \ (per interval)\n  S_t = max(0, S_{t-1} + (x_t - mean - drift))\n  IF S_t > H_threshold(service):\n\
+      \     ALERT \"flood onset detected (change point)\" at t"
+- question: Per window, does the sample entropy of source-IP, source-port, and destination-port distributions
+    shift in the flood signature (destination entropy collapsing while source entropy disperses), and
+    do wavelet/multiresolution deviation-energy spikes reveal short-lived or low-volume anomalies?
+  context: 'Under the Detect tactic, entropy and signal-analysis techniques detect distributed and stealthy
+    attacks that fixed counts miss. Compute sample entropy of source-IP, source-port, and destination-port
+    distributions per window: a distributed volumetric flood typically collapses destination-port/IP entropy
+    (traffic concentrates on one target) while dispersing source-IP entropy (many attacking sources).
+    Combine this with wavelet/multiresolution analysis of the volume signal to surface short-lived bursts
+    and low-volume anomalies that thresholds smooth away. A positive result (the characteristic entropy
+    divergence plus deviation-energy spike) is strong evidence of a coordinated/distributed attack even
+    when total volume is modest; baseline normal entropy ranges per service to interpret shifts correctly.'
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM conn.log WHERE id.resp_h IN exposed_assets\n| BUCKET ts SPAN=1min\n| STATS H_srcip=entropy(id.orig_h),\
+      \ H_srcport=entropy(id.orig_p),\n        H_dstport=entropy(id.resp_p), vol=count() BY bucket, service\n\
+      | EVAL wavelet_energy = mra_deviation(vol)\n| WHERE H_dstport < low_band AND H_srcip > high_band\n\
+      \        OR wavelet_energy > energy_threshold\n| ALERT \"entropy/signal anomaly (distributed flood)\""
+- question: When an Isolation Forest is fit on first-party inbound features (connection count, unique
+    source count, success/fail conn_state ratios, inbound/outbound byte ratio, protocol mix, source-geo/ASN
+    diversity), which windows score as high anomalies, and what are the top-3 contributing features for
+    each alert?
+  context: Under the Detect tactic, an unsupervised multivariate model catches anomalies that no single
+    univariate rule would, by learning the joint normal behavior of many inbound features at once. Fit
+    an Isolation Forest on first-party features per service/window including connection count, unique
+    source count, conn_state success/fail ratios, inbound/outbound byte ratio, protocol mix, and source-geo/ASN
+    diversity, then investigate high anomaly scores. Crucially, always attach the top-3 contributing features
+    (per-tree feature contributions) to the alert text so an analyst understands why the window is anomalous
+    and can triage quickly. A positive result with, say, 'unique_source_count' and 'fail_ratio' as top
+    contributors points to a distributed SYN flood; explainability turns an opaque score into an actionable
+    lead and reduces alert fatigue.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = per_window(service): [conn_count, uniq_src, sf_ratio, fail_ratio,\n  in_out_byte_ratio,\
+      \ proto_mix, geo_diversity, asn_diversity]\nmodel = IsolationForest(features_train_90d)\nscore =\
+      \ model.decision_function(features_now)\nIF score > anomaly_threshold:\n   top3 = feature_contributions(model,\
+      \ features_now)[:3]\n   ALERT \"multivariate inbound anomaly\" WITH top3"
+- question: Running a streaming autoencoder ensemble over incrementally maintained damped-window rate/bandwidth/jitter
+    statistics per host/service, which observations produce high reconstruction error (RMSE) in real time,
+    and which features carry the highest error?
+  context: Under the Detect tactic, an online autoencoder ensemble provides label-free, real-time anomaly
+    detection suited to catching floods and volumetric attacks as they happen. Maintain incremental damped-window
+    rate, bandwidth, and jitter statistics per host/service and feed them to a streaming autoencoder ensemble
+    (Kitsune-style); the model learns to reconstruct normal traffic and produces high reconstruction error
+    (RMSE) when traffic deviates. Alert on high RMSE and surface the highest-error features so an analyst
+    sees which dimension (e.g., packet rate, bandwidth) drove the anomaly. A positive result flags real-time
+    volumetric/flooding behavior without prior labels and adapts continuously via the damped window; validate
+    against known-good bursty periods to set the RMSE threshold and avoid concept-drift false positives.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "stream per host/service:\n  stats = damped_window(rate, bandwidth, jitter)\n  recon = autoencoder_ensemble.reconstruct(stats)\n\
+      \  rmse = sqrt(mean((stats - recon)^2))\n  IF rmse > rmse_threshold:\n     ALERT \"online reconstruction\
+      \ anomaly (flood)\" WITH top_error_features(stats, recon)"
+- question: Does the PCA subspace residual Q-statistic (squared prediction error) on network-wide inbound
+    volume exceed its confidence limit, and when triaging, does a lightweight supervised flow classifier
+    (e.g., a CNN trained on labeled flood corpora) label the traffic as a specific attack type?
+  context: Under the Detect tactic, the PCA subspace method separates network-wide traffic into a normal
+    subspace and an anomalous residual subspace; a residual Q-statistic above its confidence limit signals
+    a network-wide volume anomaly such as a distributed flood. Compute the residual SPE on network-wide
+    inbound volume and alert when it exceeds the confidence limit. For triage, optionally run a lightweight
+    CNN flow classifier with feature attribution, trained and validated on labeled flood corpora (e.g.,
+    CIC-DDoS2019, LUCID), to label the attack type (SYN flood, UDP flood, HTTP flood) during investigation.
+    A positive Q-statistic identifies that something network-wide is abnormal even when no single link
+    looks extreme, and the supervised classifier accelerates classification; keep the supervised model
+    as triage assistance, not the sole detector, and retrain as attack patterns evolve.
+  answer_sources:
+  - Zeek conn.log
+  - Firewall
+  - Suricata/IDS alerts
+  - 'NAI: Our organization''s internet gateway and perimeter firewalls.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "# PCA subspace residual on network-wide volume matrix\nproject volume_matrix into normal +\
+      \ residual subspaces\nQ = ||residual||^2  (squared prediction error)\nIF Q > Q_confidence_limit:\n\
+      \   ALERT \"network-wide volume anomaly (subspace residual)\"\n# triage: label = cnn_flow_classifier.predict(flow_features)\
+      \ with attribution"
