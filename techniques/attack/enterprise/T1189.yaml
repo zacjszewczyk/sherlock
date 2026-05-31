@@ -1,0 +1,629 @@
+name: 'T1189: Drive-by Compromise'
+id: 58f02157-11c5-400b-9741-ad1a157704ea
+description: 'Investigate potential MITRE ATT&CK T1189 Drive-by Compromise, in which an adversary gains
+  initial access by getting a user to visit a website that delivers exploit code to the browser (compromised
+  legitimate sites, malicious cloud-hosted scripts, malvertising, cross-site scripting, or abusive browser
+  push notifications), frequently as a targeted strategic web compromise / watering-hole attack. This
+  playbook helps an analyst hunt the full drive-by lifecycle across network, endpoint, and identity telemetry:
+  outbound requests to threat-intel-flagged or low-reputation/newly-observed domains and URLs; malicious
+  HTTP response bodies carrying obfuscated JavaScript, hidden 1x1 iframes, or exploit-kit signatures;
+  browser processes spawning command interpreters, scripting hosts, or non-allowlisted children and dropping
+  executables to temp/AppData; post-browse outbound connections to C2 over unusual ports or matching implant
+  TLS fingerprints; watering-hole burst patterns where a related group of hosts suddenly contacts the
+  same low-reputation domain; and post-compromise identity anomalies such as token reuse, atypical sign-ins,
+  and unexpected OAuth consent grants. It combines deterministic symbolic-logic rules, statistical baselining,
+  and machine-learning approaches across Zeek/NSM, Windows Event Log, Sysmon, auditd, macOS unified logs,
+  and cloud/IdP sources.'
+type: technique
+related:
+- tactic_id: TA0001
+  tactic_name: Initial Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any endpoint resolve or connect to a destination domain, URL, or IP address that appears
+    on a high-confidence threat-intelligence feed of known-malicious drive-by infrastructure (exploit
+    kits, malvertising, or watering holes)?
+  context: Drive-by compromise begins when a victim browser is steered to attacker-controlled infrastructure,
+    and that infrastructure is heavily shared and reused across redirect chains, so a hit against a curated,
+    high-confidence intel feed is high fidelity. Continuously correlate Zeek http.log 'host'/'uri' fields
+    and dns.log 'query' values against the feed of malicious domains/URLs and alert on matches; enrich
+    with TLS deny-listing by joining Zeek ssl.log JA3/JA3S and JA4 fingerprints against known exploit-kit
+    and RAT stacks. A positive result means a host reached known-bad drive-by infrastructure and should
+    be triaged for follow-on exploitation; a negative result lowers but does not eliminate suspicion because
+    brand-new infrastructure may not yet be in the feed. In the context of the Initial Access tactic,
+    this confirms whether a user's normal browsing carried them to an adversary's exploit delivery point.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Enterprise Web Proxy, Internet Gateway Firewall, Internal DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'index=zeek (sourcetype=zeek_http OR sourcetype=zeek_dns)
+
+      | eval ioc=coalesce(host, query)
+
+      | lookup threat_intel_malicious_domains domain AS ioc OUTPUT confidence, category
+
+      | where confidence>="high" AND category IN ("exploit_kit","malvertising","watering_hole")
+
+      | table _time, id.orig_h, ioc, uri, category'
+  - technology: Zeek/pseudocode
+    query: 'index=zeek sourcetype=zeek_ssl
+
+      | lookup ek_rat_fingerprints ja3 AS ja3, ja3s AS ja3s, ja4 AS ja4 OUTPUT stack
+
+      | where isnotnull(stack)
+
+      | table _time, id.orig_h, id.resp_h, server_name, ja3, ja4, stack'
+- question: Are any endpoints requesting domains with very low reputation (recently registered, low fleet
+    prevalence) or generating bursts of NXDOMAIN / HTTP 4xx-5xx failures consistent with fast-churning
+    exploit-kit gate and redirect domains?
+  context: Exploit-kit and watering-hole gate/redirect domains tend to be young, rarely seen across the
+    fleet, and algorithmically generated, and they often produce a burst of failed resolutions or 404/5xx
+    responses before a successful landing fetch. Score each requested domain by age, registration recency,
+    and historical fleet prevalence and alert when reputation falls in the lowest 5th percentile; in parallel
+    profile per-host NXDOMAIN and HTTP 4xx/5xx rates and the failed-to-successful ratio, and flag algorithmically
+    generated host labels using Kullback-Leibler divergence against natural-language bigrams. A positive
+    result surfaces churning or DGA-like infrastructure typical of a redirect chain; a negative result
+    indicates the host's browsing is reaching established, well-known destinations. For Initial Access,
+    this catches the delivery and gating stages of a drive-by even before any intel feed lists the domain.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Enterprise Web Proxy, Internet Gateway Firewall, Internal DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_dns
+
+      | lookup domain_reputation domain AS query OUTPUT rep_score, domain_age_days, fleet_prevalence
+
+      | eventstats perc5(rep_score) AS p5
+
+      | where rep_score<=p5 OR domain_age_days<30
+
+      | eval kl=kl_divergence_bigrams(query)
+
+      | where kl>threshold'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek (sourcetype=zeek_dns OR sourcetype=zeek_http)
+
+      | bin _time span=1h
+
+      | stats count(eval(rcode_name="NXDOMAIN")) AS nx, count(eval(status_code>=400)) AS errs, count AS
+      total by id.orig_h, _time
+
+      | eval fail_ratio=(nx+errs)/total
+
+      | where fail_ratio>0.5 AND total>20'
+- question: When a requested URL is not on any blocklist, does a lexical URL classifier predict it is
+    malicious with high confidence, and what tokens drive that prediction?
+  context: 'Newly observed or unblocklisted URLs still carry lexical tells of malicious drive-by infrastructure:
+    suspicious TLDs, IP-literal hosts, and long random paths. Score Zeek http.log URLs with a character+word
+    CNN such as URLNet layered beneath the threat-intel blocklist (AUC>0.99), optionally cascaded with
+    a transformer second-stage scorer (URLBERT) that is robust to obfuscation and randomization. Alert
+    when predicted maliciousness exceeds 0.90 and surface the top-3 contributing tokens or character n-grams
+    (suspicious TLD, IP literal, long random path) so the analyst can validate rather than trust a bare
+    score. A positive result flags a URL the blocklist missed and warrants pivoting to the response body
+    and any spawned processes; a negative result means the URL''s lexical structure resembles benign browsing.
+    For Initial Access this widens coverage to zero-day drive-by domains.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Enterprise Web Proxy, Internet Gateway Firewall, Internal DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | eval url=host.uri
+
+      | apply urlnet_model url AS mal_score
+
+      | where mal_score>0.90
+
+      | apply shap_explain url OUTPUT top_tokens
+
+      | table _time, id.orig_h, url, mal_score, top_tokens'
+- question: Do any extracted HTTP response bodies match curated YARA rules for exploit-kit landing pages,
+    heap-spraying, shellcode, or obfuscation routines?
+  context: Once a browser is steered to attacker infrastructure, the malicious payload is delivered in
+    the HTTP response body, and exploit kits reuse recognizable landing-page, heap-spray, and shellcode
+    patterns. Scan response bodies extracted via Zeek files.log with curated YARA rules (e.g., the Neo23x0
+    signature-base) targeting these constructs and alert on matches. A positive hit is high-fidelity evidence
+    that an exploit payload was served to a client and should immediately escalate triage of the receiving
+    host for code execution; a negative result indicates no known exploit-kit signature fired, though
+    custom or heavily obfuscated payloads may still evade signatures. In the Initial Access context, this
+    directly identifies the weaponized content used to compromise the browser.
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Enterprise Web Proxy, Network Intrusion Detection System (NIDS), Full Packet Capture (PCAP)
+    Storage'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'index=zeek sourcetype=zeek_files mime_type IN ("text/html","application/javascript","text/javascript")
+
+      | eval body=extracted_file
+
+      | yara ruleset="signature-base/exploit_kits" input=body OUTPUT rule_name
+
+      | where isnotnull(rule_name)
+
+      | table _time, tx_hosts, rx_hosts, rule_name, fuid'
+- question: Do any served web pages contain deterministic exploit indicators such as hidden or 1x1-pixel
+    iframes, scripts referencing out-of-band domains, or excessive de-obfuscation primitives (eval, unescape,
+    document.write, fromCharCode) above fixed thresholds?
+  context: 'Compromised legitimate sites and exploit-kit landing pages share static structural tells:
+    invisible or 1x1-pixel iframes that silently load attacker content, scripts that pull from out-of-band
+    domains, and dense use of de-obfuscation primitives. Apply deterministic Prophiler-style thresholds
+    over the DOM and scripts — presence of hidden/1x1 iframes, out-of-band script references, and counts
+    of eval/unescape/document.write/fromCharCode exceeding fixed limits (e.g., >3 eval/unescape calls,
+    or any string literal >4 KB). A positive result indicates page content that mirrors injected-iframe/redirect
+    compromise patterns and should be correlated with the source host and any process activity; a negative
+    result means the page lacks these heuristic markers. For Initial Access, this catches the injection/redirect
+    stage even when no signature or intel match exists.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Enterprise Web Proxy, Network Intrusion Detection System (NIDS), Full Packet Capture (PCAP)
+    Storage'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'index=zeek sourcetype=zeek_files mime_type="text/html"
+
+      | eval iframe_hidden=count_hidden_iframes(body), oob_scripts=count_oob_script_src(body, page_host)
+
+      | eval evals=count_calls(body,"eval|unescape|document.write|fromCharCode"), maxlit=max_string_literal_len(body)
+
+      | where iframe_hidden>0 OR oob_scripts>0 OR evals>3 OR maxlit>4096
+
+      | table _time, tx_hosts, rx_hosts, iframe_hidden, oob_scripts, evals, maxlit'
+- question: For each JavaScript block served to clients, does its Shannon entropy or de-obfuscation-call
+    density exceed benign baselines in a way consistent with packed or encoded exploit payloads?
+  context: Weaponized drive-by JavaScript is typically packed or encoded, raising its character entropy
+    well above benign minified code, and it concentrates de-obfuscation calls. For each JavaScript block
+    compute Shannon entropy and alert when it exceeds the benign baseline by more than 3 standard deviations
+    or crosses the absolute obfuscation threshold (>7.2). Add volume metrics — total script byte count
+    and the ratio of de-obfuscation calls to script size (calls per KB) — which separate weaponized obfuscation
+    from benign minification. A positive result flags a high-entropy, dense-de-obfuscation script for
+    body inspection and correlation with the requesting host; a negative result means scripts look like
+    ordinary minified content. In the Initial Access context this statistically isolates the obfuscated
+    payload that delivers the exploit.
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Enterprise Web Proxy, Network Intrusion Detection System (NIDS), Full Packet Capture (PCAP)
+    Storage'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_files mime_type IN ("application/javascript","text/javascript")
+
+      | eval ent=shannon_entropy(body), sz=length(body), calls=count_calls(body,"eval|unescape|fromCharCode|atob")
+
+      | eval calls_per_kb=calls/(sz/1024)
+
+      | eventstats avg(ent) AS mu, stdev(ent) AS sd
+
+      | where ent>7.2 OR ent>(mu+3*sd) OR calls_per_kb>5
+
+      | table _time, tx_hosts, rx_hosts, ent, sz, calls_per_kb'
+- question: Does a JavaScript AST/behavior classifier flag any served script as malicious, and which AST
+    contexts or tokens (heap-spray allocations, shellcode-like literals) drive that decision?
+  context: 'Evasive drive-by scripts can defeat entropy and keyword heuristics, so classify scripts using
+    their structure and behavior: hierarchical JavaScript AST features with a Bayesian classifier (ZOZZLE,
+    FP ~0.0003%), and/or q-gram lexical+dynamic tokens with a linear SVM deployable in-line at the web
+    proxy (Cujo); for the most evasive samples combine anomaly profiling with emulation of JS behavior
+    (Wepawet/JSAND). Surface the top-3 predictive AST contexts or tokens (heap-spray string allocation,
+    shellcode-like literals) in the alert so analysts can validate. A positive result indicates script
+    structure consistent with exploit code and should be tied back to the delivering domain and receiving
+    host; a negative result means the script''s structure resembles benign code. For Initial Access this
+    provides the most evasion-resistant detection of the exploit payload itself.'
+  answer_sources:
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Enterprise Web Proxy, Network Intrusion Detection System (NIDS), Full Packet Capture (PCAP)
+    Storage'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=zeek sourcetype=zeek_files mime_type IN ("application/javascript","text/javascript")
+
+      | apply zozzle_ast_classifier body AS js_score
+
+      | where js_score>0.9
+
+      | apply shap_explain body OUTPUT top_ast_contexts
+
+      | table _time, tx_hosts, rx_hosts, js_score, top_ast_contexts'
+- question: Did any web browser process (chrome.exe, msedge.exe, firefox.exe) spawn a command interpreter
+    or scripting host (cmd.exe, powershell.exe, wscript.exe, cscript.exe, mshta.exe, rundll32.exe), especially
+    with suspicious command-line content?
+  context: Successful browser exploitation typically results in code execution that manifests as the browser
+    spawning a shell or script host — a parent-child relationship that should essentially never occur
+    during normal browsing. Monitor Windows Event ID 4688 for browser parents spawning these interpreters
+    and alert when the command line contains hallmarks of a download/execute cradle such as '-enc', 'IEX
+    (New-Object Net.WebClient)', 'mshta.exe javascript:', or 'certutil', applying portable parent-child
+    and suspicious-child rules. A positive result is a strong indicator of post-exploitation execution
+    following a drive-by and warrants immediate host isolation and investigation; a negative result means
+    no browser-spawned interpreter activity was observed. In the Initial Access context this is the clearest
+    endpoint sign that browser exploitation succeeded and handed the adversary code execution.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "index=wineventlog EventCode=4688\n| where match(ParentImage,\"(?i)\\\\(chrome|msedge|firefox)\\\
+      .exe$\")\n  AND match(NewProcessName,\"(?i)\\\\(cmd|powershell|wscript|cscript|mshta|rundll32)\\\
+      .exe$\")\n| eval susp=if(match(CommandLine,\"(?i)(-enc|IEX |New-Object Net.WebClient|mshta.*javascript:|certutil)\"\
+      ),1,0)\n| where susp=1\n| table _time, Computer, ParentImage, NewProcessName, CommandLine"
+- question: Among browser-spawned child processes, do any command lines contain rare tokens (present in
+    <0.1% of command lines) or occur at an abnormal rate, and are there bursts of non-zero exits or EDR-blocked
+    launches indicating repeated exploitation attempts?
+  context: 'Even when keyword rules miss, exploitation cradles use command-line tokens that are statistically
+    rare for browser-spawned children. Baseline token frequencies in command lines of browser-spawned
+    children and alert when a token appears in fewer than 0.1% of command lines yet originates from a
+    browser. Add frequency and state metrics: alert on more than N (e.g., 3) browser-spawned interpreter
+    executions per minute per host, and track child-process non-zero exit codes and EDR-blocked launches
+    as a distinct failure-mode signal — repeated terminations or blocks suggest an exploit retrying. A
+    positive result surfaces anomalous or repeated execution attempts tied to a browser; a negative result
+    indicates browser-spawned execution, if any, is unremarkable. For Initial Access this catches novel
+    cradles and noisy, failing exploitation by statistics rather than signatures.'
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=wineventlog EventCode=4688 ParentImage IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | makemv CommandLine tokenizer="(\S+)"
+
+      | stats count by CommandLine_token
+
+      | eventstats sum(count) AS tot
+
+      | eval freq=count/tot
+
+      | where freq<0.001'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=wineventlog EventCode=4688 ParentImage IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | bin _time span=1m
+
+      | stats count AS execs, count(eval(Status!="0x0")) AS bad_exits by Computer, _time
+
+      | where execs>3 OR bad_exits>0'
+- question: Does a command-line maliciousness classifier score any browser-spawned command as highly malicious,
+    and which features (encoded blob length, download cradle, rare tokens) drive that score?
+  context: Drive-by execution cradles vary in form, so a learned model generalizes better than fixed rules.
+    Score command lines of browser-spawned children by length, character distribution, token sequence,
+    and suspicious-keyword features, alerting on browser-spawned commands with high maliciousness scores.
+    Critically, surface the top-3 contributing features (encoded blob length, presence of a download cradle,
+    rare token) in the alert text rather than a bare score so the analyst can validate quickly. A positive
+    result indicates a command line whose structure resembles known malicious cradles and should escalate
+    host triage; a negative result means browser-spawned commands look benign. In the Initial Access context
+    this provides robust detection of obfuscated post-exploitation execution that signature rules would
+    miss.
+  answer_sources:
+  - Windows Event ID 4688
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=wineventlog EventCode=4688 ParentImage IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | apply cmdline_maliciousness_model CommandLine AS mal_score
+
+      | where mal_score>0.9
+
+      | apply shap_explain CommandLine OUTPUT top_features
+
+      | table _time, Computer, ParentImage, NewProcessName, mal_score, top_features'
+- question: Did any browser process spawn a child not on the expected-helper allowlist, or write an executable
+    file (.exe/.dll/.scr/.js) into %APPDATA% or %TEMP%?
+  context: After exploitation, a browser may launch unexpected LOLBins (e.g., rundll32.exe, regsvr32.exe)
+    or drop a payload to a user-writable directory for follow-on execution. Query Windows Event ID 4688
+    for browser parents spawning children not on an explicit allowlist of expected helper applications,
+    and Sysmon Event ID 11 for browsers writing executable files to %APPDATA% or %TEMP%, alerting on such
+    events and using vendor-neutral suspicious-child and remote-load rules as a baseline. A positive result
+    indicates either anomalous child execution or a dropped payload and should trigger collection of the
+    file and host triage; a negative result means browser child processes and file writes match expected
+    behavior. For Initial Access this captures both the execution and the staging stages of a successful
+    drive-by.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, VDI Fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=wineventlog EventCode=4688 ParentImage IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | lookup browser_child_allowlist child AS NewProcessName OUTPUT allowed
+
+      | where isnull(allowed)
+
+      | table _time, Computer, ParentImage, NewProcessName, CommandLine'
+  - technology: SIEM/Rule pseudocode
+    query: 'index=sysmon EventCode=11 Image IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | where match(TargetFilename,"(?i)\.(exe|dll|scr|js)$") AND match(TargetFilename,"(?i)(\\AppData\\|\\Temp\\)")
+
+      | table _time, Computer, Image, TargetFilename'
+- question: Across a 30-day baseline of browser parent-child relationships and file-write locations/extensions,
+    do any events fall into the bottom 1st percentile of fleet prevalence, particularly dropped files
+    that are executed within a short window of being written?
+  context: Rare browser behaviors stand out against a fleet baseline even without an allowlist. Baseline
+    parent-child relationships and file write locations/extensions for browsers over 30 days and alert
+    when a pair or write event falls into the bottom 1st percentile of fleet prevalence. Include volume
+    (bytes written) and state (whether the file was executed within a TimeWindow of the write) to prioritize
+    dropped-and-run payloads, which are the strongest indicator of a successful drive-by delivering and
+    immediately running a binary. A positive result surfaces statistically anomalous browser execution
+    or staging activity for triage; a negative result means browser behavior is consistent with the fleet
+    norm. In the Initial Access context this prioritizes the drop-then-execute pattern characteristic
+    of exploit payloads.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, VDI Fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=wineventlog EventCode=4688 ParentImage IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | stats count by ParentImage, NewProcessName
+
+      | eventstats sum(count) AS tot | eval prev=count/tot
+
+      | where prev<=percentile1(prev)'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=sysmon EventCode=11 Image IN ("*chrome.exe","*msedge.exe","*firefox.exe")
+
+      | join TargetFilename [search index=wineventlog EventCode=4688 | rename NewProcessName AS TargetFilename,
+      _time AS exec_time]
+
+      | eval run_delay=exec_time-_time
+
+      | where run_delay>=0 AND run_delay<300
+
+      | table _time, Computer, Image, TargetFilename, run_delay'
+- question: Does density-based clustering of browser event tuples (parent, child, file path, extension)
+    flag any events as noise points or members of newly formed small clusters, and what attributes distinguish
+    them?
+  context: Malicious browser activity often appears as outliers or tiny novel clusters relative to the
+    dense mass of normal browser behavior. Apply DBSCAN on host event tuples (parent, child, file path,
+    extension) and flag noise points and newly formed small clusters as suspicious, surfacing the top-3
+    distinguishing attributes (child image, write path, signer status) in the alert for triage. A positive
+    result indicates a browser event that does not fit established behavioral clusters and warrants investigation
+    of the child process or dropped file; a negative result means the activity falls within well-populated
+    benign clusters. For Initial Access this unsupervised approach catches anomalous execution/staging
+    patterns without predefining every allowlist entry.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, VDI Fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=wineventlog (EventCode=4688) OR (index=sysmon EventCode=11)
+
+      | eval tuple=mvzip(mvzip(ParentImage,NewProcessName),mvzip(TargetFilename,file_ext))
+
+      | apply dbscan_model tuple OUTPUT cluster_id
+
+      | where cluster_id="noise" OR cluster_size(cluster_id)<5
+
+      | apply shap_explain tuple OUTPUT top_attrs
+
+      | table _time, Computer, ParentImage, NewProcessName, TargetFilename, cluster_id, top_attrs'
+- question: Within 5 minutes of a web browsing event, did the same host initiate a new connection to a
+    threat-feed destination, an unusual high-risk port (e.g., 4444, 5555, 8443), or an endpoint whose
+    TLS fingerprint matches a known implant despite a browser User-Agent?
+  context: A successful drive-by often produces an implant that immediately calls home, so a fresh outbound
+    connection closely following browsing is a key correlation. Join Zeek http.log and conn.log by source
+    IP and alert when an HTTP request is followed within 5 minutes by a connection whose destination IP
+    matches a threat feed, whose port is an unusual high-risk value (4444, 5555, 8443), or whose TLS JA3/JA4
+    fingerprint matches a known implant even though the User-Agent claims to be a browser. A positive
+    result strongly suggests post-exploitation C2 established after a drive-by and warrants host isolation;
+    a negative result means no suspicious post-browse egress was observed. In the Initial Access context
+    this links the browsing event to the command-and-control beachhead it produced.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, User Workstations, Network Core Switches'
+  range: Last 90 days. Pivot to a 5-minute window centered on each browsing event for correlation.
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | join id.orig_h [search index=zeek sourcetype=zeek_conn | rename _time AS conn_time]
+
+      | where conn_time>=_time AND conn_time<=_time+300
+
+      | lookup threat_intel_ips ip AS id.resp_h OUTPUT ti_hit
+
+      | where isnotnull(ti_hit) OR id.resp_p IN (4444,5555,8443) OR ja3_implant_match=1
+
+      | table _time, id.orig_h, id.resp_h, id.resp_p, ja3'
+- question: Do any post-browse outbound connections deviate from a host's baseline of typical ASNs, countries,
+    and ports, or show periodic beaconing behavior, and are there repeated firewall-blocked outbound attempts
+    to a new destination?
+  context: Implants installed via drive-by reach out to infrastructure that differs from a host's normal
+    destinations and frequently beacon with regular timing. For each user/host baseline typical ASNs,
+    countries, and ports and compute an anomaly score for post-browse connections, alerting above the
+    99th percentile; in parallel score periodicity on conn.log via inter-arrival/size coefficient of variation
+    and FFT (RITA/BAYWATCH style) to catch jittered C2 callbacks. As a failure-mode signal, count firewall-blocked/denied
+    outbound attempts per host — repeated blocked connects to a new destination after browsing indicate
+    an active implant retrying. A positive result indicates anomalous or beaconing egress consistent with
+    C2; a negative result means outbound behavior matches the host baseline. For Initial Access this statistically
+    surfaces the C2 channel a drive-by establishes.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, User Workstations, Network Core Switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_conn
+
+      | lookup asn_geo ip AS id.resp_h OUTPUT asn, country
+
+      | stats count by id.orig_h, asn, country, id.resp_p
+
+      | eventstats perc99(count) AS p99 by id.orig_h
+
+      | where count<(p99*0.01) OR NOT match(asn,baseline_asns)'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_conn
+
+      | streamstats current=f last(_time) AS prev by id.orig_h, id.resp_h
+
+      | eval iat=_time-prev
+
+      | stats mean(iat) AS mu, stdev(iat) AS sd, count AS n by id.orig_h, id.resp_h
+
+      | eval cv=sd/mu
+
+      | where n>20 AND cv<0.1'
+- question: Does a time-series anomaly model of each host's outbound byte volume and connection count
+    flag spikes that correlate with recent browsing, and which features (destination rarity, beacon CV,
+    byte ratio) explain the alert?
+  context: Drive-by-installed implants change a host's outbound traffic profile, producing volume or connection-count
+    anomalies that align with the browsing that delivered them. Apply a time-series anomaly model (ARIMA
+    or Seasonal-Hybrid ESD) to each host's outbound byte-volume and connection-count series, correlate
+    alerts with recent browsing activity, and report the top-3 contributing features (destination rarity,
+    beacon CV, byte ratio) in the alert text. A positive result indicates an anomalous shift in egress
+    shortly after browsing, consistent with a newly installed implant; a negative result means outbound
+    traffic follows the host's normal temporal pattern. In the Initial Access context this correlates
+    the timing of compromise with the resulting C2 traffic anomaly.
+  answer_sources:
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, User Workstations, Network Core Switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=zeek sourcetype=zeek_conn
+
+      | bin _time span=5m
+
+      | stats sum(orig_bytes) AS bytes, count AS conns by id.orig_h, _time
+
+      | apply shesd_anomaly bytes, conns AS anomaly_score
+
+      | where anomaly_score>threshold
+
+      | apply shap_explain OUTPUT top_features
+
+      | table _time, id.orig_h, bytes, conns, anomaly_score, top_features'
+- question: Did more than 10 unique hosts from the same /24 subnet or department request the same newly
+    observed domain within one hour?
+  context: Strategic web compromise / watering-hole attacks target a specific community, so a hallmark
+    pattern is many logically related hosts suddenly contacting the same brand-new domain. Track Newly
+    Observed Domains (NODs) over the past 24 hours and alert when more than 10 unique hosts from the same
+    /24 subnet or department request the same NOD within one hour. A positive result strongly suggests
+    a watering-hole or malvertising campaign aimed at a defined population and warrants pivoting to the
+    served content and any follow-on execution on those hosts; a negative result means no coordinated
+    NOD access pattern was detected. In the Initial Access context this catches the targeting fingerprint
+    of a watering-hole campaign before individual exploitation may even be visible.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Resolvers, Enterprise Web Proxy, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'index=zeek sourcetype=zeek_dns
+
+      | lookup newly_observed_domains domain AS query OUTPUT first_seen
+
+      | where (now()-first_seen)<86400
+
+      | eval subnet=cidr_24(id.orig_h)
+
+      | bin _time span=1h
+
+      | stats dc(id.orig_h) AS hosts by query, subnet, _time
+
+      | where hosts>10'
+- question: Which domains show an unusually high locality ratio (many internal hosts relative to their
+    global popularity) or a sudden change-point burst in request volume from a related host group, and
+    do they also exhibit high HTTP/NXDOMAIN failure rates?
+  context: Watering-hole gates are disproportionately popular inside a targeted enterprise relative to
+    the broader internet and tend to be adopted abruptly by a related group of hosts. Compute a 'locality
+    ratio' per domain (unique internal hosts requesting it / its global popularity) and alert when it
+    exceeds the top 5%; pair this with a change-point/burst test on the per-domain request-count time
+    series to flag sudden adoption by a related host group. Track the per-domain HTTP failure (4xx/5xx)
+    and NXDOMAIN rate as a distinct signal of fast-churning watering-hole gates. A positive result surfaces
+    an internally-overrepresented, suddenly-adopted, possibly-churning domain for content inspection;
+    a negative result means access patterns are diffuse and consistent with general browsing. For Initial
+    Access this statistically isolates the watering-hole infrastructure targeting your population.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Resolvers, Enterprise Web Proxy, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | stats dc(id.orig_h) AS internal_hosts by host
+
+      | lookup global_popularity domain AS host OUTPUT global_rank
+
+      | eval locality=internal_hosts/global_rank
+
+      | eventstats perc95(locality) AS p95
+
+      | where locality>=p95'
+  - technology: SIEM/Stats pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | timechart span=1h count by host
+
+      | apply changepoint_detection OUTPUT cp_flag
+
+      | where cp_flag=1'
+- question: Does community detection on a bipartite host-domain graph reveal newly formed dense host-domain
+    communities indicative of targeted watering-hole access, and which shared edges defined the community?
+  context: Watering-hole campaigns create tight clusters in which a set of related hosts connect to a
+    set of related attacker domains. Build a bipartite graph of internal hosts and external domains and
+    run community detection (e.g., Louvain); flag newly formed dense host-domain communities as targeted
+    watering-hole indicators, and pivot from any confirmed malicious node to related infrastructure via
+    guided search of shared content/redirect/DNS gadgets (EVILSEED-style). Surface the top-3 shared edges
+    or features that defined the community in the alert. A positive result reveals a coordinated host-domain
+    cluster that warrants investigation of the shared domains and the affected hosts; a negative result
+    means no dense novel community formed. In the Initial Access context this exposes the structure of
+    a watering-hole campaign and enables expansion to its broader infrastructure.
+  answer_sources:
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Internal DNS Resolvers, Enterprise Web Proxy, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'index=zeek sourcetype=zeek_http
+
+      | eval edge=id.orig_h."->".host
+
+      | apply louvain_community edge OUTPUT community_id, community_density, community_age
+
+      | where community_density>threshold AND community_age<86400
+
+      | apply shap_explain OUTPUT top_edges
+
+      | table community_id, community_density, top_edges'
