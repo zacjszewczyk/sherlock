@@ -1,0 +1,408 @@
+name: 'T1003.007: Proc Filesystem'
+id: bf7e5a98-a62e-43e1-aab6-342d9373211f
+description: Investigate adversary attempts to harvest credentials from the Linux /proc pseudo-filesystem
+  (T1003.007). The proc filesystem exposes per-process virtual memory via /proc/<pid>/mem and memory layout
+  via /proc/<pid>/maps, and an attacker with sufficient privilege can scrape these structures for cleartext
+  passwords, hashes, and tokens cached by services such as sshd, sudo, gnome-keyring, gdm/LightDM, browsers,
+  and authentication daemons. This playbook helps an analyst hunt for execution of known proc-dumping
+  tooling (e.g. mimipenguin and linikatz-style wrappers), abuse of ordinary utilities (grep, dd, cat,
+  strings, gdb, awk, python) against sensitive /proc paths, cross-process memory reads via ptrace/process_vm_readv,
+  low-prevalence and first-seen access patterns, permission-denied scrape reconnaissance, and the follow-on
+  use of harvested credentials for lateral SSH/Kerberos authentication. It blends symbolic-logic detections,
+  statistical baselining of rare paths and failure rates, and machine-learning sequence/graph models to
+  surface credential-access activity on Linux servers, jump boxes, developer workstations, and containers.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did a process execute that matches known Linux /proc credential-dumping tooling (such as mimipenguin
+    or linikatz-style wrappers) by binary hash, filename, or command-line behavior, particularly when
+    launched from a user-writable path on a production server?
+  context: Credential access via the proc filesystem is frequently performed with purpose-built tooling.
+    MimiPenguin scrapes the memory of gnome-keyring-daemon, gdm-password, LightDM, VSFTPd, Apache2, and
+    sshd, then validates candidates against /etc/shadow; Atomic Red Team documents the canonical 'dd if=/proc/$PID/mem'
+    and 'grep -E "^[0-9a-f-]* r" /proc/$PID/maps' procedures. Match these by file hash, binary/script
+    name, and command-line tokens in auditd execve and Sysmon for Linux Event ID 1. Because legitimate
+    admin tooling is rarely run from transient locations, escalate strongly when the binary runs from
+    /tmp, /dev/shm, a user home directory, or a container writable layer. A positive hit on a high-value
+    server is a near-certain credential-access event warranting immediate containment and credential rotation.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux servers (web, database, application), Linux developer workstations, and container environments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "execs = FILTER (Sysmon1 OR auditd_execve)\nALERT WHERE hash IN known_proc_dumper_hashes\n\
+      \  OR filename IN [\"mimipenguin\",\"linikatz\"]\n  OR cmdline MATCHES /proc/[0-9]+/(mem|maps|environ)\n\
+      \  OR cmdline MATCHES /etc/shadow\nSEVERITY=high WHERE exe_path STARTSWITH (\"/tmp\",\"/dev/shm\"\
+      ,\"/home\") OR container_writable_layer=true"
+- question: Is a binary or command signature that accesses credential-bearing process memory rare across
+    the fleet — appearing on under 1% of hosts, first-seen for a host role, or in bursty off-hours activity?
+  context: Rarity is one of the strongest signals for credential-access tooling, which by design is not
+    part of normal operations. Track the 60-day prevalence of binaries and command signatures that read
+    /proc/*/(mem|maps|environ), then alert when a signature appears on fewer than 1% of hosts, is first-seen
+    for that host's role, or clusters in bursty off-hours windows. Treat the rarity of the causal path
+    as the primary score, following the rare-path TF-IDF/LOF approach of ProvDetector. Derive the per-host
+    threshold from your own fleet baseline (for example, the bottom 1 percentile of observed signature
+    prevalence) rather than a fixed global cut, so the detector adapts to your environment's legitimate
+    debugging and profiling activity.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux servers (web, database, application), Linux developer workstations, and container environments.'
+  range: Last 90 days, baselined over a trailing 60-day window.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "sig = HASH(exe_hash, normalized_cmdline) FOR events WHERE cmdline MATCHES /proc/[0-9]+/(mem|maps|environ)\n\
+      prev = COUNT_DISTINCT(host) BY sig OVER last 60d\nfleet = COUNT_DISTINCT(host)\nALERT WHERE prev/fleet\
+      \ < 0.01\n  OR first_seen_for_host_role(sig, host_role)\n  OR off_hours_burst(sig, host)"
+- question: Is a single source process accumulating permission-denied (EPERM/EACCES) errors while attempting
+    to read /proc/*/mem or /etc/shadow, indicating credential-scrape reconnaissance even when the dump
+    itself fails?
+  context: Failure rate is a distinct and valuable signal because an unprivileged tool probing many target
+    PIDs will rack up permission-denied returns before it ever succeeds. Count EPERM/EACCES returns on
+    open/read syscalls against /proc/*/mem and failed /etc/shadow reads, grouped per source process. A
+    non-root process that touches many target PIDs and accumulates denials — a failure-rate spike above
+    its per-host baseline — reveals scraping intent even when no credentials are exfiltrated. This catches
+    attackers who lack root and attackers whose tooling is mismatched to the target. A negative result
+    (no denials clustered to one source) suggests routine, authorized access; a positive result warrants
+    pivoting to the source binary and its lineage.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux servers (web, database, application), Linux developer workstations, and container environments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "fails = FILTER auditd_syscall WHERE syscall IN [open,openat,read]\n  AND (target MATCHES /proc/[0-9]+/mem\
+      \ OR target = /etc/shadow)\n  AND exit IN [EPERM,EACCES]\nrate = COUNT(fails) BY source_pid OVER\
+      \ 5m\nbaseline = PERCENTILE(rate_history[source_exe,host], 99)\nALERT WHERE rate > baseline AND\
+      \ distinct_target_pids(source_pid) >= 3"
+- question: Does a supervised model classify a process's ancestry and command intent as malicious credential
+    access — and which top-3 features (execution path, parent process, distinct /proc targets) drove that
+    call?
+  context: 'Symbolic and statistical rules miss novel tooling, so train a supervised classifier on process
+    lineage and command features: parent/grandparent process, command-token n-grams, execution-path risk,
+    user privilege, and host role. The model output must surface the top-3 contributing features in the
+    alert (for example execution path, parent process, count of distinct /proc targets) so an analyst
+    can validate the verdict rather than trust a black box, in the spirit of ThreaTrace''s inductive node
+    classification. Prioritize events labeled malicious credential-access intent, especially when followed
+    quickly by authentication attempts, which suggests theft-to-use. Use model scores to rank a triage
+    queue rather than to auto-block, and feed analyst dispositions back as labels.'
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux servers (web, database, application), Linux developer workstations, and container environments.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = EXTRACT(parent_proc, grandparent_proc, cmd_ngrams, exe_path_risk, user_priv, host_role,
+      distinct_proc_targets)
+
+      score = model.predict_proba(feat)
+
+      ALERT WHERE score >= threshold
+
+      ATTACH top3_shap_features(feat)
+
+      ESCALATE WHERE followed_by_auth_attempt(host, 60m)'
+- question: Was /proc dumping tool execution accompanied by a near-time privilege-context shift — a sudo/su
+    transition, container-escape indicator, or service-account token use — that ties it to active adversary
+    operations?
+  context: 'Credential dumping from /proc generally requires root, so attackers chain it with privilege
+    escalation. Correlating /proc dumping tool execution with near-time sudo/su transitions, container-escape
+    indicators, or service-account token use sharply raises confidence that you are watching live adversary
+    operations rather than benign debugging. Look for the dumping event bracketed by a recent privilege
+    change on the same host and session, per the Atomic Red Team T1003.007 procedures. A positive correlation
+    should escalate the incident to active-intrusion handling: isolate the host, rotate exposed credentials,
+    and review what the elevated context could reach. A dump with no privilege shift is still suspicious
+    but may reflect an already-root service account.'
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux servers (web, database, application), Linux developer workstations, and container environments.'
+  range: Last 90 days, correlate events within a 60-minute window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'dump = FILTER events WHERE cmdline MATCHES /proc/[0-9]+/(mem|maps)
+
+      priv = FILTER events WHERE event IN [sudo,su,setuid] OR container_escape_indicator OR svc_account_token_use
+
+      ALERT WHERE EXISTS priv ON same_host AND |dump.time - priv.time| <= 60m
+
+      ORDER BY priv_tier_of_target DESC'
+- question: Did a common Linux utility (dd, grep, cat, strings, gdb, awk, or python) run with arguments
+    explicitly targeting /proc/[pid]/mem, /proc/[pid]/maps, or /proc/[pid]/environ, suggesting credential
+    scraping disguised as routine administration?
+  context: Attackers often avoid custom tooling and instead live off the land, using standard utilities
+    to read sensitive process memory. Use regex detection for command lines that combine standard utilities
+    (dd, grep, cat, strings, gdb, awk, python) with explicit /proc/*/(mem|maps|environ) targets, including
+    the heap-enumeration pattern 'grep -E "^[0-9a-f-]* r" /proc/$PID/maps' and 'dd if=/proc/$PID/mem'
+    from Atomic Red Team. Increase severity when the target PID belongs to sshd, sudo, gdm, a browser
+    credential store, or another user's context, since those processes are the ones likely to hold reusable
+    secrets. This detection is noisier than tool-hash matching because these utilities are legitimate,
+    so corroborate with the target's identity and the actor's privilege.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux hosts, especially multi-user systems like jump boxes, web servers, and database servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "ALERT WHERE proc_name IN [dd,grep,cat,strings,gdb,awk,python*]\n  AND cmdline MATCHES /proc/[0-9]+/(mem|maps|environ)\n\
+      SEVERITY=high WHERE resolve_target_pid_owner(target_pid) IN [sshd,sudo,gdm,browser]\n  OR target_pid.user\
+      \ != actor.user"
+- question: Did a single actor process read several distinct /proc/<pid>/maps entries and then access
+    /proc/<pid>/mem within a short window (for example ≥3 within 60 seconds), matching the canonical maps-then-mem
+    dump pattern?
+  context: The signature behavior of manual and MimiPenguin-style /proc dumping is to enumerate a process's
+    memory layout via /proc/<pid>/maps and then read the readable regions from /proc/<pid>/mem. Fire when
+    a single actor process reads N or more distinct /proc/<pid>/maps entries followed by /proc/<pid>/mem
+    access within a short window (Elastic's rule uses this maps-then-mem sequence). This sequence is far
+    more specific than any single file access and resists the false positives of one-off debugger use.
+    Tune N to your environment's debugger and profiler noise floor; a value like ≥3 maps reads followed
+    by mem within 60 seconds works for most fleets. A positive result is strong evidence of deliberate
+    scraping; investigate the actor and every target PID it touched.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux hosts, especially multi-user systems like jump boxes, web servers, and database servers.'
+  range: Last 90 days, correlate sequences within a 60-second sliding window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'seq = FILTER auditd_syscall WHERE target MATCHES /proc/[0-9]+/(maps|mem)
+
+      GROUP BY actor_pid OVER 60s window
+
+      ALERT WHERE distinct_maps_targets >= 3 AND any_mem_read_after_maps
+
+      LIST target_pids'
+- question: Is a /proc-access command template or argument-token pattern first-seen for this user/host,
+    an entropy outlier, or a short-window spike above the 99th percentile of historical frequency?
+  context: Even legitimate utilities have stable, learnable usage patterns per user and per host. Build
+    per-user and per-host baselines of /proc access command templates and argument tokens, then flag first-seen
+    command templates, entropy outliers, and short-window spikes above the 99th percentile of historical
+    frequency. Quantify Volume (distinct target PIDs touched per minute, bytes read from /proc/*/mem)
+    and Frequency (read count per minute); ProvDetector's rare-path scoring motivates ranking candidates
+    by template rarity. This catches an attacker reusing a familiar binary in an unfamiliar way. A novel
+    template on a normally quiet jump box deserves attention, whereas a recurring template tied to a known
+    profiling job is likely benign and can be allowlisted.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux hosts, especially multi-user systems like jump boxes, web servers, and database servers.'
+  range: Last 90 days, baselined over trailing history per user and host.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "tmpl = NORMALIZE(cmdline) FOR events WHERE cmdline MATCHES /proc/[0-9]+/(mem|maps|environ)\n\
+      ALERT WHERE first_seen(tmpl, user, host)\n  OR entropy(arg_tokens) > entropy_p99[user]\n  OR rate(tmpl)\
+      \ > PERCENTILE(rate_history[host], 99)\nSCORE BY 1/template_prevalence"
+- question: Do the auditd SYSCALL or shell-command sequences around /proc access produce high reconstruction
+    error or fall outside the top-g predicted log keys for normal Linux admin workflows, especially outside
+    maintenance windows?
+  context: Sequence anomalies catch novel scraping that signature rules miss. Train a sequence model —
+    an autoencoder or an LSTM log-key model in the style of DeepLog — on benign shell-command and auditd
+    SYSCALL sequences from your Linux admin workflows. Alert when /proc-targeting sequences produce high
+    reconstruction error or fall outside the top-g predicted next-keys, and especially when they occur
+    outside normal maintenance windows. Include the deviating log keys in the alert (for example a burst
+    of openat on /proc/*/mem) so an analyst can see exactly why the sequence was flagged. This is most
+    effective once you have a clean baseline of routine maintenance; retrain periodically to absorb legitimate
+    workflow changes and reduce drift-driven false positives.
+  answer_sources:
+  - Sysmon for Linux Event ID 1
+  - Linux auditd logs
+  - 'NAI: Linux hosts, especially multi-user systems like jump boxes, web servers, and database servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seq = SLIDING_WINDOW(auditd_syscall_keys, k)\npred = deeplog.predict_next(seq)\nALERT WHERE\
+      \ actual_key NOT IN top_g(pred)\n  OR autoencoder.recon_error(seq) > threshold\nESCALATE WHERE outside_maintenance_window\n\
+      ATTACH deviating_keys(seq)"
+- question: Did a process not on the approved debugger/EDR allowlist use ptrace, process_vm_readv, or
+    openat to access another process's /proc/<pid>/mem — especially when the target is an authentication
+    or credential-bearing process?
+  context: Direct cross-process memory reads are the heart of live credential extraction. Detect ptrace,
+    process_vm_readv, and openat access to /proc/<pid>/mem where the source process is not in an approved
+    debugger/EDR allowlist, using tamper-resistant eBPF syscall telemetry (Tracee's ptrace/memory signature
+    and SANS eBPF process-memory research). Escalate when the targets include authentication and credential-bearing
+    processes such as sshd, sudo, gnome-keyring, and krb5kdc, because reads against those processes most
+    directly yield reusable secrets. An allowlist of legitimate debuggers and EDR agents keeps false positives
+    low; anything outside it reading another process's memory on a critical server should be treated as
+    a probable credential-access attempt and investigated immediately.
+  answer_sources:
+  - Sysmon for Linux Event ID 10
+  - Linux auditd ptrace/process_vm_readv syscalls
+  - Linux auditd openat syscalls
+  - 'NAI: Critical Linux servers, including authentication servers (LDAP, Kerberos KDC), SSH jump hosts,
+    and servers running credential managers.'
+  range: Last 90 days
+  queries:
+  - technology: Linux/eBPF pseudocode
+    query: "ALERT WHERE syscall IN [ptrace, process_vm_readv]\n  OR (syscall=openat AND target MATCHES\
+      \ /proc/[0-9]+/mem)\nAND source_exe NOT IN debugger_edr_allowlist\nSEVERITY=critical WHERE resolve_target(target_pid)\
+      \ IN [sshd,sudo,gnome-keyring,krb5kdc]"
+- question: Is a memory-access edge (source process, target process, user, host role) first-seen or in
+    the bottom 1 percentile of frequency — or is a single source rapidly scraping many target PIDs above
+    the per-host 99th percentile?
+  context: Modeling memory access as a graph of edges exposes abnormal pairings that signature rules cannot.
+    Baseline memory-access edges defined by (source process, target process, user, host role) and alert
+    on first-seen edges, bottom-1-percentile low-frequency edges, or rapid multi-target scraping where
+    a single source reads many target PIDs above the per-host 99th percentile — the rare-path outlier
+    principle from ProvDetector. Track Volume (bytes read and target count) and failure State (EPERM/EACCES
+    on memory opens) as distinct features, since both a successful bulk read and a flurry of denied attempts
+    are meaningful. A first-seen edge from a web-server process into sshd's memory, for example, is highly
+    anomalous and should be escalated.
+  answer_sources:
+  - Sysmon for Linux Event ID 10
+  - Linux auditd ptrace/process_vm_readv syscalls
+  - Linux auditd openat syscalls
+  - 'NAI: Critical Linux servers, including authentication servers (LDAP, Kerberos KDC), SSH jump hosts,
+    and servers running credential managers.'
+  range: Last 90 days, baselined over trailing history per host.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "edge = (source_exe, target_exe, user, host_role)\nALERT WHERE first_seen(edge)\n  OR freq(edge)\
+      \ <= PERCENTILE(edge_freq[host], 1)\n  OR distinct_target_pids(source_pid) > PERCENTILE(scrape_history[host],\
+      \ 99)\nFEATURES: bytes_read, target_count, eperm_count"
+- question: Does a temporal graph model over auditd/eBPF provenance flag anomalous credential-scraping
+    edges — and can it reconstruct a compact attack-footprint subgraph (with top-3 contributing edges)
+    for triage?
+  context: When attackers chain steps, the relationships between events carry the signal. Build process-interaction/provenance
+    graphs from auditd/eBPF syscall telemetry and score anomalous edges with a temporal-GNN autoencoder
+    that reconstructs a compact attack-footprint subgraph for triage (KAIROS), or learn benign node roles
+    inductively and flag deviating processes (ThreaTrace). Surface the top-3 contributing edges or features
+    in the alert — target-PID identity, distinct-targets count, and path rarity — so an analyst can see
+    the scraping path at a glance. Train and evaluate on DARPA TC E3 plus your own benign provenance.
+    This approach excels at connecting a /proc read to its upstream privilege escalation and downstream
+    credential use, giving investigators the whole chain rather than an isolated alert.
+  answer_sources:
+  - Sysmon for Linux Event ID 10
+  - Linux auditd ptrace/process_vm_readv syscalls
+  - Linux auditd openat syscalls
+  - 'NAI: Critical Linux servers, including authentication servers (LDAP, Kerberos KDC), SSH jump hosts,
+    and servers running credential managers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'G = BUILD_PROVENANCE_GRAPH(auditd_ebpf_syscalls)
+
+      scores = tgnn_autoencoder.edge_anomaly(G)
+
+      ALERT WHERE scores.edge > threshold
+
+      SUBGRAPH = reconstruct_attack_footprint(G, anomalous_edges)
+
+      ATTACH top3_edges(target_pid_identity, distinct_targets, path_rarity)'
+- question: Does memory-scraping activity shift the host's whole-system provenance sketch outside the
+    benign cluster envelope, indicating credential extraction even when no single event is alarming?
+  context: Sophisticated actors keep each step quiet, so whole-system drift detection adds resilience
+    against single-event evasion. Maintain a streaming Weisfeiler-Lehman graph sketch of whole-system
+    provenance and alert when memory-scraping activity shifts the host sketch outside the benign cluster
+    envelope — an unsupervised, label-free detector in the style of UNICORN. Because it judges the host's
+    overall behavioral shape rather than any one syscall, an attacker cannot hide by spacing out or disguising
+    individual reads. A sketch that drifts out of the benign cluster after a series of /proc and ptrace
+    operations is a strong cue to investigate the host holistically. Tune the clustering envelope on representative
+    benign hosts of the same role to avoid flagging legitimate workload changes.
+  answer_sources:
+  - Sysmon for Linux Event ID 10
+  - Linux auditd ptrace/process_vm_readv syscalls
+  - Linux auditd openat syscalls
+  - 'NAI: Critical Linux servers, including authentication servers (LDAP, Kerberos KDC), SSH jump hosts,
+    and servers running credential managers.'
+  range: Last 90 days, streaming sketch updated continuously.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'sketch = WL_GRAPH_SKETCH(streaming_provenance[host])
+
+      ALERT WHERE distance(sketch, benign_cluster[host_role]) > envelope_radius
+
+      NOTE label_free, evaluate_evolution_over_time'
+- question: Did a host that recently triggered high-risk /proc credential-access telemetry then successfully
+    authenticate via SSH or Kerberos to new internal targets within 60 minutes — especially to privileged-tier
+    systems?
+  context: The payoff of credential dumping is reuse, so linking the dump to follow-on authentication
+    catches the attack mid-operation. Trigger when /proc credential-access detections are followed within
+    60 minutes by successful SSH/Kerberos authentications from the same host to new internal targets (Zeek
+    ssh.log/kerberos.log, auditd, Windows Event ID 4624). The maps-then-mem precursor pattern is defined
+    by Elastic. Prioritize destination systems in privileged tiers — Domain Controllers, backup servers,
+    key application servers — because lateral movement to those assets escalates impact fast. A positive
+    correlation strongly suggests harvested credentials are being operationalized; treat it as an active
+    intrusion, isolate the source, and rotate any credentials the dumped processes could have held.
+  answer_sources:
+  - Zeek ssh.log
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Linux auditd logs
+  - Windows Event ID 4624
+  - 'NAI: Network egress points, authentication servers (Domain Controllers, RADIUS), and network segments
+    containing high-value assets.'
+  range: Last 90 days, correlate authentications within 60 minutes of the /proc precursor.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "precursor = FILTER proc_cred_access_detections\nauth = FILTER (zeek_ssh.success OR zeek_kerberos.success\
+      \ OR Event4624) WHERE src_host = precursor.host\nALERT WHERE auth.time - precursor.time <= 60m\n\
+      \  AND auth.dest NOT IN host_normal_destinations(precursor.host)\nORDER BY dest_priv_tier DESC"
+- question: After a /proc credential-access precursor, did the host authenticate to first-seen destinations,
+    fan out above the 99th percentile, use service accounts unusually, or generate a spike in failed SSH/Kerberos
+    logons indicating credential guessing?
+  context: 'Statistical authentication anomalies after a dump distinguish successful theft-to-use from
+    noise. Baseline each host''s normal authentication destinations and per-hour login counts, then alert
+    when post-precursor activity includes first-seen destinations, destination fan-out above the 99th
+    percentile, or unusual service-account usage. Track failure State explicitly: a spike in failed SSH
+    or Kerberos logons (auth failures, Kerberos pre-auth failures) after a /proc dump indicates the attacker
+    is guessing or replaying scraped material that does not cleanly fit, per ProvDetector''s rare-path
+    framing. Both success-side novelty and failure-side spikes are actionable. Investigate the accounts
+    involved, confirm whether any succeeded, and rotate credentials for processes the dump could have
+    exposed.'
+  answer_sources:
+  - Zeek ssh.log
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Linux auditd logs
+  - Windows Event ID 4624
+  - 'NAI: Network egress points, authentication servers (Domain Controllers, RADIUS), and network segments
+    containing high-value assets.'
+  range: Last 90 days, evaluated against per-host trailing baselines.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "post = FILTER auth_events WHERE host = precursor.host AND time IN [precursor.time, +120m]\n\
+      ALERT WHERE first_seen_destination(post.dest, host)\n  OR fanout(post) > PERCENTILE(fanout_history[host],\
+      \ 99)\n  OR unusual_service_account(post)\n  OR failed_auth_rate(post) > PERCENTILE(fail_history[host],\
+      \ 99)"
+- question: Does a sequence model that fuses host /proc-access signals with SSH/Kerberos/4624 authentication
+    events flag a high-probability credential-theft-to-lateral-movement chain for immediate triage?
+  context: 'Theft-to-use is fundamentally a sequence spanning host and network telemetry, so a model that
+    consumes both catches the end-to-end behavior. Train a sequence or log-key model that combines host
+    telemetry (/proc access signals) and authentication events (SSH, Kerberos, Windows 4624) to flag high-probability
+    credential-theft-to-lateral-movement sequences for immediate triage (DeepLog); a temporal provenance
+    autoencoder such as KAIROS can additionally reconstruct the cross-host attack footprint for investigation.
+    The value here is correlation the analyst would otherwise piece together by hand: a dump on host A
+    followed by an unusual authentication to host B becomes a single ranked alert. Use the reconstructed
+    footprint to scope the incident across hosts, and feed confirmed chains back as training labels to
+    sharpen future detection.'
+  answer_sources:
+  - Zeek ssh.log
+  - Zeek kerberos.log
+  - Zeek conn.log
+  - Linux auditd logs
+  - Windows Event ID 4624
+  - 'NAI: Network egress points, authentication servers (Domain Controllers, RADIUS), and network segments
+    containing high-value assets.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'events = MERGE(proc_access_signals, ssh_kerberos_4624) ORDER BY time PER actor
+
+      score = deeplog.sequence_prob(events)
+
+      ALERT WHERE theft_to_lateral_pattern AND score < benign_threshold
+
+      ATTACH kairos.reconstruct_cross_host_footprint(events)'
