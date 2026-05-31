@@ -1,0 +1,657 @@
+name: 'T1557.002: ARP Cache Poisoning'
+id: cf4756fc-efc6-411b-ba5a-2fddea7ca66d
+description: Investigate suspected ARP cache poisoning (MITRE ATT&CK T1557.002), in which an adversary
+  sends unsolicited or gratuitous ARP replies to bind a critical IP (gateway, DNS, domain controller,
+  RADIUS, file/database server) to a MAC they control, positioning themselves as a man-in-the-middle.
+  This playbook helps an analyst confirm poisoning by validating observed IP-to-MAC bindings against an
+  authoritative inventory/DHCP source of truth, correlating Zeek arp.log/conn.log/files.log with Windows
+  address-conflict (Event ID 4199) and flow (Event ID 5156) events, and applying active verification probes.
+  It supports both the Credential Access goal (intercepting authentication traffic on insecure protocols)
+  and the Collection goal (intercepting and relaying data to and from high-value assets). Detection methods
+  span deterministic symbolic logic (binding mismatch, scan-then-poison, bidirectional claims, multi-IP
+  claims, rogue-server flows), statistical baselining (per-MAC reply/fan-out/flip-flop outliers, conflict-rate
+  spikes, reroute ratios), and machine learning (classification, sequence and graph anomaly detection,
+  clustering, and time-series forecasting) for prioritization and early warning.
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any ARP reply or gratuitous announcement mapped a critical IP (default gateway, DNS server,
+    domain controller, or RADIUS server) to a MAC address that is absent from the approved hardware inventory
+    or the DHCP-lease table?
+  context: ARP is a stateless, unauthenticated protocol, so a victim host will blindly cache whatever
+    IP-to-MAC binding it sees. In a Credential Access scenario an adversary poisons the cache for a critical
+    service so that authentication traffic (often sent over insecure or plaintext protocols) flows through
+    the attacker. The analyst should validate every observed IP-MAC binding in Zeek arp.log against an
+    authoritative source of truth (asset inventory plus DHCP leases) rather than trusting the wire. Unsolicited
+    (reply-without-request) and gratuitous replies are higher risk because legitimate hosts usually only
+    reply to a request they received. A positive result is an ARP reply that binds a critical IP to a
+    MAC not on the allowlist; a negative result is a binding that matches inventory.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - Windows Event ID 5156
+  - 'NAI: Network traffic collection points (e.g., SPAN ports, network taps) monitoring internal network
+    segments, particularly user VLANs and server subnets.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  arp.log\n  | where reply==true OR is_gratuitous==true\n  | where dst_ip in CRITICAL_IPS\n\
+      \  | lookup approved_inventory, dhcp_leases on (ip, mac)\n  | where mac NOT IN approved_mac_for(ip)\n\
+      \  | emit alert(ip, mac, src_mac, reply_type)"
+- question: When a critical IP's cached MAC address changes or flip-flops, does an active verification
+    probe (ICMP, TCP, or ARP) to the claimed owner return a contradictory or absent legitimate response,
+    deterministically confirming spoofing?
+  context: Passive observation alone can be ambiguous; an active probe removes the ambiguity. When arpwatch-style
+    monitoring detects that a critical IP's MAC has changed, the analyst (or an automated responder) should
+    send a verification probe directly to the claimed owner and observe which MAC genuinely answers. If
+    the true owner answers from its known MAC while a different MAC is also claiming the IP, or if no
+    genuine response arrives, the cache has been poisoned. Probe timeout should be derived from the segment's
+    round-trip time so legitimate slow responders are not falsely flagged. This is a high-confidence,
+    deterministic confirmation step for Credential Access ARP attacks.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - Windows Event ID 5156
+  - 'NAI: Network traffic collection points (e.g., SPAN ports, network taps) monitoring internal network
+    segments, particularly user VLANs and server subnets.'
+  range: Last 90 days; trigger probe within seconds of a detected binding change
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  on binding_change(critical_ip, new_mac):\n    resp = active_probe(critical_ip, timeout=segment_rtt*3)\n\
+      \    if resp.mac != inventory_mac(critical_ip) OR resp is None:\n      alert('spoof confirmed',\
+      \ critical_ip, new_mac)"
+- question: Which source MACs exhibit ARP reply counts or distinct-IP claim counts above their 30-day
+    99th-percentile baseline, especially those whose reply-without-request ratio is anomalously high and
+    that coincide with address-conflict events?
+  context: 'Statistical baselining catches poisoners that stay just under static thresholds. Build a histogram
+    of ARP activity per MAC over 30 days, tracking both the volume/frequency of replies and the number
+    of distinct IPs each MAC claims. A normal host replies for one or two IPs that it owns; a poisoner
+    replies for many IPs it does not own and emits an abnormal share of unsolicited replies. Flag sources
+    above the 99th percentile, and weight the alert higher when the spike coincides with conflict events.
+    The reply-without-request ratio is a distinct failure-mode (State) signal: legitimate hosts rarely
+    send replies nobody asked for. In Credential Access, this surfaces the host quietly positioning itself
+    to harvest authentication traffic.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - Windows Event ID 5156
+  - 'NAI: Network traffic collection points (e.g., SPAN ports, network taps) monitoring internal network
+    segments, particularly user VLANs and server subnets.'
+  range: Last 90 days; baseline window 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  arp.log | stats count as replies, dcount(claimed_ip) as ips,\n      sum(reply_no_request)/count\
+      \ as unsolicited_ratio by src_mac, bin=1d\n  | join baseline_p99 on src_mac\n  | where replies >\
+      \ p99_replies OR ips > p99_ips OR unsolicited_ratio > p99_ratio\n  | where exists(conflict_event\
+      \ near time)"
+- question: When the ARP-poisoning classifier (random forest / ensemble) scores a host as behaving like
+    a poisoning node, what are the top-3 contributing features (MAC/OUI novelty, reply cadence, gratuitous-ARP
+    rate, IP-MAC churn, target diversity)?
+  context: 'A supervised ML model run in parallel with the deterministic binding-floor check can rank
+    hosts by how strongly their behavior resembles an ARP poisoner, catching subtle combinations no single
+    rule captures. Train on labelled features: novelty of the MAC/OUI, cadence of replies, rate of gratuitous
+    ARP, churn in IP-MAC bindings, and diversity of targeted IPs. The model should always surface the
+    top-3 features driving each score so an analyst can triage quickly and the alert is explainable. This
+    is a prioritization aid for Credential Access — it does not replace the authoritative-binding check,
+    it focuses attention on the most poisoner-like hosts.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - Windows Event ID 5156
+  - 'NAI: Network traffic collection points (e.g., SPAN ports, network taps) monitoring internal network
+    segments, particularly user VLANs and server subnets.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  features = [oui_novelty, reply_cadence, gratuitous_rate, ipmac_churn, target_diversity]\n\
+      \  score = rf_model.predict_proba(features)\n  if score > 0.8:\n    alert(host, score, top3=shap_top_features(features,\
+      \ n=3))"
+- question: Did a single source MAC perform high-volume ARP reconnaissance (default >20 requests per /24
+    in 60 seconds, tuned per subnet size) and then emit gratuitous or reply-without-request packets for
+    a critical IP within a short window?
+  context: 'This is the classic scan-then-poison sequence: the adversary first sweeps the subnet with
+    ARP requests to map live hosts, then immediately spoofs replies for a high-value IP. Detecting the
+    two phases together is far more specific than either alone, because legitimate management tools may
+    scan but will not follow up with gratuitous claims for critical infrastructure. The 60-second/20-request
+    threshold should be tuned to subnet size. A positive result is a single MAC that both scans heavily
+    and then poisons a gateway/DNS/DC IP — strong evidence of an actor preparing to intercept credential
+    traffic.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Network infrastructure segments containing assets like default gateways, DNS servers, and Domain
+    Controllers.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  arp.log | bin(60s)\n  | stats count(request) as probes, dcount(target_ip) as fanout\
+      \ by src_mac\n  | where probes > 20\n  | join (arp.log | where gratuitous OR reply_no_request, target_ip\
+      \ in CRITICAL_IPS) on src_mac within 120s\n  | emit alert(src_mac, probes, target_ip)"
+- question: Which MACs have an ARP target fan-out (distinct IPs probed) or request rate exceeding their
+    30-day per-subnet 99th-percentile baseline, immediately followed by a cache-conflict event?
+  context: Rather than a fixed scan threshold, derive the cutoff from each subnet's empirical request-rate
+    and fan-out distribution so noisy-but-normal segments do not generate false positives. A poisoner's
+    reconnaissance shows up as an outlier in distinct-IP fan-out and request rate. Pairing that statistical
+    outlier with a subsequent cache-conflict event (Event ID 4199) sharply increases confidence that the
+    scanning was a prelude to poisoning. For Credential Access this distinguishes deliberate target enumeration
+    from routine host discovery.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Network infrastructure segments containing assets like default gateways, DNS servers, and Domain
+    Controllers.'
+  range: Last 90 days; baseline window 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  arp.log | stats dcount(target_ip) as fanout, count(request) as rate by src_mac, subnet,\
+      \ bin=1h\n  | join subnet_baseline_p99 on subnet\n  | where fanout > p99_fanout OR rate > p99_rate\n\
+      \  | join conflict_events(EID=4199) on subnet within 5m"
+- question: Does sequence modeling of a host's ARP request/reply stream (timing, request-to-reply ratio,
+    fan-out) classify the activity as a deliberate poisoning burst rather than normal host discovery,
+    and what top-3 features drive that classification?
+  context: 'Normal host discovery and deliberate poisoning have different temporal signatures: legitimate
+    discovery produces requests followed by single matching replies, while poisoning produces bursts of
+    replies (often without requests) and abnormal request:reply ratios. A sequence model (e.g., RNN/transformer
+    over the per-MAC ARP event stream) can learn these patterns and separate them. Reporting the top-3
+    features (timing, ratio, fan-out) makes the alert explainable. In Credential Access, this catches
+    stealthy poisoning that hides inside otherwise plausible scanning.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Network infrastructure segments containing assets like default gateways, DNS servers, and Domain
+    Controllers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  seq = order_by_time(arp_events[src_mac])\n  label = seq_model.classify(features=[inter_arrival,\
+      \ req_reply_ratio, fanout])\n  if label == 'poisoning_burst':\n    alert(src_mac, top3=feature_importance(seq,\
+      \ n=3))"
+- question: Did a Windows endpoint raise System Event ID 4199 (address conflict) for an IP that asset
+    inventory identifies as a critical network resource (gateway, DNS, or domain controller), with the
+    observed ARP MAC not matching the approved inventory or DHCP-lease binding?
+  context: Event ID 4199 is Windows' implementation of RFC 5227 address-conflict detection — it fires
+    when two devices claim the same IP, which is exactly what ARP poisoning of a critical service produces.
+    Enriching the raw 4199 event with asset-criticality context and cross-checking the conflicting MAC
+    against inventory turns a noisy operational event into a high-signal indicator. A positive result
+    is a 4199 conflict on a DC/DNS/gateway IP where the ARP MAC is unknown — strong evidence an adversary
+    is positioning to intercept credential traffic. A benign result is a known duplicate-IP misconfiguration
+    with recognized MACs.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: All Windows endpoints and servers, particularly Domain Controllers and other critical servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  WinEventLog where EventCode=4199\n  | lookup asset_inventory on conflict_ip -> tier\n\
+      \  | where tier == 'critical'\n  | join arp.log on conflict_ip\n  | where observed_mac NOT IN approved_mac(conflict_ip)\n\
+      \  | emit alert(host, conflict_ip, observed_mac)"
+- question: Are Event ID 4199 conflict counts on high-value infrastructure, grouped by subnet and asset
+    tier, showing statistically significant spikes above their moving baseline?
+  context: Treating the address-conflict/defense rate as an explicit failure-mode signal lets you catch
+    poisoning campaigns that generate repeated conflicts. Compare 4199 counts per subnet and asset tier
+    against a moving baseline; a sudden burst of conflicts on a high-value tier is anomalous because well-run
+    infrastructure rarely produces address conflicts. This statistical view complements per-event enrichment
+    by revealing slow or distributed poisoning that no single event would flag. For Credential Access,
+    spikes on DC/DNS subnets are especially concerning.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: All Windows endpoints and servers, particularly Domain Controllers and other critical servers.'
+  range: Last 90 days; baseline as moving average
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  WinEventLog EventCode=4199 | stats count by subnet, asset_tier, bin=1h\n  | join moving_baseline\
+      \ on (subnet, asset_tier)\n  | where count > baseline + 3*stddev\n  | where asset_tier in ('critical','high')"
+- question: When the risk model ranks address-conflict incidents (weighing asset criticality, ARP timing,
+    gratuitous-reply rate, and MAC rarity), which top-3 features drive the highest-ranked Event ID 4199
+    incidents?
+  context: Not every 4199 conflict is malicious, so a supervised risk model that fuses asset criticality,
+    ARP timing, gratuitous-reply rate, and MAC rarity helps triage which conflicts deserve immediate attention.
+    Surfacing the top-3 contributing features keeps the ranking explainable for the SOC. In Credential
+    Access, this prioritization ensures conflicts touching domain controllers or involving rare/unknown
+    MACs rise to the top of the queue ahead of benign duplicate-IP noise.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: All Windows endpoints and servers, particularly Domain Controllers and other critical servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  for event in conflict_events(EID=4199):\n    feats = [asset_criticality, arp_timing,\
+      \ gratuitous_rate, mac_rarity]\n    risk = risk_model.score(feats)\n  rank desc by risk; show top3\
+      \ = shap(feats, n=3)"
+- question: Did a gratuitous ARP for a critical IP arrive from a MAC that does not match the trusted asset
+    record, after excluding legitimate failover announcements from known cluster/VRRP MACs?
+  context: Gratuitous ARP is legitimately used by HA clusters and VRRP/HSRP gateways to announce a failover,
+    so the detection must distinguish those from spoofing. Maintain an allowlist of known cluster/VRRP
+    MACs per critical IP; any gratuitous claim for that IP from a MAC outside the allowlist, correlated
+    with a 4199 conflict, indicates a spoofed cache update rather than a valid failover. A positive result
+    is an unknown MAC announcing ownership of a gateway/DNS IP — a hallmark of Credential Access interception
+    setup. A negative result is a recognized failover MAC.
+  answer_sources:
+  - Zeek arp.log
+  - Windows Event ID 4199
+  - Zeek conn.log
+  - 'NAI: Network taps and SPAN ports monitoring core network switches, gateway routers, and DNS server
+    subnets.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  arp.log | where is_gratuitous, claimed_ip in CRITICAL_IPS\n  | where src_mac NOT IN\
+      \ trusted_mac(claimed_ip) AND src_mac NOT IN cluster_vrrp_allowlist\n  | join WinEventLog(EID=4199)\
+      \ on claimed_ip\n  | emit alert(claimed_ip, src_mac)"
+- question: Which critical assets show conflict events or gratuitous-reply counts exceeding their 99th-percentile
+    baseline over rolling 10-minute windows, with per-asset thresholds derived from 30-day history?
+  context: Per-asset, short-window baselining detects bursts of poisoning activity that a daily aggregate
+    would smooth away. For each critical asset, learn the normal frequency and state of conflict/gratuitous
+    events over 30 days, then flag rolling 10-minute windows that breach the 99th percentile. This frequency/state
+    view is well-suited to catching the rapid-fire gratuitous replies a poisoner uses to keep a victim's
+    cache poisoned. For Credential Access, an asset whose gratuitous-reply rate suddenly spikes is likely
+    under active interception.
+  answer_sources:
+  - Zeek arp.log
+  - Windows Event ID 4199
+  - Zeek conn.log
+  - 'NAI: Network taps and SPAN ports monitoring core network switches, gateway routers, and DNS server
+    subnets.'
+  range: Last 90 days; rolling 10-minute windows, 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  arp.log + conflict_events | stats count by critical_asset, bin=10m\n  | join per_asset_baseline_p99\
+      \ on critical_asset\n  | where count > p99"
+- question: Does time-series forecasting of per-asset ARP reply volumes and conflict counts produce residuals
+    beyond the prediction band, signalling emerging spoofing, and which volume/rate features contribute?
+  context: Forecasting models (e.g., Holt-Winters / ARIMA / Prophet) learn the expected diurnal pattern
+    of ARP replies and conflicts per asset, then flag observations whose residual exceeds the prediction
+    band. This catches spoofing as it begins to emerge, before it dominates traffic, and reduces false
+    positives from predictable busy periods. Listing the contributing volume/rate features keeps the alert
+    actionable. In Credential Access this provides early warning that a critical service is starting to
+    be poisoned.
+  answer_sources:
+  - Zeek arp.log
+  - Windows Event ID 4199
+  - Zeek conn.log
+  - 'NAI: Network taps and SPAN ports monitoring core network switches, gateway routers, and DNS server
+    subnets.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  for asset in critical_assets:\n    pred, band = forecast(asset.arp_reply_series + asset.conflict_series)\n\
+      \    resid = actual - pred\n    if abs(resid) > band:\n      alert(asset, resid, features=[volume,\
+      \ reply_rate])"
+- question: Did a single non-inventory MAC claim more than three unique IPs via gratuitous ARP within
+    a 5-minute interval (tune to environment), with any of those IPs being high-value authentication assets?
+  context: A legitimate host owns very few IPs; a poisoner claiming many distinct IPs in a short window
+    is impersonating multiple devices to broaden its interception. Alert when a MAC not in inventory claims
+    more than three unique IPs via gratuitous ARP in 5 minutes and one or more is a high-value asset such
+    as a domain controller or RADIUS server. Correlating with Event ID 4199 conflicts confirms endpoints
+    actually tried to use the spoofed addresses. For Credential Access this is a strong signal that an
+    actor is aggressively positioning to harvest authentication traffic.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers) and the subnets containing
+    them.'
+  range: Last 90 days; 5-minute windows
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  arp.log | where is_gratuitous, src_mac NOT IN inventory\n  | stats dcount(claimed_ip)\
+      \ as ips, collect(claimed_ip) as iplist by src_mac, bin=5m\n  | where ips > 3 AND any(iplist in\
+      \ HIGH_VALUE_AUTH_IPS)\n  | emit alert(src_mac, iplist)"
+- question: Which MACs are statistical outliers in the number of distinct IPs claimed (above the 99th
+    percentile of the empirical distinct-IP-per-MAC distribution), with associated conflict events?
+  context: Baselining the distinct-IP-per-MAC distribution lets the cutoff adapt to the environment instead
+    of relying on a fixed count of three. Compute, per MAC, how many unique IPs it claims, and flag those
+    above the 99th percentile, especially when accompanied by conflict events. This claim-entropy view
+    (Volume metric) catches both aggressive broad spoofers and stealthier ones that slightly exceed the
+    norm. For Credential Access, an outlier MAC claiming many IPs near authentication servers warrants
+    investigation.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers) and the subnets containing
+    them.'
+  range: Last 90 days; baseline window 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  arp.log | stats dcount(claimed_ip) as ips by src_mac, bin=1h\n  | join baseline_p99(distinct_ip_per_mac)\
+      \ on subnet\n  | where ips > p99 AND exists(conflict_event near time)"
+- question: When ARP claim patterns are clustered by MAC, subnet, and timing, which nodes fall into a
+    cluster behaving like broad spoofers rather than ordinary hosts, and what top-3 features distinguish
+    that cluster?
+  context: Unsupervised clustering groups hosts by their ARP claim behavior (which/how-many IPs claimed,
+    subnet spread, timing patterns). Ordinary hosts cluster together with low claim counts and stable
+    bindings; broad spoofers form a distinct cluster with high claim diversity and bursty timing. Reporting
+    the top-3 distinguishing features per cluster makes the output explainable. For Credential Access
+    this surfaces nodes systematically impersonating authentication infrastructure without needing labelled
+    training data.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 4199
+  - 'NAI: Authentication servers (e.g., Domain Controllers, RADIUS servers) and the subnets containing
+    them.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  X = features_per_mac(claim_count, subnet_spread, timing_burstiness)\n  clusters = cluster(X)\n\
+      \  spoofer_cluster = clusters.max_by(mean_claim_diversity)\n  for mac in spoofer_cluster:\n    alert(mac,\
+      \ top3=cluster_feature_importance(n=3))"
+- question: Was client traffic to a high-value IP redirected to a new destination MAC immediately after
+    an ARP reply from a MAC that is not the inventory/DHCP-bound owner of that IP, as confirmed by Windows
+    Event ID 5156 flow changes?
+  context: This correlates the cause (an ARP binding change) with the effect (rerouted flows) to confirm
+    interception for Collection. Match the arp.log binding change for a high-value IP against the subsequent
+    conn.log / Event ID 5156 destination-MAC change. A positive result is traffic to a file server, database,
+    or code repository suddenly landing on a MAC that does not own that IP per inventory/DHCP — consistent
+    with an adversary intercepting data rather than a legitimate re-homing. A negative result is a redirect
+    to a recognized, inventory-approved MAC (e.g., planned migration).
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Subnets containing high-value data assets (e.g., file servers, database servers, code repositories).'
+  range: Last 90 days; correlate ARP change with flow change within seconds
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  arp.log binding_change(high_value_ip -> new_mac) where new_mac NOT IN approved_mac(high_value_ip)\n\
+      \  | join (conn.log OR WinEventLog EID=5156) on high_value_ip within 10s\n  | where dest_mac ==\
+      \ new_mac\n  | emit alert(high_value_ip, new_mac)"
+- question: When a redirect to a high-value IP is detected, does an active probe of the IP's true owner
+    return a contradictory or absent response, confirming the cache was poisoned rather than legitimately
+    re-homed?
+  context: An active probe disambiguates a malicious redirect from a planned change. After detecting a
+    redirect, probe the high-value IP's genuine owner; if the true owner still answers from its known
+    MAC (contradicting the new binding) or fails to answer, the cache was poisoned. This deterministic
+    confirmation is valuable before taking disruptive response actions against a data server. In Collection,
+    it confirms an active man-in-the-middle is positioned on the path to sensitive data.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Subnets containing high-value data assets (e.g., file servers, database servers, code repositories).'
+  range: Last 90 days; probe within seconds of redirect detection
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  on redirect(high_value_ip, new_mac):\n    resp = active_probe(high_value_ip, timeout=segment_rtt*3)\n\
+      \    if resp.mac != inventory_mac(high_value_ip) OR resp is None:\n      alert('poison confirmed',\
+      \ high_value_ip, new_mac)"
+- question: After an ARP event affecting a protected service, do post-ARP traffic volume (bytes) and destination-MAC
+    changes deviate above the 95th percentile of the service's normal baseline, and what share of connections
+    now land on a non-approved MAC?
+  context: 'Interception changes traffic statistics: bytes may shift and, critically, the share of connections
+    landing on a non-approved MAC rises. Compare post-ARP traffic for the protected service against its
+    normal baseline and flag 95th-percentile shifts. Profiling the share of connections on a non-approved
+    MAC as a State metric is a direct measure of how much traffic is being intercepted. For Collection,
+    a sudden jump in non-approved-MAC connections to a file or database server indicates active data interception.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Subnets containing high-value data assets (e.g., file servers, database servers, code repositories).'
+  range: Last 90 days; baseline window 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log for protected_service after arp_event\n  | stats sum(bytes) as vol, sum(dest_mac\
+      \ NOT IN approved)/count as bad_mac_share by service, bin=5m\n  | join service_baseline_p95 on service\n\
+      \  | where vol > p95_vol OR bad_mac_share > p95_share"
+- question: Does the graph-based detector trained on ARP-to-connection transitions identify sessions that
+    suddenly route through a suspicious MAC, and what top-3 features (MAC novelty, binding-change recency,
+    byte volume) drive the score?
+  context: Modeling ARP-to-connection transitions as a graph lets an anomaly detector spot sessions that
+    abruptly start traversing a suspicious intermediary MAC — the signature of an interception node inserted
+    into the path. Train on transitions and score sessions by how anomalously they route. Surfacing the
+    top-3 features (MAC novelty, recency of the binding change, byte volume) keeps the alert explainable.
+    For Collection, this catches man-in-the-middle positioning on the routes to sensitive data assets,
+    even when individual ARP events look unremarkable.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Subnets containing high-value data assets (e.g., file servers, database servers, code repositories).'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  G = graph(arp_to_conn_transitions)\n  for session in sessions:\n    s = graph_anomaly.score(session)\n\
+      \    if s > thr:\n      alert(session, top3=[mac_novelty, binding_change_recency, byte_volume])"
+- question: Within a few seconds, did a single attacker MAC issue two targeted ARP replies claiming both
+    a client IP and a server IP, where neither address belongs to an approved gateway or cluster MAC?
+  context: Bidirectional poisoning — claiming both ends of a client/server pair — is the canonical way
+    to force a full man-in-the-middle position so all traffic between the two passes through the attacker.
+    Alert when the same MAC claims both sides of a pair within seconds and neither address is an approved
+    gateway/cluster MAC. This two-sided signature is highly specific to deliberate MITM for Collection;
+    legitimate devices do not impersonate both a workstation and its data server simultaneously. A positive
+    result strongly indicates active interception of the session.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Network traffic collection points monitoring communication paths between user workstations and
+    sensitive data servers.'
+  range: Last 90 days; pairing window ~10 seconds
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  arp.log | where reply==true\n  | stats collect(claimed_ip) as ips by src_mac, bin=10s\n\
+      \  | where count(ips)>=2 AND is_client_server_pair(ips)\n     AND none(ips in approved_gateway_cluster_macs)\n\
+      \  | emit alert(src_mac, ips)"
+- question: Which MACs show an IP flip-flop frequency (rate of alternating claimed IPs) above the 99th
+    percentile for their subnet, derived from per-segment ARP histograms?
+  context: A MITM node bridging a client and server alternates its claimed IPs rapidly to keep both caches
+    poisoned, producing high flip-flop frequency. Baseline this volatility per subnet using ARP histograms
+    and flag MACs above the 99th percentile. This statistical pair-volatility measure catches bidirectional
+    poisoning even when the exact two-reply timing rule is evaded. For Collection, an abnormally volatile
+    MAC sitting between users and data servers is a prime interception candidate.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Network traffic collection points monitoring communication paths between user workstations and
+    sensitive data servers.'
+  range: Last 90 days; 30-day per-segment baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  arp.log | stats flipflop_rate(claimed_ip) as ff by src_mac, subnet, bin=1h\n  | join\
+      \ subnet_histogram_p99 on subnet\n  | where ff > p99"
+- question: Does graph anomaly detection on claimed-IP relationships identify an attacker node that bridges
+    otherwise unrelated peers, and which top-3 edges/features explain it?
+  context: Representing claimed-IP relationships as a graph exposes nodes that connect peers which normally
+    have no relationship — exactly what a MITM bridge does. Graph anomaly detection scores nodes by how
+    unusually they bridge the topology. Reporting the top-3 contributing edges/features lets an analyst
+    see which client/server relationships the node is bridging. For Collection, a node bridging a workstation
+    and a sensitive data server is a high-confidence interception indicator.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Network traffic collection points monitoring communication paths between user workstations and
+    sensitive data servers.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  G = graph(node=mac, edges=claimed_ip_relationships)\n  for node in G:\n    if bridging_score(node)\
+      \ > thr:\n      alert(node, top3_edges=explain(node, n=3))"
+- question: Did a Windows system in a privileged or high-value asset group raise Event ID 4199 (IP conflict)
+    on a sensitive segment where the ARP source MAC is not the inventory-recognized owner?
+  context: On sensitive segments, an address conflict can mean an adversary is poisoning the cache to
+    intercept data immediately. Escalate Event ID 4199 events when the affected endpoint belongs to a
+    privileged/high-value group (high-value data servers or privileged-user workstations) and the ARP
+    source MAC is not the inventory-recognized owner. This prioritizes conflicts with the greatest Collection
+    impact. A positive result is a conflict on a file/database server or a privileged user's workstation
+    involving an unknown MAC; a benign result involves a recognized MAC.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Designated high-value data servers (file servers, databases) and workstations of privileged
+    users.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  WinEventLog EventCode=4199\n  | lookup asset_group on host -> group\n  | where group\
+      \ in ('high_value','privileged')\n  | join arp.log on conflict_ip\n  | where src_mac NOT IN inventory_mac(conflict_ip)\n\
+      \  | emit alert(host, conflict_ip, src_mac)"
+- question: Do conflict counts on high-value segments deviate statistically from the broader network baseline,
+    and is the conflict/defense event rate trending as a failure-mode signal?
+  context: Comparing high-value-segment conflict counts to the network-wide baseline reveals targeted
+    poisoning concentrated on sensitive segments. Flag statistically significant deviations, and track
+    the conflict/defense event rate explicitly as a failure-mode indicator. This statistical view complements
+    per-event escalation by catching slow or distributed Collection campaigns that elevate conflicts on
+    data segments without any single dramatic event.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Designated high-value data servers (file servers, databases) and workstations of privileged
+    users.'
+  range: Last 90 days; baseline as network-wide moving average
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  WinEventLog EventCode=4199 | stats count by segment, bin=1h\n  | join network_baseline\
+      \ on time\n  | where segment in high_value_segments AND count > baseline + 3*stddev"
+- question: When the supervised model ranks conflict events on sensitive assets by asset criticality,
+    MAC novelty, gratuitous-reply rate, and recent ARP behavior, which top-3 features drive the highest-risk
+    events?
+  context: A supervised model (random forest / ensemble) fuses asset criticality, MAC novelty, gratuitous-reply
+    rate, and recent ARP behavior to rank which 4199 conflicts on sensitive assets most likely represent
+    Collection interception. Surfacing the top-3 contributing features keeps triage explainable and fast.
+    This ensures conflicts on high-value data servers involving rare MACs and elevated gratuitous-reply
+    rates are prioritized over benign duplicate-IP noise.
+  answer_sources:
+  - Windows Event ID 4199
+  - Zeek arp.log
+  - Zeek conn.log
+  - 'NAI: Designated high-value data servers (file servers, databases) and workstations of privileged
+    users.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  for event in conflict_events(EID=4199, sensitive_assets):\n    feats=[asset_criticality,\
+      \ mac_novelty, gratuitous_rate, recent_arp_behavior]\n    risk=model.score(feats)\n  rank desc;\
+      \ show top3=shap(feats, n=3)"
+- question: After an ARP reply altered a high-value server's MAC, did subsequent client connections to
+    that server IP land on a MAC that is not the approved server binding (cross-checked against inventory/DHCP
+    leases)?
+  context: 'This focuses on the post-poisoning effect: clients connecting to a server IP that now resolves
+    to an unauthorized MAC. Alert when a server IP changes MAC ownership and subsequent connections (conn.log
+    / Event ID 5156) land on a MAC not in inventory/DHCP. A positive result is client traffic to a high-value
+    data server being delivered to a rogue MAC — direct evidence of data interception for Collection.
+    A negative result is connections continuing to the approved server MAC.'
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network traffic flows to and from high-value data assets, monitored at network chokepoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  arp.log mac_change(server_ip -> new_mac)\n  | join (conn.log OR EID=5156) on server_ip\
+      \ after change\n  | where dest_mac == new_mac AND new_mac NOT IN approved_mac(server_ip)\n  | emit\
+      \ alert(server_ip, new_mac)"
+- question: Is the proportion of connections redirected to non-approved MACs rising abruptly above the
+    95th percentile over short windows, relative to the service's normal MAC-destination distribution?
+  context: The reroute ratio — share of connections going to non-approved MACs — is a direct State metric
+    for how much of a service's traffic is being intercepted. Monitor it per service and flag abrupt rises
+    above the 95th percentile over short windows, with the cutoff derived from the service's normal MAC-destination
+    distribution. For Collection, a sharp climb in this ratio for a high-value data asset signals that
+    interception is actively underway, even before absolute volumes look unusual.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network traffic flows to and from high-value data assets, monitored at network chokepoints.'
+  range: Last 90 days; short windows, 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log | stats sum(dest_mac NOT IN approved)/count as reroute_ratio by service, bin=5m\n\
+      \  | join service_mac_dist_p95 on service\n  | where reroute_ratio > p95"
+- question: Do time-series models of connection destinations and MAC mappings show residuals indicating
+    emerging rerouting before it dominates traffic, and which features contribute?
+  context: Forecasting connection destinations and MAC mappings per service lets you detect rerouting
+    as it emerges, alerting on residuals beyond the prediction band before the intercepted share grows
+    large. This early-warning approach reduces dwell time for Collection interception. Listing the contributing
+    features (e.g., new-MAC share, destination shift) keeps the alert actionable so analysts can intervene
+    while only a fraction of traffic is compromised.
+  answer_sources:
+  - Zeek arp.log
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Network traffic flows to and from high-value data assets, monitored at network chokepoints.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  for service in high_value_services:\n    pred, band = forecast(service.dest_mac_series)\n\
+      \    resid = actual - pred\n    if abs(resid) > band:\n      alert(service, resid, features=[new_mac_share,\
+      \ dest_shift])"
+- question: Did a non-gateway MAC begin receiving server-style traffic or file-transfer flows on ports
+    reserved (per service inventory) for another host, indicating it is relaying intercepted traffic?
+  context: An endpoint that suddenly starts receiving traffic on ports that inventory assigns to a different
+    server is acting as a rogue relay for intercepted data. Alert when a non-gateway MAC receives server-style
+    traffic or file-transfer flows (conn.log/files.log/Event ID 5156) for ports reserved for another host.
+    A positive result is a workstation-class device fielding SMB/database/file-transfer flows meant for
+    a real server — a clear Collection interception indicator. A negative result is the legitimate server
+    continuing to serve those ports.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Windows Event ID 5156
+  - 'NAI: All non-gateway endpoints on internal network segments, with traffic monitored by network sensors.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\n  conn.log + files.log | where dest_mac IN non_gateway_macs\n  | where dest_port IN reserved_ports_for(other_host)\n\
+      \  | where dest_mac != inventory_mac(reserved_ports.host)\n  | emit alert(dest_mac, dest_port, bytes)"
+- question: Which non-gateway MACs show inbound bytes or file counts exceeding their 95th-percentile baseline
+    over short windows, with per-host thresholds derived from 30-day history?
+  context: A relay node fielding intercepted traffic shows abnormally high inbound bytes or file counts.
+    Baseline each non-gateway host's inbound volume over 30 days and flag short windows breaching the
+    95th percentile. This Volume metric catches server-impersonation even when the exact reserved-port
+    rule is not triggered. For Collection, a normally quiet endpoint suddenly absorbing large inbound
+    data or file transfers is a strong sign it is intercepting traffic destined for a real server.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Windows Event ID 5156
+  - 'NAI: All non-gateway endpoints on internal network segments, with traffic monitored by network sensors.'
+  range: Last 90 days; short windows, 30-day baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  conn.log + files.log | stats sum(inbound_bytes) as vol, count(files) as fc by dest_mac,\
+      \ bin=5m\n  | where dest_mac IN non_gateway_macs\n  | join per_host_baseline_p95 on dest_mac\n \
+      \ | where vol > p95_vol OR fc > p95_fc"
+- question: When endpoints are clustered by their inbound service mix, which nodes start behaving like
+    a server without inventory backing, and what top-3 features distinguish them?
+  context: Clustering endpoints by inbound service mix separates true servers from clients. A client-class
+    node that drifts into the 'server-like' cluster — fielding inbound service connections it never used
+    to — without any inventory record of being a server is a likely interception relay. Reporting the
+    top-3 distinguishing features per node makes the finding explainable. For Collection, this surfaces
+    stealthy server-impersonation nodes set up to harvest intercepted data.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek files.log
+  - Windows Event ID 5156
+  - 'NAI: All non-gateway endpoints on internal network segments, with traffic monitored by network sensors.'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: ">-\n  X = inbound_service_mix_per_endpoint\n  clusters = cluster(X)\n  for node where node\
+      \ in server_like_cluster AND node NOT IN server_inventory:\n    alert(node, top3=cluster_feature_importance(n=3))"
