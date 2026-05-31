@@ -1,0 +1,318 @@
+name: 'T1631: Process Injection'
+id: 08c7531e-4dc7-4257-8102-c6123d2dd3db
+description: 'This playbook helps an analyst investigate suspected process injection on managed mobile
+  devices (Android and iOS), where adversaries inject code into another live process to evade process-based
+  defenses or elevate privileges. Because neither Android nor iOS offers a legitimate mechanism for process
+  injection, any such activity implies abuse of existing root access or exploitation of a vulnerability.
+  It guides the hunt across two angles: (1) Privilege Escalation -- detecting memory-manipulation and
+  debugging API misuse (ptrace, process_vm_writev, mach_vm_write, task_for_pid), non-allowlisted dynamic-library
+  loads (.so/.dylib), instrumentation artifacts (frida/Xposed), rare library-to-app load pairs, anomalous
+  syscall/IPC sequences, and injection failure/denial signals; and (2) Defense Evasion -- identifying
+  trusted, allowlisted app processes that exhibit resource and network anomalies consistent with hidden
+  injected code (sustained CPU/memory spikes, connections to rare or known-bad destinations, abnormal
+  egress ratios, and hidden dynamic-load chains). It combines symbolic-logic rules, statistical baselining
+  and change-point analysis, and machine-learning approaches over endpoint (MDM/EDR, logcat, iOS Unified
+  Logs, audit/syscall logs, application vetting) and network (Zeek) telemetry to surface defensible, actionable
+  detections for a SOC analyst.'
+type: technique
+related:
+- tactic_id: TA0029
+  tactic_name: Privilege Escalation
+- tactic_id: TA0030
+  tactic_name: Defense Evasion
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is any mobile process invoking memory-manipulation or debugging APIs -- such as ptrace (PTRACE_POKETEXT/POKEDATA/ATTACH),
+    process_vm_writev, writes to /proc/<pid>/mem, mach_vm_write, or task_for_pid -- or loading a non-system
+    dynamic library (dlopen/System.loadLibrary/DYLD_INSERT_LIBRARIES/LD_PRELOAD) into another process
+    without a legitimate developer or debugging context?
+  context: 'This is the highest-fidelity signal that an adversary is escalating privileges via process
+    injection: writing code into another process''s address space. Because Android (Linux kernel) and
+    iOS provide no legitimate path to inject into another live process, these primitives should be exceptionally
+    rare on managed fleets. To suppress benign single events, require the ordered allocate->write->execute
+    triad on a unified memory address rather than alerting on any lone API call, and key on the write/execute
+    primitive taxonomy and the eBPF ptrace-injection signature pattern. Also alert on instrumentation
+    artifacts -- loaded frida-agent/frida-gadget/XposedBridge, a listener on TCP 27042, or injected .so/.dylib
+    appearing in /proc/<pid>/maps. Exclude signed developer tools and known diagnostic bundles via allowlists
+    of signer, bundle ID, and entitlement/profile. A positive result -- especially where the injecting
+    process lacks expected entitlements or targets a high-value process (browser, authentication, VPN)
+    -- indicates active code injection for privilege escalation and warrants device isolation.'
+  answer_sources: &id001
+  - Android logcat
+  - iOS Unified Logs
+  - MDM/EDR process telemetry
+  - Mobile OS audit logs
+  - Application vetting API call logs
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Managed mobile devices with EDR/MDM agents, network gateways monitoring corporate Wi-Fi and
+    VPN traffic, and centralized log aggregation platforms such as a SIEM or Data Lake.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "process_telemetry\n| where api in (\"ptrace:PTRACE_POKETEXT\",\"ptrace:PTRACE_POKEDATA\",\"\
+      ptrace:PTRACE_ATTACH\",\n    \"process_vm_writev\",\"mach_vm_write\",\"task_for_pid\")\n    OR (api\
+      \ in (\"dlopen\",\"System.loadLibrary\",\"setenv:DYLD_INSERT_LIBRARIES\",\"setenv:LD_PRELOAD\")\n\
+      \        AND lib_path NOT startswith (\"/system/\",\"/apex/\",\"/usr/lib/\",\"/System/\"))\n// require\
+      \ ordered allocate->write->execute on same address region within short window\n| sequence by pid,\
+      \ target_pid maxspan=5s [alloc(mmap/mprotect RWX)]->[write]->[exec]\n| join maps_artifacts where\
+      \ maps contains (\"frida\",\"gadget\",\"XposedBridge\") OR listener_port==27042\n| where signer\
+      \ NOT in allowlist_signers AND bundle_id NOT in allowlist_bundles\n| eval sev = if(target_proc in\
+      \ (\"browser\",\"auth\",\"vpn\") OR missing_entitlements,\"high\",\"med\")\n| emit alert"
+  - technology: Zeek/pseudocode
+    query: '// corroborate injecting-process egress after detection
+
+      conn.log | where id.orig_h == device_ip AND ts within 5m of injection_event | summarize by id.resp_h'
+- question: Which dynamic-library loads are rare across the fleet for a given app -- i.e., a library-app
+    load pair with fleet-wide prevalence under 1%, or one that first appears immediately after privilege-escalation
+    indicators on the same device?
+  context: Injected code frequently arrives as a dynamic library that a target app would never normally
+    load. By building a 30-day baseline of dynamic-library loads per app and computing fleet-wide prevalence
+    for each library-app pair, an analyst can surface statistically anomalous loads. Modeling API/library
+    transitions as package/family Markov chains (per MaMaDroid) makes the baseline resilient to benign
+    churn and obfuscation. Loads with prevalence below 1%, or that appear right after escalation indicators,
+    are strong leads. Correlating the same device's DNS lookups (Zeek dns.log) for concurrent high-entropy
+    or newly registered domains strengthens the case for malicious injection versus a benign rare-but-legitimate
+    library. A positive result ties a rare library to a compromised app for privilege escalation.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "lib_loads (last 30d)\n| summarize pair_count=count() by app, library\n| join (lib_loads |\
+      \ summarize app_total=count() by app)\n| eval fleet_prevalence = pair_count / fleet_total_loads_for_pair\n\
+      | where fleet_prevalence < 0.01\n    OR first_seen(app,library) within 10m after privesc_indicator(device)\n\
+      | lookup dns.log where device_ip==orig_h AND (entropy(query)>3.5 OR domain_age<30d)\n| emit alert"
+- question: On any device, do injection-relevant syscall frequencies (ptrace, mmap/mprotect with RWX,
+    process_vm_writev) plus non-allowlisted library loads exceed the device's own historical 99th-percentile
+    baseline, show an abrupt change-point shift, or cluster multiple indicators within a 10-minute window?
+  context: Rather than relying on a single API call, this approach scores the accumulation of injection-relevant
+    behavior over time. Maintain per-app baselines of injection syscall frequencies from strace/EDR syscall
+    logs and compute a rolling 7-day count of those calls plus non-allowlisted library loads. Alert when
+    counts exceed the 99th percentile of the device's historical baseline, when multiple distinct indicators
+    co-occur within 10 minutes, or when change-point tests (CUSUM/Bayesian online) flag an abrupt shift.
+    Crucially, thresholds are derived from each device/app's local 30-day distribution rather than fixed
+    global values, which keeps false positives low across a heterogeneous fleet. A positive result indicates
+    a device whose injection-relevant behavior has measurably and suspiciously increased -- consistent
+    with privilege-escalation activity.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "syscall_logs\n| where name in (\"ptrace\",\"mmap\",\"mprotect\",\"process_vm_writev\") AND\
+      \ (prot==\"RWX\" OR true)\n| timechart span=7d count as cnt by device, app, name\n| eval p99 = percentile(cnt\
+      \ over last 30d, 99)\n| eval cp = changepoint_cusum(cnt)\n| where cnt > p99 OR cp==true\n    OR\
+      \ distinct_indicator_count(device, window=10m) >= 2\n| emit alert"
+- question: Is a device generating an abnormal number of injection failure and denial signals -- failed
+    ptrace attaches (EPERM), denied SELinux/sandbox operations, mprotect RWX rejections, and post-injection
+    C2 failures (NXDOMAIN, blocked/refused connections) -- above its baseline or rising sharply?
+  context: Injection and instrumentation often probe repeatedly before succeeding, so failures are a distinct
+    and valuable signal that can fire before a successful compromise. Count failed ptrace attaches returning
+    EPERM, denied SELinux/sandbox operations, mprotect RWX rejections, and post-injection C2 failures
+    such as DNS NXDOMAIN and blocked/refused connections in Zeek conn.log/dns.log. Alert when failure
+    counts exceed the device's 99th-percentile baseline or rise sharply per change-point analysis. A burst
+    of denial signals indicates an adversary actively attempting injection or escalation and being repeatedly
+    blocked by platform defenses -- an early-warning opportunity to intervene before the attempt succeeds.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "(audit_logs | where event in (\"ptrace_EPERM\",\"selinux_denied\",\"mprotect_RWX_denied\"\
+      ))\n  UNION (dns.log | where rcode==\"NXDOMAIN\")\n  UNION (conn.log | where conn_state in (\"REJ\"\
+      ,\"S0\",\"RSTRH\"))\n| timechart span=1h count as fails by device\n| eval p99 = percentile(fails\
+      \ over last 30d, 99), cp = changepoint(fails)\n| where fails > p99 OR cp==true\n| emit alert"
+- question: Do a device's syscall/IPC sequences deviate from a learned model of benign behavior -- specifically,
+    events outside the top-g predictions of an LSTM log-key predictor or above the 99.9th-percentile prediction
+    error -- especially when they coincide with first-seen external connections within 5 minutes?
+  context: Process injection perturbs the normal ordering of syscalls and IPC in subtle ways that simple
+    thresholds miss. Train an LSTM log-key predictor (DeepLog-style) on benign syscall/IPC sequences from
+    managed devices and flag events that fall outside the top-g most-probable next events, or whose reconstruction/prediction
+    error exceeds the 99.9th percentile. Be mindful of known pitfalls -- temporal bias and explainability
+    -- surfaced in the Android deep-learning literature. Escalate when an anomalous sequence coincides
+    with a first-seen external connection in Zeek conn.log within 5 minutes, and surface the top-3 contributing
+    events/features so an analyst can triage quickly. A positive result indicates execution flow consistent
+    with injected code running inside an otherwise-legitimate process for privilege escalation.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model = LSTM_logkey.train(benign_syscall_ipc_sequences)
+
+      stream syscall_ipc_events by device
+
+      | eval pred = model.next_topg(seq, g=9), err = model.error(event)
+
+      | where event NOT in pred OR err > p99_9(err)
+
+      | join conn.log where first_seen(id.resp_h) AND ts within 5m
+
+      | eval explain = top3_contributing_events(event)
+
+      | emit alert'
+- question: When apps and execution traces are scored by a classifier trained on syscall frequency and
+    n-gram features, which apps are flagged as malicious -- and do the top-contributing syscalls involve
+    memory- and process-manipulation operations indicative of injection?
+  context: Memory- and process-manipulation syscalls are the most discriminative features for distinguishing
+    injection-capable malware from benign apps. Train RF/NN classifiers on syscall frequency and n-gram
+    features and output the top-3 contributing syscalls/features per alert so triage is explainable rather
+    than a black box. Complement the dynamic classifier with explainable static application vetting (Drebin-style)
+    that flags reflection, DexClassLoader, and native-load APIs combined with anomalous permissions. A
+    positive result -- a high-scoring app whose top features are memory/process-manipulation syscalls
+    -- identifies an app carrying injection capability and merits removal and forensic review. The feature
+    attribution lets the analyst confirm the mechanism quickly and reduces false positives from benign
+    high-syscall apps.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "clf = RF_or_NN.train(features=[syscall_freq, syscall_ngrams], labels)\nfor app in fleet_traces:\n\
+      \  score, feat_attr = clf.predict_explain(app.trace)\n  if score > threshold:\n    top3 = feat_attr.top(3)\
+      \  # expect ptrace/mmap/process_vm_writev\n    static = drebin_vet(app)  # reflection, DexClassLoader,\
+      \ native-load, perms\n    emit alert(app, score, top3, static)"
+- question: Does a trusted, allowlisted app initiate connections to threat-intel domains/IPs, present
+    a JA3/JA3S fingerprint linked to malware, or use a User-Agent inconsistent with the app's expected
+    UA for that OS version -- signs of injected code communicating through the app?
+  context: When an adversary hides code inside a legitimate, allowlisted process, the injected code's
+    network egress is masked under the trusted app's identity. Join MDM/EDR process telemetry with Zeek
+    logs by device IP and time, then alert when a trusted app connects to a known-bad domain/IP, presents
+    a malware-linked JA3/JA3S TLS fingerprint, or emits a User-Agent inconsistent with what that app/OS
+    version should produce. Cross-process IPC/data-flow instrumentation (TaintDroid-style) can tie injected-code
+    data flows to the egress, and post-injection behavioral-change logic is especially powerful for normally-quiet
+    processes that suddenly reach out. A positive result indicates injected code evading defenses by riding
+    a trusted app's network identity to reach attacker infrastructure.
+  answer_sources: &id002
+  - MDM/EDR performance telemetry
+  - MDM/EDR process telemetry
+  - Android logcat
+  - iOS Unified Logs
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - 'NAI: Managed mobile devices with EDR/MDM agents, network gateways monitoring corporate Wi-Fi and
+    VPN traffic, and centralized log aggregation platforms such as a SIEM or Data Lake.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "process_telemetry as p JOIN conn.log/ssl.log/http.log as z ON p.device_ip==z.id.orig_h AND\
+      \ time~\n| where p.app in allowlist_trusted\n| where z.id.resp_h in threat_intel OR z.ja3 in malware_ja3\
+      \ OR z.ja3s in malware_ja3s\n    OR z.user_agent != expected_ua(p.app, os_version)\n| emit alert(device,\
+      \ app, z.id.resp_h, z.ja3, z.user_agent)"
+- question: Is a trusted app sustaining CPU or memory usage above its 95th-percentile baseline for 5+
+    minutes while simultaneously showing an abnormal orig_bytes/resp_bytes egress ratio (above the 99th-percentile
+    baseline), with an abrupt change-point onset?
+  context: Hidden injected code consumes resources and exfiltrates data through the host app, producing
+    a telltale combination of sustained resource spikes and abnormal egress. Maintain 30-day rolling percentiles
+    for CPU and memory per device-app pair, flag sustained spikes above the 95th percentile for 5+ minutes,
+    and compute the orig_bytes/resp_bytes ratio from Zeek conn.log over the same window -- escalating
+    when that ratio exceeds the 99th-percentile baseline (more data going out than the app normally sends).
+    Detect the abrupt onset with change-point tests (CUSUM/PELT), consistent with the quiet-process behavioral
+    shift characteristic of injection. A positive result indicates a trusted process whose resource and
+    network behavior changed suddenly without a legitimate update -- a strong defense-evasion injection
+    signal.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'perf_telemetry
+
+      | eval cpu_p95 = percentile(cpu over 30d,95) by device,app
+
+      | where cpu>cpu_p95 OR mem>mem_p95 sustained>=5m
+
+      | join conn.log over same window
+
+      | eval egress_ratio = sum(orig_bytes)/sum(resp_bytes)
+
+      | where egress_ratio > percentile(egress_ratio over 30d,99)
+
+      | where changepoint_pelt(cpu_series)==true
+
+      | emit alert'
+- question: Is a trusted app connecting to destination domains or ASNs never observed for it over the
+    prior 30 days -- particularly when concurrent with resource anomalies, after the app binary hash changed,
+    or alongside failure-mode egress (NXDOMAIN, TLS handshake failures, refused connections)?
+  context: Injected C2 introduces destinations a trusted app would never normally contact. Baseline destination
+    domains and ASNs per app and model API/network transition prevalence with package/family Markov chains
+    (MaMaDroid) for churn resilience. Flag connections to destinations never seen for that app over 30
+    days, weighting heavily when they coincide with resource anomalies or follow a change in the app binary
+    hash (a sign the app was tampered with). Profile failure-mode egress separately -- DNS NXDOMAIN, TLS
+    handshake failures, and blocked/refused connections from a trusted app are distinct signals of injected
+    C2 beaconing to dead or blocked infrastructure. A positive result identifies a trusted app reaching
+    new, suspicious infrastructure consistent with hidden injected code.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'conn.log + dns.log + ssl.log joined to app via device_ip
+
+      | eval seen_before = dest in baseline_destinations(app, 30d)
+
+      | where seen_before == false
+
+      | eval boost = resource_anomaly(app) OR app_hash_changed(app)
+
+      // failure-mode egress as separate signal
+
+      | union (where rcode=="NXDOMAIN" OR tls_handshake_failed OR conn_state in ("REJ","S0"))
+
+      | emit alert(device, app, dest, asn, boost)'
+- question: When outbound connections are clustered on features (protocol, port, duration, bytes, ASN)
+    over 30 days, which connections are noise/outlier points -- and do they coincide with resource anomalies
+    in the same 10-minute window or localize to a specific injected process?
+  context: Injected C2 traffic often forms statistical outliers against an app's normal connection profile.
+    Build feature vectors (protocol, port, duration, bytes, ASN) for outbound connections and train DBSCAN
+    on 30-day history; alert on noise-point connections that coincide with resource anomalies in the same
+    10-minute window. Complement with benign-only one-class novelty detection (Isolation Forest / deep
+    autoencoder) for robustness, and use node-level provenance-graph learning (ThreaTrace) to localize
+    the specific injected process responsible. Surface the top-3 contributing features per alert for explainable
+    triage. A positive result isolates anomalous outbound connections and the process behind them -- pinpointing
+    injected code attempting to evade defenses through a trusted app's egress.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = features(outbound_conn, [proto,port,duration,bytes,asn]) over 30d
+
+      labels = DBSCAN(X).fit_predict()
+
+      novelty = IsolationForest(benign_X).score(X)
+
+      | where labels == -1 (noise) OR novelty < threshold
+
+      | where resource_anomaly within 10m
+
+      | eval proc = threatrace_localize(provenance_graph)
+
+      | eval explain = top3_features(X)
+
+      | emit alert'
+- question: Do any apps chain reflection + native library load + dynamic class loading -- a hidden dynamic-load
+    capability for injection -- even when each individual API call looks benign in isolation?
+  context: 'Injection-enabling capability is often assembled from individually benign API calls: reflection,
+    native library loading, and dynamic class loading combined into a chain. Model apps and their API-call
+    relations as a heterogeneous information network and learn embeddings (AiDroid-style) to flag apps
+    that chain these capabilities together even when no single call is suspicious. Pair this with explainable
+    static vetting (Drebin) that surfaces the top contributing features -- suspicious/restricted APIs
+    and permissions -- so an analyst can confirm injection-enabling capability and the specific mechanism.
+    A positive result identifies an app with a concealed dynamic-load chain capable of loading and executing
+    injected code, supporting defense-evasion, and justifies removal and deeper forensic review.'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'HIN = build_heterogeneous_network(apps, api_calls, relations)
+
+      emb = AiDroid.embed(HIN)
+
+      | score apps for chain(reflection -> native_load -> dynamic_class_load)
+
+      | where chain_score > threshold
+
+      | eval static = drebin_vet(app)  # top suspicious/restricted APIs + permissions
+
+      | emit alert(app, chain_score, static.top_features)'
