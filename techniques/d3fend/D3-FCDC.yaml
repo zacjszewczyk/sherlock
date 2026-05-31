@@ -1,0 +1,244 @@
+name: 'D3-FCDC: File Content Decompression Checking'
+id: f69cf921-4f30-45c0-90ff-29c1cffa5746
+description: 'This playbook helps an analyst investigate compressed or encoded files traversing network
+  ingress/egress points (web proxies, email gateways, and network security gateways) to determine whether
+  they conceal malicious content. It guides recursive decompression and decoding of payloads followed
+  by inspection: validating that declared compressed/encoded sections actually decode per their format
+  specification, hashing and correlating extracted artifacts against known-bad/known-good corpora, detecting
+  risky archive composition (nested archives, executable+script mixtures, encrypted entries, double extensions,
+  and polyglots), and enforcing decompression-bomb guardrails. It also covers statistical baselining of
+  compression ratio, entropy, nesting, volume/frequency, and decompression failure rates, plus machine-learning
+  classification and clustering to surface novel packed-payload families. The goal is to expose decompression
+  bombs, polyglots, and packed payloads that support isolation decisions at the network boundary.'
+type: technique
+related:
+- tactic_id: D3-I
+  tactic_name: Isolate
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: For every compressed or encoded object observed at the network boundary, can we recursively
+    decompress/decode it and hash each extracted artifact (SHA-256 plus an ssdeep fuzzy hash) to find
+    exact and near-duplicate matches against known-bad and known-good corpora?
+  context: 'Goal (D3-I Isolate): adversaries deliver malware inside archives and encoded MIME parts to
+    evade inline scanners that do not unpack. Following a signature-unpack-then-hash-correlate pipeline,
+    the analyst extracts every nested artifact from Zeek files.log/http.log/smtp.log objects with compressed/encoded
+    MIME types and computes both a SHA-256 (exact match) and an ssdeep fuzzy hash (near-duplicate produced
+    by minor mutation). A direct SHA-256 match to known-bad is a high-confidence block/isolate signal;
+    a high ssdeep similarity to known-bad warrants triage. Matches against a known-good corpus suppress
+    false positives. A no-match result does not clear the file and should hand off to the structural,
+    statistical, and ML checks.'
+  answer_sources: &id001
+  - Zeek files.log
+  - Zeek http.log
+  - Zeek smtp.log
+  - Email/web proxy gateway logs
+  - Antivirus/sandbox extraction logs
+  - Windows Event ID 4688
+  - 'NAI: Network security gateways, web proxies, and email servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from files where mime_type in (compressed_or_encoded_set)
+
+      | recurse decompress/decode -> extracted_artifacts[]
+
+      | for each a in extracted_artifacts: sha256=hash(a), fuzzy=ssdeep(a)
+
+      | lookup sha256 in known_bad -> if hit: action=BLOCK, severity=high
+
+      | lookup sha256 in known_good -> if hit: suppress
+
+      | ssdeep_compare(fuzzy, known_bad_fuzzy) >= 80 -> action=TRIAGE
+
+      | emit verdict per artifact'
+- question: Does every declared compressed or encoded section in a transferred file actually decode successfully
+    and conform to its format specification, and where does the declared MIME type disagree with the decoded
+    structure?
+  context: 'Goal (D3-I Isolate): using fast object validators and model-driven format-conformance checking,
+    confirm that each declared compressed/encoded section decodes per its specification. Reject containers
+    that are truncated, CRC-inconsistent, or structurally invalid. Treat decode failure or format mismatch
+    (declared MIME != decoded structure) as a distinct isolation signal rather than a benign processing
+    error: attackers exploit lenient parsers and deliberately malform headers so a gateway gives up while
+    the endpoint still opens the file. A clean decode that matches the declared format reduces suspicion;
+    a mismatch or failure flags the object for isolation and downstream review.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from files where has_compressed_or_encoded_section=true
+
+      | run fast_object_validator(section) per declared format
+
+      | if validator.truncated or validator.crc_mismatch or validator.invalid_structure:
+
+      |     emit signal=DECODE_FAILURE, action=ISOLATE
+
+      | decoded_type = identify(decoded_bytes)
+
+      | if decoded_type != declared_mime:
+
+      |     emit signal=FORMAT_MISMATCH, action=ISOLATE
+
+      | else: pass'
+- question: Do any archives exhibit risky composition or polyglot characteristics such as nested archives,
+    executable+script mixtures, password-protected/encrypted entries, double extensions, multi-format
+    validity, or trailing data after the logical end-of-archive?
+  context: 'Goal (D3-I Isolate): apply structural rules for suspicious archive composition. Nested archives
+    and encrypted entries hide payloads from scanners; executable+script mixtures and double extensions
+    trick users; polyglot files validate as more than one format/executable type simultaneously (e.g.,
+    a ZIP/Office archive that is also a valid PE/JAR/PDF), letting one delivery slip past format-specific
+    filters. Flag multi-offset signature matches and any trailing data after the logical end-of-archive,
+    which often carries appended payloads. A clean, single-format, single-extension archive is lower risk;
+    any of these patterns is an isolation signal warranting block-or-detonate handling.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from archives
+
+      | nested_archive_depth >= 1 -> flag NESTED
+
+      | entries contains (executable AND script) -> flag MIXED_CONTENT
+
+      | any entry.encrypted or archive.password_protected -> flag ENCRYPTED
+
+      | any entry.name matches double_extension_regex -> flag DOUBLE_EXT
+
+      | count(distinct format_signature_offsets) > 1 -> flag POLYGLOT
+
+      | bytes_after(logical_eoa) > 0 -> flag TRAILING_DATA
+
+      | if any(flags): action=ISOLATE, reason=flags'
+- question: When decompressing files inline, do any exceed deterministic decompression-bomb guardrails
+    (decompressed:compressed ratio over 100:1, total decompressed output over a tuned budget like 1 GB,
+    nesting depth over 5-10, or extracted-entry count over ~10,000)?
+  context: 'Goal (D3-I Isolate): impose hard, deterministic limits during decompression that never trust
+    declared sizes, measuring actual output as it is produced. Abort and isolate when the decompressed:compressed
+    ratio exceeds 100:1, total decompressed output exceeds a tuned budget (e.g., 1 GB), nesting depth
+    exceeds 5-10, or extracted-entry count exceeds ~10,000. These absolute caps defeat single-pass overlapped-stream
+    zip bombs that evade recursion-depth-only scanners. Tune thresholds per environment, but never remove
+    the absolute output cap. Hitting a guardrail is both a protective stop (preventing resource exhaustion)
+    and an isolation signal that the object is hostile.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "during decompress(stream):\n  accumulate output_bytes, entry_count, depth\n  ratio = output_bytes\
+      \ / compressed_bytes\n  if ratio > 100 -> ABORT, signal=BOMB_RATIO\n  if output_bytes > 1_000_000_000\
+      \ -> ABORT, signal=BOMB_OUTPUT_CAP\n  if depth > 10 -> ABORT, signal=BOMB_DEPTH\n  if entry_count\
+      \ > 10000 -> ABORT, signal=BOMB_ENTRY_COUNT\n  on ABORT: action=ISOLATE"
+- question: Per file type, are any archives statistical outliers in compression ratio, decompressed size,
+    nesting depth, extracted-file count, or Shannon entropy of decoded sections (e.g., entropy above ~7.0-7.2
+    indicating packed/encrypted content)?
+  context: 'Goal (D3-I Isolate): build per-file-type distributions of compression ratio, decompressed
+    size, nesting depth, extracted-file count, and Shannon entropy of decoded sections, then flag archives
+    outside expected percentile bands. High Shannon entropy (>~7.0-7.2) indicates packed or encrypted
+    content. Derive type-specific cutoffs from per-service baselines rather than a single global threshold,
+    because legitimate entropy varies widely by format. An archive far outside its type''s band is anomalous
+    and merits inspection or isolation; values inside the band lower suspicion. This statistical layer
+    catches novel or signature-evading payloads that the symbolic rules miss.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from archives\n| stats by file_type:\n    p_ratio=pctl(compression_ratio,99), p_size=pctl(decompressed_size,99),\n\
+      \    p_depth=pctl(nesting_depth,99), p_count=pctl(extracted_file_count,99)\n| entropy = shannon(decoded_section)\n\
+      | flag if compression_ratio>p_ratio OR decompressed_size>p_size\n        OR nesting_depth>p_depth\
+      \ OR extracted_file_count>p_count\n        OR entropy > type_specific_cutoff(file_type, default\
+      \ 7.0)\n| action=TRIAGE on flag"
+- question: Is the volume or frequency of archive traffic, or the suspicious-content ratio, between any
+    source-destination pair anomalously high relative to per-sender and per-recipient baselines (suggesting
+    campaign-scale delivery)?
+  context: 'Goal (D3-I Isolate): track Volume (archive bytes and decompressed bytes per source-destination
+    per hour), Frequency (archive transfers per minute), and suspicious-content ratio, then alert when
+    values exceed an EWMA/3-sigma or upper-percentile confidence band. Maintain per-sender and per-recipient
+    baselines so a normally quiet mailbox suddenly receiving many password-protected archives stands out.
+    A burst in archive volume/frequency or a rising suspicious-content ratio indicates campaign-scale
+    delivery (mass phishing, malware distribution). Values within the baseline band are normal business
+    traffic; sustained breaches of the confidence band warrant correlation with the content-level signals
+    above.'
+  answer_sources: *id001
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from archive_transfers\n| timechart span=1h by src,dst:\n    vol=sum(archive_bytes), decvol=sum(decompressed_bytes),\n\
+      \    freq=count, susp_ratio=avg(suspicious_flag)\n| baseline ewma(vol), sigma(vol) per src,dst (and\
+      \ per sender/recipient)\n| alert if vol > ewma + 3*sigma OR freq > pctl(freq,99) OR susp_ratio rising\n\
+      | action=INVESTIGATE_CAMPAIGN"
+- question: Is there a spike in decompression failure signals from any source -- elevated decompression-failure
+    rate, CRC/checksum-error rate, encrypted-entry fraction, or declared-vs-decoded format-mismatch rate
+    -- even when no payload is successfully extracted?
+  context: 'Goal (D3-I Isolate): baseline failure-mode signals as distinct metrics, separate from successful-extraction
+    metrics: per-source decompression-failure rate, CRC/checksum-error rate, password-protected/encrypted-entry
+    fraction, and declared-vs-decoded format-mismatch rate. A spike in these from a single source frequently
+    indicates obfuscation, fuzzing/probing, or active evasion attempts even when nothing is extracted,
+    complementing the entropy/structure heuristics that separate compressed blobs from code. A source
+    whose failure rates suddenly climb above its baseline is suspicious and should be investigated and
+    potentially isolated; steady low rates are normal noise.'
+  answer_sources: *id001
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "from decompression_events\n| stats by src over 1h:\n    fail_rate=avg(decode_failed), crc_err=avg(crc_mismatch),\n\
+      \    enc_frac=avg(entry_encrypted), mismatch_rate=avg(format_mismatch)\n| baseline mean+stddev per\
+      \ src (trailing 30d)\n| alert if any metric > baseline_mean + 3*stddev\n| action=INVESTIGATE_EVASION"
+- question: When extracted executables or documents are scored by a gradient-boosted classifier over static
+    structural and byte/section entropy-histogram features, which are predicted malicious, and do the
+    alerts surface the top-3 contributing features via SHAP attribution?
+  context: 'Goal (D3-I Isolate): score extracted executables/documents with gradient-boosted models (XGBoost/Random
+    Forest) over static structural and byte/section entropy-histogram features, reusing an EMBER-style
+    feature set and labeled corpus that reaches ~98% accuracy on unseen samples. First separate packed
+    from non-packed objects so entropy does not over-flag legitimate packers. Crucially, every alert MUST
+    surface the top-3 contributing features (e.g., section entropy, import rarity, extracted-EXE count)
+    using SHAP attribution, not just a score, so an analyst can judge and act on it. A high malicious
+    probability with sensible top features is a strong isolation signal; an unexplained or low-confidence
+    score should be deprioritized or routed for review.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'from extracted_artifacts where type in (exe, doc)
+
+      | features = ember_static(a) + entropy_histogram(a)
+
+      | packed = packer_classifier(features) ; route packed vs non-packed
+
+      | score = gbm_model.predict_proba(features)
+
+      | if score >= threshold:
+
+      |     top3 = shap_top_features(model, features, k=3)
+
+      |     emit alert{score, top3, action=ISOLATE}'
+- question: Using label-free anomaly detection and clustering on per-archive/per-artifact feature vectors,
+    are there emerging packed-payload families not yet covered by signatures that should be promoted into
+    the hash/rule layer?
+  context: 'Goal (D3-I Isolate): apply label-free anomaly detection and clustering (e.g., Extended Isolation
+    Forest) on per-archive/per-artifact feature vectors -- compression ratio, nesting depth, extracted-file
+    mix, entropy histogram, decompression-failure rate -- to surface emerging packed-payload families
+    that signatures do not yet cover. Confirmed clusters feed back into the symbolic hash/rule layer so
+    the pipeline learns. A tight cluster of anomalous, similar artifacts from multiple sources suggests
+    a new campaign or malware family; isolated singletons are likely noise. This unsupervised layer is
+    the discovery mechanism that keeps the signature and rule corpora current against novel threats.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'from artifacts
+
+      | vec = [compression_ratio, nesting_depth, extracted_file_mix, entropy_hist, fail_rate]
+
+      | anomaly_score = extended_isolation_forest(vec)
+
+      | candidates = where anomaly_score > threshold
+
+      | cluster(candidates) -> families[]
+
+      | for each family with size>=N and cross_source:
+
+      |     promote representative hashes/rules -> known_bad layer, action=REVIEW'
