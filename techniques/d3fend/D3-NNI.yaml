@@ -1,0 +1,381 @@
+name: 'D3-NNI: Network Node Inventory'
+id: fc010291-de36-4256-a43e-6834ea2ac063
+description: This playbook helps an analyst investigate and validate the organization's Network Node Inventory
+  (D3-NNI) under the Asset Inventory mission question "What is the current state of our asset inventory?".
+  It guides reconciliation of authorized active discovery results (ACAS/nmap scans yielding IP, MAC, hostname,
+  OS, and exposed-service profiles) with passive network telemetry (Zeek conn/dhcp logs and Windows Filtering
+  Platform events) to produce a trustworthy census of every host, router, switch, and firewall on managed
+  address space. It covers verifying that discovery tooling runs only from authorized scanner hosts during
+  approved windows, measuring subnet coverage and scan reach, detecting unmanaged or newly emergent nodes,
+  spotting passive fingerprint/OS drift that indicates spoofing or reimaging, distinguishing sanctioned
+  inventory scanning from hostile reconnaissance, and resolving duplicate or drifting asset identities.
+  The objective is a defensible, gap-aware inventory that surfaces blind spots and rogue devices a sophisticated
+  adversary could exploit.
+type: technique
+related:
+- tactic_id: D3-AI
+  tactic_name: Asset Inventory
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are our network discovery and scanning tools (nmap, ACAS agents, scanner binaries) being executed
+    only from the documented, approved scanner hosts and accounts, and only during approved scan windows?
+  context: Under the Asset Inventory tactic, legitimate network node inventorying and hostile reconnaissance
+    look nearly identical on the wire; the difference is provenance. By examining process-creation events
+    (Windows Event ID 4688) on the approved scanner hosts, the analyst confirms that discovery binaries
+    launched only from the documented scanner host/identity allowlist within sanctioned maintenance windows.
+    A scanner binary executing from any host or account outside the allowlist, or outside the approved
+    window, is a strong indicator that an adversary (or unsanctioned insider) is performing network enumeration
+    rather than authorized inventorying. A positive (clean) result means inventory activity is accounted
+    for; an off-allowlist execution should be escalated as possible reconnaissance.
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '>-
+
+      source=WinEventLog:Security EventCode=4688
+
+      | where NewProcessName IN ("nmap.exe","nmap","scanner_agent.exe","acas*")
+
+      | eval authorized=if((host IN approved_scanner_hosts) AND (SubjectUserName IN approved_scanner_accounts)
+      AND in_window(_time, approved_scan_windows), 1, 0)
+
+      | where authorized=0
+
+      | stats count by host, SubjectUserName, NewProcessName, _time'
+- question: Can we build a reconciled active-discovery asset ledger from scan results joined to live network
+    traffic, and does every active node reconcile against the approved component baseline?
+  context: This question drives construction of the authoritative active-discovery ledger. The analyst
+    parses ACAS scan results to extract IP, MAC, hostname, OS, and discovered services, then joins to
+    Zeek conn.log to confirm each node is actually active on the wire and to surface assets that are talking
+    on the network but missing from scan output. Reconciling the merged ledger against the approved component
+    baseline flags any first-seen or unaccounted node as a deviation. This matters for Asset Inventory
+    because an asset that is live but unscanned is a blind spot, and a first-seen component may be a rogue
+    or newly compromised device. A positive result is a fully reconciled ledger; deviations require triage
+    and baseline update or incident handling.
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      scan = parse(ACAS) -> {ip, mac, hostname, os, services}
+
+      active = stats values(*) by ip from zeek_conn
+
+      ledger = join type=outer ip [scan][active]
+
+      | eval on_wire=isnotnull(active.ip), scanned=isnotnull(scan.ip)
+
+      | eval status=case(NOT in_baseline(ip),"first_seen", on_wire AND NOT scanned,"active_unscanned",
+      true(),"reconciled")
+
+      | where status!="reconciled"
+
+      | table ip, mac, hostname, os, status'
+- question: For each managed subnet, what fraction of routable address space is actually covered by discovery,
+    and has coverage dropped below the site floor or breached its statistical control limit?
+  context: 'Coverage gaps are how assets go uninventoried. For every subnet the analyst computes discovery
+    coverage = discovered_nodes / routable_addresses and tracks it on an EWMA control chart (lambda 0.2-0.3)
+    seeded from a 30-day baseline. A coverage value below a site-specific floor (e.g., <0.90 for managed
+    server VLANs) or a breach of the lower EWMA control limit signals scan gaps, newly added uncovered
+    address space, or a scanner that has silently stopped reaching part of the network. Under Asset Inventory
+    this is the core completeness metric: low coverage means the inventory cannot be trusted to be exhaustive,
+    leaving room for hidden adversary footholds. A stable in-limit coverage value is the desired state.'
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      per subnet:
+
+      coverage = discovered_nodes / routable_addresses
+
+      baseline = first 30d of coverage
+
+      EWMA_t = lambda*coverage + (1-lambda)*EWMA_{t-1}  // lambda 0.2-0.3
+
+      LCL = mean(baseline) - 3*sigma_ewma
+
+      | where coverage < subnet_floor OR EWMA_t < LCL
+
+      | alert subnet, coverage, EWMA_t, LCL'
+- question: Which hosts respond on the wire (ARP / Zeek) but fail to answer authorized scans, and is the
+    unanswered-probe ratio rising relative to the scanner's baseline?
+  context: 'Scan reach and probe-failure state are distinct from coverage: a probe may be sent and simply
+    go unanswered. The analyst tracks the unanswered-probe ratio and counts hosts that responded to ARP
+    or appear in Zeek conn.log but did not respond to authorized scans (covered-but-unscanned). A rising
+    no-response ratio versus the scanner''s baseline points to fragile or uncooperative nodes, host-based
+    firewalls, or active blocking, while hosts seen in traffic yet absent from scan results are concrete
+    inventory blind spots needing triage. This supports Asset Inventory by distinguishing ''we didn''t
+    try'' from ''we tried and got nothing,'' which changes the remediation. A flat baseline ratio is healthy;
+    a climbing ratio or growing blind-spot list warrants investigation.'
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '>-
+
+      probes = scan_attempts
+
+      no_resp_ratio = unanswered_probes / total_probes
+
+      covered_unscanned = set(zeek_conn.ip ∪ arp.ip) - set(scan_responders.ip)
+
+      | eval baseline_ratio = avg(no_resp_ratio, last 30d)
+
+      | where no_resp_ratio > baseline_ratio * 1.5 OR count(covered_unscanned) > 0
+
+      | table no_resp_ratio, baseline_ratio, covered_unscanned'
+- question: Among the scanning flows observed on the network, which match the slow, allowlisted cadence
+    of authorized inventory versus the high-fan-out pattern of hostile reconnaissance?
+  context: Even when scans are authorized somewhere, the analyst must separate them from genuine adversary
+    port-scanning. A supervised Random Forest classifier is trained on CICFlowMeter/Zeek flow features
+    (flow duration, forward/backward packet and byte counts, flow bytes/s, SYN/RST flag counts, inter-arrival
+    times) using CICIDS2017 PortScan labels to distinguish high-fan-out hostile reconnaissance from the
+    slower, allowlisted cadence of sanctioned inventory scans. The alert should surface the top-3 contributing
+    features (e.g., distinct-port count, flow rate, SYN ratio). For Asset Inventory this ensures that
+    the discovery activity feeding the ledger is the sanctioned activity and that any parallel hostile
+    scan is flagged. A 'hostile' classification on flows not originating from approved scanners is a recon
+    indicator.
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Random Forest pseudocode
+    query: '>-
+
+      features = flow_duration, fwd_pkts, bwd_pkts, fwd_bytes, bwd_bytes, flow_bytes_s, syn_count, rst_count,
+      iat_mean, distinct_dst_ports
+
+      model = RandomForest.train(CICIDS2017_PortScan_labels)
+
+      pred = model.predict(zeek_flow_features)
+
+      | where pred=="hostile_scan" AND src_ip NOT IN approved_scanners
+
+      | eval top3 = explain_top_features(model, flow)
+
+      | table src_ip, dst_subnet, pred, top3'
+- question: Do any inventory records refer to the same physical asset (duplicates) or show identity drift
+    such as reused hostnames or rapidly reimaged endpoints?
+  context: An inventory polluted with duplicate or drifting identities overstates coverage and hides real
+    assets. The analyst applies probabilistic record linkage (Fellegi-Sunter with Jaro-Winkler string
+    comparators) and entity-resolution clustering over attributes such as IP history, MAC, hostname patterns,
+    and OS/service fingerprints drawn from ACAS and Zeek, using empirically tuned match/non-match thresholds
+    to merge duplicate records and detect identity drift (e.g., a reused hostname now on a different MAC,
+    or an endpoint reimaged repeatedly). The merge should emit the matched attributes that justified each
+    link. Under Asset Inventory this keeps the node count honest and exposes suspicious identity churn
+    that can mask adversary activity. Clean, stable identities are the goal; high-churn or ambiguous matches
+    need review.
+  answer_sources:
+  - ACAS scan results
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: All managed IP address spaces and subnets.'
+  range: Last 90 days
+  queries:
+  - technology: ML/Record-linkage pseudocode
+    query: ">-\nrecords = union(ACAS_assets, zeek_derived_assets)\nfor pair in candidate_pairs(records):\n\
+      \  w = fellegi_sunter(pair, comparators={hostname:jaro_winkler, mac:exact, ip:history_overlap, os:fingerprint_sim})\n\
+      \  if w >= match_threshold: merge(pair, reason=matched_attributes)\n  elif w >= review_threshold:\
+      \ flag(pair, \"identity_drift\")\n| table cluster_id, members, matched_attributes, status"
+- question: Using only passive telemetry, can we assemble a daily census of every active node with its
+    IP-to-hostname-to-MAC binding and passive OS/application fingerprint?
+  context: Where active scanning is restricted (e.g., OT segments) or to catch what scans miss, passive
+    telemetry builds the node census. The analyst extracts unique originator and responder IPs from Zeek
+    conn.log and Windows Event ID 5156 (WFP allowed connections), enriches with Zeek dhcp.log lease details
+    to bind each IP to a hostname and MAC, and adds p0f-style passive OS/application fingerprints from
+    TCP/IP and HTTP metadata. The result is persisted as a daily active-node ledger. For Asset Inventory
+    this provides a continuously refreshed, non-intrusive view of what is actually live, including devices
+    that never appear in a scan window. A complete daily ledger is the deliverable; missing bindings indicate
+    enrichment gaps to close.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\nips = unique(conn.id.orig_h, conn.id.resp_h) ∪ unique(wfp_5156.src_ip, wfp_5156.dst_ip)\n\
+      for ip in ips:\n  lease = lookup(dhcp.log, ip) -> {hostname, mac}\n  fp = passive_fingerprint(ip)\
+      \  // p0f TCP options/MSS/TTL, HTTP UA class\n  ledger[day][ip] = {hostname:lease.hostname, mac:lease.mac,\
+      \ os:fp.os, app:fp.app}\npersist ledger[day]"
+- question: Which active nodes are unmanaged — first-seen, lacking DHCP identity context, or communicating
+    on segments they should not be on?
+  context: This is the core rogue-device hunt for passive inventory. The analyst compares the daily active-node
+    ledger against the approved inventory and expected subnet allocations, flagging first-seen nodes,
+    nodes with no DHCP identity context, and nodes communicating on disallowed segments. On OT/control
+    segments any unauthorized device or unexpected communication should be treated as an incident rather
+    than routine drift, given the safety and availability stakes. Under Asset Inventory this directly
+    answers whether anything is on the network that we do not know about — the classic foothold for an
+    external actor or an insider's unsanctioned device. No unmanaged participants is the healthy state;
+    any hit demands attribution and, on OT, immediate escalation.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\nfor node in daily_active_ledger:\n  unmanaged = (node.ip NOT IN approved_inventory)\n\
+      \             OR (node.dhcp_identity is null)\n             OR (node.segment NOT IN allowed_segments(node))\n\
+      \  if unmanaged:\n    sev = if(node.segment in OT_segments, \"incident\", \"drift\")\n    alert\
+      \ node.ip, node.mac, node.segment, sev"
+- question: Has any stable IP or MAC begun emitting a materially different passive fingerprint, suggesting
+    spoofing, reimaging, or a rogue device reusing an address?
+  context: 'Identity-bound fingerprint drift is a high-fidelity tamper signal. For each known node the
+    analyst stores its established passive fingerprint (OS family, TCP options/MSS/TTL, HTTP user-agent
+    class) and alerts when a stable IP/MAC suddenly emits a materially different fingerprint. Such a change
+    can mean address spoofing, an endpoint reimaged to a different OS, or a rogue device that has taken
+    over a known IP/MAC. For Asset Inventory this protects the integrity of the existing records: an asset
+    whose fingerprint silently changed may no longer be the asset we think it is. A consistent fingerprint
+    over time is expected; an abrupt material change warrants verification against change-management records
+    and, absent a sanctioned change, treatment as a possible impersonation.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\nfor node (key=ip or mac):\n  stored = baseline_fingerprint[node]\n  current = passive_fingerprint(node)\
+      \  // os_family, tcp_opts, mss, ttl, http_ua_class\n  if fingerprint_distance(stored, current) >\
+      \ drift_threshold:\n    alert node, stored, current, \"fingerprint_drift\""
+- question: What is the daily new-node, returning-node, and churn rate per subnet, and have any of these
+    breached their EWMA upper control limit?
+  context: Node churn quantifies how stable each subnet's population is and catches sudden rogue-device
+    introductions. The analyst computes daily new-node rate, returning-node rate, and churn ratio per
+    subnet over a rolling 30-day window and monitors each on an EWMA control chart, with control limits
+    derived per subnet from its own baseline. A point beyond the upper control limit — for example a spike
+    in new nodes — may indicate rogue-device introduction, an unmanaged deployment, or inventory drift.
+    Under Asset Inventory this provides an early, statistically grounded warning that the population of
+    a segment has shifted in a way that warrants inspection. In-limit churn is normal background change;
+    an upper-limit breach should trigger drill-down into which specific nodes drove the spike.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\nper subnet, per day:\n  new_rate = count(first_seen nodes)\n  return_rate = count(previously_seen\
+      \ nodes)\n  churn = (new + departed) / active\nEWMA on each metric, lambda 0.2-0.3, limits from\
+      \ 30d subnet baseline\n| where metric > UCL\n| alert subnet, metric_name, value, UCL, contributing_nodes"
+- question: Are any first-seen or unmanaged nodes generating a high ratio of failed or rejected connections,
+    indicating scanning or rogue behavior rather than normal use?
+  context: 'Connection-failure profiling separates noisy newcomers from benign ones. The analyst tracks
+    the volume and ratio of failed/rejected connections (Zeek conn.log conn_state S0/REJ/RSTO and Windows
+    Event ID 5157 blocked connections) attributable to first-seen or unmanaged nodes. A new node that
+    touches many destinations but completes few handshakes — a high blocked/failed-connection ratio —
+    is a far stronger rogue or reconnaissance signal than raw connection counts. For Asset Inventory this
+    enriches the unmanaged-node finding with behavioral evidence: it is the difference between a quietly
+    misconfigured device and one actively probing the network. A low failure ratio is benign; a high ratio
+    from an unmanaged node should be correlated with the rogue-device and scan-classification findings.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: ">-\nfor node in (first_seen ∪ unmanaged):\n  fails = count(conn where conn_state in (S0,REJ,RSTO))\
+      \ + count(wfp_5157 blocked from node)\n  total = count(conn from node)\n  ratio = fails / total\n\
+      \  distinct_dst = dcount(dst_ip)\n  if ratio > fail_ratio_threshold AND distinct_dst > fanout_threshold:\n\
+      \    alert node, ratio, distinct_dst, \"rogue/recon behavior\""
+- question: For nodes of unknown role, can a supervised device-type classifier infer their function and
+    flag those whose behavior diverges from their expected device type?
+  context: Knowing what a device is matters as much as knowing it exists. The analyst builds per-node
+    behavioral fingerprints from protocol mix, port usage, connection periodicity, and damped-window byte/packet
+    statistics in Zeek conn.log, then applies supervised device-type classifiers (Random Forest as in
+    IoT Sentinel; Decision Tree/kNN as in IoTSense) to infer device roles and flag nodes whose observed
+    behavior diverges from their known or expected type. Under Asset Inventory this enriches each record
+    with a behavior-derived role and exposes mismatches — e.g., a node cataloged as a printer behaving
+    like a workstation — that can indicate misclassification, repurposing, or compromise. Agreement between
+    inferred and recorded role is reassuring; divergence is a prompt to re-examine the asset.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: ML/Random Forest pseudocode
+    query: '>-
+
+      features = protocol_mix, port_usage_vector, conn_periodicity, damped_byte_stats, damped_pkt_stats
+
+      model = train(labeled_device_types)  // IoT Sentinel RF / IoTSense DT,kNN
+
+      inferred = model.predict(node_features)
+
+      | where inferred != recorded_device_type(node)
+
+      | table node, recorded_type, inferred_type, confidence'
+- question: Which unmanaged or low-confidence nodes are the strongest behavioral outliers, and what specific
+    features make them anomalous?
+  context: To prioritize triage among many unknown nodes, the analyst runs benign-trained unsupervised
+    outlier detectors (Isolation Forest, One-Class SVM) over per-node feature vectors and uses LIME to
+    surface the top-3 contributing features (e.g., distinct-destination count, byte ratio, failed-connection
+    rate) in the alert text rather than presenting an opaque anomaly score. This ranks the unmanaged/unknown
+    population by how far each node deviates from learned-normal behavior and makes each alert explainable
+    and actionable. For Asset Inventory this focuses limited analyst attention on the nodes most likely
+    to be rogue or compromised, with the evidence needed to act. A node near the normal manifold is low
+    priority; a strong outlier with telling top features should be escalated alongside the unmanaged-node
+    and connection-failure findings.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dhcp.log
+  - Windows Event ID 5156
+  - Windows Event ID 5157
+  - 'NAI: All managed subnets and any segment carrying first-party network telemetry (Zeek, DHCP, Windows
+    Filtering Platform).'
+  range: Last 90 days
+  queries:
+  - technology: ML/Isolation Forest pseudocode
+    query: ">-\nmodel = IsolationForest.train(benign_node_features)  // also One-Class SVM\nfor node in\
+      \ (unmanaged ∪ low_confidence):\n  score = model.anomaly_score(node_features)\n  if score > outlier_threshold:\n\
+      \    top3 = LIME.explain(model, node_features)  // distinct_dst, byte_ratio, fail_rate, ...\n  \
+      \  alert node, score, top3"
