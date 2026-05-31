@@ -1,0 +1,272 @@
+name: 'T1418.001: Security Software Discovery'
+id: 2deb9fc6-1b30-4992-a8ed-9ee91e6cc4b2
+description: Investigate adversary attempts to enumerate the security and management software installed
+  on managed Android and iOS devices, a Discovery behavior adversaries use to shape follow-on actions
+  such as AV/EDR evasion, conditional infection, and targeted egress. This playbook helps an analyst correlate
+  MDM/EMM application activity with network telemetry to catch newly launched apps that quickly query
+  security tooling (PackageManager, DevicePolicyManager, AppOps, Settings, LSApplicationWorkspace, canOpenURL,
+  ManagedConfiguration) and then beacon or exfiltrate. It covers risky DNS lookups within minutes of first
+  launch, low-prevalence and high-entropy (DGA-like) domains, anomalous outbound volume and frequency
+  baselining, suspicious HTTP/S POSTs to new or low-reputation SNIs, non-browser user agents, and static/dynamic
+  application vetting that flags QUERY_ALL_PACKAGES permissions, private enumeration APIs, rare permission
+  combinations, and supervised app risk scoring. The goal is to expose the discovery -> inventory -> exfiltration
+  chain on mobile endpoints.
+type: technique
+related:
+- tactic_id: TA0032
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: When a managed device launches an application for the first time (per MDM/EMM telemetry),
+    does that device make a DNS request within five minutes that resolves to a destination matched by
+    threat intelligence, and does the subsequent TLS connection carry a known-malicious JA3/JA3S fingerprint?
+  context: 'This is the discovery-to-beacon pivot: after enumerating installed security software and deciding
+    whether to proceed, mobile malware frequently calls home within minutes of first launch. Join MDM/EMM
+    new-application-launch events to network logs on the device IP and timestamp, then inspect Zeek dns.log
+    `query` values against malicious/DGA threat-intel feeds and Zeek ssl.log `ja3`/`ja3s` hashes against
+    known-bad fingerprints. A positive match tightly bound in time to a brand-new app launch is strong
+    evidence of the post-Security-Software-Discovery beacon stage; a negative result rules out the most
+    obvious known-bad infrastructure but does not clear low-prevalence or novel domains, which the statistical
+    checks cover.'
+  answer_sources: &id001
+  - Zeek dns.log
+  - Zeek conn.log
+  - Zeek ssl.log
+  - MDM/EMM application activity logs
+  - 'NAI: Corporate DNS Resolvers, Network Egress Firewalls, VPN Concentrators, MDM/EMM Platform Servers'
+  range: Last 90 days, correlated within a 5-minute window of each first app launch.
+  queries:
+  - technology: SIEM correlation pseudocode
+    query: "launches = mdm_emm_events where event='app_first_launch';\ndns = zeek_dns where device_ip=launches.device_ip\
+      \ and ts within 5m after launches.ts;\ntls = zeek_ssl where device_ip=launches.device_ip and ts\
+      \ within 5m after launches.ts;\nalert when dns.query in threat_intel(malicious_or_dga)\n  or tls.ja3\
+      \ in bad_ja3 or tls.ja3s in bad_ja3s;\noutput device, app, dns.query, tls.ja3, tls.ja3s, launch_ts"
+- question: Is a managed device querying a domain that is extremely rare across the mobile fleet (below
+    the 1st percentile of 30-day prevalence) or whose registered-domain label has high Shannon entropy
+    consistent with a DGA, and are there bursts of NXDOMAIN failures from a single device?
+  context: Adversary infrastructure used after security-software enumeration is often freshly registered
+    or algorithmically generated, so it appears only on one or a few devices and looks random. Compute
+    30-day prevalence of each queried domain across the mobile subnet and alert when a device hits a domain
+    seen by <1% of devices; separately compute Shannon entropy of the registered-domain label and alert
+    above 4.0 to catch DGA-style randomness. Because DGA beacons frequently miss, also alert distinctly
+    on >5 NXDOMAIN responses per minute from one device as a resolution-failure signal. Rare + high-entropy
+    + NXDOMAIN bursts together strongly indicate automated C2 resolution following discovery.
+  answer_sources: *id001
+  range: Last 90 days, using a rolling 30-day prevalence baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prev = prevalence(zeek_dns.query) over 30d across mobile_subnet;
+
+      alert when device.query_prevalence < percentile(1);
+
+      ent = shannon_entropy(registered_domain_label(zeek_dns.query));
+
+      alert when ent > 4.0;
+
+      nx = count zeek_dns where rcode=NXDOMAIN by device,1m;
+
+      alert when nx > 5;
+
+      output device, query, prevalence, entropy, nxdomain_rate'
+- question: Within five minutes of a first app launch, does a device's outbound byte volume exceed the
+    99th percentile of its own 30-day baseline, or does its connection frequency to a single new destination
+    exceed its baseline mean plus three standard deviations?
+  context: Per-device behavioral baselining of sent bytes and connection frequency is a validated way
+    to surface exfiltration that follows discovery, because a device that has just inventoried its security
+    tooling and begins shipping data will deviate sharply from its own norm. Baseline 30-day outbound
+    `orig_bytes` (Zeek conn.log) and conns/min per device, then alert when, inside the 5-minute post-launch
+    window, egress crosses the device's 99th percentile OR connection frequency to one new destination
+    exceeds mean + 3σ. A positive result indicates an abnormal egress burst tied to a fresh launch; a
+    negative result suggests the app's network behavior is within historical norms for that device.
+  answer_sources: *id001
+  range: Last 90 days, with a 30-day per-device baseline and 5-minute post-launch windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = baseline(zeek_conn.orig_bytes, conns_per_min) by device over 30d;\nwin = zeek_conn\
+      \ where ts within 5m after app_first_launch;\nalert when sum(win.orig_bytes) > base.p99\n  or freq(win\
+      \ to single_new_dest) > base.mean + 3*base.stddev;\noutput device, app, egress_bytes, dest, conn_freq,\
+      \ baseline"
+- question: Does a per-device time-series forecast (Prophet/LSTM) or unsupervised one-class model (Isolation
+    Forest/autoencoder) flag the post-launch outbound traffic as anomalous, and does that anomaly coincide
+    with a low-prevalence DNS query?
+  context: Static thresholds miss devices whose normal volume varies; forecasting and one-class anomaly
+    detection adapt to each device. Build a per-device model that forecasts expected `orig_bytes` in 1-minute
+    bins and flag transfers within five minutes of a new app launch that exceed the 99% prediction interval
+    AND align with a rare DNS query. Complement with an Isolation Forest/autoencoder trained only on benign
+    CICFlowMeter-style flow features so previously unseen exfil patterns are caught. Every alert must
+    list the top-3 contributing features (e.g., bytes-over-forecast, destination novelty, DNS rarity)
+    so an analyst can judge whether the deviation reflects the security-discovery-then-exfil chain or
+    a benign update spike.
+  answer_sources: *id001
+  range: Last 90 days for model training, with 1-minute scoring bins around launches.
+  queries:
+  - technology: ML pseudocode
+    query: 'model = prophet_or_lstm(zeek_conn.orig_bytes by device, 1m_bins);
+
+      anom = where observed > model.pred_interval_99 and ts within 5m after app_launch;
+
+      oc = isolation_forest_or_autoencoder(benign_flow_features);
+
+      alert when anom and dns_query_prevalence < p1 or oc.outlier=top0.5%;
+
+      explain = top3_features([bytes_over_forecast, dest_novelty, dns_rarity]);
+
+      output device, app, score, explain'
+- question: Does mobile traffic show an HTTP `host` or TLS `server_name` matching known C2 infrastructure,
+    or an HTTP request using a generic non-browser user agent (curl/Wget/python-requests/okhttp) not tied
+    to a declared developer tool, especially on a device with prior security-software enumeration?
+  context: After enumerating defenses, malware often exfiltrates over HTTP/S to attacker infrastructure,
+    sometimes betraying itself through a generic client library user agent. Match Zeek http.log `host`
+    and Zeek ssl.log `server_name` against threat-intel C2 lists, and alert on mobile HTTP requests using
+    non-browser user agents (`curl/*`, `Wget/*`, `python-requests/*`, `okhttp/*` from a non-declared app)
+    that are not attributable to a sanctioned developer tool. Correlating these hits with earlier security-software
+    discovery on the same device confirms the discovery->exfil chain. A match warrants immediate triage;
+    absence of a match shifts attention to volume and SNI-novelty baselining.
+  answer_sources: &id002
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek conn.log
+  - MDM/EMM application inventory logs
+  - 'NAI: Network Egress Points, Forward Proxies, Cloud Access Security Brokers (CASB), VPN Concentrators'
+  range: Last 90 days.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "req = zeek_http join zeek_ssl on conn_uid where device in mobile_subnet;\nalert when req.host\
+      \ in c2_intel or req.server_name in c2_intel;\nalert when req.user_agent matches ['curl/*','Wget/*','python-requests/*','okhttp/*']\n\
+      \  and app not in approved_dev_tools;\nenrich with prior security_software_discovery on device;\n\
+      output device, app, host, server_name, user_agent"
+- question: For a given application, does an HTTP/S POST exceed the 99th percentile of that app's 30-day
+    `request_body_len` baseline or go to a first-seen SNI, and are there spikes of 4xx/5xx or TLS handshake
+    failures indicating probing of dead or blocked C2?
+  context: Exfiltration shows up as abnormally large POST bodies and contact with destinations the app
+    has never used. Resolve the app via MDM inventory, build a 30-day baseline of HTTP POST `request_body_len`,
+    and alert above the 99th percentile; maintain a historical set of `server_name` values per app and
+    alert on first-seen SNIs. Derive thresholds from your own flow CSVs. As a failure-mode signal, track
+    per-app rates of HTTP 4xx/5xx and TLS handshake failures, because a spike of 404s or blocked POSTs
+    reveals an actor probing dead or blocked C2. A large POST to a brand-new SNI from a non-browser app
+    is a high-confidence exfil indicator.
+  answer_sources: *id002
+  range: Last 90 days, with a 30-day per-application baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'app = resolve_app(mdm_inventory, conn);
+
+      base = baseline(zeek_http.request_body_len) by app over 30d;
+
+      alert when post.request_body_len > base.p99;
+
+      sni_hist = historical_set(zeek_ssl.server_name) by app;
+
+      alert when post.server_name not in sni_hist;
+
+      err = rate(http_4xx_5xx, tls_handshake_fail) by app;
+
+      alert when err spikes;
+
+      output app, device, post_size, server_name, error_rate'
+- question: Does an unsupervised Isolation Forest over mobile Zeek session features flag an HTTP/S session
+    as a top-0.5% outlier, and which features drive the anomaly?
+  context: When signatures and simple baselines fall short, a one-class model trained only on benign baseline
+    traffic can surface novel anomalous sessions. Train an Isolation Forest on mobile Zeek features (URI
+    length, `request_body_len`, User-Agent prevalence, SNI prevalence, TLS version, JA3 prevalence, orig/resp
+    byte ratio) and flag the top 0.5% of outliers. Every alert must surface the top-3 anomalous features
+    so the analyst can interpret it. Layer in app-level behavioral scoring from dynamic real-device execution,
+    which exposes runtime enumeration and egress that static analysis misses. This is the catch-all for
+    stealthy exfil sessions that follow security-software discovery without tripping deterministic rules.
+  answer_sources: *id002
+  range: Last 90 days for training; score sessions continuously.
+  queries:
+  - technology: ML pseudocode
+    query: "feats = [uri_len, request_body_len, ua_prevalence, sni_prevalence,\n         tls_version,\
+      \ ja3_prevalence, orig_resp_byte_ratio];\nmodel = isolation_forest(train=benign_mobile_sessions);\n\
+      alert when session in top_0.5%_outliers;\nexplain = top3_anomalous_features(session);\nenrich with\
+      \ dynamic_app_behavior_score;\noutput device, app, session, score, explain"
+- question: Does any newly installed app declare `android.permission.QUERY_ALL_PACKAGES`, use unfiltered
+    `getInstalledPackages()`/`queryIntentActivities()` outside a declared `<queries>` element, or (iOS)
+    use private APIs like `LSApplicationWorkspace` or vendor-scheme `canOpenURL` probing without being
+    on the approved tooling allow-list?
+  context: Broad package-visibility on Android and private enumeration APIs on iOS are the primary mechanisms
+    for Security Software Discovery, and Google Play restricts QUERY_ALL_PACKAGES to a narrow set of AV/file/security/banking
+    apps. In the MDM/MTD platform, alert or block any new install whose manifest holds QUERY_ALL_PACKAGES,
+    that enumerates packages outside a declared `<queries>` element, or whose iOS scan detects LSApplicationWorkspace
+    or vendor-scheme canOpenURL probing -- unless the package name+hash is pre-approved. Keep this deterministic
+    rule even when ML is present, since ML-only detectors are evadable. A non-allow-listed app with these
+    capabilities is a strong discovery indicator and should be quarantined for vetting.
+  answer_sources: &id003
+  - MDM/EMM application scan reports
+  - Mobile application vetting platform data
+  - 'NAI: Mobile Device Management (MDM) / Enterprise Mobility Management (EMM) Platform, Integrated Mobile
+    Threat Defense (MTD) Solution, Third-party Application Vetting Service'
+  range: Last 90 days, evaluated at each new app install/update.
+  queries:
+  - technology: MDM/MTD rule pseudocode
+    query: "for app in new_installs:\n  android_hit = 'QUERY_ALL_PACKAGES' in manifest.permissions\n \
+      \   or uses(getInstalledPackages|queryIntentActivities) without <queries>;\n  ios_hit = scan.private_api\
+      \ in [LSApplicationWorkspace] or vendor_canOpenURL_probing;\n  alert/block when (android_hit or\
+      \ ios_hit)\n    and (app.package, app.hash) not in approved_allowlist;\n  output app, platform,\
+      \ capability, developer"
+- question: During static analysis, does a non-security app's disassembled code contain suspicious enumeration
+    API strings (e.g., getInstalledPackages, getActiveAdmins, isDeviceOwnerApp) or AppOps reads of PACKAGE_USAGE_STATS/BIND_DEVICE_ADMIN/BIND_VPN_SERVICE?
+  context: Drebin-style explainable feature sets show that the presence of specific enumeration and policy-introspection
+    API strings in an app's bytecode is a strong indicator of security/management discovery intent. During
+    static analysis, match the disassembled dexcode against the suspicious-API string set (getInstalledPackages,
+    getSystemService, getActiveAdmins, isDeviceOwnerApp) and AppOps reads of PACKAGE_USAGE_STATS, BIND_DEVICE_ADMIN,
+    and BIND_VPN_SERVICE, then alert when these appear in an app that is not a declared security product.
+    A hit in a game or social app is far more suspicious than the same string in an AV product, so weight
+    by app category and developer reputation when triaging.
+  answer_sources: *id003
+  range: Last 90 days, at each static analysis run.
+  queries:
+  - technology: Static-analysis rule pseudocode
+    query: 'api_set = [getInstalledPackages, getSystemService, getActiveAdmins, isDeviceOwnerApp];
+
+      appops = [PACKAGE_USAGE_STATS, BIND_DEVICE_ADMIN, BIND_VPN_SERVICE];
+
+      hits = match(disassembled_dex, api_set) + appops_reads(appops);
+
+      alert when hits and app.category != security;
+
+      output app, matched_apis, category, developer'
+- question: Across the full app inventory, is QUERY_ALL_PACKAGES held by a non-security app whose prevalence
+    is in the bottom 5th percentile for its Play-store category, or does an app exhibit a statistically
+    improbable permission co-occurrence (e.g., QUERY_ALL_PACKAGES + RECORD_AUDIO)?
+  context: 'Rarity within a peer group exposes apps that hold enumeration permissions when almost no peer
+    app does. Periodically analyze the entire app inventory: compute the prevalence of QUERY_ALL_PACKAGES
+    within each Play-store category and flag any non-security app (Games, Social, etc.) holding it when
+    its prevalence falls in the bottom 5th percentile for that category. Also compute permission co-occurrence
+    (Jaccard index) and flag statistically improbable combinations below a 1st-percentile co-occurrence
+    threshold, since pairings like QUERY_ALL_PACKAGES + RECORD_AUDIO suggest discovery plus collection.
+    These statistical outliers are good candidates for deeper vetting even without a code-level match.'
+  answer_sources: *id003
+  range: Last 90 days, recomputed on each inventory snapshot.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for cat in play_categories:\n  prev = prevalence('QUERY_ALL_PACKAGES') within cat;\n  alert\
+      \ when app.category=cat and app.category!=security\n    and prev < percentile(5);\njac = jaccard(permission_pairs)\
+      \ across inventory;\nalert when app has pair below percentile(1) (e.g., QUERY_ALL_PACKAGES+RECORD_AUDIO);\n\
+      output app, category, permission, prevalence, cooccurrence"
+- question: Does a supervised app-risk classifier (XGBoost/Random Forest) assign a high risk score to
+    an app based on QUERY_ALL_PACKAGES/private-API usage, permission counts, developer reputation, and
+    update recency, and do behavioral Markov/dynamic models confirm enumeration bursts?
+  context: A supervised model fuses many weak signals into a prioritized risk score for vetting. Train
+    a classifier producing an app risk score from a high-weight binary flag for QUERY_ALL_PACKAGES/private-API
+    usage, requested-permission count, other dangerous permissions (e.g., INSTALL_PACKAGES), developer
+    reputation, rating count, and time-since-update, then auto-submit high scores to dynamic sandbox analysis.
+    Output the top-3 contributing features per app for explainability. Complement static scoring with
+    behavioral models -- MaMaDroid-style Markov chains over package/family API transitions detect enumeration
+    bursts robustly to API churn, and real-device dynamic execution adds runtime features. A high score
+    plus a confirmed enumeration burst is a strong discovery indicator warranting removal.
+  answer_sources: *id003
+  range: Last 90 days for training; score apps at install and on inventory refresh.
+  queries:
+  - technology: ML pseudocode
+    query: "feats = [flag_query_all_or_private_api*high_weight, permission_count,\n         dangerous_perms,\
+      \ developer_reputation, rating_count, time_since_update];\nscore = xgboost_or_rf.predict(feats);\n\
+      explain = top3_features(feats);\nif score >= high: submit_to_dynamic_sandbox(app);\nbehavior = mamadroid_markov(api_transitions)\
+      \ + dynamic_realdevice_features;\nalert when score>=high and behavior.enumeration_burst;\noutput\
+      \ app, score, explain, behavior_flags"
