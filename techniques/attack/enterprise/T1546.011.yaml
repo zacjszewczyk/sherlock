@@ -1,0 +1,617 @@
+name: 'T1546.011: Application Shimming'
+id: 0beeb661-9b4d-4cf0-b59d-a67931ab74ca
+description: Investigate potential abuse of the Microsoft Windows Application Compatibility Infrastructure
+  (application shimming, T1546.011) for persistence and privilege escalation. Adversaries register custom
+  shim databases (.sdb) — typically via sdbinst.exe — to hook and redirect the execution of legitimate
+  programs, injecting DLLs (InjectDLL), bypassing User Account Control through auto-elevating executables
+  (eventvwr.exe, fodhelper.exe, computerdefaults.exe, msconfig.exe), disabling defenses, and re-running
+  malicious code whenever a shimmed program launches. This playbook helps an analyst hunt for malicious
+  .sdb files dropped to user-writable or AppPatch\Custom directories, suspicious sdbinst.exe executions,
+  modifications of the AppCompatFlags Custom/InstalledSDB registry keys, and the post-installation behavior
+  of shim-target and auto-elevating processes (anomalous child processes, integrity-level jumps, unsigned
+  DLL loads, and outbound C2 connections). It combines symbolic-logic detections, statistical baselining
+  (frequency, volume, entropy, and failure-mode anomalies), and machine-learning approaches (classification,
+  sequence modeling, and provenance-graph analysis), drawing on documented FIN7 shim tradecraft.
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any newly created custom shim database (.sdb) in %WINDIR%\AppPatch\Custom\ (or Custom64)
+    matched known-malicious threat intelligence by hash or triggered a YARA rule for malicious shim content?
+  context: 'Persistence via application shimming begins with the creation of a custom shim database. Trigger
+    on file creation events (Sysmon Event ID 11 / Windows Event ID 4663) where the TargetFilename ends
+    in ''.sdb'' under %WINDIR%\AppPatch\Custom\ or \Custom\Custom64\, compute the SHA256 and query CTI,
+    and scan the content with YARA. Also surface documented FIN7 tells: random-GUID .sdb filenames, an
+    .sdb staged first as a .tmp in C:\Windows\Temp, and a fake ''Microsoft KB#######'' uninstall description
+    in the Add/Remove Programs registry. A hash/CTI or YARA hit on a fresh custom .sdb is strong evidence
+    of an attempt to persist by hooking legitimate programs; a clean result lowers but does not eliminate
+    suspicion since novel shims may evade signatures.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "file_create where (Sysmon.EventID==11 OR Security.EventID==4663)\n  and TargetFilename matches\
+      \ (?i)\\\\AppPatch\\\\Custom(64)?\\\\.*\\.sdb$\n| eval sha256=hash(TargetFilename)\n| lookup CTI\
+      \ sha256 OR yara_scan(TargetFilename, rules='malicious_shim')\n| eval fin7=(filename matches GUID)\
+      \ OR staged_as_tmp_in('C:\\\\Windows\\\\Temp')\n       OR uninstall_desc matches '(?i)Microsoft\
+      \ KB[0-9]+'\n| where cti_hit OR yara_hit OR fin7\n| alert"
+- question: Do any newly created custom .sdb files exhibit abnormally high Shannon entropy relative to
+    the known-good baseline, indicating a packed or encrypted payload concealed inside the shim database?
+  context: Beyond signature matching, malicious shims often carry packed/encrypted payloads that raise
+    file entropy. For every new .sdb in the custom-shim directory, compute Shannon entropy and file size,
+    build a baseline distribution from known-good .sdb files, and alert when entropy exceeds the 95th
+    percentile (derive the exact per-environment cutoff). High entropy on a custom shim is a statistical
+    anomaly consistent with malware staging and warrants escalation; entropy within the benign band is
+    reassuring but should still be correlated with the writer process and install context for this persistence
+    technique.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = entropy distribution of known-good *.sdb\nfor new_sdb in AppPatch\\Custom:\n  e\
+      \ = shannon_entropy(new_sdb); sz = filesize(new_sdb)\n  if e > percentile(baseline.entropy, 95):\
+      \ alert(new_sdb, e, sz)"
+- question: When a new .sdb is scored by the gradient-boosting / Random Forest classifier trained on benign
+    vs. malicious shim features, does it exceed the 0.90 malicious-confidence threshold?
+  context: To catch novel shims that evade hash and YARA detection, train a gradient-boosting / Random
+    Forest classifier on byte/section n-gram and Shannon-entropy features from labeled benign vs. malicious
+    .sdb files, then classify each new .sdb in real time. Alert above confidence 0.90 and ALWAYS surface
+    the top-3 contributing features (e.g., section entropy, suspicious string n-grams, writer process)
+    so the analyst can triage. A high-confidence malicious classification on a freshly written custom
+    shim strongly indicates an attempt to persist via application shimming; the explainable features point
+    at exactly what made the file suspicious.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'model = GradientBoosting/RandomForest.fit(features=[byte_ngrams, section_entropy, strings],
+      labels)
+
+      for new_sdb: p = model.predict_proba(features(new_sdb))
+
+      if p_malicious > 0.90: alert(new_sdb, top3=model.explain(new_sdb))'
+- question: Is there an anomalous spike in access-denied writes to %WINDIR%\AppPatch\Custom\ or in failed/aborted
+    sdbinst.exe executions on any host, suggesting an under-privileged adversary attempting shim installation?
+  context: 'Adversaries lacking administrator rights will generate failure signals when they attempt to
+    install shims. Explicitly baseline these as a distinct count/min series per host: access-denied writes
+    to %WINDIR%\AppPatch\Custom\ (Event ID 4663 with a failed access mask) and failed/aborted sdbinst.exe
+    runs. Compute per-host z-scores and alert on spikes. A burst of blocked shim writes is high-signal
+    for an attacker probing for persistence without the needed privileges; the absence of such failures
+    does not rule out a successful privileged install, which the other detections cover.'
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "series = count_per_min(EventID==4663 and path~AppPatch\\Custom and access_result=='DENIED'\n\
+      \                       OR sdbinst.exe exit_status!=0) by host\nz = (series - mean_host)/std_host\n\
+      if z > 3: alert(host, window)"
+- question: Was sdbinst.exe executed with a command line referencing a .sdb (or .tmp) file located in
+    a user-writable directory such as C:\Users\, C:\Temp\, C:\Windows\Temp\, %APPDATA%, or C:\ProgramData\?
+  context: Legitimate shim installs are normally driven by trusted installers writing to controlled locations;
+    an attacker stages the .sdb in a user-writable path. Trigger on process creation (Sysmon Event ID
+    1 / Windows Event ID 4688) where Image is sdbinst.exe and the CommandLine references a .sdb or .tmp
+    in a user-writable path. The .tmp-staged shim in C:\Windows\Temp is a documented FIN7 pattern. A match
+    indicates a likely malicious shim registration for persistence; investigate the parent process, the
+    user context, and the referenced .sdb file.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Staging Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc_create where Image endswith 'sdbinst.exe'\n  and CommandLine matches (?i)(c:\\\\users\\\
+      \\|c:\\\\temp\\\\|c:\\\\windows\\\\temp\\\\|\\\\appdata\\\\|c:\\\\programdata\\\\).*\\.(sdb|tmp)\n\
+      | alert(host, user, parent=ParentImage, CommandLine)"
+- question: Does any sdbinst.exe execution reference a .sdb parent directory that is first-seen or observed
+    fewer than five times across the last 90 days?
+  context: Malicious shim installs often originate from directories never used for legitimate patching.
+    Parse the .sdb parent directory from every sdbinst.exe command line and keep a 90-day frequency table;
+    alert when the parent directory is first-seen or seen fewer than 5 times, applying the rare-value
+    baseline pattern of MITRE CAR-2014-11-002. A rare or novel install directory is a statistical outlier
+    worth investigating for persistence; common, frequently used directories are more likely legitimate
+    but should still be checked against the allowlist of trusted installers.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Staging Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'freq = count(sdb_parent_dir) over 90d from sdbinst.exe cmdlines
+
+      for each sdbinst event: d = parent_dir(sdb_path)
+
+      if freq[d] < 5 or first_seen(d): alert(host, d)'
+- question: Is sdbinst.exe being launched by a rare or non-standard parent process — for example powershell.exe
+    or cmd.exe rather than msiexec.exe or an approved patch agent?
+  context: 'The lineage of sdbinst.exe is a strong discriminator: legitimate installs flow from installer/patch
+    processes, while attacker installs are frequently spawned by interactive shells or scripting engines.
+    Maintain a per-environment frequency baseline of sdbinst.exe parent processes and its invocation rate
+    (count/min), and alert when the parent is rare (bottom 1st percentile) or non-standard. A shell- or
+    script-spawned sdbinst.exe is a high-signal persistence indicator under the outlier-parent pattern
+    of MITRE CAR-2014-11-002.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Staging Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "parent_freq = count(ParentImage) where Image=='sdbinst.exe' over baseline\nfor each sdbinst\
+      \ event:\n  if percentile_rank(parent_freq[ParentImage]) < 1\n     or ParentImage in (powershell.exe,\
+      \ cmd.exe, wscript.exe): alert"
+- question: When unsupervised novelty detection is applied to sdbinst.exe events (user context, parent
+    process, .sdb directory, time-of-day), do any executions fall into small/sparse clusters or land outside
+    the learned boundary?
+  context: Multi-feature anomalies in shim installs can be surfaced without labels. Apply Isolation Forest
+    / DBSCAN / One-Class SVM over sdbinst.exe event features — user context, parent process, full .sdb
+    directory, time-of-day — and investigate small/sparse clusters or out-of-boundary points, using LIME-style
+    attribution to surface the top-3 deviating features. Outlier sdbinst.exe executions that combine an
+    unusual user, parent, directory, and time are prime persistence candidates; the attribution explains
+    which feature combination triggered the alert.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Staging Servers, Application Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'X = features(sdbinst events: user, parent, sdb_dir, hour)
+
+      model = IsolationForest/DBSCAN/OneClassSVM.fit(X)
+
+      for e in new events: if model.is_outlier(e): alert(e, top3=LIME(e))'
+- question: Did a known shim-target process (services.exe, spoolsv.exe, explorer.exe, svchost.exe) spawn
+    a C2-associated child (powershell.exe, rundll32.exe, cmd.exe) or load an unsigned/unusual DLL, and
+    then make an outbound connection to a CTI-blocklisted IP?
+  context: 'This correlation captures the payoff of a shim: injected code executing inside a trusted process.
+    Correlate (1) a shim-target process starting; (2) within 60s it spawns a C2-associated child OR loads
+    an unsigned/unusual DLL (Sysmon Event ID 7, the InjectDLL shim effect); (3) the child makes an outbound
+    connection (Sysmon Event ID 3 / Zeek conn.log) to a CTI-blocklisted IP. The FIN7 case patched services.exe
+    to inject a backdoor. A full chain match is high-confidence evidence of active shim-based persistence
+    with C2; partial matches still merit investigation.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: 'Last 90 days (event-centered: 60s correlation window after shim-target launch)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "seq within 60s:\n  A: proc_create Image in (services.exe, spoolsv.exe, explorer.exe, svchost.exe)\n\
+      \  B: child of A in (powershell.exe, rundll32.exe, cmd.exe)\n     OR module_load(EventID==7) unsigned/unusual\
+      \ DLL into A\n  C: netconn (Sysmon EID3/Zeek conn) from B to dest in CTI_blocklist\n| join on ProcessGuid\
+      \ | alert"
+- question: For each shim-target process, are there bottom-1st-percentile rare child names or destination
+    ASNs, anomalous bytes-out volume, or a burst of NXDOMAIN/failed connections coinciding with a shim
+    event?
+  context: Statistical baselining of a shim-target process's behavior reveals injected activity. Build
+    a 30-day baseline of each shim-target process's child names, destination ASNs, and bytes-out from
+    Zeek conn.log; alert on bottom-1st-percentile child/ASN. Separately track NXDOMAIN/failed-connection
+    rates per process as a distinct series — a burst of NXDOMAIN or blocked egress alongside a shim event
+    is high-signal — using per-host z-scores. Rare children/ASNs or failure spikes around shim activity
+    strongly suggest a hijacked trusted process beaconing or resolving C2.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline 30d per shim_target_proc: child_names, dest_ASN, bytes_out, nxdomain_rate\nfor events:\
+      \ if pct_rank(child)<1 or pct_rank(ASN)<1\n            or zscore(bytes_out)>3 or zscore(nxdomain_rate)>3:\
+      \ alert"
+- question: When an LSTM autoencoder scores the event sequence immediately following the launch of a shim-target
+    process, does the reconstruction error exceed the anomaly threshold?
+  context: Sequence modeling captures abnormal behavior chains that simple rules miss. Train an LSTM autoencoder
+    on event sequences (process creations, module loads, network, registry) immediately following the
+    launch of shim-target processes, and flag high reconstruction error, outputting the top-3 reconstruction-error
+    contributors in the alert. A high-error sequence after a trusted process starts indicates the process
+    is behaving unlike its learned norm — consistent with shim-injected code executing for persistence;
+    low error reflects normal post-launch behavior.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'seqs = event_sequences after launch of shim_target_procs
+
+      ae = LSTM_autoencoder.fit(normal seqs)
+
+      for s in new seqs: err = ae.reconstruction_error(s)
+
+      if err > threshold: alert(s, top3=err_contributors(s))'
+- question: Does graph representation learning over the host provenance graph flag the shim-install plus
+    post-shim-injection subgraph as anomalous?
+  context: Provenance-graph analysis ties the entire shim-persistence chain together for root-cause triage.
+    Construct a host provenance graph (process/file/registry/network nodes) and score the shim-install
+    + post-shim-injection subgraph with graph representation learning — node-level GNN tracing (ThreaTrace),
+    masked-graph self-supervised detection (MAGIC), or temporal-GNN with auto-reconstructed analyst-readable
+    attack graphs (KAIROS) — surfacing the implicated nodes/edges. An anomalous subgraph linking the .sdb
+    write, sdbinst.exe, registry change, and injected behavior is strong, explainable evidence of shim-based
+    persistence.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'G = provenance_graph(processes, files, registry, network)
+
+      model = ThreaTrace/MAGIC/KAIROS.fit(G_benign)
+
+      score = model.score_subgraph(shim_install + post_injection nodes)
+
+      if score > threshold: alert(subgraph=implicated_nodes_edges)'
+- question: Was the AppCompatFlags Custom or InstalledSDB registry key modified, or a file created in
+    %WINDIR%\AppPatch\Custom*, by a process that is NOT on the allowlist of trusted installers/patch tools?
+  context: These are the canonical shim registration artifacts. Alert on any modification to HKLM\SOFTWARE\Microsoft\Windows
+    NT\CurrentVersion\AppCompatFlags\Custom\ or ...\InstalledSDB\ (Sysmon Event ID 13 / Windows Event
+    ID 4657) or file creation in %WINDIR%\AppPatch\Custom* (Sysmon Event ID 11) by a process not on an
+    allowlist (sdbinst.exe launched by a trusted patch agent). An off-allowlist writer touching these
+    keys/paths is a direct indicator of unauthorized shim persistence and should be triaged immediately.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'reg_set (EID13/4657) on ...\AppCompatFlags\Custom\* OR ...\InstalledSDB\*
+
+      OR file_create (EID11) in %WINDIR%\AppPatch\Custom*
+
+      | where WriterProcess not in allowlist(trusted_installers)
+
+      | alert(host, WriterProcess, target)'
+- question: Are shim registry/file modifications occurring outside normal patch/maintenance windows —
+    more than 3 standard deviations from the host's baseline by hour-of-day and day-of-week?
+  context: Timing is a strong discriminator between legitimate patching and covert shim installs. Baseline
+    shim registry/file modification counts by hour-of-day and day-of-week per host, and alert on events
+    exceeding 3 standard deviations from legitimate patch/install windows. A shim change at an unusual
+    time (e.g., off-hours, outside change windows) is anomalous and consistent with an attacker establishing
+    persistence; changes inside known maintenance windows are more likely benign but should be cross-checked
+    with the allowlist.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = count(shim_mod) by host, hour_of_day, day_of_week
+
+      for event: z = (count - mean[host,hod,dow]) / std[host,hod,dow]
+
+      if z > 3: alert(host, event_time)'
+- question: Does the Random Forest classifier score a shim file/registry modification as high-confidence
+    'suspicious' based on parent process, user context, time-of-day, signing status, and correlated recent
+    events?
+  context: An explainable ensemble can weigh multiple weak signals into a confident verdict. Train a Random
+    Forest to score shim file/registry modifications using parent process, user context, time-of-day,
+    signing status, and correlated recent events; alert on high-confidence 'suspicious' and surface the
+    top-3 feature importances. A high-confidence suspicious score on a shim modification — for example
+    an unsigned shell parent at an odd hour alongside other recent anomalies — is strong evidence of unauthorized
+    shim persistence, with the feature importances guiding triage.
+  answer_sources:
+  - Windows Event ID 4663
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'model = RandomForest.fit(features=[parent, user, hour, signed, recent_corr], labels)
+
+      for mod in shim_modifications: p = model.predict_proba(features(mod))
+
+      if p_suspicious > threshold: alert(mod, top3=model.feature_importances(mod))'
+- question: Was a custom .sdb file created in a user-writable directory (%TEMP%, %APPDATA%, C:\Users\*,
+    C:\Windows\Temp) that matches a YARA rule for shims targeting auto-elevating executables such as eventvwr.exe,
+    fodhelper.exe, or msconfig.exe?
+  context: UAC-bypass shims are dropped to user-writable locations and tuned to hook auto-elevating Microsoft
+    binaries. Watch for .sdb (and .tmp-staged) file creation (Sysmon Event ID 11) in user-writable dirs
+    and scan with YARA rules tuned for shims that target eventvwr.exe, fodhelper.exe, and msconfig.exe;
+    the .tmp staging path is a FIN7 IOC. A YARA hit on such a file indicates an attempt to escalate privileges
+    by abusing application shimming for UAC bypass — a Medium-integrity user preparing to gain High integrity.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'file_create (EID11) where TargetFilename matches (?i)(c:\\users\\|\\temp\\|\\appdata\\|windows\\temp).*\.(sdb|tmp)
+
+      | yara_scan(TargetFilename, rules=''uac_bypass_shim: eventvwr|fodhelper|msconfig'')
+
+      | where yara_hit | alert'
+- question: Does any .sdb in a user-writable directory have a file size and entropy within 2 standard
+    deviations of a known UAC-bypass shim profile, or above the 95th-percentile benign entropy?
+  context: Known UAC-bypass shims have characteristic size/entropy signatures. Profile file size and Shannon
+    entropy of .sdb files in user-writable dirs and flag any within 2 standard deviations of a known UAC-bypass
+    shim profile or above the 95th-percentile benign entropy. A file matching the bypass-shim profile
+    or exhibiting packed-payload entropy is a statistical indicator of a privilege-escalation shim staged
+    for execution; benign temp files should fall well within the normal entropy band.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for sdb in user_writable_dirs:\n  sz=filesize(sdb); ent=shannon_entropy(sdb)\n  if within_2std(sz,ent,\
+      \ known_uac_shim_profile) or ent>percentile(benign,95): alert(sdb)"
+- question: When the classifier scores .sdb files in user-writable directories using path, size, entropy,
+    n-grams, and writer-process features, does it flag any as high-confidence malicious?
+  context: A supervised classifier separates benign temp files from malicious UAC-bypass shims. Train
+    a gradient-boosting / Random Forest model on file-path patterns, size, entropy, n-grams, and writer-process
+    features; alert on high-confidence malicious and surface the top-3 contributing features. A high-confidence
+    malicious verdict on a .sdb in %TEMP%/%APPDATA% indicates a probable privilege-escalation shim; the
+    contributing features (e.g., entropy, writer process, suspicious n-grams) accelerate triage.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'model = GradientBoosting/RandomForest.fit(features=[path, size, entropy, ngrams, writer],
+      labels)
+
+      for sdb in user_writable_dirs: p=model.predict_proba(features(sdb))
+
+      if p_malicious>0.90: alert(sdb, top3=model.explain(sdb))'
+- question: Is there an anomalous spike in access-denied .sdb writes or failed sdbinst.exe elevations
+    on a host, indicating a Medium-integrity adversary attempting a UAC-bypass shim?
+  context: Failed elevation attempts leave detectable traces. Baseline access-denied .sdb writes (Event
+    ID 4663 failed access) and failed sdbinst.exe elevations as a distinct count/min series, scoring spikes
+    with per-host z-scores. A spike in blocked .sdb writes or failed elevations is high-signal for a Medium-integrity
+    attacker trying to install a UAC-bypass shim; the absence of failures does not exclude a successful
+    bypass, which the sequence and integrity detections cover.
+  answer_sources:
+  - Windows Event ID 4663
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = count_per_min(EID4663 denied .sdb write OR sdbinst.exe failed) by host
+
+      z = (series - mean_host)/std_host
+
+      if z > 3: alert(host, window)'
+- question: Did sdbinst.exe execute and, within 10 seconds and under the same user/LogonId, an auto-elevating
+    executable on the UAC-bypass watchlist (eventvwr.exe, msconfig.exe, fodhelper.exe, computerdefaults.exe)
+    launch?
+  context: The defining sequence of a shim-based UAC bypass is installing the shim then immediately triggering
+    an auto-elevating binary. Trigger when sdbinst.exe is followed within 10s by a watchlisted auto-elevating
+    executable sharing the same User and LogonId. This tight, same-session pairing strongly indicates
+    an active privilege-escalation attempt via application shimming; investigate the .sdb installed and
+    the subsequent High-integrity child processes.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Administrator Jump Boxes'
+  range: 'Last 90 days (event-centered: 10s window after sdbinst.exe)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "seq within 10s same (User, LogonId):\n  A: proc_create Image endswith 'sdbinst.exe'\n  B:\
+      \ proc_create Image in (eventvwr.exe, msconfig.exe, fodhelper.exe, computerdefaults.exe)\n| alert(host,\
+      \ user, A, B)"
+- question: Does the process transition sdbinst.exe -> auto-elevating-executable within a 10-second window
+    fall in the bottom 0.1% of observed sequential process pairs over the last 30 days?
+  context: Rare process transitions expose attack sequences statistically. Maintain transition probabilities
+    for sequential process pairs within a 10s window over 30 days and alert when sdbinst.exe -> auto-elevating-exe
+    falls in the bottom 0.1%, combining rare-pair baselining (MITRE CAR-2014-11-002) with multi-order
+    Markov transition modeling. An ultra-rare transition into an auto-elevating binary right after a shim
+    install is a high-signal privilege-escalation indicator; common transitions reflect normal usage.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Administrator Jump Boxes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "trans = P(proc_B | proc_A within 10s) over 30d\nfor pair (sdbinst.exe -> auto_elevating_exe):\n\
+      \  if percentile_rank(trans[pair]) < 0.1: alert(host, pair)"
+- question: When per-user process sequences are scored with a Markov chain or RNN, does the observed sdbinst.exe
+    -> auto-elevating-executable sequence fall below the anomaly likelihood threshold?
+  context: Probabilistic sequence models flag improbable activity per user. Model per-user process sequences
+    with a Markov chain or RNN trained on normal activity, compute the likelihood of the observed sdbinst.exe
+    -> auto-elevating-exe sequence, and alert below an anomaly threshold while surfacing the lowest-probability
+    transition. A very-low-likelihood sequence for that user indicates anomalous behavior consistent with
+    a shim-driven UAC bypass; the flagged transition pinpoints where the activity deviated from the user's
+    norm.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Administrator Jump Boxes'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'model = Markov/RNN.fit(per_user normal process sequences)
+
+      L = model.likelihood(observed seq incl sdbinst.exe -> auto_elevating_exe)
+
+      if L < anomaly_threshold: alert(user, lowest_prob_transition)'
+- question: Is there a process ancestry where a Medium-integrity process spawns an auto-elevating executable
+    (e.g., eventvwr.exe) at High integrity, which then spawns a High-integrity child (cmd.exe/powershell.exe)?
+  context: The integrity-level escalation chain is the observable footprint of a successful UAC bypass.
+    Using Sysmon Event ID 1 ancestry (join on ProcessGuid/ParentProcessGuid), detect a Medium-integrity
+    grandparent spawning an auto-elevating parent at High integrity that spawns a High-integrity child.
+    Correlate with a recent custom-shim install. A Medium -> High -> High chain through an auto-elevating
+    binary is a hallmark of shim-based RedirectEXE/UAC bypass and warrants immediate investigation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "join Sysmon EID1 on ProcessGuid/ParentProcessGuid:\n  GP: IntegrityLevel==Medium\n  P : Image\
+      \ in (eventvwr.exe, fodhelper.exe, ...) and IntegrityLevel==High and parent==GP\n  C : Image in\
+      \ (cmd.exe, powershell.exe) and IntegrityLevel==High and parent==P\n| alert(chain GP->P->C)"
+- question: Does an auto-elevating executable spawn a statistically rare child (e.g., cmd.exe from eventvwr.exe
+    seen <0.01% of the time) accompanied by a Medium-to-High integrity jump?
+  context: Auto-elevating binaries have predictable normal children; deviations expose abuse. Baseline
+    each auto-elevating executable's typical children and frequencies and alert when it spawns a statistically
+    rare child accompanied by a Medium->High integrity jump. A rare child plus an integrity jump (e.g.,
+    a shell from eventvwr.exe) is high-signal for a shim-driven UAC bypass; expected children without
+    integrity anomalies reflect normal behavior.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = freq(child | auto_elevating_parent)
+
+      for event: if pct(child)<0.01 and integrity_jump(Medium->High): alert(parent, child)'
+- question: Does graph representation learning over the host process graph flag the Medium->High->High
+    UAC-bypass subgraph as anomalous?
+  context: Graph-based detection captures the structural anomaly of a UAC bypass. Represent the host process
+    graph (nodes=processes with name/integrity-level, edges=parent-child) and use graph representation
+    learning (ThreaTrace, MAGIC) to flag the Medium->High->High subgraph as anomalous, emitting the implicated
+    subgraph for analyst review (KAIROS). An anomalous integrity-escalation subgraph through an auto-elevating
+    binary is strong, explainable evidence of shim-based privilege escalation.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'G = process_graph(nodes=proc{name,integrity}, edges=parent_child)
+
+      model = ThreaTrace/MAGIC.fit(G_benign)
+
+      if model.anomaly(Medium->High->High subgraph): alert(subgraph)'
+- question: Did a watchlisted auto-elevating utility (computerdefaults.exe, dccw.exe, msconfig.exe, eventvwr.exe)
+    initiate an external (non-RFC1918) network connection, write an executable to disk, or load an unsigned
+    DLL?
+  context: After shim-driven elevation, auto-elevating utilities should not be networking, dropping executables,
+    or loading unsigned DLLs. Alert when a watchlisted auto-elevating utility initiates an external connection
+    (non-RFC1918 dest in Zeek conn.log / Sysmon Event ID 3), writes an executable (.exe/.dll/.ps1/.bat)
+    to disk (Sysmon Event ID 11), or loads an unsigned DLL (Sysmon Event ID 7, shim InjectDLL) — all behaviors
+    outside these utilities' normal profile. Such activity indicates the elevated process is being used
+    to further the intrusion.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - Windows Event ID 4663
+  - 'NAI: User Workstations, Network Egress Points, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "proc in (computerdefaults.exe, dccw.exe, msconfig.exe, eventvwr.exe) AND (\n   netconn (EID3/Zeek\
+      \ conn) to dest NOT in RFC1918\n   OR file_create (EID11) ext in (.exe,.dll,.ps1,.bat)\n   OR module_load\
+      \ (EID7) unsigned DLL )\n| alert(host, proc, action)"
+- question: For each auto-elevating process, are there high-entropy (DGA-like) domains, statistically
+    rare write paths, or a spike in NXDOMAIN/failed-resolution and blocked-connection rates?
+  context: Statistical baselining of post-elevation network and file behavior reveals C2 and staging.
+    Baseline domains (Zeek dns.log), file-write paths, and bytes-out per auto-elevating process; alert
+    on top-5% domain-name Shannon entropy (DGA) or rare write paths, and track NXDOMAIN/failed-resolution
+    and blocked-connection rates as a distinct series (DGA fallback often spikes NXDOMAIN), scored with
+    z-scores. High-entropy domains or NXDOMAIN bursts from an elevated utility are high-signal indicators
+    of shim-enabled C2 following privilege escalation.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - Windows Event ID 4663
+  - 'NAI: User Workstations, Network Egress Points, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "per auto_elevating_proc baseline: domains, write_paths, bytes_out, nxdomain_rate\nfor event:\
+      \ if domain_entropy in top5% (DGA) or rare(write_path)\n           or zscore(nxdomain_rate)>3 or\
+      \ zscore(blocked_conn)>3: alert"
+- question: When a One-Class SVM / Isolation Forest trained on each critical auto-elevating process's
+    normal behavior is applied, does any activity fall outside the learned boundary?
+  context: Novelty detection isolates abnormal post-elevation behavior per process. For each critical
+    auto-elevating process, train a One-Class SVM / Isolation Forest on normal behavior (network destinations,
+    file-write paths, registry keys) and flag out-of-boundary activity, using LIME to surface the top-3
+    anomalous features. Out-of-boundary activity by an elevated utility — unusual destinations, paths,
+    or registry writes — indicates it is being driven beyond its normal role, consistent with shim-based
+    privilege escalation followed by post-exploitation.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - Windows Event ID 4663
+  - 'NAI: User Workstations, Network Egress Points, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: "for proc in critical_auto_elevating:\n  model = OneClassSVM/IsolationForest.fit(normal: net_dest,\
+      \ write_path, reg_keys)\n  if model.is_outlier(event): alert(proc, event, top3=LIME(event))"
+- question: Does whole-system provenance learning score the causal subgraph following shim-driven elevation
+    (auto-elevating exe -> file/network/registry effects) as anomalous?
+  context: Provenance learning summarizes the post-elevation blast radius for root-cause analysis. Score
+    the causal subgraph following shim-driven elevation (auto-elevating exe -> file/network/registry effects)
+    with whole-system provenance learning, emitting a compact, analyst-readable attack-summary graph (KAIROS).
+    An anomalous post-elevation subgraph linking the auto-elevating binary to suspicious file, network,
+    and registry effects is strong, explainable evidence of shim-driven privilege escalation and aids
+    rapid scoping.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 5156
+  - Sysmon Event ID 3
+  - Windows Event ID 4663
+  - 'NAI: User Workstations, Network Egress Points, File Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML pipeline/pseudocode
+    query: 'G = provenance_graph(post-elevation: auto_elev_exe -> file/net/registry)
+
+      model = KAIROS.fit(G_benign)
+
+      if model.anomaly(subgraph): alert(attack_summary_graph)'
