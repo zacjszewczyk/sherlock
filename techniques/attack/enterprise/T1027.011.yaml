@@ -1,0 +1,532 @@
+name: 'T1027.011: Obfuscated Files or Information: Fileless Storage'
+id: a2e6096d-2480-41c8-bc2e-9a2fb24a8ce1
+description: 'Hunt for adversary use of fileless storage to conceal payloads, scripts, collected data,
+  and persistence artifacts in non-file formats. On Windows this covers oversized or high-entropy blobs
+  written to the Registry, WMI class properties, PowerShell script blocks, and custom event-log entries,
+  as well as creation of permanent WMI event consumers and direct tampering with the on-disk Registry
+  hive and WMI repository backing files. On Linux it covers payloads written to or executed from shared-memory
+  directories (/dev/shm, /run/shm, /var/run, /var/lock) and memfd-backed execution, plus the network behavior
+  that follows such staging: rare-domain script downloads, low-jitter C2 beaconing, and outbound data-transfer
+  spikes. The playbook combines signature/symbolic-logic floor rules, statistical baselining (entropy,
+  length, volume, frequency, and failure-mode signals), and machine-learning models so an analyst can
+  detect, scope, and confirm fileless storage abuse across endpoint and network telemetry.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Does any newly created or modified PowerShell script block (Event ID 4104/4103) or Registry
+    value (Event ID 4657) match a YARA/Sigma signature for known fileless markers, or contain a large
+    base64/hex blob written by a scripting or Office host process?
+  context: Adversaries staging fileless payloads (Kovter/Poweliks-style encoded data in Run keys or custom
+    subkeys) leave recognizable obfuscation in script blocks and registry-resident decoders. Scan ScriptBlockText
+    from 4104/4103 and the NewValue field from 4657 with curated YARA/Sigma rules (e.g., registry_set_susp_blob_persistence.yml,
+    gen_powershell_obfuscation.yar). As a floor rule, alert on any base64/hex blob larger than 1024 bytes
+    written to a registry value, WMI property, or custom event-log entry by a scripting engine or Office
+    application. A hit on a known marker is high-confidence; a large unexplained blob from a non-admin
+    writer warrants decoding and scoping. This supports the Stealth tactic by exposing concealed payloads
+    that evade file-scanning AV.
+  answer_sources: &id001
+  - Windows Event ID 4657
+  - Windows Event ID 5861
+  - Windows PowerShell Event ID 4103
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Critical Windows Servers (e.g., Application, Database), User Workstations,
+    Centralized Log Aggregator/SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'scripts = FROM Event4104, Event4103 SELECT ScriptBlockText, host, process
+
+      regvals = FROM Event4657 SELECT NewValue, ObjectName, process, host
+
+      sig_hit = YARA_SIGMA_MATCH(scripts.ScriptBlockText OR regvals.NewValue, ruleset=[registry_set_susp_blob_persistence,
+      gen_powershell_obfuscation])
+
+      blob = REGEX_MATCH(NewValue|ScriptBlockText, base64|hex) AND decoded_len > 1024 AND process IN scripting_or_office_hosts
+
+      ALERT WHERE sig_hit OR blob'
+- question: When registry values, WMI class properties, or script blocks are base64/hex-decoded, does
+    the decoded content exceed an entropy of 7.2 bits/byte or surpass the per-key 99th-percentile decoded
+    length, and is the host showing an unusual rate of malformed-base64 decode failures?
+  context: Packed or encrypted fileless payloads exhibit high Shannon entropy (>7.2 bits/byte per Lyda
+    & Hamrock) and abnormal length compared with a key's legitimate history. Decode the candidate values,
+    compute entropy and length, and compare length to the per-key 99th percentile derived from 30 days
+    of that key's own history. Separately track the malformed-base64/decode-failure rate per host as a
+    distinct failure-mode signal, since brute or staged obfuscation often produces partially valid encodings.
+    High entropy plus oversized length on a key that normally holds short config strings strongly suggests
+    concealed payload staging; clean low-entropy values are benign. This advances Stealth detection by
+    surfacing obfuscated data designed to look like ordinary registry content.
+  answer_sources: *id001
+  range: Last 90 days, with a rolling 30-day per-key baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'vals = FROM Event4657, Event5861, Event4104 SELECT decode_b64_or_hex(value) AS dec, key, host
+
+      dec.entropy = shannon(dec); dec.len = length(dec)
+
+      base = baseline(key) OVER last 30d => p99_len[key]
+
+      fail_rate = COUNT(decode_failure) BY host OVER 1d
+
+      ALERT WHERE dec.entropy > 7.2 OR dec.len > p99_len[key] OR fail_rate > baseline_fail[host]'
+- question: Does a supervised classifier on hybrid text/token/AST features (length, decoded entropy, keyword/API
+    frequency) score a script block or registry-resident decoder as obfuscated/malicious, and which top
+    contributing features drive that score?
+  context: Signatures miss novel obfuscation, so train XGBoost or logistic regression on hybrid features
+    (raw length, decoded entropy, cmdlet/API keyword frequency, AST structure) per Fang et al. and Revoke-Obfuscation;
+    for AMSI-captured post-deobfuscation content use contextual embeddings per Hendler et al. A high malicious
+    probability flags content for analyst review even when no rule fires. Surface the top-3 contributing
+    features (e.g., decoded entropy, cmdlet frequency, value length) in the alert so the analyst can quickly
+    judge the verdict. This explainable ML layer strengthens Stealth detection by catching evasive script/registry
+    payloads that defeat static rules.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feats = EXTRACT(length, decoded_entropy, keyword_freq, api_freq, ast_features) FROM ScriptBlockText,
+      RegistryNewValue
+
+      score = XGBoost.predict_proba(feats)   # logistic_regression fallback; embeddings for AMSI content
+
+      ALERT WHERE score > 0.8 WITH explain = top3_shap(feats)'
+- question: Do Zeek conn.log/dns.log destinations or ssl.log JA3/JA4 hashes match threat intelligence
+    for malware families that stage payloads in shared memory (e.g., BPFDoor), and does the same host
+    show execution from /dev/shm, /run/shm, /var/run, or /var/lock outside the benign allowlist?
+  context: Linux fileless malware that lives in tmpfs (shared memory) still must reach C2. Correlate Zeek
+    conn.log/dns.log destinations and ssl.log JA3/JA4 fingerprints with TI for shared-memory-staging families,
+    then pivot to the endpoint exec-from-shared-memory signal per Elastic and Sysdig. As a floor rule,
+    alert on any exec by uid 0 from /dev/shm, /run/shm, /var/run, or /var/lock that is not in the documented
+    benign allowlist (docker, utsns, s6, cloudera-scm-agent, argoexec, runc init). A matched C2 fingerprint
+    paired with shared-memory execution is high-confidence compromise; allowlisted container runtimes
+    are expected. This serves Stealth by linking concealed in-memory payloads to their network signature.
+  answer_sources: &id002
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: Network Egress/Ingress Points, DNS Resolvers, Critical Linux Servers (e.g., Web, Application),
+    Linux Server Network Segments'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'net = FROM conn.log, dns.log, ssl.log SELECT dest_ip, query, ja3, ja4, host
+
+      ti_hit = net.dest_ip IN TI_ips OR net.query IN TI_domains OR net.ja3 IN TI_ja3 OR net.ja4 IN TI_ja4
+
+      shm_exec = FROM auditd SELECT exec WHERE uid=0 AND path IN [/dev/shm,/run/shm,/var/run,/var/lock]
+      AND comm NOT IN allowlist
+
+      ALERT WHERE ti_hit AND JOIN net WITH shm_exec ON host'
+- question: Is any Linux host beaconing to a destination with inter-arrival-time standard deviation below
+    1 second across more than 10 connections, and are those sessions showing low orig_bytes/resp_bytes
+    variance or an unusual S0/REJ failed-connection ratio?
+  context: Fileless implants beacon on regular intervals to receive tasking. Per destination IP, compute
+    the standard deviation of connection inter-arrival times and the connection count; alert when std
+    stays below 1 second across more than 10 connections (robust periodicity ranking per BAYWATCH). Flag
+    sessions with low orig/resp byte variance as a volume signal of automated check-ins, and profile the
+    failed/blocked connection ratio (Zeek conn_state S0/REJ) per host as a distinct failure-mode signal.
+    Tight, low-jitter periodicity to a single destination is a classic beacon; human and legitimate-app
+    traffic is far more variable. This advances Stealth detection by exposing the rhythmic network footprint
+    of memory-resident malware.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: "beacons = FROM conn.log GROUP BY src_host, dest_ip\n  COMPUTE iat_std = stddev(delta(ts)),\
+      \ n = count(), byte_var = var(orig_bytes/resp_bytes)\nfail = ratio(conn_state IN [S0,REJ]) BY src_host\n\
+      ALERT WHERE iat_std < 1s AND n > 10 OR byte_var < low_thresh OR fail > baseline_fail[src_host]"
+- question: Does a server's daily outbound orig_bytes exceed the upper confidence bound of a time-series
+    forecast, and does that excess coincide with provenance-graph anomalies such as shared-memory write-then-exec
+    edges?
+  context: Data staged in fileless storage is eventually exfiltrated, producing outbound-volume anomalies.
+    Forecast daily orig_bytes per server with Prophet/ARIMA and alert when observed volume breaches the
+    upper confidence bound, then correlate with provenance-graph anomalies like shared-memory write+exec
+    edges per KAIROS. Report the top-3 drivers (observed vs predicted bytes, new destination, beacon regularity)
+    in the alert for fast triage. A volume breach that lines up with a shared-memory provenance anomaly
+    is strong evidence of fileless-staged exfiltration; an isolated volume bump may be benign batch traffic.
+    This supports Stealth by tying concealed in-memory staging to its eventual network egress.
+  answer_sources: *id002
+  range: Last 90 days, daily aggregation with forecast confidence bounds
+  queries:
+  - technology: Zeek/ML pseudocode
+    query: 'daily = FROM conn.log SUM(orig_bytes) BY server, day
+
+      fc = Prophet_or_ARIMA.fit(daily).forecast(); ub = fc.upper_ci
+
+      prov = provenance_graph.anomaly(shm_write_then_exec_edges)
+
+      ALERT WHERE daily.orig_bytes > ub AND prov.anomaly WITH explain = top3(obs_vs_pred, new_dest, beacon_regularity)'
+- question: Did reg.exe or PowerShell Set-ItemProperty/New-ItemProperty write a string longer than 1024
+    characters, or target a non-standard key frequently abused for fileless storage?
+  context: Command-line registry writes are a direct vector for staging fileless payloads. Alert when
+    reg.exe or PowerShell's Set-ItemProperty/New-ItemProperty writes strings longer than 1024 characters
+    or targets non-standard keys on the fileless-abuse list (per Microsoft fileless threats and SigmaHQ).
+    Keep the explicit length threshold and key-path list as hard controls so the rule is deterministic
+    and defensible. An oversized value written to an unusual key by an interactive or scripted process
+    is a high-confidence indicator of payload concealment; short writes to standard config keys are benign.
+    Correlate the issuing command (4688/4103/4104) with the resulting 4657 write to confirm intent. This
+    advances Stealth detection by catching the act of placing concealed data into the Registry.
+  answer_sources: &id003
+  - Windows Event ID 4688
+  - Windows PowerShell Event ID 4103
+  - Windows Event ID 4104
+  - Windows Event ID 4657
+  - 'NAI: User Workstations, Domain Controllers, Windows Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "cmds = FROM Event4688, Event4103, Event4104 WHERE image IN [reg.exe, powershell.exe, pwsh.exe]\n\
+      \  AND cmdline MATCH (Set-ItemProperty|New-ItemProperty|reg add)\nwrites = FROM Event4657 JOIN cmds\
+      \ ON host, time_window 2m\nALERT WHERE length(writes.NewValue) > 1024 OR writes.ObjectName IN nonstandard_fileless_keys"
+- question: Does a registry NewValue length exceed the 99th percentile for that key and process, does
+    the decoded value show entropy above 7.2 bits/byte, and are there write-then-immediate-read sequences
+    or failed Set-ItemProperty attempts on the same key?
+  context: Beyond fixed thresholds, baseline NewValue length per registry key and process and alert when
+    a write exceeds the per-key 99th percentile (volume signal). Additionally decode the value and flag
+    Shannon entropy above 7.2 bits/byte per Lyda & Hamrock, indicating packed/encrypted content. Track
+    write-then-immediate-read sequences (payload store-and-retrieve) and failed Set-ItemProperty attempts
+    as distinct failure-mode signals. An oversized, high-entropy write to a key that normally holds small
+    plaintext, followed by a quick read, is a strong fileless-storage pattern. This serves Stealth by
+    detecting concealed registry-resident payloads even when they avoid known signatures.
+  answer_sources: *id003
+  range: Last 90 days, with per-key/per-process baselining
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "base = baseline(Event4657.NewValue length) BY key, process OVER last 30d => p99\nALERT WHERE\
+      \ length(NewValue) > p99[key,process]\n  OR shannon(decode(NewValue)) > 7.2\n  OR seq(write THEN\
+      \ read same key < 5s)\n  OR count(failed Set-ItemProperty) BY host > baseline"
+- question: Does a One-Class SVM trained on normal scripting-engine and reg.exe command-line structure
+    flag a registry-writing command as anomalous, and which tokens/features make it an outlier?
+  context: Obfuscated commands that write fileless payloads deviate structurally from routine administration.
+    Train a One-Class SVM on tokenized command-line arguments and structural features (per Revoke-Obfuscation
+    feature engineering) for scripting engines and reg.exe, then flag commands that fall outside the learned
+    normal boundary. Surface the top-3 anomalous tokens/features in the alert for analyst context. An
+    anomalous registry-writing command (unusual token mix, excessive concatenation, encoding) is a candidate
+    for fileless storage even with no signature match; routine admin scripts score as normal. This explainable
+    anomaly layer reinforces Stealth detection against novel obfuscation.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feats = TOKENIZE(cmdline) + structural_features FROM Event4688, Event4103, Event4104 WHERE
+      image IN [reg.exe, powershell.exe, pwsh.exe]
+
+      model = OneClassSVM.fit(normal_admin_commands)
+
+      ALERT WHERE model.decision(feats) < 0 WITH explain = top3_anomalous_tokens(feats)'
+- question: Does a script transferred over the network (Zeek files.log/http.log) reference /dev/shm, /run/shm,
+    /var/run, memfd_create, or contain write-then-exec command sequences targeting shared memory?
+  context: Linux fileless attacks frequently download a dropper that writes and executes a payload from
+    tmpfs. Scan Zeek files.log reconstructed script content for references to /dev/shm, /run/shm, /var/run,
+    memfd_create, or command sequences that write-then-exec files in shared memory (per Sysdig and Elastic).
+    Treat a write+chmod+exec chain in a tmpfs path as a high-confidence floor rule. Such references in
+    a downloaded script are a strong precursor to in-memory execution; legitimate scripts rarely chmod-and-run
+    from /dev/shm. Preserve the source domain/URL and the host for pivoting. This advances Stealth detection
+    by catching fileless staging at the point of delivery.
+  answer_sources: &id004
+  - Zeek http.log
+  - Zeek files.log
+  - 'NAI: Network Egress/Ingress Points, Web Proxies, Linux Server Segments'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "files = FROM files.log, http.log WHERE mime IN [text/x-shellscript, application/x-sh, text/plain]\n\
+      content = reconstruct(files)\nALERT WHERE content MATCH (/dev/shm|/run/shm|/var/run|memfd_create)\n\
+      \  OR content MATCH seq(write THEN chmod +x THEN exec in tmpfs path)"
+- question: Are Linux servers downloading scripts from domains in the bottom 5% of historical frequency,
+    is the download byte volume anomalous for the host, and is the HTTP 4xx/404 failed-fetch rate unusual?
+  context: Payload-staging downloads often come from infrastructure the host has never or rarely contacted.
+    Monitor source domains per Linux server and alert when a downloaded script originates from a domain
+    in the bottom 5% of historical frequency (frequency signal), consistent with shared-memory payload
+    staging per Sysdig. Baseline download byte volume per host (volume signal) and profile HTTP 4xx/404
+    and failed-fetch rates as a distinct failure-mode signal, since staging may probe multiple URLs. A
+    script fetched from a rare domain by a server that normally talks to a small known set is suspicious;
+    established mirrors and package repos are benign. This supports Stealth by spotting anomalous delivery
+    channels for fileless payloads.
+  answer_sources: *id004
+  range: Last 90 days, with per-host domain-frequency baseline
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'dl = FROM http.log WHERE method=GET AND resp_mime IN script_types
+
+      freq = baseline(domain) BY server OVER 90d
+
+      fail = ratio(status_code IN [4xx]) BY server
+
+      ALERT WHERE freq[domain] < p05 OR resp_bytes > p99_vol[server] OR fail > baseline_fail[server]'
+- question: Does a classifier using bag-of-words/TF-IDF plus token and AST features predict a downloaded
+    script as malicious with high confidence, and which terms/features drive the verdict?
+  context: To catch novel malicious scripts at download time, classify reconstructed scripts using bag-of-words/TF-IDF
+    plus token and AST features (Naive Bayes baseline, XGBoost preferred) per Fang et al., alerting on
+    high-confidence malicious predictions. Report the top-3 contributing features/terms (e.g., shared-memory
+    paths, exec primitives, encoded blobs) for explainability. A high-confidence malicious prediction
+    flags a downloaded dropper even before it runs; benign automation scripts score low. This explainable
+    ML layer reinforces Stealth detection by intercepting fileless payload delivery that evades static
+    rules.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: Zeek/ML pseudocode
+    query: 'feats = TFIDF(script_text) + token_features + ast_features FROM files.log scripts
+
+      score = XGBoost.predict_proba(feats)   # NaiveBayes baseline
+
+      ALERT WHERE score > 0.85 WITH explain = top3_terms_features(feats)'
+- question: Did a process outside the per-key or per-namespace allowlist write a registry value or WMI
+    object (Event ID 4657/5861), especially a user-application host such as winword.exe or acrord32.exe?
+  context: Document-handling and other user applications should not normally write to the Registry or
+    WMI repository; when they do, it often indicates exploitation staging a fileless payload or backdoor.
+    Maintain a per-key/per-namespace allowlist of legitimate writers and alert when 4657 or 5861 shows
+    a non-allowlisted process writing values, with special attention to winword.exe, acrord32.exe, and
+    similar Office/PDF hosts (per Microsoft fileless threats and Graeber's WMI fileless backdoor research).
+    Keep the allowlist as a hard control. An Office process writing a registry blob or WMI property is
+    a high-confidence fileless indicator; allowlisted admin tooling is expected. This serves Stealth by
+    catching unexpected writers concealing data in central stores.
+  answer_sources: &id005
+  - Windows Event ID 4657
+  - Windows Event ID 5861
+  - Windows Event ID 4688
+  - 'NAI: Domain Controllers, Certificate Authority Servers, Critical Windows Servers, Centralized Log
+    Aggregators/SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "writes = FROM Event4657, Event5861 SELECT process, ObjectName AS key_or_namespace, host\n\
+      ALERT WHERE process NOT IN allowlist[key_or_namespace]\n  OR process IN [winword.exe, acrord32.exe,\
+      \ excel.exe, outlook.exe, mshta.exe]"
+- question: Does a process's registry NewValue size exceed Q3 + 1.5x IQR for that process, does it write
+    to an unusual number of distinct keys/namespaces per hour, and are there failed/denied write attempts?
+  context: Registry-resident fileless storage produces oversized encoded blobs that stand out from a process's
+    normal write sizes. Baseline NewValue size per process name and flag writes exceeding Q3 + 1.5x IQR
+    (volume signal) per Microsoft fileless threats. Count distinct keys/namespaces written per process
+    per hour (frequency signal) to catch spraying behavior, and track failed/denied write attempts as
+    a distinct failure-mode signal. An outsized write from a process that usually makes small writes,
+    or a sudden fan-out across many keys, suggests payload concealment; steady small writes are routine.
+    This advances Stealth detection by statistically isolating abnormal registry write behavior.
+  answer_sources: *id005
+  range: Last 90 days, with per-process IQR baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = baseline(Event4657.NewValue size) BY process OVER 30d => Q1,Q3,IQR
+
+      fanout = count(distinct key) BY process OVER 1h
+
+      fail = count(denied_write) BY process
+
+      ALERT WHERE size > Q3 + 1.5*IQR OR fanout > baseline_fanout OR fail > baseline_fail'
+- question: Do WMI/registry write events form a small or distant outlier cluster under K-Means, or does
+    a Random Forest on write features (process, key/namespace, size, entropy) classify them as malicious,
+    and which features drive the outcome?
+  context: Fileless write events cluster differently from benign administration. Cluster WMI/registry
+    write events with K-Means and alert on small or distant outlier clusters; alternatively train a Random
+    Forest on write features (process, key/namespace, size, entropy) per Khalid et al., which found tree
+    ensembles best for fileless artifacts. Surface the top-3 features driving the outlier/score in the
+    alert. A tight cluster of anomalous high-entropy writes from an unusual process, or a high RF malicious
+    score, points to fileless storage; mainstream admin writes fall in the dense benign cluster. This
+    explainable ML layer reinforces Stealth detection across registry and WMI staging.
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feats = FROM Event4657, Event5861, Event4688 SELECT process, key_or_namespace, size, entropy
+
+      clusters = KMeans.fit(feats); outliers = small_or_distant(clusters)
+
+      rf_score = RandomForest.predict_proba(feats)
+
+      ALERT WHERE feats IN outliers OR rf_score > 0.8 WITH explain = top3_features(feats)'
+- question: Was a permanent WMI event consumer created (Event ID 5861), and does correlation with 5860
+    and 4688 reveal an unsigned/unknown provider as the responsible parent and target namespace, with
+    a matching __FilterToConsumerBinding in root\subscription?
+  context: Permanent WMI event consumers are a classic fileless persistence mechanism that stores logic
+    entirely in the WMI repository. Alert on Event ID 5861 (permanent event consumer creation) and correlate
+    with 5860 (filter activity) and 4688 to identify the responsible parent process and target namespace,
+    then enumerate __FilterToConsumerBinding objects in root\subscription per Graeber. Encode this known
+    persistence chain (filter -> consumer -> binding) as a graph query per POIROT. A new consumer from
+    an unsigned or unknown provider is high-confidence fileless persistence; signed management agents
+    are expected. This serves Stealth by exposing concealed WMI-resident backdoors.
+  answer_sources: &id006
+  - Windows Event ID 5859
+  - Windows Event ID 5860
+  - Windows Event ID 5861
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: WMI Infrastructure Servers, Domain Controllers, High-Value Asset Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Graph pseudocode
+    query: 'consumers = FROM Event5861
+
+      ctx = JOIN consumers WITH Event5860, Event4688 ON host, time_window 5m => parent, namespace, signer
+
+      GRAPH_MATCH(EventFilter -> EventConsumer -> FilterToConsumerBinding in root\subscription)
+
+      ALERT WHERE consumer.signer NOT IN trusted_signers OR parent NOT IN allowlist'
+- question: Is wmiprvse.exe spawning a child process that is in the bottom 5% of historical prevalence
+    for the host, and is that child opening new outbound connections or failing to launch?
+  context: WMI consumer-triggered execution surfaces as wmiprvse.exe launching unusual children. Baseline
+    wmiprvse.exe child-process frequencies per host and flag children in the bottom 5% of prevalence (frequency
+    signal) per Graeber. Track children that initiate new outbound connections (state signal) and failed
+    launches as distinct failure-mode signals. A rare wmiprvse child, especially one that immediately
+    beacons, is a strong indicator of WMI-resident fileless execution; common children (e.g., scripted
+    inventory tasks) are benign. Correlate with conn.log to confirm network follow-on. This advances Stealth
+    detection by catching the runtime footprint of WMI persistence.
+  answer_sources: *id006
+  range: Last 90 days, with per-host prevalence baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'children = FROM Event4688 WHERE parent_image = wmiprvse.exe
+
+      prev = baseline(child_image) BY host OVER 90d
+
+      newconn = JOIN children WITH Zeek_conn ON host, time_window 2m
+
+      ALERT WHERE prev[child_image] < p05 OR newconn.new_destination OR child.launch_failed'
+- question: Does a graph neural network trained on WMI-related process and network subgraphs assign a
+    high anomaly score, and which nodes/edges (parent, consumer, child process) are most anomalous?
+  context: Multi-stage WMI persistence is best captured as a graph. Train a GNN on WMI-related process
+    and network subgraphs and alert on high anomaly scores per KAIROS, surfacing the top-3 anomalous nodes/edges
+    (parent, consumer, child process) in the alert. A high-scoring subgraph linking an unusual parent,
+    a new consumer, and an anomalous child or beacon is strong evidence of fileless WMI abuse; routine
+    WMI activity scores low. This explainable graph-ML layer reinforces Stealth detection for complex
+    WMI-resident persistence that point detections miss.
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'subgraphs = BUILD_GRAPH(Event5859, Event5860, Event5861, Event4688, Zeek_conn) AROUND wmiprvse/consumer
+      nodes
+
+      score = GNN.predict(subgraphs)
+
+      ALERT WHERE score > threshold WITH explain = top3_anomalous_nodes_edges(subgraphs)'
+- question: Does Event ID 4663 show a non-allowlisted process obtaining write-access masks against the
+    Registry hive files (%SystemRoot%\System32\Config) or the WMI repository (%SystemRoot%\System32\Wbem\Repository)?
+  context: Some fileless techniques manipulate the physical backing files of the Registry and WMI repository
+    directly. Apply SACLs to the registry-hive files (%SystemRoot%\System32\Config) and the WMI repository
+    (%SystemRoot%\System32\Wbem\Repository), then alert when Event ID 4663 shows write-access masks from
+    non-allowlisted processes per Microsoft fileless threats. Keep the allowlist and backing-file paths
+    as hard controls. A user-land process writing to these hive/repository files is highly abnormal and
+    indicates tampering with the central fileless stores; the Registry/WMI subsystems and backup tooling
+    are the only expected writers. This serves Stealth by detecting direct manipulation of fileless backing
+    artifacts.
+  answer_sources: &id007
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File Systems of Domain Controllers and Critical Windows Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "acc = FROM Event4663 WHERE ObjectName MATCH (System32\\Config\\*|System32\\Wbem\\Repository\\\
+      *)\n  AND AccessMask CONTAINS write\nALERT WHERE acc.ProcessName NOT IN backing_file_allowlist"
+- question: Does a process's daily count of 4663 write accesses to the hive or WMI repository files exceed
+    its mean by more than 3 standard deviations, or is its denied-access (4663 failure) rate unusually
+    high?
+  context: The Registry hive and Wbem\Repository files are the central backing artifacts of fileless storage,
+    so anomalous access frequency is meaningful. Baseline daily 4663 write-access counts per process against
+    these files and alert when counts exceed the mean by more than 3 standard deviations (frequency/volume
+    signal) per Microsoft fileless threats. Profile denied-access (4663 failure) rates as a distinct failure-mode
+    signal, since unauthorized tampering often triggers access denials. A process suddenly hammering the
+    hive files, or repeatedly denied write access to the repository, suggests fileless manipulation; steady
+    low-rate access from system components is normal. This advances Stealth detection by statistically
+    catching backing-file abuse.
+  answer_sources: *id007
+  range: Last 90 days, with per-process daily baseline
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'acc = FROM Event4663 WHERE ObjectName MATCH (System32\Config\*|System32\Wbem\Repository\*)
+
+      daily = count(acc) BY process, day; base = mean,std OVER 30d
+
+      denied = count(acc WHERE status=denied) BY process
+
+      ALERT WHERE daily > mean + 3*std OR denied > baseline_denied[process]'
+- question: Does a Random Forest trained on Event ID 4663 features (ProcessName, AccessMask, ObjectName,
+    SubjectUserSid) classify an access to the hive/repository files as malicious, and which features drive
+    the prediction?
+  context: Tree ensembles excel at fileless-artifact detection (per Khalid et al.). Train a Random Forest
+    on Event ID 4663 features (ProcessName, AccessMask, ObjectName, SubjectUserSid) against the hive and
+    WMI repository files and alert on malicious predictions, reporting the top-3 contributing features
+    for explainability. A high malicious score on an access event flags backing-file tampering even when
+    frequency or allowlist rules do not fire; legitimate system access scores benign. This explainable
+    ML layer reinforces Stealth detection for direct manipulation of the Registry/WMI physical stores.
+  answer_sources: *id007
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feats = FROM Event4663 SELECT ProcessName, AccessMask, ObjectName, SubjectUserSid WHERE ObjectName
+      MATCH (Config|Wbem\Repository)
+
+      score = RandomForest.predict_proba(feats)
+
+      ALERT WHERE score > 0.8 WITH explain = top3_features(feats)'
+- question: Does a Zeek file download referencing /dev/shm or /run/shm get followed within 5 minutes by
+    a connection to a rare destination IP, forming a download-then-beacon chain?
+  context: Fileless Linux attacks pull a payload into shared memory and then call home. Detect Zeek file
+    downloads referencing /dev/shm or /run/shm followed within 5 minutes by a connection to a rare destination
+    IP per Sysdig and Elastic, and encode this download-then-beacon chain as a correlation/graph query
+    per HOLMES. The temporal linkage of a shared-memory-referencing download to a novel outbound connection
+    is high-confidence fileless staging-and-C2; unrelated downloads and known destinations are benign.
+    Preserve both the download source and the rare destination for scoping. This serves Stealth by chaining
+    concealed in-memory staging to its network follow-on.
+  answer_sources: &id008
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek files.log
+  - Zeek dns.log
+  - 'NAI: Network Egress/Ingress Points, Linux Server Network Segments'
+  range: Last 90 days, with a 5-minute download-to-connection correlation window
+  queries:
+  - technology: Zeek/Graph pseudocode
+    query: 'dl = FROM files.log, http.log WHERE content MATCH (/dev/shm|/run/shm)
+
+      rare = FROM conn.log WHERE dest_ip IN bottom_5pct_prevalence[host]
+
+      GRAPH_MATCH(download -> [<=5m] -> connection_to_rare_dest ON host)
+
+      ALERT WHERE chain.exists'
+- question: In the hour following a shared-memory-referencing download, does a host's outbound orig_bytes
+    exceed its 99th percentile, does the new destination show beacon regularity, and is the blocked/failed
+    connection ratio elevated?
+  context: Staging in shared memory often precedes data theft. Baseline daily orig_bytes per host and
+    alert when the hour following such a download exceeds the 99th percentile (volume signal), correlating
+    the spike with provenance-graph anomalies per KAIROS. Compute beacon regularity on the new destination
+    (frequency signal) and track blocked/failed connection ratios as a distinct failure-mode signal. An
+    upload spike to a freshly seen, regularly beaconing destination right after a shared-memory download
+    is strong evidence of fileless-staged exfiltration; routine backups score against their own baseline.
+    This advances Stealth detection by quantifying post-staging egress.
+  answer_sources: *id008
+  range: Last 90 days, with hourly volume baseline anchored to download events
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'dl = FROM files.log WHERE content MATCH (/dev/shm|/run/shm)
+
+      post = FROM conn.log WHERE ts IN [dl.ts, dl.ts+1h] BY host
+
+      base = p99(orig_bytes per hour) BY host
+
+      ALERT WHERE sum(post.orig_bytes) > base AND (beacon_regular(post.dest) OR fail_ratio(post) > baseline)'
+- question: Do an LSTM beaconing/sequence detector on Zeek conn.log and a classifier on the downloaded
+    file both assign high scores within 10 minutes of each other, and which features (beacon regularity,
+    byte volume, file class) drive the composite alert?
+  context: A robust verdict combines network-sequence and file-content signals. Run an LSTM beaconing/sequence
+    detector on Zeek conn.log (per DeepLog) alongside a classifier on downloaded files (per Khalid et
+    al.), and alert when both assign high scores within 10 minutes, surfacing the top-3 contributing features
+    (beacon regularity, byte volume, file class) for explainability. Concurrent high scores from independent
+    models strongly indicate a fileless payload that was downloaded and is now beaconing; isolated high
+    scores are lower confidence and may be benign. This composite, explainable ML approach reinforces
+    Stealth detection by fusing delivery and command-and-control evidence.
+  answer_sources: *id008
+  range: Last 90 days, with a 10-minute cross-model correlation window
+  queries:
+  - technology: Zeek/ML pseudocode
+    query: "beacon_score = LSTM.predict(conn.log sequence per host)\nfile_score = Classifier.predict_proba(downloaded_file_features)\n\
+      ALERT WHERE beacon_score > thr AND file_score > thr WITHIN 10m\n  WITH explain = top3(beacon_regularity,\
+      \ byte_volume, file_class)"
