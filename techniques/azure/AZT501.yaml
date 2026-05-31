@@ -1,0 +1,421 @@
+name: 'AZT501: Account Manipulation'
+id: 8d124b6c-cdd9-4fc2-9a37-8b8c606ae18c
+description: 'Investigate whether an adversary has manipulated existing Azure/Entra ID accounts or account-related
+  controls to maintain persistent access that survives remediation or credential changes. This playbook
+  helps an analyst examine three persistence vectors: (1) user-account lifecycle abuse where an account
+  is enabled, restored, or password-reset to preserve or re-establish access, especially for privileged,
+  dormant, or break-glass accounts; (2) service principal manipulation where new credentials, owners,
+  roles, or federated identity credentials are added so the adversary can keep authenticating as a durable
+  non-user identity; and (3) VM access-extension or RunCommand operations that reset the local administrator
+  on an Azure VM to create a host-level backdoor. For each vector the analyst correlates control-plane
+  administrative events with subsequent authentication and privileged activity, baselines normal operator
+  and target behavior, and applies sequence/graph models to separate genuine persistence establishment
+  from routine identity administration and app maintenance.'
+type: technique
+related:
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which Entra ID user-account lifecycle operations (Reset password, Enable account, Restore
+    user, Update user, Change user password) were followed within 24 hours by a successful sign-in (ResultType==0)
+    from the same account, and did any of these target a break-glass, privileged, or dormant account or
+    occur outside documented identity-administration workflows?
+  context: An adversary who has compromised an environment frequently re-enables, restores, or resets
+    the password of an existing account to regain durable access after defenders remediate. By correlating
+    AuditLogs lifecycle operations with a subsequent successful SigninLogs event by the same account you
+    confirm the manipulated account was actually used, which is far stronger evidence than the administrative
+    change alone. Severity should rise to high when the target is a break-glass/privileged account, a
+    dormant account (no successful sign-in in >=30 days), or when the change does not match a known help-desk
+    or IAM workflow, because legitimate recovery rarely targets such accounts off-process. A positive
+    result (lifecycle change + quick successful sign-in on a sensitive account) indicates likely persistence
+    under the Persistence tactic; a negative result reflects routine account administration.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - IdentityProtectionRiskEvents
+  - 'NAI: Entra ID user lifecycle events, privileged and dormant accounts, and sign-in activity for recently
+    restored or password-reset users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      AuditLogs where OperationName in ('Reset password','Enable account','Restore user','Update user','Change user password') and Result=='success'
+      | join kind=inner (SigninLogs where ResultType==0) on $left.TargetUserId==$right.UserId
+      | where SigninTime between (AuditTime .. AuditTime+24h)
+      | extend severity = iif(TargetIsBreakGlass or TargetIsPrivileged or DaysSinceLastSignin>=30 or NOT(InApprovedIAMWorkflow), 'high','medium')
+- question: Did any restored or password-reset user account sign in successfully from an unfamiliar IP/ASN,
+    via legacy authentication, or from a new device within 60 minutes of the administrative change, and
+    is there a corresponding identity-protection risk detection on that account?
+  context: Genuine help-desk recovery is usually followed by the user signing in from a familiar device
+    and location, often after some delay. Immediate reuse of a supposedly remediated account from unfamiliar
+    infrastructure, via legacy auth, or from a brand-new device strongly suggests the actor who triggered
+    the change is the one using it, i.e., persistence rather than recovery. Correlating with IdentityProtectionRiskEvents
+    (impossible travel, anonymous IP, leaked credentials) on the same account provides independent corroboration.
+    A positive result is high-confidence persistence under the Persistence tactic; absence of unfamiliar
+    context lowers concern but does not fully clear sensitive targets.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - IdentityProtectionRiskEvents
+  - 'NAI: Entra ID user lifecycle events, privileged and dormant accounts, and sign-in activity for recently
+    restored or password-reset users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      AuditLogs where OperationName in ('Restore user','Reset password','Change user password')
+      | join kind=inner SigninLogs on TargetUserId==UserId
+      | where SigninTime - AuditTime <= 60m and ResultType==0
+      | where IpAddress !in (KnownUserIPs) or ASN !in (KnownUserASNs) or AuthMethod=='legacy' or DeviceId !in (KnownDevices)
+      | join kind=leftouter IdentityProtectionRiskEvents on UserId
+- question: For accounts that were recovered or reset, was the change preceded or followed by a burst
+    of failed sign-ins (e.g., >5 in 10 minutes) from a single source converging on a success, or by low-and-slow
+    failed attempts spread across many source IPs?
+  context: Failed sign-in telemetry for recovered/reset accounts is a distinct signal of credential-guessing
+    converging on the target. A tight burst of failures from one source ending in a success indicates
+    brute-force/guessing immediately around the recovery, while low-and-slow failures spread over many
+    IPs indicate a stealthy password-spray narrowing onto the recovered account. Profiling SigninLogs
+    ResultType!=0 around the lifecycle event distinguishes adversary credential testing from a user simply
+    mistyping a new password. A positive result implies the recovered account was an attacker objective,
+    reinforcing the Persistence hypothesis.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - IdentityProtectionRiskEvents
+  - 'NAI: Entra ID user lifecycle events, privileged and dormant accounts, and sign-in activity for recently
+    restored or password-reset users'
+  range: Last 90 days; center the window on each reset/restore event +/- 24h
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      let recovered = AuditLogs where OperationName in ('Reset password','Restore user','Change user password') | project TargetUserId, AuditTime;
+      SigninLogs where UserId in (recovered.TargetUserId) and ResultType!=0
+      | summarize fails=count(), srcs=dcount(IpAddress) by UserId, bin(TimeGenerated,10m)
+      | where fails>5 or srcs>=10
+      | join kind=inner (SigninLogs where ResultType==0) on UserId
+- question: Do any administrators or target accounts fall outside the normal baseline for password-reset/restore
+    cadence, target account age/privilege, or time-to-next-sign-in, and are there any first-time administrator-to-target-account
+    pairs?
+  context: Baselining the per-administrator reset/restore cadence and the characteristics of targeted
+    accounts surfaces operators and targets that deviate from tenant norms. Using the trailing 95th percentile
+    with robust median/MAD thresholds, flag operators who reset far more than peers, restored accounts
+    that return to use faster than the tenant norm, or accounts targeted by an administrator who has never
+    touched them before. First-time admin->target pairs are especially meaningful because adversaries
+    often use a compromised or unusual admin identity to manipulate accounts. A positive outlier guides
+    the analyst toward anomalous recovery activity consistent with persistence; routine recoveries cluster
+    near the baseline.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - IdentityProtectionRiskEvents
+  - 'NAI: Entra ID user lifecycle events, privileged and dormant accounts, and sign-in activity for recently
+    restored or password-reset users'
+  range: Last 90 days for baseline; evaluate recent events
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      let base = AuditLogs where OperationName in ('Reset password','Restore user') and TimeGenerated>ago(90d)
+      | summarize p95=percentile(daily_count,95), med=percentile(daily_count,50), mad=... by Actor;
+      AuditLogs recent
+      | extend ttsignin = next_signin_time - AuditTime
+      | where actor_daily_count>base.p95 or ttsignin < tenant_norm or pair_first_seen(Actor,TargetUserId)
+      | project Actor, TargetUserId, ttsignin, score
+- question: When identity-administration sequences (account recovery, password change, risk detection,
+    post-change authentication) are scored by a sequence/graph model over the authentication graph, which
+    reset/restore events produced rare account-to-resource edges or high-risk post-recovery activity,
+    and what top-3 features drove the score?
+  context: A machine-learning model trained over identity-administration sequences and the authentication
+    graph can capture persistence patterns that single rules miss, scoring rare account->resource edges
+    that appear only after a recovery. Prioritizing sequences where a reset/restore is followed by a suspicious
+    sign-in or privileged action, and surfacing the top-3 contributing features (e.g., dormancy days,
+    actor rarity, time-to-sign-in), gives the analyst an explainable, ranked queue of likely persistence.
+    A high model score with intuitive contributing features warrants investigation under the Persistence
+    tactic; low scores deprioritize routine recoveries. Tools like Microsoft Sentinel UEBA provide complementary
+    entity-behavior scoring.
+  answer_sources:
+  - AuditLogs
+  - SigninLogs
+  - IdentityProtectionRiskEvents
+  - 'NAI: Entra ID user lifecycle events, privileged and dormant accounts, and sign-in activity for recently
+    restored or password-reset users'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = build_sequence_features(AuditLogs recovery/reset, IdentityProtectionRiskEvents, SigninLogs post-change)
+      graph = build_auth_graph(account->resource edges)
+      score = model.predict(features) + rare_edge_score(graph)
+      alert where score>threshold and post_change_suspicious
+      emit top3_features(score)  // dormancy_days, actor_rarity, time_to_signin
+- question: Which service principals or applications had a genuinely new secret or certificate added (AuditLogs
+    'Add service principal credentials' / 'Update application - Certificates and secrets management',
+    Result success), confirmed by set_difference(newValue,oldValue) on modifiedProperties.KeyDescription
+    where KeyUsage='Verify', and which of those principals hold broad Microsoft Graph permissions or were
+    modified by a non-owner actor?
+  context: Adding a new credential to a service principal is one of the most durable Azure persistence
+    techniques because non-user identities are often overlooked during user-focused remediation. Parsing
+    modifiedProperties.KeyDescription and taking the set difference of new vs old values where KeyUsage='Verify'
+    confirms an actual new signing secret/certificate was added rather than an MFA or benign change. Escalation
+    is warranted when the affected principal has broad Graph permissions (e.g., Directory.ReadWrite.All,
+    Mail.Read) or the actor is not a normal app owner, since that combination yields powerful, stealthy
+    access. A positive result is strong persistence evidence (maps to T1098.001 Additional Cloud Credentials)
+    under the Persistence tactic.
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      AuditLogs where OperationName in ('Add service principal credentials','Update application - Certificates and secrets management') and Result=='success'
+      | extend newKeys = parse_json(modifiedProperties.KeyDescription).newValue, oldKeys=...oldValue
+      | extend added = set_difference(newKeys,oldKeys)
+      | where added has 'KeyUsage:Verify'
+      | where SPGraphPermissions in (broad) or Actor !in (AppOwners[SP])
+      | project SP, Actor, added
+- question: Were any new owners added to applications/service principals, new directory-role memberships
+    granted to a service principal, or new federated identity credentials added, and did the affected
+    principal then perform privileged Microsoft Graph/API access?
+  context: Beyond secrets, adversaries establish service-principal persistence by adding themselves as
+    an owner (allowing future credential additions), granting the SP a directory role, or attaching a
+    federated identity credential (allowing token issuance from an external IdP). Alerting on 'Add owner
+    to application/service principal', 'Add member to role', and federated-credential additions, then
+    correlating with subsequent SP sign-ins and privileged Graph/API calls, confirms the grant translated
+    into capability. A new owner unrelated to app administration, a directory-role grant to an SP, or
+    a new federated credential should be treated as concrete persistence (T1098.003 Additional Cloud Roles)
+    under the Persistence tactic.
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      AuditLogs where OperationName in ('Add owner to application','Add owner to service principal','Add member to role') or OperationName has 'federated'
+      | join kind=leftouter AADServicePrincipalSignInLogs on ServicePrincipalId
+      | join kind=leftouter (MicrosoftGraphActivityLogs where privileged) on ServicePrincipalId
+      | where Actor !in (AppAdministrators) or RoleGranted!='' or FederatedCredAdded
+      | project SP, Actor, OperationName, subsequent_graph_access
+- question: Considering a 14-day baseline of service principals that have a successful sign-in, did any
+    credential add/update target a principal NOT in that baseline and get followed by a successful SP
+    sign-in, or did any principal sign in successfully within 30 minutes of a credential being added?
+  context: 'Reactivating a dormant service principal is a hallmark of staged persistence: an SP that has
+    not authenticated recently suddenly gains a new credential and immediately signs in. Building a 14-day
+    baseline of SPs with successful AADServicePrincipalSignInLogs events and flagging credential operations
+    on principals outside that set—followed by a successful sign-in—catches reactivation. Likewise, a
+    credential add followed by a successful sign-in for the same principal within 30 minutes indicates
+    the actor is testing/using the new credential right away (post-compromise staging). A positive result
+    strongly indicates persistence establishment under the Persistence tactic rather than routine maintenance.'
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days; 14-day rolling baseline for SP activity
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      let active14 = AADServicePrincipalSignInLogs where ResultType==0 and TimeGenerated>ago(14d) | distinct ServicePrincipalId;
+      AuditLogs where OperationName has 'credential' and Result=='success'
+      | where ServicePrincipalId !in (active14)
+      | join kind=inner (AADServicePrincipalSignInLogs where ResultType==0) on ServicePrincipalId
+      | where SigninTime>=AuditTime  // also flag SigninTime-AuditTime<=30m for any SP
+- question: Over a 90-day actor baseline, were any service-principal credential operations performed by
+    a never-before-seen actor (user UPN or app), and do any principals show an abrupt change in credential-rotation
+    cadence, owner-change frequency, or post-update sign-in scope/volume beyond their historical 95th
+    percentile?
+  context: Maintaining a 90-day baseline of actors that legitimately perform credential operations and
+    using a leftanti join to surface first-time actors isolates anomalous credential additions that warrant
+    scrutiny. Profiling each SP's normal credential-rotation cadence, owner-change frequency, and sign-in
+    source diversity lets the analyst flag principals whose maintenance pattern changes abruptly or whose
+    post-update sign-in scope or volume exceeds the historical 95th percentile—both signs of takeover.
+    To control false positives, tune out newly onboarded admins, first-run IaC pipelines, and known alternate
+    cert-rotation operators. A persistent positive after tuning supports the Persistence hypothesis.
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      let known = AuditLogs where OperationName has 'credential' and TimeGenerated between (ago(90d)..ago(1d)) | distinct Actor;
+      AuditLogs where OperationName has 'credential' and TimeGenerated>ago(1d)
+      | join kind=leftanti known on Actor   // never-before-seen actor
+      | union (per_SP_profile | where rotation_cadence_shift or postupdate_scope>p95)
+      | where Actor !in (NewAdmins, IaCPipelines, CertRotationOps)
+- question: Do failed service-principal authentications (AADServicePrincipalSignInLogs ResultType!=0,
+    e.g., invalid-client/expired-credential) spike from a newly added credential or new source immediately
+    before the first successful sign-in?
+  context: Failed SP authentication telemetry is a distinct early-warning signal. When an adversary adds
+    a credential they often generate a cluster of failures (invalid client, expired credential) while
+    testing it or its source before the first success. Profiling these failures and correlating a pre-success
+    spike with a recently added credential or a new source IP distinguishes attacker credential testing
+    from routine app maintenance, which rarely produces such a failure pattern. A positive result around
+    a credential addition reinforces that the new credential is adversary-controlled, supporting persistence
+    detection under the Persistence tactic.
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days; center on credential-addition events
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      AADServicePrincipalSignInLogs where ResultType!=0
+      | summarize fails=count() by ServicePrincipalId, IpAddress, bin(TimeGenerated,10m)
+      | where fails>baseline_p95
+      | join kind=inner (AuditLogs where OperationName has 'credential') on ServicePrincipalId
+      | join kind=inner (AADServicePrincipalSignInLogs where ResultType==0) on ServicePrincipalId  // first success after spike
+- question: When service-principal lifecycle changes are scored by a non-user persistence classifier using
+    features such as actor novelty, owner identity, credential type, prior activity level, source/IP novelty,
+    downstream Graph permission sensitivity, and temporal link-prediction for first-time SP-to-resource
+    edges, which modifications rank as likely persistence establishment, and what top-3 features explain
+    each alert?
+  context: A classifier that models SP lifecycle changes across novelty, ownership, credential type, prior
+    activity, source novelty, and downstream Graph scope—augmented with temporal link-prediction scores
+    for first-time SP->resource edges—can separate persistence establishment from routine maintenance
+    better than any single rule. Prioritizing the highest-scoring modifications and emitting the top-3
+    features (e.g., actor-rarity, dormancy, Graph scope) yields an explainable, ranked queue for the analyst.
+    High scores with sensible contributing features merit investigation as persistence under the Persistence
+    tactic; low scores deprioritize benign rotations.
+  answer_sources:
+  - AuditLogs
+  - AADServicePrincipalSignInLogs
+  - MicrosoftGraphActivityLogs
+  - 'NAI: Service principals with elevated permissions, credential and owner update events, and subsequent
+    sign-ins by identities that were newly modified or re-enabled'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      features = sp_lifecycle_features(actor_novelty, owner_identity, cred_type, prior_activity, src_novelty, graph_scope)
+      edge_score = temporal_link_prediction(SP->resource first-time edges)
+      score = classifier.predict(features) + edge_score
+      alert where score>threshold
+      emit top3_features(score)  // actor_rarity, dormancy, graph_scope
+- question: Which Azure VMs received a VM access-extension write or RunCommand (VMAccessWindowsPasswordReset
+    semantics / 'Microsoft.Compute/virtualMachines/runCommand/action', success via Start/Accepted/Succeeded)
+    — parsing Caller, CallerIpAddress, Subscription, and VirtualMachineName — and were these correlated
+    with a nearby guest password-change (Event ID 4724) and a successful local-administrator logon (Event
+    ID 4624)?
+  context: Resetting the local administrator on an Azure VM through the VMAccess extension or RunCommand
+    creates a host-level backdoor that survives user-account remediation elsewhere in the tenant. Detecting
+    AzureActivity extension writes/deployment validations with password-reset semantics and parsing the
+    Authorization field for Caller, CallerIpAddress, Subscription, and VirtualMachineName identifies who
+    reset which host from where. Correlating the control-plane event with a guest-side password change
+    (Event ID 4724) and a subsequent successful local-administrator logon (Event ID 4624) confirms the
+    backdoor was created and used. Severity should rise for internet-reachable or high-value VMs. A correlated
+    positive is strong persistence evidence under the Persistence tactic.
+  answer_sources:
+  - AzureActivity
+  - Windows Event ID 4624
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - 'NAI: Azure virtual machines exposed through administrative paths, VM extension write activity, and
+    guest logons to local administrator accounts after VMAccess reset operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      AzureActivity where (OperationName has 'runCommand/action' or extension has 'VMAccess') and ActivityStatus in ('Start','Accepted','Succeeded')
+      | extend Caller, CallerIpAddress, Subscription, VM = parse_authorization(Authorization)
+      | join kind=inner (SecurityEvent where EventID==4724) on Computer==VM
+      | join kind=inner (SecurityEvent where EventID==4624 and LogonAccount is local admin) on Computer==VM
+      | extend severity=iif(VM_internet_reachable or VM_high_value,'high','medium')
+- question: Were there sequences where the VMAccess extension was written and a local-administrator logon
+    (Event ID 4624) followed within 15 minutes from a source that rarely administers that host?
+  context: The combination of a control-plane VMAccess extension write and the first successful guest
+    local-administrator logon is far stronger evidence of an established backdoor than either event alone.
+    Flagging cases where the local-admin 4624 follows the extension write within 15 minutes—particularly
+    from a source (account/IP/device) that rarely administers that host—pinpoints fresh, suspicious local
+    access created by the reset. A tight extension-to-logon chain from an unusual administrator is consistent
+    with adversary persistence rather than routine maintenance, mapping to T1098 Account Manipulation
+    under the Persistence tactic.
+  answer_sources:
+  - AzureActivity
+  - Windows Event ID 4624
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - 'NAI: Azure virtual machines exposed through administrative paths, VM extension write activity, and
+    guest logons to local administrator accounts after VMAccess reset operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: |-
+      let resets = AzureActivity where extension has 'VMAccess' | project VM, ResetTime, Caller;
+      SecurityEvent where EventID==4624 and IsLocalAdmin
+      | join kind=inner resets on Computer==VM
+      | where LogonTime - ResetTime <= 15m
+      | where SourceAccount !in (UsualAdmins[VM]) or SourceIp !in (UsualAdminIPs[VM])
+- question: Against a per-VM baseline of extension-write frequency, operator identities, reset timing,
+    and post-reset local-logon counts, which resets occurred on VMs that rarely use VMAccess/RunCommand,
+    showed local-admin logons above the host's trailing 95th percentile, involved first-time operator-to-VM
+    pairs, or were followed by failed guest logons (Event ID 4625) indicating credential testing?
+  context: Baselining each VM's normal extension-write cadence, the operators that perform them, typical
+    reset timing, and post-reset local-logon volume lets the analyst flag statistically anomalous resets.
+    Using robust median/MAD thresholds, surface resets on VMs that rarely use VMAccess/RunCommand, hosts
+    where local-admin logons spike above the trailing 95th percentile after the change, and first-time
+    operator->VM pairs. Profiling failed guest logons (Event ID 4625) after a reset as a distinct signal
+    catches credential testing against the freshly reset account. Anomalous results focus the investigation
+    on suspicious host-level persistence under the Persistence tactic.
+  answer_sources:
+  - AzureActivity
+  - Windows Event ID 4624
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - 'NAI: Azure virtual machines exposed through administrative paths, VM extension write activity, and
+    guest logons to local administrator accounts after VMAccess reset operations'
+  range: Last 90 days for baseline; evaluate recent resets
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: |-
+      let base = AzureActivity VMAccess/RunCommand by VM over 90d | summarize freq, operators, p95_logons, med, mad;
+      recent_resets
+      | where VM_reset_freq < rare_threshold or post_reset_localadmin_logons > base.p95 or pair_first_seen(Operator,VM)
+      | join kind=leftouter (SecurityEvent where EventID==4625) on Computer==VM  // failed guest logons post-reset
+      | project VM, Operator, anomaly_reasons
+- question: When control-plane extension events are combined with guest authentication/process telemetry
+    and scored by a host-backdoor anomaly model — using rare-script hashing (imported cmdlets + size)
+    for RunCommand payloads and graph/sequence scoring of operator-to-VM-to-logon paths — which VM access
+    resets most likely establish persistence, and what top-3 features explain each alert?
+  context: A model that fuses control-plane extension events with guest-side authentication and process
+    telemetry can score VM access resets that likely establish persistence. Rare-script hashing over imported
+    cmdlets and script size flags unusual RunCommand payloads, while graph/sequence scoring of operator->VM->logon
+    paths highlights resets followed by unusual local-admin use, lateral movement, or further persistence.
+    Prioritizing the highest-scoring resets and surfacing the top-3 contributing features gives the analyst
+    an explainable, ranked queue. High scores with intuitive features merit investigation as host-level
+    persistence under the Persistence tactic; low scores deprioritize routine maintenance resets.
+  answer_sources:
+  - AzureActivity
+  - Windows Event ID 4624
+  - Windows Event ID 4723
+  - Windows Event ID 4724
+  - 'NAI: Azure virtual machines exposed through administrative paths, VM extension write activity, and
+    guest logons to local administrator accounts after VMAccess reset operations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: |-
+      payload_score = rare_script_hash(imported_cmdlets + script_size)  // RunCommand payloads
+      path_score = graph_sequence_score(operator->VM->logon paths)
+      score = model.predict(control_plane + guest_auth + process_features) + payload_score + path_score
+      alert where score>threshold and post_reset_unusual_localadmin
+      emit top3_features(score)
