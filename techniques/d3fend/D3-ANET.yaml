@@ -1,0 +1,466 @@
+name: 'D3-ANET: Authentication Event Thresholding'
+id: 80977db2-ab81-44d8-8378-727b307560f9
+description: Investigate authentication telemetry to determine whether successful or failed logon events
+  deviate from per-user and peer-group baselines for source location, host affinity, timing, concurrency,
+  fan-out, and failure-to-success patterns. This playbook layers deterministic floor rules (known-hostile
+  origins, concurrent accounts on a host, single-account fan-out, failure-burst-then-success, password-spray
+  distinct-user counts, structurally invalid logins), statistical baselining (per-user deviation scores,
+  failed-auth drift and bursts, authentication-graph edge rarity and footprint growth, structural-anomaly
+  scoring), and explainable machine learning (graph link prediction, supervised graph-feature classifiers,
+  sequence/language models, login-path rarity ranking, and UEBA peer-group scoring) over first-party identity
+  telemetry. It helps an analyst surface compromised credentials, lateral movement, brute-force/password-spray
+  success, and anomalous authentication origins while profiling failure rates (failed logons / lockouts)
+  as distinct signals.
+type: technique
+related:
+- tactic_id: D3-D
+  tactic_name: Detect
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are any successful or failed authentication events originating from known-malicious infrastructure,
+    unsanctioned anonymization/VPN services, or geographies and ASNs that are not on the approved allow-list?
+  context: This is a deterministic floor rule that should never be replaced by ML. Enrich every Windows
+    Event ID 4624 (success) and 4625 (failure) source IP, plus VPN/RADIUS authentication source addresses,
+    with threat-intelligence indicators, sanctioned-VPN ranges, and geo/ASN allow-lists. Under the Detect
+    tactic the goal is to immediately surface any authentication that touches known-hostile infrastructure
+    or unauthorized anonymization services (Tor, commercial VPNs, residential proxies) where a sophisticated
+    external actor would mask origin. A positive hit warrants immediate triage and possible account locking;
+    a clean result still feeds peer/UEBA anomaly corroboration (new geo/ASN logons). Tune allow-lists
+    per site to reduce false positives from legitimate travel or sanctioned remote access.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM auth_events (EventID IN (4624,4625) OR source=vpn_radius)\n| ENRICH src_ip WITH threat_intel,\
+      \ asn, geo, sanctioned_vpn_list\n| WHERE src_ip IN threat_intel_malicious\n     OR asn IN anonymization_asns\n\
+      \     OR (geo NOT IN allowed_countries AND src_ip NOT IN sanctioned_vpn_list)\n| ALERT severity=high,\
+      \ action=review_account_lock"
+  - technology: Zeek/pseudocode
+    query: 'LOAD conn.log, intel framework hits
+
+      | MATCH id.orig_h against Intel::ADDR
+
+      | JOIN auth sessions by orig_h
+
+      | EMIT alert(orig_h, account, intel_source)'
+- question: Is any single host showing multiple distinct interactive or remote user accounts logged on
+    simultaneously or within the same hour, beyond its expected baseline?
+  context: Multiple distinct users logged into one machine at the same time (or within the same hour)
+    is rare in most enterprises and can indicate credential abuse, shared compromise, or an attacker piggybacking
+    on a host. Group logon sessions from Windows Event ID 4624 with logon types 2 (interactive), 3 (network),
+    9 (new credentials), and 10 (remote interactive/RDP) by host and overlapping time window, then alert
+    when the count of distinct accounts exceeds the expected baseline (default 1, or more than one within
+    the same hour). For the Detect tactic this builds situational awareness of anomalous co-location of
+    identities. Whitelist known shared or admin/jump hosts to avoid noise. A positive result is a strong
+    pivot point for lateral-movement investigation.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM EventID=4624 WHERE LogonType IN (2,3,9,10)\n| BIN time INTO 1h windows\n| STATS dcount(account)\
+      \ AS distinct_users BY host, window\n| WHERE distinct_users > baseline(host) DEFAULT 1\n     AND\
+      \ host NOT IN shared_admin_hosts\n| ALERT"
+- question: Does any single account authenticate to an unusually large number of distinct destination
+    hosts within a short sliding window, exceeding its tuned per-user threshold?
+  context: Most users authenticate to only one or two machines during normal business. An account that
+    logs into many hosts in a short period, especially remotely, is a hallmark of lateral movement using
+    compromised credentials. For each account, count distinct destination hosts authenticated to over
+    a sliding window (e.g., 1 hour) and alert when the distinct-host count exceeds a tuned threshold (start
+    at the per-user 99th percentile; default >5-10 for non-admins). Under the Detect tactic this flags
+    footprint expansion. Whitelist admin and service accounts that legitimately touch many hosts, and
+    derive the cutoff from local history or public datasets like LANL. A positive result should be correlated
+    with edge-rarity and failure-burst signals.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FROM EventID=4624 WHERE LogonType IN (3,9,10)\n| BIN time INTO 1h windows\n| STATS dcount(dest_host)\
+      \ AS host_fanout BY account, window\n| WHERE host_fanout > per_user_p99(account) DEFAULT 5\n   \
+      \  AND account NOT IN admin_service_accounts\n| ALERT"
+- question: For any account and source IP, are there N or more consecutive failed logons immediately followed
+    by a successful logon within a short interval, indicating likely password-guessing success?
+  context: A burst of authentication failures followed quickly by a success strongly suggests successful
+    brute-force or guessing. For each account+source IP pair, detect N consecutive Windows Event ID 4625
+    failures (default N>=5) followed by a 4624 success within a short interval (e.g., 10 minutes). Record
+    the failed-to-success transition as a distinct high-fidelity state-change signal. For the Detect tactic,
+    this is one of the most actionable indicators because it captures the moment of compromise. A positive
+    match should trigger immediate escalation and credential reset. Tune N and the window to the environment
+    to avoid flagging users who simply mistype passwords a few times.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FROM auth_events ORDER BY time BY account, src_ip\n| DETECT sequence: (EventID=4625){N>=5}\
+      \ THEN EventID=4624\n     WITHIN 10m\n| ALERT severity=high label=\"guessing_success\", emit(account,\
+      \ src_ip, fail_count)"
+- question: Within a sliding window, does any single source IP or host generate failed logons against
+    an unusually high number of DISTINCT accounts, indicating password spraying rather than single-account
+    brute force?
+  context: Password spraying tries a few common passwords against many accounts to evade lockout, so it
+    appears as many distinct users failing from one source with few attempts each, unlike brute force
+    (one user, many attempts). Per source IP (and per host) in a sliding window, count distinct accounts
+    that produced a 4625 failure and alert when the unique-failed-user count exceeds a tuned threshold
+    (start >30 distinct users / 5 min). Also alert on Event ID 4740 account-lockout spikes. Under the
+    Detect tactic this catches early-stage credential access by external actors. A positive result warrants
+    reviewing which accounts subsequently succeeded and correlating with the failure-burst-then-success
+    rule.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM EventID=4625
+
+      | BIN time INTO 5m windows
+
+      | STATS dcount(account) AS uniq_failed_users BY src_ip, host, window
+
+      | WHERE uniq_failed_users > 30
+
+      | ALERT label="password_spray"
+
+      ;; ALSO: FROM EventID=4740 | STATS count BY window | WHERE count > p99'
+- question: Are there logins that violate the learned structural relationship between source-host type,
+    destination-host type, and user role, even when each individual attribute is common?
+  context: Some malicious logins are anomalous not in any single field but in their combination, e.g.,
+    a workstation-role account authenticating server-to-server. Maintain an allow-list of frequent (source-host-type,
+    destination-host-type, user-role) login triples learned from history and alert when a login violates
+    that learned structure. For the Detect tactic this catches stealthy lateral movement that mimics normal
+    individual attributes but breaks expected topology. A positive match indicates a credential being
+    used in a context it never legitimately occupies. Continuously relearn the structure to adapt to environment
+    changes, and validate by injecting synthetic attack logins.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'LEARN allowed_triples = frequent (src_host_type, dest_host_type, user_role) FROM history
+
+      | FROM new_logins
+
+      | MAP each login -> (src_host_type, dest_host_type, user_role)
+
+      | WHERE triple NOT IN allowed_triples
+
+      | ALERT label="structural_invalid_login"'
+- question: When scored against a rolling 30-90 day per-user profile, do new authentication events show
+    statistically significant deviation in login hour, day-of-week, source ASN/country, destination host
+    class, or authentication frequency?
+  context: This statistical baseline establishes what 'normal' looks like for each user and scores deviations.
+    Build rolling 30-90 day profiles per user for login hour, day-of-week, source ASN/country, destination
+    host class, and authentication frequency (count/min). Score each new event with percentile and robust
+    (median/MAD) z-score metrics and alert when the composite score exceeds tuned thresholds. Crucially,
+    surface the top-3 contributing features (e.g., new ASN, off-hours, frequency spike) in the alert text
+    so analysts get explainable context. For the Detect tactic this produces user-specific anomaly detection
+    that adapts per-identity, catching compromised-credential use that a global threshold would miss.
+    A high score with a 'new ASN + off-hours' explanation is a strong investigative lead.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "BUILD profile[user] OVER last 30-90d:\n   dist(login_hour), dist(dow), dist(asn), dist(country),\
+      \ dist(dest_class), freq=count/min\n| FOR each new event:\n     z = robust_z(value, median, MAD);\
+      \ pct = percentile(value, profile)\n     score = combine(z_features)\n| WHERE score > threshold\n\
+      | ALERT emit(top3_contributing_features)"
+- question: Do failed and successful logon counts per user or per subnet exceed historical control limits,
+    or does the failed-to-success ratio shift in a way that indicates a regime change in authentication
+    behavior?
+  context: Failed-authentication volume is a distinct signal from success volume and benefits from time-series
+    monitoring. Aggregate failed (4625) and successful (4624) logon counts per user and per subnet in
+    15-minute windows. Alert when failed-logon counts exceed the historical 99th percentile or when EWMA/CUSUM
+    residuals breach control limits, and treat the failed-to-success ratio as a separate state metric.
+    Use change-point detection (CUSUM, EWMA, PELT, Bayesian online CPD) for dynamic thresholds that adapt
+    to regime shifts rather than static cutoffs. For the Detect tactic this catches gradual or bursty
+    credential-access campaigns and infrastructure changes. A detected change-point in failed-auth volume
+    on a subnet is a strong pivot for spray/brute-force investigation.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM EventID IN (4624,4625)
+
+      | BIN time INTO 15m windows
+
+      | STATS fail=count(4625), succ=count(4624) BY user, subnet, window
+
+      | COMPUTE ewma, cusum residuals; ratio = fail/(succ+1)
+
+      | WHERE fail > hist_p99 OR cusum_breach OR changepoint(ratio)
+
+      | ALERT'
+- question: In the user->host and host->host authentication graph, are there previously-unseen edges or
+    users whose host footprint has expanded beyond their baseline, characterizing lateral movement?
+  context: Modeling authentication as a graph exposes structural anomalies invisible to per-event analysis.
+    Build a user->host / host->host graph and compute per-edge rarity, first-time (new) edges, and each
+    user's host 'footprint' (distinct hosts touched). Alert on previously-unseen edges and on footprint
+    expansion beyond the user's baseline (e.g., footprint > 99th percentile). For the Detect tactic these
+    features directly characterize compromised-credential lateral movement, where an attacker traverses
+    new authentication paths. Derive baselines from local history or public LANL authentication data.
+    A cluster of new edges from one credential in a short window is a high-priority lateral-movement indicator.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'BUILD auth_graph edges (user->host, host->host) FROM EventID=4624 + Kerberos
+
+      | FOR each edge: rarity = 1/historical_freq; is_new = edge NOT IN baseline
+
+      | FOR each user: footprint = dcount(dest_host) in window
+
+      | WHERE is_new OR footprint > per_user_p99
+
+      | ALERT emit(edge_endpoints, footprint)'
+- question: Using frequent-pattern mining over (source-type, destination-type, user-role) login patterns,
+    which logins receive a low support (high structural-anomaly) score?
+  context: This statistical complement to the deterministic structural rule assigns a continuous anomaly
+    score rather than a binary allow/deny. Learn the frequency of (source-type, destination-type, user-role)
+    login patterns via market-basket / frequent-pattern mining and assign each login a structural-anomaly
+    score derived from its pattern support; low support means a rare structural combination. Alert above
+    a tuned percentile. For the Detect tactic this prioritizes logins whose topology is statistically
+    unusual, catching subtle lateral movement. Validate the model by injecting synthetic attack logins
+    and confirming they score above threshold. A high structural-anomaly score is most convincing when
+    corroborated by edge-rarity or fan-out signals.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'MINE frequent_patterns(src_type, dest_type, user_role) FROM history -> support table
+
+      | FOR each login: score = 1 - support(triple)
+
+      | WHERE score > percentile_threshold
+
+      | ALERT label="structural_anomaly"'
+- question: When the authentication graph is embedded with node2vec-style features and scored with a link-prediction
+    model, which authentication edges have a low predicted probability indicating rare or unseen connections?
+  context: This ML method learns the latent structure of the authentication graph to score how 'expected'
+    each edge is. Learn node2vec-style embeddings of the authentication graph and train link prediction
+    (e.g., logistic regression over embedding features) to score the probability of each authentication
+    edge; flag low-probability (rare/unseen) edges as candidate lateral movement (>85% TPR at ~0.0004%
+    FPR on LANL). Report the edge endpoints and nearest-baseline neighbors as the top contributing factors
+    for triage. For the Detect tactic this provides high-precision detection of stealthy credential reuse
+    across the graph. A low-probability edge between two hosts a credential has never linked before is
+    a strong lateral-movement lead; explainability via nearest neighbors speeds triage.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pipeline pseudocode
+    query: 'GRAPH = build_auth_graph(4624, Kerberos)
+
+      emb = node2vec(GRAPH)
+
+      model = logistic_regression.train(edge_features=concat(emb[u],emb[v]), labels=observed)
+
+      FOR each new edge: p = model.predict_proba(u,v)
+
+      WHERE p < threshold -> ALERT emit(u, v, nearest_baseline_neighbors)'
+- question: Do supervised classifiers trained on per-host and per-user authentication-graph features (degree,
+    distinct peers, edge novelty) identify hosts or users likely targeted in lateral movement?
+  context: This ML method frames lateral-movement detection as supervised classification over engineered
+    graph features. Extract per-host/per-user graph features (degree, distinct peers, edge novelty) from
+    authentication logs, balance classes with over/under-sampling (since attacks are rare), and train
+    supervised classifiers/ensembles. Surface the top-3 features per prediction for explainability, and
+    test robustness to attackers who slow or shrink their movement to evade detection. For the Detect
+    tactic this complements unsupervised edge scoring by learning known attack patterns. A host flagged
+    with high edge-novelty and abnormal degree is a candidate compromise; analysts should verify with
+    raw authentication timelines and confirm the model is not over-fitting to benign admin behavior.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pipeline pseudocode
+    query: 'features = per_entity(degree, distinct_peers, edge_novelty) FROM auth_graph
+
+      train = balance(features, labels) via over/under-sampling
+
+      model = ensemble.train(train)
+
+      FOR each entity: pred = model.predict(features); explain = top3_shap(features)
+
+      WHERE pred=targeted -> ALERT emit(entity, explain)'
+- question: When a self-supervised sequence model is trained on per-user authentication event streams,
+    which events have low predicted likelihood or high reconstruction error, and which fields drove the
+    anomaly?
+  context: This ML method treats each user's authentication history as a language to be modeled. Train
+    a self-supervised sequence/language model (transformer or attention-RNN) on per-user authentication
+    event streams, using features from 4624/4625, Kerberos, and Zeek conn.log metadata. Flag events with
+    low predicted likelihood / high reconstruction error and use attention weights to name the authentication
+    fields (user, source, destination, auth type, time) that drove the anomaly in the alert. For the Detect
+    tactic this captures sequential context that point-in-time scoring misses, e.g., an out-of-order or
+    improbable authentication step. A low-likelihood event with attention pointing at an unusual destination
+    or auth type is an explainable lead. Requires sufficient per-user history to train; sparse users may
+    need peer-group pooling.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pipeline pseudocode
+    query: 'seqs = per_user_event_stream(features=[user,src,dst,auth_type,time] from 4624/4625,Kerberos,conn.log)
+
+      model = transformer.self_supervised_train(seqs)
+
+      FOR each event: likelihood = model.score(event | history)
+
+      WHERE likelihood < threshold -> ALERT emit(event, attention_top_fields)'
+- question: After reconstructing causal login paths per user and combining credential-switch / new-privileged-access
+    rules with a path-rarity model, which rarest login paths should be prioritized for analyst review?
+  context: This ML method controls alert volume by ranking rather than flagging everything. Reconstruct
+    causal login paths per user and combine deterministic credential-switch / new-privileged-access rules
+    with a rarity model over path features, then rank only the rarest paths for review to keep alert budgets
+    low (e.g., ~9 alerts/day at high recall). For the Detect tactic this makes graph-based lateral-movement
+    detection operationally sustainable in a SOC by surfacing the highest-value cases. A top-ranked rare
+    path that also includes a credential switch into privileged access is a high-priority investigation.
+    Tune the daily alert budget to analyst capacity and periodically audit recall against red-team activity.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pipeline pseudocode
+    query: 'paths = reconstruct_causal_login_paths(per_user)
+
+      flag = rule(credential_switch OR new_privileged_access)
+
+      score = rarity_model(path_features)
+
+      RANK paths BY score DESC WHERE flag
+
+      EMIT top_k(daily_budget) -> ALERT'
+- question: When each user/host entity and its dynamic peer group are baselined, which authentication
+    and access activities (new geo/ASN, unusual logon time, first resource access, account enumeration)
+    score as anomalous against both per-entity and peer-group norms?
+  context: User and Entity Behavior Analytics (UEBA) scores activity against both the entity's own baseline
+    and that of its dynamic peer group, catching deviations that are normal for some roles but abnormal
+    for this entity. Baseline each user/host entity and its peer group, then score authentication/access
+    activity to flag anomalies such as new geo/ASN logons, unusual logon time, first-time resource access,
+    and account enumeration. Emit contributing-factor insights so analysts see why the entity scored anomalous.
+    For the Detect tactic this is the integrative layer corroborating the deterministic and statistical
+    rules above. An entity that is anomalous against both its own and its peer-group baseline is a strong
+    compromise indicator; the contributing factors guide where to investigate first.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Windows Event ID 4634
+  - Windows Event ID 4740
+  - VPN/RADIUS authentication logs
+  - Kerberos network traffic
+  - Zeek conn.log
+  - 'NAI: Domain Controllers, VPN Concentrators, RADIUS/IDAM servers, and Internet Gateway'
+  range: Last 90 days
+  queries:
+  - technology: ML/pipeline pseudocode
+    query: "baseline_entity = profile(user/host) ; baseline_peers = profile(dynamic_peer_group)\nFOR each\
+      \ activity (auth/access):\n  score = anomaly(activity vs baseline_entity, vs baseline_peers)\n \
+      \ factors = [new_geo, new_asn, unusual_time, first_resource_access, enumeration]\nWHERE score >\
+      \ threshold -> ALERT emit(entity, contributing_factors)"
