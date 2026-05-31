@@ -1,0 +1,415 @@
+name: 'T1030: Data Transfer Size Limits'
+id: de374b8c-4c9d-4c3e-91dc-96c8dbb82fc0
+description: 'Investigate possible use of Data Transfer Size Limits (T1030), in which an adversary exfiltrates
+  data in fixed-size chunks or caps packet/transfer sizes below known thresholds to evade volume-based
+  data-loss and network alerting. This playbook helps an analyst hunt for: outbound connections to known-malicious
+  C2/exfiltration endpoints from threat intelligence; traffic carrying signatures of known exfil tools
+  (anomalous HTTP headers, DNS TXT/NULL tunneling, fixed inter-packet delays); flows with abnormally low
+  packet-size variance indicating programmatic uniform chunking; periodic beacon-like connections from
+  a single host that each move a near-identical data volume; and outbound uploads originating from processes
+  that do not normally communicate over the network. It combines symbolic-logic detections, statistical
+  baselining (modified Z-score, entropy/heavy-hitter, autocorrelation), and machine-learning models (reputation
+  scoring, time-series forecasting, one-class/Isolation-Forest anomaly detection) across Zeek network
+  logs, full packet capture, and Windows endpoint telemetry to surface low-and-slow chunked exfiltration.'
+type: technique
+related:
+- tactic_id: TA0010
+  tactic_name: Exfiltration
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any internal host establish a successfully completed outbound connection (Zeek conn_state='SF'),
+    HTTP request, or DNS query to a destination IP, domain, or URL that appears on a high-confidence threat-intelligence
+    feed of known C2 or data-exfiltration endpoints?
+  context: For the Exfiltration tactic, a confirmed connection to a known-bad endpoint is among the strongest
+    signals that staged data is leaving the network. Continuously match Zeek conn.log destinations (focusing
+    on successful transfers, conn_state='SF'), HTTP host headers, and DNS queries against curated threat
+    intelligence. An established (SF) connection to a known C2/exfil indicator is a high-confidence hit;
+    blocked or rejected attempts (conn_state S0/REJ/RSTO) to the same indicator are a distinct, lower-confidence
+    retry signal that is consistent with chunked exfiltration repeatedly attempting to push data. A positive
+    result warrants immediate scoping of what data the host could access; a negative result lowers but
+    does not eliminate suspicion since adversaries rotate infrastructure.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, DNS resolvers, and web proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "SOURCE zeek_conn, zeek_http, zeek_dns\n| JOIN ti_feed ON conn.id_resp_h = ti.indicator\n \
+      \   OR http.host = ti.indicator OR dns.query = ti.indicator\n| EVAL severity = IF(conn_state=\"\
+      SF\", \"high\", IF(conn_state IN (\"S0\",\"REJ\",\"RSTO\"), \"medium-retry\", \"low\"))\n| WHERE\
+      \ ti.confidence = \"high\"\n| ALERT by id_orig_h, indicator, conn_state, severity"
+- question: Has the cumulative outbound byte volume (orig_bytes) to any single threat-intel indicator
+    risen above that indicator's historical 95th percentile when measured with an outlier-robust modified
+    Z-score?
+  context: Even when an indicator is only moderately suspicious, a sudden rise in egress volume toward
+    it suggests active data theft. Baseline cumulative orig_bytes per indicator over a sliding window
+    and raise a medium alert when the current transfer volume exceeds the indicator's 95th percentile.
+    Use the modified Z-score (flag |Z|>3.5 on the median absolute deviation) instead of mean/standard
+    deviation so that occasional large legitimate transfers do not skew the baseline and mask malicious
+    activity. A positive result means egress to that destination is anomalously heavy relative to its
+    own history, which for chunked exfiltration accumulates across many small transfers into a large total.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, DNS resolvers, and web proxies'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SOURCE zeek_conn | WHERE id_resp_h IN ti_indicators
+
+      | BIN window=1h | STATS cum_bytes = sum(orig_bytes) by indicator, window
+
+      | EVAL med = median(cum_bytes), mad = mad(cum_bytes)
+
+      | EVAL mz = 0.6745 * (cum_bytes - med) / mad
+
+      | WHERE mz > 3.5 OR cum_bytes > pctl95(cum_bytes)
+
+      | ALERT severity="medium" by indicator, cum_bytes, mz'
+- question: When scored by a destination-reputation classifier using features such as domain age, ASN
+    reputation, geographic prevalence, cumulative bytes-out, and threat-intel matches, does any outbound
+    destination receive a predicted-malicious probability above 0.85?
+  context: Threat-intel feeds miss freshly registered or never-before-seen infrastructure, so a learned
+    reputation model fills the gap for Exfiltration. Train a Logistic Regression or Gradient Boosting
+    classifier on the listed features and alert when predicted malicious probability exceeds 0.85. Surface
+    the top-3 SHAP feature contributions in the alert text so the analyst understands why the destination
+    scored high (e.g., very new domain + high bytes-out + rare ASN). A positive result identifies likely-malicious
+    endpoints that no static list flagged; review the contributing features to confirm and to avoid false
+    positives on legitimate but rare services.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, DNS resolvers, and web proxies'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [domain_age, asn_reputation, geo_prevalence, cum_bytes_out, ti_match]\np = reputation_model.predict_proba(features)\n\
+      IF p > 0.85:\n    shap = explain(reputation_model, features)\n    ALERT(destination, p, top3=shap.top(3))"
+- question: Does any outbound HTTP or DNS traffic match the signatures of known exfiltration tools, such
+    as POST requests with atypical User-Agent/Content-Type pairings or floods of DNS TXT/NULL queries
+    that exceed the lossless-compression information limit for a registered domain?
+  context: Exfiltration tools leave protocol fingerprints. Use IDS/Sigma rules to flag HTTP POSTs with
+    unusual User-Agent and Content-Type combinations and DNS TXT/NULL query floods characteristic of tunneling.
+    Critically, bound the benign DNS-carrying capacity using lossless-compression information limits per
+    registered domain, so that fixed-size chunked tunnels are caught regardless of the size of any individual
+    query — the adversary cannot evade detection simply by shrinking each chunk. A positive result strongly
+    indicates tool-based exfiltration; pivot to the responsible host and process and quantify total information
+    transferred to the domain.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, web proxies, and internal DNS servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "SOURCE zeek_http | WHERE method=\"POST\" AND (user_agent IN atypical_ua OR content_type IN\
+      \ rare_ct)\n| UNION (SOURCE zeek_dns | WHERE qtype IN (\"TXT\",\"NULL\")\n         | STATS info_bits\
+      \ = sum(compressed_len(query)) by parent_domain, window=1h\n         | WHERE info_bits > benign_capacity(parent_domain))\n\
+      | ALERT by id_orig_h, target, signature"
+- question: Do DNS subdomain queries for any parent domain show Shannon entropy or n-gram/Zipfian label
+    scores beyond mean + 3σ, or anomalous counts of distinct subdomains and NXDOMAIN responses, indicating
+    encoded data in DNS labels?
+  context: DNS tunneling encodes data into subdomain labels, raising their randomness and volume. Baseline
+    Shannon entropy and bigram/Zipfian label scores for DNS subdomains per parent domain and alert on
+    queries exceeding mean + 3σ or with anomalous n-gram match scores. Also aggregate distinct-subdomain
+    counts and NXDOMAIN rate per domain over sliding windows as failure-state signals, since tunneling
+    and chunked exfiltration generate many unique, often non-resolving subdomains. A positive result for
+    an unfamiliar domain is a strong tunneling indicator; legitimate CDNs and AV/telemetry domains can
+    be high-entropy, so whitelist known services.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, web proxies, and internal DNS servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "SOURCE zeek_dns | EVAL ent = shannon(subdomain), ng = ngram_score(subdomain)\n| STATS m=mean(ent),\
+      \ s=stddev(ent), distinct_sub=dc(subdomain),\n        nx=avg(rcode=\"NXDOMAIN\") by parent_domain,\
+      \ window=1h\n| WHERE ent > m + 3*s OR ng < ngram_threshold OR distinct_sub > sub_baseline OR nx\
+      \ > nx_baseline\n| ALERT by parent_domain, ent, distinct_sub, nx"
+- question: Across a streaming per-domain estimate of cumulative information content (not merely query
+    count), does any domain rank as an information heavy hitter, betraying deliberately low-throughput
+    chunked exfiltration?
+  context: Counting queries misses adversaries who keep each query small and slow; measuring information
+    content does not. Maintain a streaming per-domain estimate of cumulative information content (bits
+    carried, not just number of queries) and alert on domains whose information rate ranks as a heavy
+    hitter at line rate. This catches deliberately low-and-slow chunked exfil that stays under per-query
+    and per-window count thresholds but still moves meaningful total data. A positive result identifies
+    a domain quietly accumulating exfiltrated bits; correlate with the originating hosts to confirm and
+    scope.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, web proxies, and internal DNS servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'STREAM zeek_dns
+
+      | SKETCH info_per_domain USING count_min(weight = info_bits(query))
+
+      | TOPK heavy_hitters BY estimated_info_rate
+
+      | WHERE estimated_info_rate > heavy_hitter_threshold
+
+      | ALERT by parent_domain, estimated_info_rate'
+- question: When the per source-destination sequence of (inter-connection delta, bytes) is modeled with
+    LSTM/transformer or ARIMA, does any host-destination pair deviate significantly from its forecast,
+    including high-jitter beacons that defeat FFT/CV detectors?
+  context: Sophisticated beacons add jitter to evade periodicity detectors, but learned sequence models
+    still flag them. Model the per source-destination sequence of inter-connection delta and bytes with
+    an LSTM/transformer or ARIMA and alert on significant deviations from the forecast. This catches high-jitter
+    beacons that defeat FFT/coefficient-of-variation detectors. Report the top-3 contributing features
+    (size CV, interval regularity, destination rarity) so the analyst can validate. A positive result
+    indicates automated, machine-driven communication consistent with chunked exfiltration; investigate
+    the process and data scope on the source host.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Egress network gateways, web proxies, and internal DNS servers'
+  range: Last 90 days (analyze in event-centered windows of 1-24 hours to resolve periodicity)
+  queries:
+  - technology: ML/pseudocode
+    query: "seq = sequence_of(zeek_conn, key=(id_orig_h,id_resp_h), feats=[interval_delta, orig_bytes])\n\
+      pred = ts_model.forecast(seq)\nerr = residual(seq, pred)\nIF err > anomaly_threshold:\n    ALERT(src,\
+      \ dst, err, top3=[size_cv, interval_regularity, dest_rarity])"
+- question: Are there Zeek conn.log flows of more than 10 packets whose per-packet sizes are nearly identical
+    (orig_ip_bytes/orig_pkts within ±5%) across successive transfers, or sets of 5+ same-destination flows
+    whose orig_bytes coefficient of variation is below 0.1?
+  context: Programmatic fixed-size chunking produces unnaturally uniform packet and flow sizes. Alert
+    when flows with more than 10 packets show nearly identical per-packet sizes (orig_ip_bytes/orig_pkts
+    within ±5%) across successive transfers, or when the coefficient of variation of orig_bytes across
+    at least 5 same-destination flows is below 0.1. Human and most application traffic is bursty and variable,
+    so such tight uniformity directly signals data deliberately split into uniform sizes to stay under
+    transfer thresholds — the core of T1030. A positive result is a strong chunking indicator; confirm
+    the destination and the originating process.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Egress network gateways and core network switches where full packet capture is available'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "SOURCE zeek_conn | WHERE orig_pkts > 10\n| EVAL per_pkt = orig_ip_bytes / orig_pkts\n| STATS\
+      \ cv_bytes = stddev(orig_bytes)/avg(orig_bytes), n=count,\n        pkt_spread = stddev(per_pkt)/avg(per_pkt)\
+      \ by id_orig_h, id_resp_h\n| WHERE (pkt_spread <= 0.05) OR (n >= 5 AND cv_bytes < 0.1)\n| ALERT\
+      \ by id_orig_h, id_resp_h, cv_bytes"
+- question: Using PCAP/Zeek, do any flows exhibit a per-packet-size standard deviation in the bottom 1st
+    percentile for their protocol (with a modified Z-score applied for robustness), indicating uniform
+    chunking?
+  context: Baselining packet-size dispersion per protocol exposes flows that are abnormally uniform. Compute
+    per-packet-size standard deviation (σ) per protocol from PCAP/Zeek and flag flows whose σ lies in
+    the bottom 1st percentile, i.e. unusually uniform chunking. Apply the modified Z-score on the size
+    distribution to stay robust against mixed traffic. Most legitimate protocols show meaningful packet-size
+    variation; a flow that is far more uniform than its protocol peers is consistent with programmatic
+    fixed-size transfer for T1030. A positive result identifies candidate chunked flows; corroborate with
+    destination reputation and process attribution.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Egress network gateways and core network switches where full packet capture is available'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SOURCE pcap_or_zeek | STATS sigma = stddev(pkt_size) by flow_id, proto
+
+      | EVAL med = median(sigma) by proto, mad = mad(sigma) by proto
+
+      | EVAL mz = 0.6745*(sigma - med)/mad
+
+      | WHERE sigma <= pctl01(sigma by proto)
+
+      | ALERT by flow_id, proto, sigma, mz'
+- question: When per-flow temporal features (packet-size sequence, inter-arrival times, directional byte
+    sequence) are classified by a model trained on labeled single-flow datasets, is any flow predicted
+    to match the low-variance uniform-chunk exfiltration class?
+  context: Single-flow time-series classification turns raw per-flow dynamics into a label. Extract the
+    packet-size sequence, inter-arrival times, and directional byte sequence for each flow and classify
+    with a model trained on labeled single-flow datasets; the packet-size-sequence features directly encode
+    the low-variance uniform-chunk signature of T1030. A positive classification flags a flow whose internal
+    rhythm matches known chunked-exfil behavior even when aggregate volume looks ordinary. Validate by
+    inspecting the flow's packet-size sequence and the destination, since rare legitimate automated transfers
+    can resemble chunking.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Egress network gateways and core network switches where full packet capture is available'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "for flow in zeek_or_pcap_flows:\n    feats = [pkt_size_seq(flow), inter_arrival_seq(flow),\
+      \ directional_byte_seq(flow)]\n    label, prob = single_flow_model.predict(feats)\n    IF label\
+      \ == \"chunked_exfil\" AND prob > 0.8:\n        ALERT(flow.id, prob)"
+- question: When flows are clustered by average packet size, packet-size σ, total bytes, and duration
+    using DBSCAN, do any dense low-variance/high-volume clusters emerge that distinguish chunked-exfil
+    flows from normal traffic?
+  context: Unsupervised clustering groups together the many near-identical flows that chunking produces.
+    Cluster flows on average packet size, σ, total bytes, and duration with DBSCAN to isolate dense, low-variance/high-volume
+    groups, and surface the defining features for each cluster. A tight cluster of high-volume, low-variance
+    flows to a common destination is a hallmark of automated chunked exfiltration. A positive result is
+    a cluster worth investigating as a unit; examine the shared destination and source processes. Because
+    DBSCAN needs no labels, it can reveal previously unseen campaigns.
+  answer_sources:
+  - Zeek conn.log
+  - 'NAI: Egress network gateways and core network switches where full packet capture is available'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "X = flows[[avg_pkt_size, pkt_size_sigma, total_bytes, duration]]\nlabels = DBSCAN(eps, min_samples).fit_predict(X)\n\
+      for c in dense_clusters(labels):\n    if low_variance(c) and high_volume(c):\n        ALERT(cluster=c,\
+      \ members=flows_in(c), defining_feats=shap_summary(c))"
+- question: Are there sources making more than 5 regular-interval connections to the same destination
+    within an hour where the originated bytes vary by less than 5% (i.e. both the interval CV and the
+    byte CV are below threshold)?
+  context: Fixed-size beaconing combines periodic timing with near-constant payloads. Detect sources making
+    more than 5 regular-interval connections to the same destination within an hour where orig_bytes vary
+    less than 5%. Compute RITA-style interval and byte coefficients of variation and alert when both are
+    below threshold. This pairs the 'when' (regular cadence) with the 'how much' (uniform volume) to identify
+    automated, chunked exfiltration from a single host. A positive result is a strong beacon indicator;
+    pivot to the originating process and destination reputation to confirm and scope.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, servers hosting sensitive data, and egress network gateways'
+  range: Last 90 days (analyze in event-centered windows of 1-24 hours to resolve periodicity)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "SOURCE zeek_conn (or win_5156) | BIN window=1h\n| STATS n=count, interval_cv=cv(delta(ts)),\
+      \ byte_cv=cv(orig_bytes)\n        by id_orig_h, id_resp_h, window\n| WHERE n > 5 AND interval_cv\
+      \ < 0.1 AND byte_cv < 0.05\n| ALERT by id_orig_h, id_resp_h, n, byte_cv"
+- question: Do FFT/autocorrelation analyses of outbound connection timestamps per source-destination reveal
+    strong periodicity combined with low orig_bytes variance, after applying role-aware thresholds to
+    suppress update/telemetry traffic?
+  context: Frequency-domain analysis exposes hidden regularity in connection timing. Run FFT/ACF on outbound
+    connection timestamps per source-destination and flag hosts showing strong periodicity plus low orig_bytes
+    variance. Use benign campus-edge periodic-traffic distributions to set role-aware thresholds and suppress
+    false positives from software updates and telemetry, which are also periodic. A positive result (sharp
+    spectral peak with uniform byte volume) indicates an automated beacon consistent with chunked exfiltration.
+    Tune thresholds by host role, since servers and workstations have different legitimate periodic patterns.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, servers hosting sensitive data, and egress network gateways'
+  range: Last 90 days (analyze in event-centered windows of 1-24 hours to resolve periodicity)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SOURCE zeek_conn | SERIES ts by id_orig_h, id_resp_h
+
+      | EVAL spectrum = FFT(ts_intervals), peak = max(spectrum), bcv = cv(orig_bytes)
+
+      | WHERE peak > periodicity_threshold(host_role) AND bcv < 0.1
+
+      | EXCLUDE known_update_telemetry_domains
+
+      | ALERT by id_orig_h, id_resp_h, peak, bcv'
+- question: Does an Isolation Forest on per-host/hour features (connection count, unique destinations,
+    average interarrival, byte σ, failed/aborted-connection ratio), complemented by an interpretable CT-HMM,
+    flag any host as exhibiting irregular chunked cadences?
+  context: Machine learning captures beaconing rhythms that fixed rules miss. Train an Isolation Forest
+    on per-host/hour features — connection count, unique destinations, average interarrival, byte σ, and
+    failed/aborted-connection ratio — and flag anomalies. Complement it with a continuous-time HMM (CT-HMM)
+    that yields interpretable likelihoods for irregular chunked cadences, helping explain why a host was
+    flagged. A positive result identifies a host whose outbound rhythm deviates from its peers and its
+    own norm, consistent with automated chunked exfiltration. Review the contributing features and the
+    CT-HMM state likelihoods before escalating.
+  answer_sources:
+  - Zeek conn.log
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, servers hosting sensitive data, and egress network gateways'
+  range: Last 90 days (analyze in event-centered windows of 1-24 hours to resolve periodicity)
+  queries:
+  - technology: ML/pseudocode
+    query: "X = per_host_hour[[conn_count, unique_dst, avg_interarrival, bytes_sigma, failed_ratio]]\n\
+      scores = IsolationForest().fit(X).decision_function(X)\nll = CT_HMM.likelihood(X)\nfor host where\
+      \ scores < anomaly_cut or ll < ll_cut:\n    ALERT(host, scores, ll, top_feats=explain(host))"
+- question: Did a non-whitelisted process (e.g. powershell.exe, cscript.exe, notepad.exe, or a temp-directory
+    executable) initiate an outbound connection — correlating Windows EID 5156 with the EID 4688 process
+    — where Zeek conn.log confirms cumulative orig_bytes over 100 KB, or where repeated EID 5157 blocks
+    suggest chunked retries?
+  context: 'Processes that never normally talk to the network are prime exfiltration vehicles. Correlate
+    Windows Event ID 5156 (allowed connection) with the Event ID 4688 (process creation) that owns the
+    connection, detect non-whitelisted processes such as powershell.exe, cscript.exe, notepad.exe, or
+    temp-directory executables initiating outbound flows, and confirm via Zeek conn.log that cumulative
+    orig_bytes exceed 100 KB before alerting. Also flag repeated blocked/failed outbound attempts (Event
+    ID 5157) from the same process as a chunked-retry signal. A positive result is a high-value lead:
+    an unexpected process uploading data, which is exactly how staged data leaves a host under T1030.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, application servers, and user workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'SOURCE win_5156 | JOIN win_4688 ON pid, host
+
+      | WHERE image NOT IN process_whitelist
+
+      | JOIN zeek_conn ON 4-tuple | STATS cum_bytes=sum(orig_bytes) by image, dst
+
+      | WHERE cum_bytes > 100KB
+
+      | UNION (SOURCE win_5157 | STATS blocks=count by image | WHERE blocks > retry_threshold)
+
+      | ALERT by host, image, dst, cum_bytes'
+- question: For any process, does an outbound connection exceed that process's 99th-percentile orig_bytes/resp_bytes
+    ratio or a modified Z-score threshold on cumulative bytes-out, indicating abnormally upload-heavy
+    behavior?
+  context: Exfiltration inverts the usual download-heavy ratio into upload-heavy traffic. For each process
+    name, maintain the 99th percentile of the orig_bytes/resp_bytes ratio and the modified Z-score of
+    cumulative bytes-out, and flag connections that exceed either threshold. The modified Z-score keeps
+    the baseline robust to occasional large legitimate uploads. A high upload-to-download ratio from a
+    process that normally downloads (or barely uses the network) is a classic exfiltration tell. A positive
+    result highlights abnormal upload-heavy behavior; correlate with destination reputation and the chunking
+    signals to confirm T1030.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, application servers, and user workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'SOURCE zeek_conn (+process attribution) | EVAL ratio = orig_bytes / max(resp_bytes,1)
+
+      | STATS p99=pctl99(ratio), med=median(cum_out), mad=mad(cum_out) by image
+
+      | EVAL mz = 0.6745*(cum_out - med)/mad
+
+      | WHERE ratio > p99 OR mz > 3.5
+
+      | ALERT by image, dst, ratio, mz'
+- question: Does a per-process one-class model (Isolation Forest/OC-SVM/autoencoder) trained on benign
+    NetFlow features (bytes-out, size variance, destination rarity, interval regularity) produce a high
+    reconstruction/anomaly error for any outbound flow?
+  context: Per-process one-class modeling learns each process's normal egress and flags deviations. Train
+    an Isolation Forest, OC-SVM, or autoencoder per process on benign NetFlow features — bytes-out, size
+    variance, destination rarity, interval regularity — and alert on high reconstruction error, surfacing
+    the top-3 contributing features in the alert. This catches a process behaving unlike its own baseline,
+    such as a normally quiet process suddenly uploading uniform chunks to a rare destination. A positive
+    result is a per-process anomaly worth investigating; the surfaced features explain the deviation and
+    help separate true exfiltration from benign change.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4688
+  - Windows Event ID 5156
+  - 'NAI: Endpoint devices, application servers, and user workstations'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "model = one_class_per_process[image]  # IsolationForest/OC-SVM/autoencoder\nfeats = [bytes_out,\
+      \ size_variance, dest_rarity, interval_regularity]\nerr = model.anomaly_score(feats)\nIF err > threshold[image]:\n\
+      \    ALERT(image, dst, err, top3=explain(model, feats))"
