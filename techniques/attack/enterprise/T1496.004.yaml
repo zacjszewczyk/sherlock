@@ -1,0 +1,539 @@
+name: 'T1496.004: Cloud Service Hijacking'
+id: cd9d6d82-df25-4657-8eaf-de9a46a9baa6
+description: Investigate suspected Cloud Service Hijacking (T1496.004), in which an adversary abuses compromised
+  SaaS / cloud credentials to drive resource-intensive workloads that impact availability and run up cost.
+  This playbook helps an analyst hunt for LLMJacking against cloud-hosted AI (e.g., AWS Bedrock InvokeModel)
+  fronted by reverse proxies; bulk spam/smishing through messaging services (AWS SES SendEmail/SendRawEmail,
+  SNS Publish, SendGrid, Twilio); and the enabling steps that precede abuse (service/policy enablement
+  such as UpdateAccountSendingEnabled, PutIdentityPolicy, PutFoundationModelEntitlement, sandbox/sending-limit
+  increases, new IAM users/keys). It pairs deterministic symbolic-logic floors (recon-then-invoke windows,
+  send-rate and recipient-domain fan-out thresholds, long-duration high-volume egress) with statistical
+  baselining (Seasonal-Hybrid ESD, change-point, 3-sigma, peer-group percentiles, attribute rarity) and
+  machine-learning approaches (LSTM/DeepLog sequence modeling, Extended Isolation Forest, CS-GAD graph
+  anomaly) to surface anomalous principals, source regions/ASNs, and usage spikes. Evidence spans the
+  cloud control plane (CloudTrail), network telemetry (Zeek http/conn/smtp), and endpoint authentication
+  (Windows Event ID 4624).
+type: technique
+related:
+- tactic_id: TA0040
+  tactic_name: Impact
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is a single cloud principal performing Bedrock/LLM model-access reconnaissance and then issuing
+    high-volume InvokeModel/InvokeModelWithResponseStream calls, invoking models in regions the account
+    has never used, or being reached through an OAI Reverse Proxy user-agent?
+  context: LLMJacking abuses stolen cloud credentials to resell access to cloud-hosted AI models, and
+    can cost a victim tens of thousands of dollars per day. Build a deterministic rule that fires when
+    one principal (userIdentity.arn) runs Bedrock recon (GetFoundationModelAvailability, GetModelInvocationLoggingConfiguration,
+    ListFoundationModels) and then InvokeModel within ~30 minutes, OR invokes a model in an awsRegion
+    outside the org baseline / outside Bedrock-supported regions (us-east-1, us-west-2, ap-southeast-1,
+    ap-northeast-1, eu-central-1, eu-west-3, us-gov-west-1), OR exceeds a hard floor (>50 InvokeModel
+    calls in 5 minutes). In parallel flag Zeek http.log requests matching the OAI Reverse Proxy fingerprint.
+    A hit indicates the recon-then-abuse pattern characteristic of hijacked AI services; keep the hard
+    count floor even after tuning to per-account baselines.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Cloud AI service control plane (CloudTrail bedrock.amazonaws.com), API gateways, outbound web
+    proxies'
+  range: Last 90 days (correlate recon-to-invoke within a 30-minute window)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // Recon-then-invoke + unused-region + count-floor + reverse-proxy UA
+
+      let recon = CloudTrail where eventName in (GetFoundationModelAvailability, GetModelInvocationLoggingConfiguration,
+      ListFoundationModels)
+
+      let invoke = CloudTrail where eventName in (InvokeModel, InvokeModelWithResponseStream)
+
+      alert if same userIdentity.arn has recon then invoke within 30m
+
+      OR invoke.awsRegion not in baseline_regions(account) or not in BEDROCK_SUPPORTED
+
+      OR count(invoke) by userIdentity.arn over 5m > 50
+
+      union Zeek http.log where user_agent =~ /OAI Reverse Proxy/
+- question: Does a principal's hourly InvokeModel rate, token volume, or estimated cost show a sustained
+    step increase or seasonal anomaly versus its own robust baseline, including bursts of AccessDenied/ThrottlingException?
+  context: 'Statistical baselining catches gradual or sustained LLM abuse that a single hard threshold
+    misses. Build a per-principal hourly time series of InvokeModel count and (from invocation logs) input/output
+    token volume and estimated cost, then apply Seasonal-Hybrid ESD and change-point detection to find
+    step increases against daily/weekly seasonality. Alert when volume exceeds the robust baseline by
+    >3 MAD or a change-point fires, and list the top-3 contributors (invocation rate, region, token/cost
+    delta). A separate spike in AccessDenied/ThrottlingException on InvokeModel signals credential probing
+    or quota exhaustion. This directly ties to the Impact tactic: runaway invocation drives availability
+    loss and cost.'
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Cloud AI service control plane (CloudTrail bedrock.amazonaws.com), API gateways, outbound web
+    proxies'
+  range: Last 90 days (hourly buckets; >=30 days history for baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // Per-principal hourly InvokeModel volume/token/cost baseline
+
+      series = bucket(InvokeModel, by=userIdentity.arn, span=1h) -> count, sum(input_tokens), sum(output_tokens),
+      est_cost
+
+      baseline = SeasonalHybridESD(series); cp = ChangePoint(series)
+
+      alert if current > baseline + 3*MAD OR cp.detected
+
+      also alert if spike in (AccessDenied|ThrottlingException) on InvokeModel
+
+      emit top3_contributors(rate, region, token_cost_delta)
+- question: Do a principal's CloudTrail event sequences resemble a low-probability recon-to-enable-to-high-rate-invoke
+    chain, or does its feature vector make it an outlier among learned administrative workflows?
+  context: Sequence and outlier models catch tool-driven LLMJacking that mimics no human admin pattern.
+    Represent each principal's CloudTrail activity as a sequence of event-name keys and train an LSTM
+    next-event predictor (DeepLog) to flag low-probability sequences like recon->enable->high-rate-invoke
+    that diverge from learned workflows. Complement with an Extended Isolation Forest over a per-principal
+    feature vector (InvokeModel rate, distinct regions, token volume, source ASN, ratio of failed calls).
+    Alert text must surface the top-3 contributing features/log keys, not just the score, so an analyst
+    can quickly validate whether the principal is genuinely abusing the AI service.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - 'NAI: Cloud AI service control plane (CloudTrail bedrock.amazonaws.com), API gateways, outbound web
+    proxies'
+  range: Last 90 days (train on >=30 days of per-principal sequences)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // LSTM next-event + Extended Isolation Forest per principal
+
+      seq = ordered(eventName) by userIdentity.arn
+
+      model = DeepLog.train(admin_sequences); flag if P(next|history) < epsilon
+
+      feats = [invoke_rate, distinct_regions, token_volume, source_asn, failed_ratio]
+
+      eif = ExtendedIsolationForest.fit(feats); flag outliers
+
+      alert with top3_features
+- question: Is a single principal or source IP exceeding a high-frequency send floor on messaging APIs
+    (SES SendEmail/SendRawEmail, SNS Publish, SendGrid /v2/email/send, Twilio /api/v1/messages) consistent
+    with a bulk spam/smishing tool?
+  context: 'Bulk abuse tools (e.g., SNS Sender) drive messaging APIs at machine speed. Create a stateful
+    rule that triggers when one principal or source IP (id.orig_h) exceeds a send floor: >100 SendEmail/SendRawEmail
+    (CloudTrail) or SNS Publish calls in 5 minutes, or >100 requests to */v2/email/send (SendGrid) or
+    */api/v1/messages (Twilio) in Zeek http.log in 5 minutes. SNS-based SMS smishing via sns:Publish and
+    SES bulk abuse are both documented attack patterns. Keep these concrete count thresholds as the deterministic
+    floor and tune to account baselines. A hit indicates the messaging service is being weaponized for
+    spam/smishing, the core Impact outcome of this technique (cost, quota exhaustion, reputational damage).'
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek smtp.log
+  - 'NAI: Cloud messaging service control plane (CloudTrail), cloud application gateways, API gateways,
+    outbound web proxies'
+  range: Last 90 days (5-minute sliding windows)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // Stateful high-frequency send signature
+
+      ses_sns = CloudTrail where eventName in (SendEmail, SendRawEmail, Publish)
+
+      http = Zeek http.log where uri =~ /\/v2\/email\/send|\/api\/v1\/messages/
+
+      alert if count(ses_sns) by userIdentity.arn over 5m > 100
+
+      OR count(http) by id.orig_h over 5m > 100
+- question: For each principal or source IP hitting a messaging endpoint, are inter-request times below
+    the automation threshold or hourly send volume above the seasonal baseline, with rising bounce/complaint/delivery-failure
+    rates?
+  context: 'Scripted senders produce machine-regular timing and volume spikes. For each principal/source
+    IP, compute inter-request times and per-hour send counts; baseline the distribution and alert when
+    inter-request time falls below the 5th percentile (automation) or hourly volume exceeds the robust
+    seasonal baseline using Seasonal-Hybrid ESD / change-point detection. Separately profile the failure
+    state signal: SES bounce and complaint rates and SNS delivery-failure counts climb sharply during
+    spam campaigns because address lists are dirty. Together these distinguish a compromised-account spam
+    run from legitimate transactional traffic, supporting the Impact investigation.'
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek smtp.log
+  - 'NAI: Cloud messaging service control plane (CloudTrail), cloud application gateways, API gateways,
+    outbound web proxies'
+  range: Last 90 days (hourly volume; per-request timing)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // Inter-request timing + send-rate percentile baseline
+
+      irt = diff(timestamp) by principal_or_ip on messaging endpoints
+
+      alert if irt < p5(irt_baseline)
+
+      vol = bucket(sends, span=1h); alert if vol > SeasonalHybridESD(vol) OR ChangePoint(vol)
+
+      also alert if SES bounce/complaint or SNS delivery_failure rate rises sharply
+- question: Do messaging API sessions form scripted send loops that deviate from human/application workflows,
+    and do flow features (request rate, payload size, response codes, destination ASN) classify as tool-driven
+    sending?
+  context: ML catches tool-driven sending that evades fixed thresholds. Model each API session as a sequence
+    of URI paths/methods or CloudTrail event keys and train an RNN/LSTM (DeepLog) to flag scripted send
+    loops that deviate from human/application workflows. In parallel train a supervised flow-feature classifier
+    (request rate, payload size, response codes, destination ASN) following the explainable Volume/Frequency
+    approach of Cryptomining Makes Noise. Surface the top-3 contributing features in the alert so an analyst
+    can confirm whether the session is an automated spam/smishing loop abusing the cloud messaging service.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Zeek smtp.log
+  - 'NAI: Cloud messaging service control plane (CloudTrail), cloud application gateways, API gateways,
+    outbound web proxies'
+  range: Last 90 days (train on labeled human vs scripted sessions)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // Sequence anomaly + flow-feature classifier
+
+      seq = ordered(uri_method | eventName) by session
+
+      DeepLog.flag(low_prob_loops)
+
+      feats = [request_rate, payload_size, response_code_mix, dest_asn]
+
+      clf = SupervisedClassifier.fit(feats, labels)
+
+      alert tool_driven with top3_features
+- question: Is a single internal source IP or principal sending email to an unusually high number of unique
+    recipient domains within one hour (e.g., >50), indicating SES-driven spam fan-out?
+  context: A compromised account driving a spam campaign sprays mail across many unrelated recipient domains,
+    unlike legitimate business mail that clusters on known partners. In Zeek smtp.log (or CloudTrail SES
+    SendEmail destinations), alert when a single internal source IP or principal sends to an unusually
+    high number of unique recipient domains within one hour (>50). Retain this hard threshold as the deterministic
+    floor. A positive result is a strong indicator of SES abuse for spam, a direct Impact outcome that
+    consumes quotas and damages sending reputation.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail gateways, cloud messaging/AI control plane, network egress points, servers hosting cloud
+    service SDKs'
+  range: Last 90 days (1-hour windows)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // Unique recipient-domain fan-out
+
+      smtp = Zeek smtp.log (or CloudTrail SES SendEmail destinations)
+
+      uniq = distinct_count(recipient_domain) by id.orig_h_or_principal over 1h
+
+      alert if uniq > 50
+- question: Does a principal's or host's hourly outbound bytes or API call count exceed its own 30-day
+    mean by more than 3 standard deviations, after suppressing predictable daily/weekly peaks?
+  context: Resource-intensive abuse manifests as a usage volume far above an entity's own history. For
+    each principal/host, aggregate outbound bytes (orig_bytes) and API counts into hourly buckets, compute
+    a 30-day moving average and standard deviation, and alert when current volume exceeds the mean by
+    >3 standard deviations. Layer a seasonality-aware detector (Seasonal-Hybrid ESD) to suppress predictable
+    peaks and a change-point test to catch sustained step increases. Keep the 3-sigma rule as the floor.
+    This flags the availability/cost impact of hijacked messaging or AI usage even when the actor stays
+    under fixed per-minute thresholds.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail gateways, cloud messaging/AI control plane, network egress points, servers hosting cloud
+    service SDKs'
+  range: Last 90 days (hourly buckets; 30-day moving baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // 3-sigma moving average + seasonal baseline + change-point
+
+      series = bucket(orig_bytes, api_count, by=principal_or_host, span=1h)
+
+      ma=mean30d(series); sd=std30d(series)
+
+      alert if current > ma + 3*sd
+
+      suppress predictable peaks via SeasonalHybridESD; also alert if ChangePoint(series)
+- question: When a seasonal forecast of a critical cloud service's request/cost volume is compared to
+    actuals, do standardized residuals exceed the dynamic threshold, alongside spikes in bounce/complaint/delivery-failure
+    or AccessDenied/ThrottlingException?
+  context: 'Forecast-residual scoring adapts the alert threshold to each service''s normal rhythm. For
+    each critical cloud service, fit a seasonal forecasting model (e.g., SARIMA) on >=30-60 days of hourly
+    request/cost volume and alert on standardized residuals beyond a dynamic threshold. Additionally profile
+    the distinct state/failure signal: a spike in SES bounce/complaint or SNS delivery-failure rates and
+    in AccessDenied/ThrottlingException responses, and include the top-3 contributing metrics in the alert.
+    Sustained positive residuals indicate resource-intensive abuse impacting availability and cost under
+    the Impact tactic.'
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek smtp.log
+  - Zeek http.log
+  - 'NAI: Mail gateways, cloud messaging/AI control plane, network egress points, servers hosting cloud
+    service SDKs'
+  range: Last 90 days (hourly; 30-60 days history for SARIMA)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // Forecast-residual anomaly scoring
+
+      model = SARIMA.fit(hourly_volume_cost, history>=30d)
+
+      resid = standardize(actual - forecast)
+
+      alert if |resid| > dynamic_threshold
+
+      also profile bounce/complaint/delivery_failure and AccessDenied/ThrottlingException spikes
+
+      emit top3_metrics
+- question: Is a cloud authentication or AssumeRole event sourced from a known-malicious IP, TOR exit,
+    or anonymizing VPN/proxy, from a first-seen region/ASN for that principal, or showing console use
+    by a programmatic-only principal?
+  context: 'Hijacked credentials are frequently used from infrastructure the legitimate owner never touches.
+    For each cloud authentication or AssumeRole event, extract sourceIPAddress (CloudTrail) or source
+    IP from Zeek conn.log / Windows Event ID 4624 and correlate against a CTI feed of malicious IPs, TOR
+    exit nodes, and anonymizing VPN/proxy services; alert on any match. Also alert when a principal authenticates
+    or invokes a service from a region/ASN never seen for it. The sessionCredentialFromConsole field is
+    key: console use by a programmatic-only principal is itself alertable. Positive results indicate likely
+    credential compromise preceding the resource-intensive abuse of this technique.'
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud IAM infrastructure (CloudTrail AssumeRole/ConsoleLogin), authentication servers, VPN concentrators'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // CTI/anonymizer match + first-seen region + console-by-programmatic
+
+      auth = CloudTrail (ConsoleLogin|AssumeRole) ; src = sourceIPAddress | Zeek conn.log id.orig_h |
+      EID4624 IpAddress
+
+      alert if src in CTI(malicious|TOR|anon_vpn_proxy)
+
+      OR region/asn first_seen for principal
+
+      OR sessionCredentialFromConsole=true AND principal is programmatic-only
+- question: Does a new access for a principal fall outside its historical country/ASN/region or 95% time
+    window, or is it immediately preceded by a burst of failed AssumeRole/ConsoleLogin or AccessDenied
+    events?
+  context: An attribute-rarity profile flags first-seen access conditions that a static IP list misses.
+    Maintain a per-principal historical profile of successful access attributes (source country, ASN,
+    region, typical hours). Flag a new access as anomalous when its country/ASN/region has never been
+    seen for that principal or its time falls outside the 95% time window. Per change-point residual logic,
+    also alert on a burst of failed AssumeRole/ConsoleLogin or AccessDenied events immediately preceding
+    a success (credential stuffing / key validation) as a distinct state signal. These conditions point
+    to a hijacked identity about to drive resource-intensive abuse.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud IAM infrastructure (CloudTrail AssumeRole/ConsoleLogin), authentication servers, VPN concentrators'
+  range: Last 90 days (per-principal profile; correlate failures->success within minutes)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // Per-user attribute rarity + failure-before-success
+
+      profile = per_principal(country, asn, region, hour_dist)
+
+      alert if new.country/asn/region not in profile OR new.hour outside p95 window
+
+      alert if burst(failed AssumeRole|ConsoleLogin|AccessDenied) immediately before success
+- question: Does a principal's login/API feature vector fall outside its established behavioral cluster,
+    or does the tenant user-service graph show a principal suddenly linking to messaging/AI services it
+    never used?
+  context: Per-principal outlier and graph models catch subtle identity hijacking. Train a per-principal
+    Extended Isolation Forest over feature vectors (time-of-day, geo lat/lon, ASN, service mix, failed-call
+    ratio) to flag logins/API activity outside the established cluster. At the tenant level, apply CS-GAD
+    to dynamic user-service-activity graphs to detect a principal suddenly linking to messaging/AI services
+    it never used. Alerts must list the top-3 contributing features/edges. A new edge from a developer
+    or service account to SES/SNS/Bedrock is a strong precursor to the Impact abuse this technique describes.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek http.log
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud IAM infrastructure (CloudTrail AssumeRole/ConsoleLogin), authentication servers, VPN concentrators'
+  range: Last 90 days (train on >=30 days of per-principal behavior)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // Per-principal EIF + tenant graph anomaly
+
+      feats = [tod, geo_lat, geo_lon, asn, service_mix, failed_ratio]
+
+      eif = ExtendedIsolationForest.fit(feats); flag outliers
+
+      graph = dynamic(user-service-activity); CSGAD.score(new_edges)
+
+      alert if principal links to messaging/AI service never used; emit top3_features_edges
+- question: Are there connections to cloud service IP ranges in Zeek conn.log that are both abnormally
+    long (e.g., >24h) and transfer an unusually high total volume (e.g., >50 GB)?
+  context: Resource-intensive cloud abuse leaves a heavy egress footprint. Monitor Zeek conn.log for connections
+    to cloud service IP ranges where duration is abnormally long (>24h) and total transferred (orig_bytes+resp_bytes)
+    is unusually high (>50 GB); alert when both predefined thresholds are exceeded. Retain these concrete
+    thresholds as the deterministic floor, consistent with the resource-intensive egress profile of this
+    technique. A hit highlights a host sustaining heavy traffic to cloud endpoints, consistent with the
+    availability/cost Impact of hijacked services.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Data center network core, cloud usage/billing telemetry, developer workstations, service-account
+    inventory'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // Long-duration high-volume connection floor
+
+      conn = Zeek conn.log where resp_h in CLOUD_SERVICE_RANGES
+
+      alert if duration > 24h AND (orig_bytes + resp_bytes) > 50e9
+- question: Does a host or principal exceed its peer group's 95th percentile of daily outbound volume,
+    API count, or cost by a significant margin (e.g., >50%)?
+  context: Peer-group comparison reveals an entity that breaks from others of the same role. Group hosts/principals
+    by role (CMDB, AD groups, IAM role) and compute the 95th percentile of daily outbound volume / API
+    count / cost per group; alert when a member exceeds its peer group's 95th percentile by a significant
+    margin (>50%). Use windowed event-count feature vectors for stable peer comparison. An outlier developer
+    workstation, web server, or service account is a strong signal of hijacked usage driving Impact, even
+    if its own short history looks normal.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Data center network core, cloud usage/billing telemetry, developer workstations, service-account
+    inventory'
+  range: Last 90 days (daily aggregation per peer group)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // Peer-group percentile thresholding
+
+      group = role(host_or_principal) via CMDB/AD/IAM
+
+      p95 = percentile95(daily_bytes_out|api_count|cost) by group
+
+      alert if member_value > p95 * 1.5
+- question: Does a host or principal abruptly shift from a low- to high-usage behavioral cluster, or become
+    an isolation-based outlier to its long-standing peer cluster across bytes, destinations, duration,
+    and service mix?
+  context: Behavioral clustering plus isolation detection catches peer outliers that fixed thresholds
+    miss. Build per-host/principal feature profiles (avg daily bytes out, distinct destinations, connection
+    duration, protocol mix, service mix) and apply clustering plus Extended Isolation Forest to flag entities
+    that abruptly shift from a low- to high-usage cluster or become outliers to their long-standing cluster;
+    complement with CS-GAD graph embeddings. Report the top-3 features driving the outlier score. A sudden
+    cluster jump for an entity is consistent with credential/host hijacking now generating resource-intensive
+    cloud usage under the Impact tactic.
+  answer_sources:
+  - AWS:CloudTrail
+  - Zeek conn.log
+  - Zeek http.log
+  - Windows Event ID 4624
+  - 'NAI: Data center network core, cloud usage/billing telemetry, developer workstations, service-account
+    inventory'
+  range: Last 90 days (train on >=30 days of per-entity behavior)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // Behavioral clustering + isolation-based peer outlier
+
+      feats = [avg_daily_bytes_out, distinct_dest, conn_duration, protocol_mix, service_mix]
+
+      clusters = cluster(feats); eif = ExtendedIsolationForest.fit(feats)
+
+      alert if entity jumps low->high cluster OR eif outlier; corroborate CSGAD embeddings; emit top3_features
+- question: Is a principal issuing service-enablement or policy-modification APIs (VerifyEmailIdentity/CreateEmailIdentity,
+    UpdateAccountSendingEnabled, PutAccountSendingAttributes, PutIdentityPolicy, PutFoundationModelEntitlement,
+    CreateUser then CreateAccessKey) for a service it has not historically administered, or filing an
+    SES sending-limit increase for an unused account?
+  context: The enablement step is frequently the first observable action of cloud service hijacking. Alert
+    when a principal issues a service-enablement or policy-modification API for a service it has not historically
+    administered, e.g., VerifyEmailIdentity/CreateEmailIdentity, UpdateAccountSendingEnabled, PutAccountSendingAttributes,
+    PutIdentityPolicy, PutFoundationModelEntitlement, or CreateUser followed by CreateAccessKey. Treat
+    a support case requesting an SES sending-limit increase for an account not previously using SES as
+    high-fidelity; Bedrock model-access enablement preceding invocation is similarly documented. Catching
+    the enable step gives the earliest opportunity to interrupt the Impact chain before mass abuse begins.
+  answer_sources:
+  - AWS:CloudTrail
+  - 'NAI: Cloud service control plane (CloudTrail management events), IAM, AWS Support case API'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      // First-use service-enablement / policy-modification
+
+      e = CloudTrail where eventName in (VerifyEmailIdentity, CreateEmailIdentity, UpdateAccountSendingEnabled,
+          PutAccountSendingAttributes, PutIdentityPolicy, PutFoundationModelEntitlement)
+      alert if principal has no history administering that service
+
+      OR CreateUser followed by CreateAccessKey
+
+      OR Support case: SES sending-limit increase for previously-unused account
+- question: Does a previously-unseen (principal, eventName) administrative/enablement event appear in
+    a principal's CloudTrail stream, or is there a burst of AccessDenied on enablement calls indicating
+    an under-privileged attacker probing for usable services?
+  context: Rarity scoring surfaces first-seen administrative behavior that precedes abuse. Compute the
+    historical frequency of each (principal, eventName) pair and flag first-seen administrative/enablement
+    events; trigger a change-point alert when previously-unseen management event types appear in a principal's
+    stream. Profile AccessDenied on these enablement calls as a distinct failure-mode signal of an under-privileged
+    attacker probing for usable services, using windowed event-count features. Both conditions indicate
+    a principal exploring or enabling services it does not normally touch, an early Impact-chain indicator
+    of cloud service hijacking.
+  answer_sources:
+  - AWS:CloudTrail
+  - 'NAI: Cloud service control plane (CloudTrail management events), IAM, AWS Support case API'
+  range: Last 90 days (per-principal eventName history)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      // Rarity scoring of (principal, eventName) + AccessDenied probing
+
+      freq = count(eventName) by (principal, eventName) historical
+
+      alert if (principal, eventName) first_seen for management/enablement events (ChangePoint)
+
+      alert if burst(AccessDenied) on enablement calls by principal
+- question: Does the tenant user-service graph show a principal newly creating an edge to a messaging/AI
+    service it has never administered, and does an LSTM over CloudTrail event keys flag an enable-to-abuse
+    ordering?
+  context: Graph and sequence models tie enablement to the abuse that follows. Apply CS-GAD over dynamic
+    user-service-activity graphs to score a principal newly creating an edge to a messaging/AI service
+    it has never administered; corroborate with an LSTM sequence model (DeepLog) over CloudTrail event
+    keys to flag enable->abuse orderings. Alert text must name the top-3 contributing edges/events. A
+    new principal-to-service edge immediately followed by resource-intensive use is the signature of cloud
+    service hijacking and gives high-confidence corroboration of the Impact tactic.
+  answer_sources:
+  - AWS:CloudTrail
+  - 'NAI: Cloud service control plane (CloudTrail management events), IAM, AWS Support case API'
+  range: Last 90 days (dynamic graph; train LSTM on >=30 days of sequences)
+  queries:
+  - technology: ML/pseudocode
+    query: >-
+      // Graph anomaly on principal->service enablement + LSTM enable->abuse
+
+      graph = dynamic(user-service-activity); CSGAD.score(new_edges to messaging/AI)
+
+      seq = ordered(eventName) by principal; DeepLog.flag(enable->abuse ordering)
+
+      alert with top3_edges_events
