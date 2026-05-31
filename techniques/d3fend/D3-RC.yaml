@@ -1,0 +1,342 @@
+name: 'D3-RC: Restore Configuration'
+id: c7567f78-1877-4a70-ad2f-27a5d3e0fe14
+description: 'This playbook helps an analyst verify and investigate an organization''s capability to restore
+  critical system and software configurations to a known-good state following a security incident. It
+  covers three investigative themes drawn from the Restore tactic: (1) backup and configuration-restore
+  health, confirming that each critical asset completed a successful backup/replication within its window
+  and that scheduled test-restores pass (a backup that merely ran is not evidence of recoverability);
+  (2) configuration drift against a known-good baseline, detecting deviations of restored or managed configuration
+  from the approved baseline or version-controlled desired state (registry, services, files, IaC); and
+  (3) unauthorized configuration-modification activity and post-restore tampering, identifying illegitimate
+  use of configuration/registry tooling, failed/blocked change attempts, and rare process-to-configuration
+  causal chains that indicate a freshly restored asset is being re-modified by an unauthorized actor.
+  Use it to validate recoverability, surface configuration deviations, and catch adversary activity targeting
+  recovery operations.'
+type: technique
+related:
+- tactic_id: D3-RST
+  tactic_name: Restore
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did every critical asset establish a successful network connection to its designated backup
+    or replication target within the most recent backup window?
+  context: Under the Restore tactic, recoverability depends on backups actually running on schedule. This
+    check implements the scheduled-completion verification required by NIST SP 800-34 Rev. 1. Query Zeek
+    conn.log for successful connections from each critical asset to its backup/replication target within
+    the defined window (e.g., the last 24 hours). A missing connection from a critical asset is a strong
+    indicator that a backup failed to occur, leaving that asset without a recovery point. A positive result
+    (heartbeat present) confirms the transport-layer prerequisite for backup; a negative result (no connection)
+    should be alerted and investigated as a potential backup failure or an adversary disrupting recovery
+    infrastructure.
+  answer_sources:
+  - Zeek conn.log
+  - Backup application job logs
+  - Windows Event ID 4688
+  - 'NAI: Configuration management servers, backup repositories, replication targets, critical application
+    servers, domain controllers'
+  range: Last 24 hours
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'from conn.log where id.orig_h in critical_assets and id.resp_h in backup_targets and conn_state
+      in (SF,S1,RSTO)
+
+      group by id.orig_h
+
+      // alert on any critical_asset with zero successful connections to its assigned backup target in
+      the last 24h'
+- question: For each critical asset, did the backup job actually succeed (correct status, non-trivial
+    bytes transferred, and a recent successful test-restore) rather than merely execute?
+  context: 'A backup that ran but failed, transferred near-zero bytes, or was never test-restored provides
+    false assurance of recoverability. Per NIST SP 800-34 Rev. 1, only verified, test-restored backups
+    count. Parse backup application job logs and alert when a critical asset''s job is missing, reports
+    status != success, moves near-zero bytes, or has had no successful test-restore within the policy
+    interval (e.g., 30 days). In this Restore context, the failed/missing/never-tested backup is itself
+    the finding: it represents a gap in the organization''s ability to restore configuration to a known-good
+    state after an incident.'
+  answer_sources:
+  - Zeek conn.log
+  - Backup application job logs
+  - Windows Event ID 4688
+  - 'NAI: Configuration management servers, backup repositories, replication targets, critical application
+    servers, domain controllers'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "from backup_job_logs\nfor each critical_asset:\n  alert if job missing OR status != 'success'\
+      \ OR bytes_transferred < min_expected_bytes\n         OR last_successful_test_restore older than\
+      \ 30 days"
+- question: Is the volume of network traffic between production servers and backup infrastructure consistent
+    with its forecasted, learned-normal level, or has it dropped outside the expected confidence interval?
+  context: Systemic backup failures may not trip a per-job rule but will manifest as an anomalous drop
+    in aggregate backup/replication traffic. Train a time-series forecasting model (e.g., Prophet) on
+    the hourly volume of traffic between production servers and backup infrastructure derived from Zeek
+    conn.log, then alert when observed volume falls significantly outside the predicted confidence interval.
+    Surface the forecast value, observed value, and residual magnitude so the analyst can gauge severity.
+    For the Restore mission, a sustained shortfall signals that recovery points are not being created
+    as expected, which would undermine post-incident configuration restoration. Approach validated for
+    backup/replication volume by Cloud Intrusion Detection Using Time Series Forecasting.
+  answer_sources:
+  - Zeek conn.log
+  - Backup application job logs
+  - Windows Event ID 4688
+  - 'NAI: Configuration management servers, backup repositories, replication targets, critical application
+    servers, domain controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'series = hourly_sum(bytes) from conn.log where prod->backup_infra
+
+      model = Prophet().fit(series[train_window])
+
+      forecast = model.predict(now)
+
+      alert if observed < forecast.lower_ci  // report forecast, observed, residual'
+- question: Has the per-asset backup/replication byte volume exhibited a sustained downward change point,
+    indicating an abrupt backup-job failure a static threshold would miss?
+  context: Static thresholds miss gradual or context-dependent backup failures. Apply CUSUM or PELT change-point
+    detection to each asset's backup/replication byte-volume time series and alert on a sustained downward
+    change point (e.g., volume dropping below 10% of the prior 30-day median for more than one window).
+    In the Restore context this catches the moment an asset silently stops being backed up. A detected
+    change point with a persistent low level is a strong recoverability-gap signal; report the change-point
+    timestamp and the before/after volume levels. Per A Survey of Methods for Time Series Change Point
+    Detection.
+  answer_sources:
+  - Zeek conn.log
+  - Backup application job logs
+  - Windows Event ID 4688
+  - 'NAI: Configuration management servers, backup repositories, replication targets, critical application
+    servers, domain controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each asset: series = daily_sum(backup_bytes)
+
+      cp = PELT(series) or CUSUM(series)
+
+      alert if change_point detected AND post_level < 0.10 * median(prior_30d) sustained >1 window'
+- question: Does the current configuration of each critical asset (registry keys, service definitions,
+    security-relevant files, SCAP results) match the archived approved baseline, or are there unapproved
+    deviations, especially outside maintenance windows?
+  context: NIST SP 800-128 mandates continuous monitoring for deviations from archived baseline configurations.
+    For each critical asset, diff the current configuration against the approved baseline and alert on
+    any unapproved deviation, weighting changes that occur outside an approved maintenance window. Within
+    the Restore tactic, this confirms whether a restored or managed asset has drifted away from its known-good
+    state. A clean diff means the asset conforms to baseline; any deviation, particularly off-window,
+    warrants investigation as either unauthorized change or an incomplete/incorrect restore.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Configuration management / SCAP scan results
+  - Version control (IaC) diffs
+  - 'NAI: Critical application servers, domain controllers, configuration management servers, IaC pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'for each asset: diff(current_config, approved_baseline) over {registry, services, sec_files,
+      scap}
+
+      alert on any deviation; raise severity if change_time NOT in approved_maintenance_window'
+- question: When configuration is managed as Infrastructure as Code, do scheduled plan/diff runs reveal
+    out-of-band changes (resources modified outside the pipeline) or high-risk defect classes versus the
+    version-controlled desired state?
+  context: When configuration is expressed as IaC, deviations from version control are directly checkable.
+    Run a scheduled plan/diff against the version-controlled desired state and alert on resources modified
+    outside the pipeline and on high-risk defect classes. Configuration drift and outages frequently originate
+    from such out-of-band deviations (Bugs in Infrastructure as Code, Rahman et al). For the Restore mission,
+    IaC drift means the live environment no longer matches its declared known-good state, complicating
+    reliable restoration. A clean plan indicates conformance; drift indicates manual tampering or process
+    bypass that should be reconciled and investigated.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Configuration management / SCAP scan results
+  - Version control (IaC) diffs
+  - 'NAI: Critical application servers, domain controllers, configuration management servers, IaC pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'scheduled: run iac_plan(desired_state_from_vcs) against live
+
+      alert if plan shows resources changed outside pipeline (drift) OR high_risk_defect_class detected'
+- question: After a restore operation, did validation confirm the restored configuration matches the trusted
+    known-good baseline (hash/SCAP compliance) and meet recovery termination criteria before the asset
+    returned to production?
+  context: This is the core recovery-validation activity of the Restore tactic, grounded in NIST SP 800-184
+    and the recovery phase of the CISA Cybersecurity Incident & Vulnerability Response Playbooks. After
+    a restore, verify the configuration matches the trusted known-good baseline via hash comparison or
+    SCAP compliance and that the restore met its recovery termination criteria before returning the asset
+    to production; alert if validation fails. A passing validation gives defensible assurance the asset
+    was restored correctly; a failed validation means the asset may have been returned to service in an
+    incorrect or compromised state and must be re-examined.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Configuration management / SCAP scan results
+  - Version control (IaC) diffs
+  - 'NAI: Critical application servers, domain controllers, configuration management servers, IaC pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on restore_complete(asset):\n  alert if hash(restored_config) != hash(known_good_baseline)\n\
+      \       OR scap_compliance(asset) < required\n       OR recovery_termination_criteria not met before\
+      \ return_to_production"
+- question: Has the daily count of modifications to any critical registry key exceeded its per-key baseline
+    (mean + 3*sigma / 99th percentile), indicating anomalous configuration drift?
+  context: Monitor modification events for critical registry keys (Windows Event ID 4657) and establish
+    a per-key baseline for change frequency. Alert when the daily count of changes for a specific key
+    exceeds mean + 3*sigma (>=99th percentile) of the baseline, naming the deviating key and its observed-vs-expected
+    counts. In the Restore context, an unusual burst of changes to a security-relevant key may indicate
+    that a restored asset is drifting from baseline or being actively re-modified. Method per Finding
+    Anomalies in Windows Event Logs Using Standard Deviation, Dwyer and Truta. A statistically normal
+    count is benign; an outlier count is the finding to investigate.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Configuration management / SCAP scan results
+  - Version control (IaC) diffs
+  - 'NAI: Critical application servers, domain controllers, configuration management servers, IaC pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from EventID=4657 group by registry_key, day count as c
+
+      baseline mean,std per key over trailing window
+
+      alert if c > mean + 3*std  // report key, observed c, expected mean'
+- question: Across the enterprise, are there sustained spikes or drops in aggregate configuration-change
+    volume (versus rolling 30-day baselines) that do not correlate with approved maintenance windows?
+  context: Aggregate configuration-change events enterprise-wide and apply a change-point test against
+    rolling 30-day baselines to identify sustained spikes or drops. Investigate periods of high churn
+    that do not align with approved maintenance windows, surfacing the magnitude and timing of the shift.
+    Per A Survey of Methods for Time Series Change Point Detection. For the Restore tactic, a sudden enterprise-wide
+    change spike may indicate mass re-configuration following an incident or adversary activity; an unexplained
+    drop may indicate logging gaps. Correlate detected shifts with the change calendar to separate authorized
+    maintenance from suspicious churn.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 13
+  - Configuration management / SCAP scan results
+  - Version control (IaC) diffs
+  - 'NAI: Critical application servers, domain controllers, configuration management servers, IaC pipelines'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = daily_count(config_change_events) across enterprise
+
+      cp = change_point(series, baseline=rolling_30d)
+
+      alert on sustained spike/drop NOT in approved_maintenance_window  // report magnitude, timing'
+- question: Were configuration-management tools or registry editors (regedit.exe, reg.exe, sc.exe, gpedit)
+    executed by non-administrative accounts or spawned from unusual parent processes?
+  context: Monitor process execution events (Windows Event ID 4688 / Sysmon Event ID 1) for configuration
+    tools or registry editors initiated by non-administrative accounts or from unusual parent processes,
+    and alert on any unauthorized attempt to modify system configuration. This enforces the change-control
+    requirements of NIST SP 800-128. Within the Restore tactic, such activity on a freshly restored asset
+    suggests an unauthorized actor attempting to re-modify the recovered configuration. Legitimate admin-initiated
+    tool use is benign; execution by unexpected accounts or odd parent chains (e.g., spawned from Office
+    or a web shell) is the finding.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - Windows Event ID 4657
+  - 'NAI: Critical application servers, domain controllers, configuration management servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'from EventID=4688 or Sysmon=1 where process in (regedit.exe,reg.exe,sc.exe,gpedit.msc,gpedit.exe)
+
+      alert if account not in admin_group OR parent_process not in expected_parents'
+- question: Are there bursts of access-denied or policy-blocked configuration/registry change attempts
+    per account and host that exceed baseline, indicating an actor probing a re-hardened asset?
+  context: Failure-rate profiling complements success-based detection. Count access-denied and policy-blocked
+    configuration/registry change attempts per account and host, and alert when failed attempts exceed
+    a baseline (e.g., more than 5 access-denied registry/service writes in 10 minutes). In the Restore
+    context, a spike of blocked changes can indicate an actor probing a freshly restored, re-hardened
+    asset to find weakened controls. A few scattered failures are normal operational noise; a concentrated
+    burst from one account/host is a strong investigative lead.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - Windows Event ID 4657
+  - 'NAI: Critical application servers, domain controllers, configuration management servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from config/registry change attempts where result in (access_denied, policy_blocked)
+
+      group by account, host over 10min windows count as f
+
+      alert if f > 5  // baseline failure-rate per account/host'
+- question: Are backup-job, configuration-change, and restore audit records tamper-evident, with intact
+    hash chains and sequence numbers, and are any agents unexpectedly silenced?
+  context: Recovery integrity depends on trustworthy audit trails. Apply forward-secure hash-chaining
+    or per-entry MAC to backup-job, configuration-change, and restore audit records, and alert on broken
+    chains, missing sequence numbers, or a silenced agent, treating the integrity break itself as the
+    alert. Per Cryptographic Support for Secure Logs on Untrusted Machines, Schneier and Kelsey. For the
+    Restore tactic, an adversary covering tracks after re-modifying a restored asset may tamper with or
+    stop these logs. An intact, verifiable chain provides assurance; a broken chain, gap in sequence,
+    or sudden agent silence is itself the finding and should be escalated.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - Windows Event ID 4657
+  - 'NAI: Critical application servers, domain controllers, configuration management servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'verify hash_chain / per_entry_MAC over {backup_job, config_change, restore} audit records
+
+      alert on broken_chain OR missing_sequence_number OR agent_heartbeat_lost'
+- question: Do whole-system provenance graphs reveal rare process-to-configuration causal chains, i.e.,
+    a process modifying registry/service/config objects in patterns that deviate from the learned benign
+    baseline?
+  context: Build whole-system provenance graphs from host audit/Sysmon telemetry and flag anomalous edges
+    where a process modifies registry/service/config objects in patterns deviating from the learned benign
+    baseline, surfacing the contributing subgraph as the explanation (KAIROS, Cheng et al). Node-level
+    tracing of the specific responsible process/file is provided by ThreaTrace. In the Restore context,
+    this exposes a restored asset being re-modified through an unusual causal path (e.g., an unexpected
+    process writing service definitions). A familiar, benign provenance pattern is expected; a rare anomalous
+    subgraph is the finding, with the subgraph guiding the analyst to the responsible process and file.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - Windows Event ID 4657
+  - 'NAI: Critical application servers, domain controllers, configuration management servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'graph = build_provenance(host_audit + sysmon)
+
+      score edges process->{registry,service,config} vs learned_benign_baseline
+
+      alert on anomalous edges; emit contributing_subgraph + responsible process/file'
+- question: Which critical assets receive high anomaly scores from an Isolation Forest over their configuration/backup
+    feature vectors, and what are the top contributing features?
+  context: Train an Isolation Forest over per-asset feature vectors (registry/service change count, bytes
+    backed up, job duration, backup success ratio, time-since-last-success, count of failed change attempts)
+    and alert on high anomaly scores, ranking the top-3 contributing features in the alert. Scalable unsupervised
+    scoring per Isolation Forest, Liu, Ting and Zhou; retain the deterministic thresholds elsewhere in
+    this playbook as a parallel floor. For the Restore tactic, this surfaces assets whose combined backup-and-configuration
+    posture is statistically abnormal, catching multi-factor recovery problems no single rule would. A
+    low-scoring asset is normal; a high-scoring asset warrants investigation guided by its top features.
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 13
+  - Windows Event ID 4657
+  - 'NAI: Critical application servers, domain controllers, configuration management servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = per_asset[reg_svc_change_count, bytes_backed_up, job_duration, backup_success_ratio,\n\
+      \                     time_since_last_success, failed_change_attempts]\nmodel = IsolationForest().fit(features)\n\
+      alert on high anomaly_score; report top-3 contributing features"
