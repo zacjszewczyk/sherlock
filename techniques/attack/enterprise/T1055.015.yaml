@@ -1,0 +1,1518 @@
+name: 'T1055.015: Process Injection: ListPlanting'
+id: fd3054e4-6872-43b7-ba75-6cb519cd6b48
+description: 'This playbook helps an analyst investigate Process Injection: ListPlanting (T1055.015),
+  a message-passing "shatter"-style injection in which an adversary copies code into a victim GUI process
+  that uses a list-view (SysListView32) control and triggers it by sending an LVM_SORTITEMS window message
+  so the payload runs as the ListView_SortItems sort callback. Because execution is masked under a legitimate,
+  trusted process (commonly explorer.exe or mmc.exe) and the payload can be copied two bytes at a time
+  via LVM_SETITEMPOSITION/LVM_GETITEMPOSITION messages to avoid the heavily monitored WriteProcessMemory
+  API, this technique supports both defense evasion/stealth and privilege escalation. The questions below
+  guide the analyst across the full attack chain: identifying ListPlanting tooling and rare executables,
+  detecting the OpenProcess -> memory-allocation -> LVM_SORTITEMS handle-and-message sequence between
+  processes of differing integrity, spotting console/non-GUI processes that abuse list-view messaging,
+  catching anomalous child processes and DLL/RWX execution from trusted GUI hosts, and uncovering post-injection
+  actions such as suspicious egress, beaconing, domain-generation traffic, and file-staging for exfiltration.
+  Each question offers symbolic-logic, statistical, and machine-learning approaches over endpoint (Sysmon/Windows
+  Event Log), API/EDR, and network (Zeek) telemetry.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any host execute a binary whose file hash matches a known ListPlanting/InvisiMole loader,
+    or whose memory contains a registered ListView_SortItems/LVGroupCompare callback pointing into an
+    unbacked private RWX region?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". This is the deterministic,
+    highest-confidence check for ListPlanting. Join process-creation telemetry against curated threat-intel
+    hash feeds of documented ListPlanting tooling (e.g., InvisiMole loaders from ESET), and in parallel
+    run EDR/YARA memory scans for the technique''s structural fingerprint: a list-view sort callback (ListView_SortItems
+    / LVGroupCompare) whose target address lies in a private RWX region not backed by any module on disk.
+    A positive match is near-conclusive evidence of injection tooling on the host; a negative result does
+    not rule out novel tooling, so pair it with the prevalence and classifier questions. Source detection
+    guidance (Symbolic Logic): Join process creation logs (Sysmon Event ID 1 / 4688) with a threat-intel
+    feed of file hashes known to be used for ListPlanting (e.g., InvisiMole loaders documented by [ESET](https://www.welivesecurity.com/wp-content/uploads/2020/06/ESET_InvisiMole.pdf)).
+    In parallel, run EDR/YARA memory scans for ListPlanting code patterns — a registered ListView_SortItems/LVGroupCompare
+    callback whose target lies in a private RWX region not backed by a module on disk, as described by
+    [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Flag any match
+    deterministically.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (Sysmon:EventCode=1, WinEventLog:4688)
+
+      | join hash == threat_intel_listplanting_hashes.sha256
+
+      | union (edr_memscan WHERE callback IN (ListView_SortItems, LVGroupCompare) AND region.protect ==
+      RWX AND region.backed_by_module == false)
+
+      | emit alert(host, image, hash, pid, parent_image)'
+- question: Across the fleet, which executables are extremely rare (seen on only 1-2 hosts / lowest prevalence
+    percentile) and were launched by a common GUI host such as explorer.exe or mmc.exe?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". ListPlanting loaders are
+    typically bespoke and low-prevalence. Compute enterprise-wide prevalence (distinct host count and
+    execution count) for every file hash observed in process creation over a rolling 30 days, then alert
+    on images in the lowest percentile (<0.01%), weighting the score with the rarity/entropy of the full
+    command line. Escalate when the parent is a GUI host, since that is the staging context for ListPlanting.
+    Maintain first-seen state so a given rare-but-benign binary is not re-alerted indefinitely. A positive
+    result surfaces never-before-seen tooling for triage. Source detection guidance (Statistical Method):
+    Compute enterprise-wide prevalence (count of distinct hosts, count of executions) for every file hash
+    seen in process creation over a rolling 30 days. Alert on execution of any image with host-prevalence
+    in the lowest percentile (e.g., seen on 1-2 hosts, <0.01%), weighting the score with rarity/entropy
+    of the full command line as in [SCADE](https://arxiv.org/abs/2412.04259); escalate when the parent
+    is a common GUI host such as explorer.exe or mmc.exe. Track first-seen state so the same rare binary
+    is not re-alerted forever.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'events = proc_create(last=30d)
+
+      | stats dc(host) as host_prev, count as execs, by hash, image, cmdline
+
+      | eval cmd_entropy = shannon(cmdline)
+
+      | where host_prev <= 2 OR percentile_rank(host_prev) < 0.01
+
+      | eval score = rarity(host_prev) * (1 + cmd_entropy)
+
+      | where parent_image IN (explorer.exe, mmc.exe) AND first_seen(hash)
+
+      | sort -score'
+- question: Does a supervised process classifier (Random Forest / Gradient Boosting) flag a newly executed
+    process as malicious based on parent image, command line, path, integrity, hash prevalence and PE
+    header subsystem/imports, and what top-3 SHAP features drove the score?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Train a supervised model
+    on process metadata; PE structural and import features tend to dominate ListPlanting-relevant detections.
+    Rather than emitting a bare probability, surface the top-3 SHAP contributions (e.g., ''parent=explorer.exe'',
+    ''subsystem=console'', ''hash_prevalence=1'') so the analyst can validate the reasoning. Prioritize
+    high-probability hits whose parent is a GUI host, the classic ListPlanting launch pattern. A high-confidence
+    hit with intuitive feature attributions warrants immediate memory inspection of both the launching
+    and target process. Source detection guidance (Machine Learning): Train a supervised classifier (Random
+    Forest / Gradient Boosting) on process metadata (parent image, command line, path, user/integrity,
+    hash prevalence, PE header subsystem/imports). PE structural and import features dominate such models,
+    so emit the top-3 SHAP feature contributions in every alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9)
+    (e.g., ''parent=explorer.exe'', ''subsystem=console'', ''hash_prevalence=1'') rather than a bare score;
+    investigate high-probability hits originating from GUI hosts.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features(parent_image, cmdline, path, user_integrity, hash_prevalence, pe_subsystem, pe_imports)
+
+      model = GradientBoosting.load(''proc_clf'')
+
+      p = model.predict_proba(X)
+
+      top3 = shap_top_k(model, X, k=3)
+
+      if p > 0.9: emit alert(host, pid, image, p, top3)'
+- question: Within a 5-second window, did a lower-integrity process open a handle to a higher-integrity
+    process, cause a memory allocation/protection change in it, and then send an LVM_SORTITEMS message
+    to its SysListView32 control (instead of using WriteProcessMemory)?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". This ordered chain is the
+    canonical ListPlanting injection signature. Correlate on a shared target PID: (1) Sysmon EID 10 ProcessAccess
+    where SourceImage integrity < TargetImage integrity (a successful cross-integrity OpenProcess), (2)
+    a memory allocation/protect-change in the target via Sysmon EID 8 or ETW (the allocate+execute correlation
+    that is the core injection observable), and (3) an LVM_SORTITEMS trigger to the target''s list-view
+    control rather than the heavily monitored WriteProcessMemory. Requiring the events to share the target
+    PID and arrive in order makes this high-fidelity; a match is strong evidence of an active injection
+    and likely privilege escalation when the target is high/system integrity. Source detection guidance
+    (Symbolic Logic): Alert when one source/target process pair produces, within 5 seconds, the ordered
+    chain: (1) Sysmon Event ID 10 ProcessAccess where SourceImage integrity < TargetImage integrity (a
+    successful OpenProcess), (2) a memory allocation/protection change in the target observed via Sysmon
+    Event ID 8 or ETW (the allocation+execute correlation shown to be the core injection observable by
+    [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w)), and (3) an LVM_SORTITEMS
+    message sent to the target''s SysListView32 control instead of WriteProcessMemory, the exact ListPlanting
+    trigger documented by [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Require the
+    events to share the target PID; ordered-chain matching follows the API-sequence alignment of [Cho
+    et al.](https://journals.sagepub.com/doi/full/10.1155/2015/659101).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 7 days; correlate events within a 5-second window per target PID
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'open  = Sysmon(EventCode=10) WHERE src_integrity < tgt_integrity
+
+      alloc = Sysmon(EventCode=8) | union etw_vallocex
+
+      sort  = etw_win32k WHERE msg == LVM_SORTITEMS AND target_class == SysListView32
+
+      | sequence by target_pid within 5s: open -> alloc -> sort
+
+      | emit alert(src_image, tgt_image, target_pid, host)'
+- question: Has any source process exceeded the 99th percentile of its own baseline rate of ProcessAccess
+    events targeting higher-integrity processes, or produced a burst of access-DENIED handle attempts
+    against sensitive processes?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline, per source process
+    name, the rate (count/min and count/day) of Sysmon EID 10 ProcessAccess events that target higher-integrity
+    processes using sliding-window frequency vectors. Alert when an instance exceeds its 99th-percentile
+    baseline. Separately, treat a burst of access-DENIED (masked GrantedAccess / STATUS_ACCESS_DENIED)
+    handle attempts as its own injection-probing signal, since a low-integrity injector often fails before
+    it succeeds. Escalate when the target is lsass.exe, winlogon.exe or csrss.exe. This catches both successful
+    and attempted cross-integrity access characteristic of the privilege-escalation path. Source detection
+    guidance (Statistical Method): For each source process name, baseline the rate (count/min and count/day)
+    of Sysmon Event ID 10 ProcessAccess events that target higher-integrity processes, using sliding-window
+    frequency vectors per [Bag of System Calls](https://arxiv.org/abs/1611.03053). Alert when an instance
+    exceeds the 99th percentile of its baseline, and separately profile the failure mode — a burst of
+    access-DENIED (GrantedAccess masked / STATUS_ACCESS_DENIED) handle attempts is itself a distinct signal
+    of injection probing. Escalate when the target is lsass.exe, winlogon.exe or csrss.exe.'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'acc = Sysmon(EventCode=10) WHERE tgt_integrity > src_integrity
+
+      | bin span=1m | stats count by src_image, window
+
+      | eventstats p99(count) as thr by src_image
+
+      | where count > thr
+
+      | append (acc WHERE granted_access_denied=true | stats count as denied by src_image,tgt_image |
+      where denied > burst_thr)
+
+      | eval sev = if(tgt_image IN (lsass.exe,winlogon.exe,csrss.exe),''high'',''med'')'
+- question: Does a seasonal time-series model detect a sharp spike in LVM_SORTITEMS/LVM_SETITEMPOSITION/LVM_GETITEMPOSITION
+    messages between a specific source/target process pair of differing integrity?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". The two-bytes-at-a-time payload
+    copy via LVM_SETITEMPOSITION/LVM_GETITEMPOSITION and the LVM_SORTITEMS trigger produce a distinctive
+    message-frequency signature per process pair. Model per-pair message frequency with a seasonal anomaly
+    detector (e.g., S-H-ESD) and flag sharp spikes, especially across an integrity boundary. Surface the
+    top-3 contributing features (message type, pair integrity delta, count vs. baseline) so the analyst
+    understands the alert. A spike between a low-integrity source and a high-integrity GUI target is a
+    strong ListPlanting indicator. Source detection guidance (Machine Learning): Model the per-process-pair
+    frequency of LVM_SORTITEMS/LVM_SETITEMPOSITION/LVM_GETITEMPOSITION messages (the two-bytes-at-a-time
+    payload-copy primitive described by [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/)
+    and used in the wild by [InvisiMole](https://www.welivesecurity.com/wp-content/uploads/2020/06/ESET_InvisiMole.pdf))
+    with a seasonal time-series detector (e.g., S-H-ESD). Flag sharp spikes between processes of differing
+    integrity, and surface the top-3 contributing features (message type, pair integrity delta, count
+    vs. baseline) in the alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 30 days; per-pair message-frequency baselining
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = counts(msg IN (LVM_SORTITEMS,LVM_SETITEMPOSITION,LVM_GETITEMPOSITION)) by (src_pid,tgt_pid),
+      bin=1m
+
+      anom = SH_ESD(ts, season=''1d'')
+
+      | where anom AND integrity_delta(src,tgt) > 0
+
+      | emit alert(src_image, tgt_image, top3=[msg_type, integrity_delta, count_vs_baseline])'
+- question: Did a process whose PE header lacks IMAGE_SUBSYSTEM_WINDOWS_GUI (a console app, service, or
+    non-windowed binary) emit more than ~50 SendMessage/PostMessage calls carrying LVM_* arguments within
+    one minute?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". List-view messaging is fundamentally
+    a GUI primitive, so a non-GUI binary driving large volumes of LVM_* SendMessage/PostMessage traffic
+    is anomalous and consistent with the ListPlanting payload-copy/trigger primitives. Alert when a non-GUI
+    process exceeds a tuned per-minute threshold (~50) of LVM_* messages. Tune the count to your busiest
+    legitimate console GUI automation to manage false positives. A positive result identifies the injector
+    itself, even when it never used WriteProcessMemory. Source detection guidance (Symbolic Logic): Alert
+    when a process whose PE header lacks IMAGE_SUBSYSTEM_WINDOWS_GUI (a console app, service, or non-windowed
+    binary) emits more than 50 SendMessage/PostMessage calls carrying LVM_* arguments within a one-minute
+    window — anomalous because list-view messaging is a GUI primitive, per [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Tune the count
+    threshold to your environment''s busiest legitimate console GUI automation.'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 7 days; evaluate in 1-minute windows
+  queries:
+  - technology: EDR/API-monitor pseudocode
+    query: 'api = api_monitor WHERE func IN (SendMessage,PostMessage) AND arg LIKE ''LVM_%''
+
+      | where proc.pe_subsystem != IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+      | bin span=1m | stats count by proc.pid, proc.image, window
+
+      | where count > 50
+
+      | emit alert(host, image, pid, count)'
+- question: Does any process exceed mean + 3 standard deviations of its baseline SendMessage/PostMessage
+    rate (calls/min), particularly process types whose baseline is normally ~0, and are LVM_SETITEMPOSITION/LVM_GETITEMPOSITION
+    round-trips returning errors?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Profile per-process-name
+    the distribution of SendMessage/PostMessage volume (calls/min) and alert on instances exceeding mean
+    + 3 SD, with special attention to console apps and services whose legitimate baseline mean is near
+    zero. Additionally track the failure mode: LVM_SETITEMPOSITION/LVM_GETITEMPOSITION round-trips that
+    return error/zero indicate failed payload-staging copies. Both the volume anomaly and the failed-copy
+    signal point to active ListPlanting staging. Source detection guidance (Statistical Method): For each
+    process name, profile the distribution of SendMessage/PostMessage (Volume: calls/min) and alert when
+    an instance exceeds mean + 3 standard deviations, especially for process types whose baseline mean
+    is ~0 (console apps, services), using frequency-vector baselining from [Bag of System Calls](https://arxiv.org/abs/1611.03053).
+    Also track the failure-mode signal: LVM_SETITEMPOSITION/LVM_GETITEMPOSITION round-trips that return
+    error/zero (failed copies during payload staging).'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 30 days; evaluate in 1-minute windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'm = api_monitor WHERE func IN (SendMessage,PostMessage)
+
+      | bin span=1m | stats count as cpm by image, window
+
+      | eventstats mean(cpm) avg, stdev(cpm) sd by image
+
+      | where cpm > avg + 3*sd
+
+      | append (api_monitor WHERE arg IN (LVM_SETITEMPOSITION,LVM_GETITEMPOSITION) AND ret IN (0,ERROR)
+      | stats count as failed by image)'
+- question: When clustering processes on LVM_* messaging frequency, PE subsystem flag, window-handle count
+    and image path, which processes fall out as outliers exhibiting heavy LVM_* messaging but lacking
+    GUI characteristics?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Use a density-based clusterer
+    (e.g., DBSCAN) over features that separate genuine GUI apps from injectors: LVM_* SendMessage/PostMessage
+    frequency, PE subsystem flag, window-handle count, and image path. Investigate outliers/noise points
+    that show high LVM_* messaging yet lack GUI traits (no window handles, console subsystem). Report
+    the top-3 features driving the outlier assignment (e.g., ''subsystem=console'',''lvm_sortitems/min=120'',''has_window=false'')
+    so the analyst can confirm the contradiction between behavior and process type. Source detection guidance
+    (Machine Learning): Cluster processes (e.g., DBSCAN) on features including LVM_* SendMessage/PostMessage
+    frequencies, PE subsystem flag, window-handle count, and image path. Investigate outliers exhibiting
+    high LVM_* messaging but lacking GUI characteristics; report the top-3 features driving the outlier
+    assignment per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9) so
+    analysts see why (e.g., ''subsystem=console'',''lvm_sortitems/min=120'',''has_window=false'').'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features(lvm_send_freq, lvm_post_freq, pe_subsystem, window_handle_count, image_path)
+
+      labels = DBSCAN(eps, min_samples).fit_predict(X)
+
+      | where labels == -1 AND pe_subsystem == console AND lvm_freq high
+
+      | emit alert(image, pid, top3_features)'
+- question: Did explorer.exe (or another high-integrity GUI host such as mmc.exe) spawn a command-line
+    interpreter or script host such as cmd.exe, powershell.exe, cscript.exe, wscript.exe or rundll32.exe?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". A trusted GUI host launching
+    a shell or script interpreter is an unusual parent-child relationship and a high-fidelity injection/privilege-escalation
+    indicator: after ListPlanting executes inside explorer.exe, payload-spawned children inherit its integrity.
+    Alert on these parent-child pairs while maintaining a per-environment allow-list of legitimate explorer-launched
+    helpers (some software does legitimately spawn helpers from explorer). A match warrants reviewing
+    the explorer.exe process for injected memory and the child''s command line. Source detection guidance
+    (Symbolic Logic): Alert when ''C:\\Windows\\explorer.exe'' (or another high-integrity GUI host such
+    as mmc.exe) spawns cmd.exe, powershell.exe, cscript.exe, wscript.exe or rundll32.exe — an unusual
+    parent-child relationship treated as a high-fidelity injection/priv-esc indicator by [Elastic](https://detection.fyi/elastic/detection-rules/windows/privilege_escalation_unusual_parentchild_relationship/).
+    Maintain a per-environment allow-list for legitimate explorer-launched helpers.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=1) | union WinEventLog(4688)\n| where parent_image IN ('C:\\Windows\\explorer.exe','*\\\
+      mmc.exe')\n  AND child_image IN (cmd.exe,powershell.exe,cscript.exe,wscript.exe,rundll32.exe)\n\
+      \  AND NOT allowlisted(parent_image, child_image, cmdline)\n| emit alert(host, parent_image, child_image,\
+      \ cmdline)"
+- question: Against a 90-day frequency distribution of explorer.exe child images/command lines, did a
+    rare child (<0.1%) appear, or did explorer.exe connect to a destination IP/domain in the bottom 1st
+    percentile of fleet popularity?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Maintain a 90-day frequency
+    distribution of child image names and command lines per common parent (explorer.exe) and alert on
+    children in low-frequency categories (<0.1%), scoring with rarity/log-entropy weighting. Apply the
+    same rarity test to explorer.exe network destinations (bottom 1st percentile of fleet popularity).
+    Rare children or rare destinations from a normally-predictable GUI host suggest injected behavior.
+    A positive result narrows triage to genuinely anomalous activity rather than common helper launches.
+    Source detection guidance (Statistical Method): For each common parent (explorer.exe), maintain a
+    90-day frequency distribution of child image names and command lines; alert on children in low-frequency
+    categories (<0.1%), scoring with rarity/log-entropy weighting as in [SCADE](https://arxiv.org/abs/2412.04259).
+    Apply the same rarity test to destination IP/domain for explorer.exe network connections (bottom 1st
+    percentile of fleet popularity).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = proc_create(last=90d) WHERE parent_image==''explorer.exe'' | stats count by child_image,
+      cmdline | eval freq = count/total
+
+      | where freq < 0.001
+
+      | append (net WHERE proc==''explorer.exe'' | stats count by dest | eval pop=percentile_rank(count)
+      | where pop < 0.01)
+
+      | eval score = rarity(freq)*log_entropy(cmdline)'
+- question: Compared against the fleet of explorer.exe peers (process tree, child names, network destinations,
+    loaded modules), does a given explorer.exe instance deviate more than 3 standard deviations from the
+    peer centroid?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". explorer.exe should look
+    broadly similar across endpoints. Build a cross-fleet baseline of explorer.exe instances using features
+    like child-process set, network destinations, and loaded modules, then flag instances that sit >3
+    SD from the peer centroid and list the top-3 deviating features in the alert. An injected explorer.exe
+    will diverge from its peers precisely because the payload adds atypical children, modules or connections.
+    This catches novel post-injection behavior that signature rules miss. Source detection guidance (Machine
+    Learning): Compare a given explorer.exe instance against the fleet of explorer.exe peers (process
+    tree, child names, network destinations, loaded modules), the cross-fleet baselining advocated by
+    [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).
+    Flag instances >3 SD from the peer centroid and list the top-3 deviating features in the alert per
+    [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'P = feature_matrix(explorer_instances: child_set, net_dests, loaded_modules, tree_shape)
+
+      centroid, sd = robust_stats(P)
+
+      | foreach inst: z = (inst - centroid)/sd
+
+      | where max(z) > 3
+
+      | emit alert(host, pid, top3=argsort(z)[:3])'
+- question: Did explorer.exe initiate a network connection to a destination IP/domain on a C2 threat-intel
+    feed, or one whose JA3/JA3S/HASSH fingerprint matches a known-malicious signature?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". A normally-quiet GUI process
+    initiating egress is a primary post-injection tell. Join Sysmon EID 3 (process context) with Zeek
+    conn.log/ssl.log/ssh.log and alert when the source process is explorer.exe and either the destination
+    matches a C2 feed or the TLS/SSH fingerprint (ja3/ja3s/HASSH) matches a known-malicious signature.
+    A match strongly indicates the injected trusted process is communicating with adversary infrastructure,
+    supporting both stealth (blending into a trusted process) and the broader intrusion. Source detection
+    guidance (Symbolic Logic): Join Sysmon Event ID 3 (process context) with Zeek conn.log/ssl.log. Alert
+    when source process is explorer.exe and the destination IP matches a C2 feed or the ja3/ja3s/HASSH
+    matches a known-malicious signature; a normally-quiet GUI process initiating egress is a primary post-injection
+    tell per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "join Sysmon(EventCode=3) AS p, conn.log+ssl.log+ssh.log AS c ON p.conn_id==c.uid\n| where\
+      \ p.image=='explorer.exe'\n  AND (c.dest IN ti_c2_feed OR c.ja3 IN bad_ja3 OR c.ja3s IN bad_ja3s\
+      \ OR c.hassh IN bad_hassh)\n| emit alert(host, dest, ja3, ja3s, hassh)"
+- question: Do domains/SNIs queried by explorer.exe show high Shannon entropy (~>4.5 bits, DGA-like),
+    or is there a rise in NXDOMAIN responses for explorer.exe-attributed lookups?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". DGA-based C2 produces high-entropy,
+    random-looking domains. Compute Shannon entropy and character-count features of SNI (ssl.log) and
+    queried domains (dns.log) for connections attributed to explorer.exe and alert above ~4.5 bits. Explicitly
+    profile the failure mode: a rise in NXDOMAIN responses for explorer.exe lookups indicates DGA resolution
+    failures and is a distinct signal. High-entropy domains or NXDOMAIN bursts from a trusted GUI process
+    point to algorithmically generated C2 used after injection. Source detection guidance (Statistical
+    Method): Compute Shannon entropy and character-count features of SNI (ssl.log) and queried domains
+    (dns.log) for connections attributed to explorer.exe; alert above ~4.5 bits (DGA-like), the stateless
+    lexical approach validated by [Nadler et al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf).
+    Profile the failure mode explicitly: a rise in NXDOMAIN responses for explorer.exe-attributed lookups
+    indicates DGA C2 resolution failures and is a distinct signal.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'q = dns.log+ssl.log attributed_to(explorer.exe via Sysmon EID3)
+
+      | eval ent = shannon(query|server_name), len = strlen(query)
+
+      | where ent > 4.5
+
+      | append (dns.log WHERE rcode_name==''NXDOMAIN'' AND proc==''explorer.exe'' | bin 1h | stats count
+      | where count > base)
+
+      | emit alert(host, query, ent)'
+- question: Does a seasonal forecast (ARIMA/Prophet) of per-host explorer.exe egress show significant
+    positive deviation, and does an Isolation Forest over stateless flow features flag the connections
+    as outliers?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Forecast per-host explorer.exe
+    egress (outbound bytes, connection duration, connection count) with a seasonal model and alert on
+    significant positive deviations, then combine with an Isolation Forest over stateless flow features
+    to catch anomalous connections even absent a volume spike. Emit the top-3 contributing features per
+    alert. Unexpected growth in explorer.exe egress is consistent with C2/exfiltration through an injected
+    trusted process; the forecast handles normal diurnal/weekly seasonality to reduce false positives.
+    Source detection guidance (Machine Learning): Forecast per-host explorer.exe egress (Volume: outbound
+    bytes, connection duration, connection count) with a seasonal model (ARIMA/Prophet) and alert on significant
+    positive deviations; combine with an Isolation Forest over stateless flow features as in [Nadler et
+    al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf) and the fleet-anomaly framing of [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).
+    Emit the top-3 contributing features per alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'series = per_host(explorer.exe: out_bytes, conn_duration, conn_count) bin=1h
+
+      fc = Prophet.fit(series).predict()
+
+      | where actual > fc.yhat_upper
+
+      flow_out = IsolationForest(stateless_flow_features).score(new_conns)
+
+      | where flow_out < thr
+
+      | emit alert(host, top3_features)'
+- question: Did a trusted process (explorer.exe, mmc.exe) load a DLL from a user-writable path (C:\Users\,
+    C:\Temp\, C:\ProgramData\) or execute code from a private RWX region not backed by a file on disk?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Trusted GUI processes normally
+    load DLLs from system directories and execute file-backed code. Alert on Sysmon EID 7 ImageLoad for
+    a trusted process where ImageLoaded resides under a user-writable path, OR when execution occurs from
+    a private RWX region with no backing file on disk (the unbacked-execution observable strongly correlated
+    with injection). Either condition is highly suspicious for ListPlanting, where the payload lives in
+    injected memory or a planted DLL rather than a legitimate signed module. Source detection guidance
+    (Symbolic Logic): Alert on Sysmon Event ID 7 ImageLoad for a trusted process (explorer.exe, mmc.exe)
+    when ImageLoaded is under a user-writable path (C:\\Users\\, C:\\Temp\\, C:\\ProgramData\\), OR when
+    execution occurs from a private RWX region not backed by a file on disk — the unbacked-execution observable
+    correlated with injection by [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=7) WHERE image IN (explorer.exe,mmc.exe)\n  AND image_loaded LIKE ('C:\\\
+      Users\\%','C:\\Temp\\%','C:\\ProgramData\\%')\n| union (Sysmon(EventCode=8)/memscan WHERE region.protect==RWX\
+      \ AND backed_by_file==false AND host_image IN (explorer.exe,mmc.exe))\n| emit alert(host, image,\
+      \ image_loaded)"
+- question: Among DLLs loaded by explorer.exe across the fleet, did any load have host-prevalence below
+    threshold (e.g., <5 hosts), or carry an unsigned/invalid signature?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline all DLL hashes loaded
+    by explorer.exe across the fleet and alert on loads whose host-prevalence is below threshold (e.g.,
+    <5 hosts), rarity-scored. Track unsigned/invalid-signature loads as a distinct state. A rare or unsigned
+    DLL loaded into a trusted GUI host is a classic planted-payload indicator; combining prevalence with
+    signature status reduces noise from legitimate but uncommon plugins while still surfacing genuinely
+    suspicious loads. Source detection guidance (Statistical Method): Baseline all DLL hashes loaded by
+    explorer.exe across the fleet and alert on loads whose host-prevalence is below threshold (e.g., <5
+    hosts), rarity-scored as in [SCADE](https://arxiv.org/abs/2412.04259). Track unsigned/invalid-signature
+    loads as a distinct state.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'loads = Sysmon(EventCode=7) WHERE image==''explorer.exe''
+
+      | stats dc(host) as host_prev by dll_hash, image_loaded, signed, sig_status
+
+      | where host_prev < 5 OR signed==false OR sig_status!=''valid''
+
+      | eval score = rarity(host_prev) + if(signed==false,1,0)
+
+      | sort -score'
+- question: Does a sequence model (HMM/LSTM) trained on benign explorer.exe event sequences assign a low
+    probability to an observed chain such as remote allocation (EID 8) -> ImageLoad from temp (EID 7)
+    -> new network connection (EID 3)?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". ListPlanting and its follow-on
+    actions produce an ordered event chain that is rare in benign explorer.exe behavior. Train an HMM
+    or LSTM on benign explorer.exe event sequences and flag low-probability chains, e.g., remote memory
+    allocation followed by an ImageLoad from a temp path followed by a new outbound connection. Report
+    the top-3 events/features driving the low likelihood. This captures the allocate->execute->communicate
+    progression of injection even when each individual event looks innocuous in isolation. Source detection
+    guidance (Machine Learning): Train a sequence model (HMM or LSTM) on benign explorer.exe event sequences
+    and flag low-probability chains such as remote allocation (EID 8) -> ImageLoad from temp (EID 7) ->
+    new network connection (EID 3); ordered-chain detection follows the API-sequence alignment of [Cho
+    et al.](https://journals.sagepub.com/doi/full/10.1155/2015/659101) and the allocation->execute correlation
+    of [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w). Report the top-3
+    events/features driving the low likelihood per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ordered_events(explorer.exe: [EID8_alloc, EID7_imageload_temp, EID3_newconn])
+
+      ll = LSTM.load(''explorer_seq'').log_likelihood(seq)
+
+      | where ll < threshold
+
+      | emit alert(host, pid, seq, top3_low_prob_events)'
+- question: Did explorer.exe spawn an archiving/compression utility such as 7z.exe, rar.exe, tar.exe,
+    zip.exe or compact.exe?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Spawning an archiver from
+    explorer.exe is staging behavior incongruent with an interactive shell host and consistent with post-injection
+    collection/exfil preparation. Alert when Sysmon EID 1 shows explorer.exe as the parent of an archiving
+    utility. While users do double-click archives in Explorer, the launched process is normally the archiver''s
+    GUI in a different process tree context; programmatic archiving spawned by injected code is the concern.
+    Correlate with file-creation bursts and egress to confirm staging-then-exfil. Source detection guidance
+    (Symbolic Logic): Alert when Sysmon Event ID 1 shows explorer.exe as parent of an archiving utility
+    (7z.exe, rar.exe, tar.exe, zip.exe) or compact.exe — staging behavior incongruent with an interactive
+    shell host, consistent with the post-injection action chains noted by [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=1) | union WinEventLog(4688)\n| where parent_image=='explorer.exe'\n  AND\
+      \ child_image IN (7z.exe,rar.exe,tar.exe,zip.exe,compact.exe)\n| emit alert(host, child_image, cmdline)"
+- question: Did explorer.exe exceed the 99.5th percentile of its per-host hourly file-creation count for
+    that hour-of-week, or generate a burst of failed/access-denied file operations?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline, per host, hourly
+    file-creation counts (Sysmon EID 11) attributed to explorer.exe and alert above the 99.5th percentile
+    for that hour-of-week using sliding-window frequency baselining, which accounts for normal daily/weekly
+    rhythms. Also track failed writes / access-denied file operations as a distinct burst signal, since
+    an injector may probe locations it cannot write. A sustained, off-baseline write burst from explorer.exe
+    suggests bulk data staging for exfiltration. Source detection guidance (Statistical Method): Per host,
+    baseline hourly file-creation counts (Sysmon Event ID 11) from explorer.exe and alert above the 99.5th
+    percentile for that hour-of-week, using sliding-window frequency baselining per [Bag of System Calls](https://arxiv.org/abs/1611.03053).
+    Also track failed writes / access-denied file operations as a distinct burst signal.'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'w = Sysmon(EventCode=11) WHERE image==''explorer.exe''
+
+      | bin span=1h | stats count as writes by host, hour_of_week
+
+      | eventstats p99.5(writes) as thr by host, hour_of_week
+
+      | where writes > thr
+
+      | append (file_ops WHERE result==''ACCESS_DENIED'' AND image==''explorer.exe'' | bin 1h | stats
+      count as denied | where denied > burst)'
+- question: Compared against the peer fleet, does an explorer.exe instance's file-I/O profile (read:write
+    ratio, unique directories touched, entropy of created file extensions) sit more than 3 standard deviations
+    from the peer centroid?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Compare explorer.exe file-I/O
+    feature vectors against the peer fleet and flag instances >3 SD from the peer centroid, surfacing
+    the top-3 deviating features. Features like a skewed read:write ratio, an unusually large number of
+    unique directories touched, and high entropy of created file extensions distinguish an instance staging
+    diverse data from normal interactive use. This peer-relative approach adapts to environments without
+    needing fixed thresholds and explains why an instance was flagged. Source detection guidance (Machine
+    Learning): Compare explorer.exe file-I/O feature vectors (read:write ratio, unique directories touched,
+    entropy of created file extensions) against the peer fleet per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies);
+    flag instances >3 SD from the peer centroid and surface the top-3 deviating features per [Anthony
+    et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'F = vectors(explorer_instances: rw_ratio, unique_dirs, ext_entropy, files_per_min)
+
+      centroid, sd = robust_stats(F)
+
+      | foreach inst: z = (inst-centroid)/sd
+
+      | where max(z) > 3
+
+      | emit alert(host, pid, top3=argsort(z)[:3])'
+- question: Did explorer.exe send far more bytes than it received (e.g., orig_bytes:resp_bytes > 100:1
+    and >10MB total) to an external destination not on a corporate/cloud allow-list?
+  context: 'In the context of Stealth (TA0005), this Symbolic Logic approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". A large outbound:inbound
+    byte asymmetry from a trusted GUI process is a volume/state signature typical of exfiltration through
+    a hijacked process. Correlate Sysmon EID 3 from explorer.exe with Zeek conn.log and alert when orig_bytes
+    greatly exceeds resp_bytes (e.g., >100:1 ratio and >10MB total) to an external destination not on
+    a corporate/cloud allow-list. A match indicates likely data exfiltration via the injected explorer.exe
+    and should trigger containment and scoping of what data left. Source detection guidance (Symbolic
+    Logic): Correlate Sysmon Event ID 3 from explorer.exe with Zeek conn.log and alert when orig_bytes
+    >> resp_bytes (e.g., >100:1 ratio and >10MB total) to an external destination not on a corporate/cloud
+    allow-list — a volume/state asymmetry typical of exfiltration via a hijacked trusted process per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "join Sysmon(EventCode=3) AS p, conn.log AS c ON p.conn_id==c.uid\n| where p.image=='explorer.exe'\
+      \ AND c.dest NOT IN corp_cloud_allowlist AND is_external(c.dest)\n  AND c.orig_bytes > 100*c.resp_bytes\
+      \ AND c.orig_bytes > 10MB\n| emit alert(host, dest, orig_bytes, resp_bytes)"
+- question: For any explorer.exe source/destination pair, is the standard deviation of inter-connection
+    time deltas near zero (<1s jitter) over a sustained run (>10 connections), or are there repeated blocked/rejected
+    (S0/REJ) attempts to one destination?
+  context: 'In the context of Stealth (TA0005), this Statistical Method approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Automated C2 beaconing produces
+    highly regular connection timing. For each explorer.exe source/destination pair, compute the standard
+    deviation of inter-connection time deltas in conn.log; near-zero jitter (<1s) over a sustained run
+    (>10 connections) indicates machine-driven beaconing rather than human activity. Separately profile
+    the failure mode: repeated blocked/rejected (S0/REJ) connection attempts to a single destination is
+    its own beaconing signal. Either pattern from explorer.exe points to injected C2. Source detection
+    guidance (Statistical Method): For each explorer.exe source/destination pair, compute the standard
+    deviation of inter-connection time deltas in conn.log; a near-zero deviation (<1s jitter) over a sustained
+    run (>10 connections) indicates automated C2 beaconing. Separately profile the failure mode — repeated
+    blocked/rejected (S0/REJ) connection attempts to one destination — as its own beaconing signal, complementing
+    the network-anomaly approach of [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 14 days; require sustained runs of >10 connections
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'c = conn.log attributed_to(explorer.exe via Sysmon EID3)
+
+      | sort ts | streamstats by src,dest: delta = ts - prev(ts)
+
+      | stats stdev(delta) as jitter, count as n by src, dest
+
+      | where n > 10 AND jitter < 1s
+
+      | append (conn.log WHERE proc==''explorer.exe'' AND conn_state IN (S0,REJ) | stats count by dest
+      | where count > thr)'
+- question: Does a one-class SVM or Isolation Forest trained on benign explorer.exe connection vectors
+    (dest port, bytes sent/received, duration, dest reputation, inter-arrival jitter) score a new explorer.exe
+    connection as an outlier?
+  context: 'In the context of Stealth (TA0005), this Machine Learning approach addresses the requirement
+    "Has the adversary attempted to elevate privileges using ListPlanting?". Train a one-class model on
+    benign explorer.exe connection vectors and score new connections, alerting on outliers; report the
+    top-3 contributing features. By learning the normal envelope of explorer.exe network behavior (ports,
+    byte volumes, durations, destination reputation, jitter), the model flags connections that fall outside
+    it without needing labeled malicious data. This catches novel C2/exfil channels through an injected
+    trusted process while the feature attributions guide analyst triage. Source detection guidance (Machine
+    Learning): Train a one-class SVM (or Isolation Forest, as used for stateless flow features by [Nadler
+    et al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf)) on benign explorer.exe connection
+    vectors (dest port, bytes sent/received, duration, dest reputation, inter-arrival jitter) and score
+    new connections, alerting on outliers; report the top-3 contributing features in the alert per [Anthony
+    et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = conn_vectors(explorer.exe: dest_port, bytes_out, bytes_in, duration, dest_reputation,
+      ia_jitter)
+
+      model = OneClassSVM.load(''explorer_net'')  # or IsolationForest
+
+      s = model.decision_function(X)
+
+      | where s < 0
+
+      | emit alert(host, dest, top3_features)'
+- question: Did any host execute a binary whose file hash matches a known ListPlanting/InvisiMole loader,
+    or whose memory contains a registered ListView_SortItems/LVGroupCompare callback pointing into an
+    unbacked private RWX region?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". This is the deterministic,
+    highest-confidence check for ListPlanting. Join process-creation telemetry against curated threat-intel
+    hash feeds of documented ListPlanting tooling (e.g., InvisiMole loaders from ESET), and in parallel
+    run EDR/YARA memory scans for the technique''s structural fingerprint: a list-view sort callback (ListView_SortItems
+    / LVGroupCompare) whose target address lies in a private RWX region not backed by any module on disk.
+    A positive match is near-conclusive evidence of injection tooling on the host; a negative result does
+    not rule out novel tooling, so pair it with the prevalence and classifier questions. Source detection
+    guidance (Symbolic Logic): Join process creation logs (Sysmon Event ID 1 / 4688) with a threat-intel
+    feed of file hashes known to be used for ListPlanting (e.g., InvisiMole loaders documented by [ESET](https://www.welivesecurity.com/wp-content/uploads/2020/06/ESET_InvisiMole.pdf)).
+    In parallel, run EDR/YARA memory scans for ListPlanting code patterns — a registered ListView_SortItems/LVGroupCompare
+    callback whose target lies in a private RWX region not backed by a module on disk, as described by
+    [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Flag any match
+    deterministically.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source IN (Sysmon:EventCode=1, WinEventLog:4688)
+
+      | join hash == threat_intel_listplanting_hashes.sha256
+
+      | union (edr_memscan WHERE callback IN (ListView_SortItems, LVGroupCompare) AND region.protect ==
+      RWX AND region.backed_by_module == false)
+
+      | emit alert(host, image, hash, pid, parent_image)'
+- question: Across the fleet, which executables are extremely rare (seen on only 1-2 hosts / lowest prevalence
+    percentile) and were launched by a common GUI host such as explorer.exe or mmc.exe?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". ListPlanting
+    loaders are typically bespoke and low-prevalence. Compute enterprise-wide prevalence (distinct host
+    count and execution count) for every file hash observed in process creation over a rolling 30 days,
+    then alert on images in the lowest percentile (<0.01%), weighting the score with the rarity/entropy
+    of the full command line. Escalate when the parent is a GUI host, since that is the staging context
+    for ListPlanting. Maintain first-seen state so a given rare-but-benign binary is not re-alerted indefinitely.
+    A positive result surfaces never-before-seen tooling for triage. Source detection guidance (Statistical
+    Method): Compute enterprise-wide prevalence (count of distinct hosts, count of executions) for every
+    file hash seen in process creation over a rolling 30 days. Alert on execution of any image with host-prevalence
+    in the lowest percentile (e.g., seen on 1-2 hosts, <0.01%), weighting the score with rarity/entropy
+    of the full command line as in [SCADE](https://arxiv.org/abs/2412.04259); escalate when the parent
+    is a common GUI host such as explorer.exe or mmc.exe. Track first-seen state so the same rare binary
+    is not re-alerted forever.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'events = proc_create(last=30d)
+
+      | stats dc(host) as host_prev, count as execs, by hash, image, cmdline
+
+      | eval cmd_entropy = shannon(cmdline)
+
+      | where host_prev <= 2 OR percentile_rank(host_prev) < 0.01
+
+      | eval score = rarity(host_prev) * (1 + cmd_entropy)
+
+      | where parent_image IN (explorer.exe, mmc.exe) AND first_seen(hash)
+
+      | sort -score'
+- question: Does a supervised process classifier (Random Forest / Gradient Boosting) flag a newly executed
+    process as malicious based on parent image, command line, path, integrity, hash prevalence and PE
+    header subsystem/imports, and what top-3 SHAP features drove the score?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Train a supervised
+    model on process metadata; PE structural and import features tend to dominate ListPlanting-relevant
+    detections. Rather than emitting a bare probability, surface the top-3 SHAP contributions (e.g., ''parent=explorer.exe'',
+    ''subsystem=console'', ''hash_prevalence=1'') so the analyst can validate the reasoning. Prioritize
+    high-probability hits whose parent is a GUI host, the classic ListPlanting launch pattern. A high-confidence
+    hit with intuitive feature attributions warrants immediate memory inspection of both the launching
+    and target process. Source detection guidance (Machine Learning): Train a supervised classifier (Random
+    Forest / Gradient Boosting) on process metadata (parent image, command line, path, user/integrity,
+    hash prevalence, PE header subsystem/imports). PE structural and import features dominate such models,
+    so emit the top-3 SHAP feature contributions in every alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9)
+    (e.g., ''parent=explorer.exe'', ''subsystem=console'', ''hash_prevalence=1'') rather than a bare score;
+    investigate high-probability hits originating from GUI hosts.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User workstations, Administrative workstations, Terminal servers, Enterprise SIEM'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features(parent_image, cmdline, path, user_integrity, hash_prevalence, pe_subsystem, pe_imports)
+
+      model = GradientBoosting.load(''proc_clf'')
+
+      p = model.predict_proba(X)
+
+      top3 = shap_top_k(model, X, k=3)
+
+      if p > 0.9: emit alert(host, pid, image, p, top3)'
+- question: Within a 5-second window, did a lower-integrity process open a handle to a higher-integrity
+    process, cause a memory allocation/protection change in it, and then send an LVM_SORTITEMS message
+    to its SysListView32 control (instead of using WriteProcessMemory)?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". This ordered
+    chain is the canonical ListPlanting injection signature. Correlate on a shared target PID: (1) Sysmon
+    EID 10 ProcessAccess where SourceImage integrity < TargetImage integrity (a successful cross-integrity
+    OpenProcess), (2) a memory allocation/protect-change in the target via Sysmon EID 8 or ETW (the allocate+execute
+    correlation that is the core injection observable), and (3) an LVM_SORTITEMS trigger to the target''s
+    list-view control rather than the heavily monitored WriteProcessMemory. Requiring the events to share
+    the target PID and arrive in order makes this high-fidelity; a match is strong evidence of an active
+    injection and likely privilege escalation when the target is high/system integrity. Source detection
+    guidance (Symbolic Logic): Alert when one source/target process pair produces, within 5 seconds, the
+    ordered chain: (1) Sysmon Event ID 10 ProcessAccess where SourceImage integrity < TargetImage integrity
+    (a successful OpenProcess), (2) a memory allocation/protection change in the target observed via Sysmon
+    Event ID 8 or ETW (the allocation+execute correlation shown to be the core injection observable by
+    [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w)), and (3) an LVM_SORTITEMS
+    message sent to the target''s SysListView32 control instead of WriteProcessMemory, the exact ListPlanting
+    trigger documented by [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Require the
+    events to share the target PID; ordered-chain matching follows the API-sequence alignment of [Cho
+    et al.](https://journals.sagepub.com/doi/full/10.1155/2015/659101).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 7 days; correlate events within a 5-second window per target PID
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'open  = Sysmon(EventCode=10) WHERE src_integrity < tgt_integrity
+
+      alloc = Sysmon(EventCode=8) | union etw_vallocex
+
+      sort  = etw_win32k WHERE msg == LVM_SORTITEMS AND target_class == SysListView32
+
+      | sequence by target_pid within 5s: open -> alloc -> sort
+
+      | emit alert(src_image, tgt_image, target_pid, host)'
+- question: Has any source process exceeded the 99th percentile of its own baseline rate of ProcessAccess
+    events targeting higher-integrity processes, or produced a burst of access-DENIED handle attempts
+    against sensitive processes?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline,
+    per source process name, the rate (count/min and count/day) of Sysmon EID 10 ProcessAccess events
+    that target higher-integrity processes using sliding-window frequency vectors. Alert when an instance
+    exceeds its 99th-percentile baseline. Separately, treat a burst of access-DENIED (masked GrantedAccess
+    / STATUS_ACCESS_DENIED) handle attempts as its own injection-probing signal, since a low-integrity
+    injector often fails before it succeeds. Escalate when the target is lsass.exe, winlogon.exe or csrss.exe.
+    This catches both successful and attempted cross-integrity access characteristic of the privilege-escalation
+    path. Source detection guidance (Statistical Method): For each source process name, baseline the rate
+    (count/min and count/day) of Sysmon Event ID 10 ProcessAccess events that target higher-integrity
+    processes, using sliding-window frequency vectors per [Bag of System Calls](https://arxiv.org/abs/1611.03053).
+    Alert when an instance exceeds the 99th percentile of its baseline, and separately profile the failure
+    mode — a burst of access-DENIED (GrantedAccess masked / STATUS_ACCESS_DENIED) handle attempts is itself
+    a distinct signal of injection probing. Escalate when the target is lsass.exe, winlogon.exe or csrss.exe.'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'acc = Sysmon(EventCode=10) WHERE tgt_integrity > src_integrity
+
+      | bin span=1m | stats count by src_image, window
+
+      | eventstats p99(count) as thr by src_image
+
+      | where count > thr
+
+      | append (acc WHERE granted_access_denied=true | stats count as denied by src_image,tgt_image |
+      where denied > burst_thr)
+
+      | eval sev = if(tgt_image IN (lsass.exe,winlogon.exe,csrss.exe),''high'',''med'')'
+- question: Does a seasonal time-series model detect a sharp spike in LVM_SORTITEMS/LVM_SETITEMPOSITION/LVM_GETITEMPOSITION
+    messages between a specific source/target process pair of differing integrity?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". The two-bytes-at-a-time
+    payload copy via LVM_SETITEMPOSITION/LVM_GETITEMPOSITION and the LVM_SORTITEMS trigger produce a distinctive
+    message-frequency signature per process pair. Model per-pair message frequency with a seasonal anomaly
+    detector (e.g., S-H-ESD) and flag sharp spikes, especially across an integrity boundary. Surface the
+    top-3 contributing features (message type, pair integrity delta, count vs. baseline) so the analyst
+    understands the alert. A spike between a low-integrity source and a high-integrity GUI target is a
+    strong ListPlanting indicator. Source detection guidance (Machine Learning): Model the per-process-pair
+    frequency of LVM_SORTITEMS/LVM_SETITEMPOSITION/LVM_GETITEMPOSITION messages (the two-bytes-at-a-time
+    payload-copy primitive described by [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/)
+    and used in the wild by [InvisiMole](https://www.welivesecurity.com/wp-content/uploads/2020/06/ESET_InvisiMole.pdf))
+    with a seasonal time-series detector (e.g., S-H-ESD). Flag sharp spikes between processes of differing
+    integrity, and surface the top-3 contributing features (message type, pair integrity delta, count
+    vs. baseline) in the alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 10
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Domain Controllers (if admin tools are used), Management servers with GUI
+    tools'
+  range: Last 30 days; per-pair message-frequency baselining
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = counts(msg IN (LVM_SORTITEMS,LVM_SETITEMPOSITION,LVM_GETITEMPOSITION)) by (src_pid,tgt_pid),
+      bin=1m
+
+      anom = SH_ESD(ts, season=''1d'')
+
+      | where anom AND integrity_delta(src,tgt) > 0
+
+      | emit alert(src_image, tgt_image, top3=[msg_type, integrity_delta, count_vs_baseline])'
+- question: Did a process whose PE header lacks IMAGE_SUBSYSTEM_WINDOWS_GUI (a console app, service, or
+    non-windowed binary) emit more than ~50 SendMessage/PostMessage calls carrying LVM_* arguments within
+    one minute?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". List-view messaging
+    is fundamentally a GUI primitive, so a non-GUI binary driving large volumes of LVM_* SendMessage/PostMessage
+    traffic is anomalous and consistent with the ListPlanting payload-copy/trigger primitives. Alert when
+    a non-GUI process exceeds a tuned per-minute threshold (~50) of LVM_* messages. Tune the count to
+    your busiest legitimate console GUI automation to manage false positives. A positive result identifies
+    the injector itself, even when it never used WriteProcessMemory. Source detection guidance (Symbolic
+    Logic): Alert when a process whose PE header lacks IMAGE_SUBSYSTEM_WINDOWS_GUI (a console app, service,
+    or non-windowed binary) emits more than 50 SendMessage/PostMessage calls carrying LVM_* arguments
+    within a one-minute window — anomalous because list-view messaging is a GUI primitive, per [Hexacorn](https://www.hexacorn.com/blog/2019/04/25/listplanting-yet-another-code-injection-trick/)
+    and [modexp](https://modexp.wordpress.com/2019/04/25/seven-window-injection-methods/). Tune the count
+    threshold to your environment''s busiest legitimate console GUI automation.'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 7 days; evaluate in 1-minute windows
+  queries:
+  - technology: EDR/API-monitor pseudocode
+    query: 'api = api_monitor WHERE func IN (SendMessage,PostMessage) AND arg LIKE ''LVM_%''
+
+      | where proc.pe_subsystem != IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+      | bin span=1m | stats count by proc.pid, proc.image, window
+
+      | where count > 50
+
+      | emit alert(host, image, pid, count)'
+- question: Does any process exceed mean + 3 standard deviations of its baseline SendMessage/PostMessage
+    rate (calls/min), particularly process types whose baseline is normally ~0, and are LVM_SETITEMPOSITION/LVM_GETITEMPOSITION
+    round-trips returning errors?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Profile per-process-name
+    the distribution of SendMessage/PostMessage volume (calls/min) and alert on instances exceeding mean
+    + 3 SD, with special attention to console apps and services whose legitimate baseline mean is near
+    zero. Additionally track the failure mode: LVM_SETITEMPOSITION/LVM_GETITEMPOSITION round-trips that
+    return error/zero indicate failed payload-staging copies. Both the volume anomaly and the failed-copy
+    signal point to active ListPlanting staging. Source detection guidance (Statistical Method): For each
+    process name, profile the distribution of SendMessage/PostMessage (Volume: calls/min) and alert when
+    an instance exceeds mean + 3 standard deviations, especially for process types whose baseline mean
+    is ~0 (console apps, services), using frequency-vector baselining from [Bag of System Calls](https://arxiv.org/abs/1611.03053).
+    Also track the failure-mode signal: LVM_SETITEMPOSITION/LVM_GETITEMPOSITION round-trips that return
+    error/zero (failed copies during payload staging).'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 30 days; evaluate in 1-minute windows
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'm = api_monitor WHERE func IN (SendMessage,PostMessage)
+
+      | bin span=1m | stats count as cpm by image, window
+
+      | eventstats mean(cpm) avg, stdev(cpm) sd by image
+
+      | where cpm > avg + 3*sd
+
+      | append (api_monitor WHERE arg IN (LVM_SETITEMPOSITION,LVM_GETITEMPOSITION) AND ret IN (0,ERROR)
+      | stats count as failed by image)'
+- question: When clustering processes on LVM_* messaging frequency, PE subsystem flag, window-handle count
+    and image path, which processes fall out as outliers exhibiting heavy LVM_* messaging but lacking
+    GUI characteristics?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Use a density-based
+    clusterer (e.g., DBSCAN) over features that separate genuine GUI apps from injectors: LVM_* SendMessage/PostMessage
+    frequency, PE subsystem flag, window-handle count, and image path. Investigate outliers/noise points
+    that show high LVM_* messaging yet lack GUI traits (no window handles, console subsystem). Report
+    the top-3 features driving the outlier assignment (e.g., ''subsystem=console'',''lvm_sortitems/min=120'',''has_window=false'')
+    so the analyst can confirm the contradiction between behavior and process type. Source detection guidance
+    (Machine Learning): Cluster processes (e.g., DBSCAN) on features including LVM_* SendMessage/PostMessage
+    frequencies, PE subsystem flag, window-handle count, and image path. Investigate outliers exhibiting
+    high LVM_* messaging but lacking GUI characteristics; report the top-3 features driving the outlier
+    assignment per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9) so
+    analysts see why (e.g., ''subsystem=console'',''lvm_sortitems/min=120'',''has_window=false'').'
+  answer_sources:
+  - API Monitoring Logs
+  - EDR Telemetry
+  - 'NAI: User workstations, Application servers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = features(lvm_send_freq, lvm_post_freq, pe_subsystem, window_handle_count, image_path)
+
+      labels = DBSCAN(eps, min_samples).fit_predict(X)
+
+      | where labels == -1 AND pe_subsystem == console AND lvm_freq high
+
+      | emit alert(image, pid, top3_features)'
+- question: Did explorer.exe (or another high-integrity GUI host such as mmc.exe) spawn a command-line
+    interpreter or script host such as cmd.exe, powershell.exe, cscript.exe, wscript.exe or rundll32.exe?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". A trusted GUI
+    host launching a shell or script interpreter is an unusual parent-child relationship and a high-fidelity
+    injection/privilege-escalation indicator: after ListPlanting executes inside explorer.exe, payload-spawned
+    children inherit its integrity. Alert on these parent-child pairs while maintaining a per-environment
+    allow-list of legitimate explorer-launched helpers (some software does legitimately spawn helpers
+    from explorer). A match warrants reviewing the explorer.exe process for injected memory and the child''s
+    command line. Source detection guidance (Symbolic Logic): Alert when ''C:\\Windows\\explorer.exe''
+    (or another high-integrity GUI host such as mmc.exe) spawns cmd.exe, powershell.exe, cscript.exe,
+    wscript.exe or rundll32.exe — an unusual parent-child relationship treated as a high-fidelity injection/priv-esc
+    indicator by [Elastic](https://detection.fyi/elastic/detection-rules/windows/privilege_escalation_unusual_parentchild_relationship/).
+    Maintain a per-environment allow-list for legitimate explorer-launched helpers.'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=1) | union WinEventLog(4688)\n| where parent_image IN ('C:\\Windows\\explorer.exe','*\\\
+      mmc.exe')\n  AND child_image IN (cmd.exe,powershell.exe,cscript.exe,wscript.exe,rundll32.exe)\n\
+      \  AND NOT allowlisted(parent_image, child_image, cmdline)\n| emit alert(host, parent_image, child_image,\
+      \ cmdline)"
+- question: Against a 90-day frequency distribution of explorer.exe child images/command lines, did a
+    rare child (<0.1%) appear, or did explorer.exe connect to a destination IP/domain in the bottom 1st
+    percentile of fleet popularity?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Maintain
+    a 90-day frequency distribution of child image names and command lines per common parent (explorer.exe)
+    and alert on children in low-frequency categories (<0.1%), scoring with rarity/log-entropy weighting.
+    Apply the same rarity test to explorer.exe network destinations (bottom 1st percentile of fleet popularity).
+    Rare children or rare destinations from a normally-predictable GUI host suggest injected behavior.
+    A positive result narrows triage to genuinely anomalous activity rather than common helper launches.
+    Source detection guidance (Statistical Method): For each common parent (explorer.exe), maintain a
+    90-day frequency distribution of child image names and command lines; alert on children in low-frequency
+    categories (<0.1%), scoring with rarity/log-entropy weighting as in [SCADE](https://arxiv.org/abs/2412.04259).
+    Apply the same rarity test to destination IP/domain for explorer.exe network connections (bottom 1st
+    percentile of fleet popularity).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'base = proc_create(last=90d) WHERE parent_image==''explorer.exe'' | stats count by child_image,
+      cmdline | eval freq = count/total
+
+      | where freq < 0.001
+
+      | append (net WHERE proc==''explorer.exe'' | stats count by dest | eval pop=percentile_rank(count)
+      | where pop < 0.01)
+
+      | eval score = rarity(freq)*log_entropy(cmdline)'
+- question: Compared against the fleet of explorer.exe peers (process tree, child names, network destinations,
+    loaded modules), does a given explorer.exe instance deviate more than 3 standard deviations from the
+    peer centroid?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". explorer.exe
+    should look broadly similar across endpoints. Build a cross-fleet baseline of explorer.exe instances
+    using features like child-process set, network destinations, and loaded modules, then flag instances
+    that sit >3 SD from the peer centroid and list the top-3 deviating features in the alert. An injected
+    explorer.exe will diverge from its peers precisely because the payload adds atypical children, modules
+    or connections. This catches novel post-injection behavior that signature rules miss. Source detection
+    guidance (Machine Learning): Compare a given explorer.exe instance against the fleet of explorer.exe
+    peers (process tree, child names, network destinations, loaded modules), the cross-fleet baselining
+    advocated by [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).
+    Flag instances >3 SD from the peer centroid and list the top-3 deviating features in the alert per
+    [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - 'NAI: User workstations, Network egress points, DNS servers, Core network switches'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'P = feature_matrix(explorer_instances: child_set, net_dests, loaded_modules, tree_shape)
+
+      centroid, sd = robust_stats(P)
+
+      | foreach inst: z = (inst - centroid)/sd
+
+      | where max(z) > 3
+
+      | emit alert(host, pid, top3=argsort(z)[:3])'
+- question: Did explorer.exe initiate a network connection to a destination IP/domain on a C2 threat-intel
+    feed, or one whose JA3/JA3S/HASSH fingerprint matches a known-malicious signature?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". A normally-quiet
+    GUI process initiating egress is a primary post-injection tell. Join Sysmon EID 3 (process context)
+    with Zeek conn.log/ssl.log/ssh.log and alert when the source process is explorer.exe and either the
+    destination matches a C2 feed or the TLS/SSH fingerprint (ja3/ja3s/HASSH) matches a known-malicious
+    signature. A match strongly indicates the injected trusted process is communicating with adversary
+    infrastructure, supporting both stealth (blending into a trusted process) and the broader intrusion.
+    Source detection guidance (Symbolic Logic): Join Sysmon Event ID 3 (process context) with Zeek conn.log/ssl.log.
+    Alert when source process is explorer.exe and the destination IP matches a C2 feed or the ja3/ja3s/HASSH
+    matches a known-malicious signature; a normally-quiet GUI process initiating egress is a primary post-injection
+    tell per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "join Sysmon(EventCode=3) AS p, conn.log+ssl.log+ssh.log AS c ON p.conn_id==c.uid\n| where\
+      \ p.image=='explorer.exe'\n  AND (c.dest IN ti_c2_feed OR c.ja3 IN bad_ja3 OR c.ja3s IN bad_ja3s\
+      \ OR c.hassh IN bad_hassh)\n| emit alert(host, dest, ja3, ja3s, hassh)"
+- question: Do domains/SNIs queried by explorer.exe show high Shannon entropy (~>4.5 bits, DGA-like),
+    or is there a rise in NXDOMAIN responses for explorer.exe-attributed lookups?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". DGA-based
+    C2 produces high-entropy, random-looking domains. Compute Shannon entropy and character-count features
+    of SNI (ssl.log) and queried domains (dns.log) for connections attributed to explorer.exe and alert
+    above ~4.5 bits. Explicitly profile the failure mode: a rise in NXDOMAIN responses for explorer.exe
+    lookups indicates DGA resolution failures and is a distinct signal. High-entropy domains or NXDOMAIN
+    bursts from a trusted GUI process point to algorithmically generated C2 used after injection. Source
+    detection guidance (Statistical Method): Compute Shannon entropy and character-count features of SNI
+    (ssl.log) and queried domains (dns.log) for connections attributed to explorer.exe; alert above ~4.5
+    bits (DGA-like), the stateless lexical approach validated by [Nadler et al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf).
+    Profile the failure mode explicitly: a rise in NXDOMAIN responses for explorer.exe-attributed lookups
+    indicates DGA C2 resolution failures and is a distinct signal.'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'q = dns.log+ssl.log attributed_to(explorer.exe via Sysmon EID3)
+
+      | eval ent = shannon(query|server_name), len = strlen(query)
+
+      | where ent > 4.5
+
+      | append (dns.log WHERE rcode_name==''NXDOMAIN'' AND proc==''explorer.exe'' | bin 1h | stats count
+      | where count > base)
+
+      | emit alert(host, query, ent)'
+- question: Does a seasonal forecast (ARIMA/Prophet) of per-host explorer.exe egress show significant
+    positive deviation, and does an Isolation Forest over stateless flow features flag the connections
+    as outliers?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Forecast
+    per-host explorer.exe egress (outbound bytes, connection duration, connection count) with a seasonal
+    model and alert on significant positive deviations, then combine with an Isolation Forest over stateless
+    flow features to catch anomalous connections even absent a volume spike. Emit the top-3 contributing
+    features per alert. Unexpected growth in explorer.exe egress is consistent with C2/exfiltration through
+    an injected trusted process; the forecast handles normal diurnal/weekly seasonality to reduce false
+    positives. Source detection guidance (Machine Learning): Forecast per-host explorer.exe egress (Volume:
+    outbound bytes, connection duration, connection count) with a seasonal model (ARIMA/Prophet) and alert
+    on significant positive deviations; combine with an Isolation Forest over stateless flow features
+    as in [Nadler et al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf) and the fleet-anomaly
+    framing of [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).
+    Emit the top-3 contributing features per alert per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek ssh.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, Proxy servers, DNS resolvers, Endpoint Detection and Response (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'series = per_host(explorer.exe: out_bytes, conn_duration, conn_count) bin=1h
+
+      fc = Prophet.fit(series).predict()
+
+      | where actual > fc.yhat_upper
+
+      flow_out = IsolationForest(stateless_flow_features).score(new_conns)
+
+      | where flow_out < thr
+
+      | emit alert(host, top3_features)'
+- question: Did a trusted process (explorer.exe, mmc.exe) load a DLL from a user-writable path (C:\Users\,
+    C:\Temp\, C:\ProgramData\) or execute code from a private RWX region not backed by a file on disk?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Trusted GUI processes
+    normally load DLLs from system directories and execute file-backed code. Alert on Sysmon EID 7 ImageLoad
+    for a trusted process where ImageLoaded resides under a user-writable path, OR when execution occurs
+    from a private RWX region with no backing file on disk (the unbacked-execution observable strongly
+    correlated with injection). Either condition is highly suspicious for ListPlanting, where the payload
+    lives in injected memory or a planted DLL rather than a legitimate signed module. Source detection
+    guidance (Symbolic Logic): Alert on Sysmon Event ID 7 ImageLoad for a trusted process (explorer.exe,
+    mmc.exe) when ImageLoaded is under a user-writable path (C:\\Users\\, C:\\Temp\\, C:\\ProgramData\\),
+    OR when execution occurs from a private RWX region not backed by a file on disk — the unbacked-execution
+    observable correlated with injection by [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=7) WHERE image IN (explorer.exe,mmc.exe)\n  AND image_loaded LIKE ('C:\\\
+      Users\\%','C:\\Temp\\%','C:\\ProgramData\\%')\n| union (Sysmon(EventCode=8)/memscan WHERE region.protect==RWX\
+      \ AND backed_by_file==false AND host_image IN (explorer.exe,mmc.exe))\n| emit alert(host, image,\
+      \ image_loaded)"
+- question: Among DLLs loaded by explorer.exe across the fleet, did any load have host-prevalence below
+    threshold (e.g., <5 hosts), or carry an unsigned/invalid signature?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline
+    all DLL hashes loaded by explorer.exe across the fleet and alert on loads whose host-prevalence is
+    below threshold (e.g., <5 hosts), rarity-scored. Track unsigned/invalid-signature loads as a distinct
+    state. A rare or unsigned DLL loaded into a trusted GUI host is a classic planted-payload indicator;
+    combining prevalence with signature status reduces noise from legitimate but uncommon plugins while
+    still surfacing genuinely suspicious loads. Source detection guidance (Statistical Method): Baseline
+    all DLL hashes loaded by explorer.exe across the fleet and alert on loads whose host-prevalence is
+    below threshold (e.g., <5 hosts), rarity-scored as in [SCADE](https://arxiv.org/abs/2412.04259). Track
+    unsigned/invalid-signature loads as a distinct state.'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'loads = Sysmon(EventCode=7) WHERE image==''explorer.exe''
+
+      | stats dc(host) as host_prev by dll_hash, image_loaded, signed, sig_status
+
+      | where host_prev < 5 OR signed==false OR sig_status!=''valid''
+
+      | eval score = rarity(host_prev) + if(signed==false,1,0)
+
+      | sort -score'
+- question: Does a sequence model (HMM/LSTM) trained on benign explorer.exe event sequences assign a low
+    probability to an observed chain such as remote allocation (EID 8) -> ImageLoad from temp (EID 7)
+    -> new network connection (EID 3)?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". ListPlanting
+    and its follow-on actions produce an ordered event chain that is rare in benign explorer.exe behavior.
+    Train an HMM or LSTM on benign explorer.exe event sequences and flag low-probability chains, e.g.,
+    remote memory allocation followed by an ImageLoad from a temp path followed by a new outbound connection.
+    Report the top-3 events/features driving the low likelihood. This captures the allocate->execute->communicate
+    progression of injection even when each individual event looks innocuous in isolation. Source detection
+    guidance (Machine Learning): Train a sequence model (HMM or LSTM) on benign explorer.exe event sequences
+    and flag low-probability chains such as remote allocation (EID 8) -> ImageLoad from temp (EID 7) ->
+    new network connection (EID 3); ordered-chain detection follows the API-sequence alignment of [Cho
+    et al.](https://journals.sagepub.com/doi/full/10.1155/2015/659101) and the allocation->execute correlation
+    of [Springer/IJIS](https://link.springer.com/article/10.1007/s10207-024-00836-w). Report the top-3
+    events/features driving the low likelihood per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - 'NAI: User workstations, Critical servers with GUI management tools, Endpoint Detection and Response
+    (EDR) platform'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ordered_events(explorer.exe: [EID8_alloc, EID7_imageload_temp, EID3_newconn])
+
+      ll = LSTM.load(''explorer_seq'').log_likelihood(seq)
+
+      | where ll < threshold
+
+      | emit alert(host, pid, seq, top3_low_prob_events)'
+- question: Did explorer.exe spawn an archiving/compression utility such as 7z.exe, rar.exe, tar.exe,
+    zip.exe or compact.exe?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Spawning an archiver
+    from explorer.exe is staging behavior incongruent with an interactive shell host and consistent with
+    post-injection collection/exfil preparation. Alert when Sysmon EID 1 shows explorer.exe as the parent
+    of an archiving utility. While users do double-click archives in Explorer, the launched process is
+    normally the archiver''s GUI in a different process tree context; programmatic archiving spawned by
+    injected code is the concern. Correlate with file-creation bursts and egress to confirm staging-then-exfil.
+    Source detection guidance (Symbolic Logic): Alert when Sysmon Event ID 1 shows explorer.exe as parent
+    of an archiving utility (7z.exe, rar.exe, tar.exe, zip.exe) or compact.exe — staging behavior incongruent
+    with an interactive shell host, consistent with the post-injection action chains noted by [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "Sysmon(EventCode=1) | union WinEventLog(4688)\n| where parent_image=='explorer.exe'\n  AND\
+      \ child_image IN (7z.exe,rar.exe,tar.exe,zip.exe,compact.exe)\n| emit alert(host, child_image, cmdline)"
+- question: Did explorer.exe exceed the 99.5th percentile of its per-host hourly file-creation count for
+    that hour-of-week, or generate a burst of failed/access-denied file operations?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Baseline,
+    per host, hourly file-creation counts (Sysmon EID 11) attributed to explorer.exe and alert above the
+    99.5th percentile for that hour-of-week using sliding-window frequency baselining, which accounts
+    for normal daily/weekly rhythms. Also track failed writes / access-denied file operations as a distinct
+    burst signal, since an injector may probe locations it cannot write. A sustained, off-baseline write
+    burst from explorer.exe suggests bulk data staging for exfiltration. Source detection guidance (Statistical
+    Method): Per host, baseline hourly file-creation counts (Sysmon Event ID 11) from explorer.exe and
+    alert above the 99.5th percentile for that hour-of-week, using sliding-window frequency baselining
+    per [Bag of System Calls](https://arxiv.org/abs/1611.03053). Also track failed writes / access-denied
+    file operations as a distinct burst signal.'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'w = Sysmon(EventCode=11) WHERE image==''explorer.exe''
+
+      | bin span=1h | stats count as writes by host, hour_of_week
+
+      | eventstats p99.5(writes) as thr by host, hour_of_week
+
+      | where writes > thr
+
+      | append (file_ops WHERE result==''ACCESS_DENIED'' AND image==''explorer.exe'' | bin 1h | stats
+      count as denied | where denied > burst)'
+- question: Compared against the peer fleet, does an explorer.exe instance's file-I/O profile (read:write
+    ratio, unique directories touched, entropy of created file extensions) sit more than 3 standard deviations
+    from the peer centroid?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Compare explorer.exe
+    file-I/O feature vectors against the peer fleet and flag instances >3 SD from the peer centroid, surfacing
+    the top-3 deviating features. Features like a skewed read:write ratio, an unusually large number of
+    unique directories touched, and high entropy of created file extensions distinguish an instance staging
+    diverse data from normal interactive use. This peer-relative approach adapts to environments without
+    needing fixed thresholds and explains why an instance was flagged. Source detection guidance (Machine
+    Learning): Compare explorer.exe file-I/O feature vectors (read:write ratio, unique directories touched,
+    entropy of created file extensions) against the peer fleet per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies);
+    flag instances >3 SD from the peer centroid and surface the top-3 deviating features per [Anthony
+    et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 1
+  - Windows Event ID 4688
+  - 'NAI: File servers, User workstations, Document management systems, Endpoint logs'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'F = vectors(explorer_instances: rw_ratio, unique_dirs, ext_entropy, files_per_min)
+
+      centroid, sd = robust_stats(F)
+
+      | foreach inst: z = (inst-centroid)/sd
+
+      | where max(z) > 3
+
+      | emit alert(host, pid, top3=argsort(z)[:3])'
+- question: Did explorer.exe send far more bytes than it received (e.g., orig_bytes:resp_bytes > 100:1
+    and >10MB total) to an external destination not on a corporate/cloud allow-list?
+  context: 'In the context of Privilege Escalation (TA0004), this Symbolic Logic approach addresses the
+    requirement "Has the adversary attempted to elevate privileges using ListPlanting?". A large outbound:inbound
+    byte asymmetry from a trusted GUI process is a volume/state signature typical of exfiltration through
+    a hijacked process. Correlate Sysmon EID 3 from explorer.exe with Zeek conn.log and alert when orig_bytes
+    greatly exceeds resp_bytes (e.g., >100:1 ratio and >10MB total) to an external destination not on
+    a corporate/cloud allow-list. A match indicates likely data exfiltration via the injected explorer.exe
+    and should trigger containment and scoping of what data left. Source detection guidance (Symbolic
+    Logic): Correlate Sysmon Event ID 3 from explorer.exe with Zeek conn.log and alert when orig_bytes
+    >> resp_bytes (e.g., >100:1 ratio and >10MB total) to an external destination not on a corporate/cloud
+    allow-list — a volume/state asymmetry typical of exfiltration via a hijacked trusted process per [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "join Sysmon(EventCode=3) AS p, conn.log AS c ON p.conn_id==c.uid\n| where p.image=='explorer.exe'\
+      \ AND c.dest NOT IN corp_cloud_allowlist AND is_external(c.dest)\n  AND c.orig_bytes > 100*c.resp_bytes\
+      \ AND c.orig_bytes > 10MB\n| emit alert(host, dest, orig_bytes, resp_bytes)"
+- question: For any explorer.exe source/destination pair, is the standard deviation of inter-connection
+    time deltas near zero (<1s jitter) over a sustained run (>10 connections), or are there repeated blocked/rejected
+    (S0/REJ) attempts to one destination?
+  context: 'In the context of Privilege Escalation (TA0004), this Statistical Method approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Automated
+    C2 beaconing produces highly regular connection timing. For each explorer.exe source/destination pair,
+    compute the standard deviation of inter-connection time deltas in conn.log; near-zero jitter (<1s)
+    over a sustained run (>10 connections) indicates machine-driven beaconing rather than human activity.
+    Separately profile the failure mode: repeated blocked/rejected (S0/REJ) connection attempts to a single
+    destination is its own beaconing signal. Either pattern from explorer.exe points to injected C2. Source
+    detection guidance (Statistical Method): For each explorer.exe source/destination pair, compute the
+    standard deviation of inter-connection time deltas in conn.log; a near-zero deviation (<1s jitter)
+    over a sustained run (>10 connections) indicates automated C2 beaconing. Separately profile the failure
+    mode — repeated blocked/rejected (S0/REJ) connection attempts to one destination — as its own beaconing
+    signal, complementing the network-anomaly approach of [Akamai](https://www.akamai.com/blog/security-research/novel-detection-methodology-process-injection-using-network-anomalies).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 14 days; require sustained runs of >10 connections
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'c = conn.log attributed_to(explorer.exe via Sysmon EID3)
+
+      | sort ts | streamstats by src,dest: delta = ts - prev(ts)
+
+      | stats stdev(delta) as jitter, count as n by src, dest
+
+      | where n > 10 AND jitter < 1s
+
+      | append (conn.log WHERE proc==''explorer.exe'' AND conn_state IN (S0,REJ) | stats count by dest
+      | where count > thr)'
+- question: Does a one-class SVM or Isolation Forest trained on benign explorer.exe connection vectors
+    (dest port, bytes sent/received, duration, dest reputation, inter-arrival jitter) score a new explorer.exe
+    connection as an outlier?
+  context: 'In the context of Privilege Escalation (TA0004), this Machine Learning approach addresses
+    the requirement "Has the adversary attempted to elevate privileges using ListPlanting?". Train a one-class
+    model on benign explorer.exe connection vectors and score new connections, alerting on outliers; report
+    the top-3 contributing features. By learning the normal envelope of explorer.exe network behavior
+    (ports, byte volumes, durations, destination reputation, jitter), the model flags connections that
+    fall outside it without needing labeled malicious data. This catches novel C2/exfil channels through
+    an injected trusted process while the feature attributions guide analyst triage. Source detection
+    guidance (Machine Learning): Train a one-class SVM (or Isolation Forest, as used for stateless flow
+    features by [Nadler et al.](https://www2.ee.unsw.edu.au/~hhabibi/pubs/conf/19im.pdf)) on benign explorer.exe
+    connection vectors (dest port, bytes sent/received, duration, dest reputation, inter-arrival jitter)
+    and score new connections, alerting on outliers; report the top-3 contributing features in the alert
+    per [Anthony et al.](https://link.springer.com/chapter/10.1007/978-3-032-08887-1_9).'
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Sysmon Event ID 3
+  - 'NAI: Network egress points, DNS servers, Core switches providing flow data'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = conn_vectors(explorer.exe: dest_port, bytes_out, bytes_in, duration, dest_reputation,
+      ia_jitter)
+
+      model = OneClassSVM.load(''explorer_net'')  # or IsolationForest
+
+      s = model.decision_function(X)
+
+      | where s < 0
+
+      | emit alert(host, dest, top3_features)'
