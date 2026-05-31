@@ -1,0 +1,497 @@
+name: 'T1417.001: Keylogging'
+id: 5e4d5ca3-5003-4cb9-a883-790037dfdca3
+description: Investigate adversary input capture on managed mobile devices (iOS/Android), covering both
+  Keylogging (T1417.001) and GUI Input Capture (T1417.002) across the Credential Access and Collection
+  tactics. This playbook helps an analyst determine whether a non-allowlisted keyboard (IME), accessibility
+  service, or overlay-capable app is intercepting credentials or harvesting sensitive content such as
+  messages, contacts, and on-screen data. It chains MDM application inventory/permission telemetry, on-device
+  logcat/unified-log signals (capability grant, foreign-package text/commit callbacks, overlay/activity-on-top
+  events, look-alike prompts and WebViews, local keylog/credential/form artifact writes), and Zeek network
+  evidence (low-volume regular beaconing for credential exfil vs. large bursty post-app-use egress for
+  bulk collection, new destinations, suspicious TLS/JA3, DGA entropy). It applies deterministic source-to-sink
+  rules, statistical baselining/beacon analysis, Markov behavioral modeling, and explainable ML classification
+  to surface defensible, attributable detections for a SOC analyst.
+type: technique
+related:
+- tactic_id: TA0031
+  tactic_name: Credential Access
+- tactic_id: TA0035
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: On a managed device, is a non-allowlisted keyboard (IME) or accessibility-enabled application
+    installed that holds input-capture capability, and do its observed network destinations match known
+    malicious or C2 infrastructure?
+  context: 'Tactic: Credential Access (TA0031). A third-party keyboard or accessibility service is the
+    most direct way for an adversary to intercept passwords, PINs, and tokens as a user types them. Continuously
+    reconcile MDM Application Inventory Logs against a curated keyboard/accessibility allow-list; any
+    package that is set as the default IME, holds BIND_INPUT_METHOD/BIND_ACCESSIBILITY_SERVICE, or has
+    iOS keyboard ''Full Access'' AND later writes keylog artifacts and egresses is, per the TaintDroid
+    source-to-sink principle, a high-confidence keylogger. Use Drebin-style features (IME/accessibility
+    APIs, embedded URLs) to qualify the package and cross-reference its Zeek dns.log destinations against
+    a threat-intel C2/malicious-domain feed. A positive intel match is a high-priority alert; a clean
+    reputation lowers but does not eliminate suspicion, so retain the behavioral chain checks.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FROM mdm_app_inventory WHERE app_type IN ('keyboard','accessibility') AND package NOT IN (allowlist)
+      | JOIN logcat ON package WHERE (default_ime_set OR bind_input_method OR bind_accessibility OR ios_full_access)
+      AND keylog_artifact_write=true | JOIN zeek_dns ON device WHERE query_domain IN threat_intel_c2 |
+      ALERT priority=high
+- question: Does a non-allowlisted package register an AccessibilityService or default IME and then receive
+    text-change/commit callbacks sourced from OTHER applications, followed by local keylog writes and
+    network egress?
+  context: 'Tactic: Credential Access (TA0031). This is the on-device behavioral signature of keylogging
+    independent of any allow-list lookup. Deterministically flag when a non-allowlisted package registers
+    an AccessibilityService and receives TYPE_VIEW_TEXT_CHANGED/TYPE_VIEW_FOCUSED events from foreign
+    packages, or sets itself as default IME and issues onStartInput/commitText for foreground apps it
+    does not own. Apply DeepLog workflow logic to alert on the canonical out-of-order chain: capability
+    grant -> foreign-package input callbacks -> CREATE/WRITE to /data/data/<pkg>/(files|databases)/(keys|inputs|clipboard).*
+    -> network egress. A complete chain strongly implies live credential interception; a partial chain
+    (capability without foreign callbacks) is lower priority but worth monitoring.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: 'Last 90 days (event-centered: pivot +/- 1 hour around capability grant)'
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM logcat WHERE pkg NOT IN allowlist AND (accessibility_connected OR default_ime_set) |
+      SEQUENCE BY pkg, time: capability_grant -> text_event(source_pkg != pkg) [TYPE_VIEW_TEXT_CHANGED|commitText|onStartInput]
+      -> file_write(path ~ ''/data/data/''+pkg+''/(files|databases)/(keys|inputs|clipboard).*'') -> net_egress
+      | ALERT priority=high'
+- question: For devices running a non-allowlisted keyboard/accessibility app, do outbound connections
+    exhibit low-volume, regular-interval beaconing consistent with periodic credential exfiltration to
+    a low-reputation destination?
+  context: 'Tactic: Credential Access (TA0031). Stolen credentials are typically small and trickled out
+    on a schedule. Build a 14-day per-device baseline of Zeek conn.log orig_bytes and inter-arrival times.
+    Following RITA beaconing logic, alert when median connection size is 500 bytes-5 KB AND the coefficient
+    of variation of inter-arrival times is low (std dev < 30s), tuning to each site''s 95th/99th percentiles.
+    Add Volume (bytes/min), Frequency (connections/min plus input-callback events/min from logcat), and
+    State metrics (failed/blocked connections, NXDOMAIN in dns.log) as a beacon-failure signal. Compute
+    Shannon entropy of requested subdomains; entropy > 3.5 for a parent domain indicates DGA-based C2.
+    Regular, jittered, low-byte beacons to a recently-registered domain is a strong positive.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 14 days for baseline; alert on current
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'FROM conn.log WHERE device HAS non_allowlisted_kbd | BASELINE 14d per device: med_bytes=median(orig_bytes),
+      iat_cv=stddev(inter_arrival) | ALERT WHERE med_bytes BETWEEN 500 AND 5000 AND stddev(inter_arrival)<30s
+      AND dest_reputation=low | ENRICH shannon_entropy(subdomain)>3.5 => DGA; count NXDOMAIN as beacon_failure'
+- question: Does the app's package/family-level API call sequence over accessibility/IME and network APIs
+    deviate sharply from the benign fleet baseline, and do input-callback rates exceed the device's 99th
+    percentile?
+  context: 'Tactic: Credential Access (TA0031). Keyloggers exhibit an atypical behavioral grammar: heavy
+    accessibility/IME interception transitioning to file I/O and network calls. Build a MaMaDroid Markov-chain
+    model of each app''s API call sequence and flag apps whose transition probabilities over accessibility/IME
+    and network APIs diverge from the benign fleet. Combine with DeepLog frequency baselining of input-callback
+    log keys, alerting when commitText/TYPE_VIEW_TEXT_CHANGED events/min exceed the device''s 99th percentile.
+    A sharp transition-probability anomaly plus an input-callback burst indicates programmatic keystroke
+    harvesting rather than normal typing assistance.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Markov + log-frequency pseudocode
+    query: model = MaMaDroid.fit(benign_fleet_api_sequences); score = model.transition_divergence(app_api_seq);
+      ALERT WHERE score > fleet_threshold | AND DeepLog.freq(commitText|TYPE_VIEW_TEXT_CHANGED per min)
+      > device_p99
+- question: Does a per-device time-series anomaly model over network features flag abnormal egress that
+    correlates with a newly installed input-capture app scored as malicious by an explainable classifier?
+  context: 'Tactic: Credential Access (TA0031). This fuses network and app-level ML for high-confidence
+    attribution. Train a per-device online anomaly detector over Zeek conn.log features (orig_bytes, resp_bytes,
+    duration, protocol, connections/hour) using the Kitsune autoencoder-ensemble, deriving the alert threshold
+    from the 99th percentile of the training-phase reconstruction-error distribution. In parallel, score
+    each newly installed input-capture app with the explainable XMal attention model and Drebin linear-SVM
+    features; the alert MUST list the top-3 contributing features (e.g., BIND_ACCESSIBILITY_SERVICE, sendTextMessage,
+    hardcoded C2 URL). Correlate the network anomaly timestamp with MDM install logs to attribute the
+    behavior to the suspect keyboard. Joint network + app positives warrant containment.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Autoencoder + classifier pseudocode
+    query: net_score = Kitsune.score(conn_features); ALERT WHERE net_score > train_p99 | app_score, top3
+      = explainable_clf(perm+api_features, model='Drebin+XMal'); IF app_score high THEN correlate(anomaly_ts,
+      mdm_install_ts) -> attribute_app; emit top3_features
+- question: Was an app granted SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE, and is it absent from
+    the curated allow-list of overlay/accessibility-capable apps?
+  context: 'Tactic: Credential Access (TA0031). These two permissions are the prerequisites for overlay/activity-on-top
+    phishing that steals credentials. From MDM Application Permission Logs, generate a medium-priority
+    alert whenever an app is granted SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE; escalate to high
+    priority if the package is not on a curated allow-list. Immediately enrich the package name and signing-certificate
+    hash against threat intel and internal inventory. Per ''What the App is That?'' this is the deterministic
+    floor for GUI-confusion-capable apps. A non-allowlisted grant from an unknown signer is the trigger
+    to apply the behavioral checks below.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FROM mdm_app_permissions WHERE permission IN ('SYSTEM_ALERT_WINDOW','BIND_ACCESSIBILITY_SERVICE')
+      | SET priority=medium | IF package NOT IN allowlist THEN priority=high | ENRICH signing_cert_hash,
+      package vs threat_intel + internal_inventory
+- question: Does a non-allowlisted app read the foreground target package and then draw an overlay or
+    start an activity on top of it, immediately followed by writes of captured prompt input that flow
+    to a network sink?
+  context: 'Tactic: Credential Access (TA0031). This is the core overlay/activity-on-top credential-phishing
+    chain. Implement the GUI-confusion rules from ''What the App is That?'': alert when a non-allowlisted
+    app reads the current foreground package via accessibility/focus events (TYPE_WINDOW_STATE_CHANGED
+    for a foreign target_pkg) and then (a) calls addView with TYPE_APPLICATION_OVERLAY over that target,
+    or (b) startActivity(singleTop) on top of it, immediately followed by CREATE/WRITE to /data/data/<pkg>/(files|databases)/(creds|form|prompt).*.
+    Use the TaintDroid source-to-sink principle to confirm captured prompt input flows to a network sink.
+    On iOS, flag presentation of a credential-like UIAlertController/WebView not backed by a system auth
+    controller. A full chain is high-confidence credential theft.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days (event-centered around permission grant)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM logcat WHERE pkg NOT IN allowlist | SEQUENCE: read_foreground(TYPE_WINDOW_STATE_CHANGED,
+      target_pkg!=pkg) -> (addView TYPE_APPLICATION_OVERLAY over target_pkg OR startActivity singleTop
+      on target_pkg) -> file_write(''/data/data/''+pkg+''/(files|databases)/(creds|form|prompt).*'') ->
+      net_egress | iOS: UIAlertController/WebView credential view WITHOUT system_auth_controller | ALERT
+      priority=high'
+- question: Within 24 hours of the permission grant, does the flagged app connect to a domain absent from
+    its baseline, use self-signed certificates, or present rare JA3/JA3S fingerprints?
+  context: 'Tactic: Credential Access (TA0031). After harvesting credentials via a fake prompt, the app
+    must exfiltrate them. For any flagged app, establish a 30-day per-device baseline of destination domains/IPs
+    from Zeek dns.log/conn.log and alert if, within 24 hours of the permission grant, the app connects
+    to a domain absent from the baseline. Inspect Zeek ssl.log and flag self-signed certificates or JA3/JA3S
+    pairs with enterprise prevalence < 0.1%. Add State metrics: count failed TLS handshakes, blocked connections,
+    and NXDOMAIN/404 (http.log) as distinct exfil-failure signals, deriving site-specific thresholds from
+    observed percentiles. A new destination plus an anomalous TLS fingerprint shortly after the grant
+    strongly supports credential exfiltration.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 30 days for baseline; alert within 24h of grant
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'BASELINE 30d per device: known_dest from dns.log+conn.log | ALERT WHERE flagged_app connects
+      within 24h of grant AND dest NOT IN known_dest | FROM ssl.log FLAG self_signed OR ja3/ja3s prevalence<0.1%
+      | COUNT tls_fail, blocked, NXDOMAIN, http_4xx as exfil_failure'
+- question: Does an app's rate of overlay/activity-on-top events over foreign target packages exceed its
+    own or the fleet's 99th percentile?
+  context: 'Tactic: Credential Access (TA0031). Legitimate overlay users (chat heads, password managers)
+    draw overlays at predictable, modest rates; phishing campaigns produce bursts of overlays over sensitive
+    targets. Using DeepLog frequency baselining over logcat, profile per-app overlay/activity-on-top events
+    and foreground-read callbacks per minute, and alert when an app''s overlay-over-foreign-target rate
+    exceeds its (or the fleet''s) 99th percentile. This statistical separation helps distinguish benign
+    overlay use from credential-phishing bursts even when the app is technically allow-listed. A sustained
+    high overlay rate over banking/login screens is a strong positive.'
+  answer_sources:
+  - android:logcat
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'FROM logcat | BASELINE per app: overlay_events/min, foreground_read/min | ALERT WHERE overlay_over_foreign_target_rate
+      > max(app_p99, fleet_p99)'
+- question: When an app requests SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE, what risk score does
+    an explainable classifier assign, and which top-3 features drive a high score?
+  context: 'Tactic: Credential Access (TA0031). Score each app requesting SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE
+    with an explainable classifier: the Drebin linear-SVM feature set plus the XMal attention-MLP so the
+    alert surfaces the top-3 contributing features (requested permissions, overlay/accessibility APIs,
+    look-alike URLs). Fuse with AiDroid fleet-level relational signals (apps sharing C2 IPs or signing
+    keys). A risk score > 0.8 triggers automated device isolation and a critical SOC incident; retain
+    the deterministic permission/overlay rules as the non-ML floor. The explanation lets the analyst confirm
+    whether the high score reflects genuine phishing capability or a benign-but-overprivileged app.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Explainable classifier pseudocode
+    query: 'score, top3 = clf(features=permissions+overlay_api+lookalike_url, model=''Drebin-SVM + XMal-attention'');
+      fuse(AiDroid relational: shared_c2_ip|signing_key); ALERT WHERE score>0.8 => isolate_device + critical_incident;
+      emit top3_features; keep deterministic rules as floor'
+- question: Is a newly installed, non-allowlisted keyboard/accessibility app capturing messaging/email
+    content and sending it to known spyware drop zones?
+  context: 'Tactic: Collection (TA0035). Here the goal is bulk harvesting of messages, contacts, and email
+    rather than just credentials. Continuously monitor MDM Application Inventory Logs for newly installed
+    keyboard/accessibility apps; for any non-allowlisted package, apply the TaintDroid source-to-sink
+    rule (sensitive IME/message content captured then sent to the network) and cross-reference observed
+    Zeek dns.log destinations against threat-intel spyware drop zones, raising high-priority alerts on
+    match. Use Drebin features (READ_SMS, accessibility/IME APIs, embedded URLs) to qualify the package
+    as collection-capable. A match against a known spyware C2 plus collection-capable permissions is a
+    strong positive.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FROM mdm_app_inventory WHERE app_type IN ('keyboard','accessibility') AND package NOT IN allowlist
+      AND install_recent | QUALIFY drebin_features INCLUDE (READ_SMS, accessibility/IME api, embedded_url)
+      | JOIN zeek_dns WHERE domain IN threat_intel_spyware_dropzones | ALERT priority=high
+- question: Does a non-allowlisted package receive accessibility text events or IME commits from messaging/email
+    apps, persist them locally, and then perform bulk egress?
+  context: 'Tactic: Collection (TA0035). This is the on-device collection chain for harvesting conversation
+    content. Deterministically alert when a non-allowlisted package receives accessibility text events
+    or IME commits sourced from messaging/email packages and writes them to /data/data/<pkg>/(files|databases)/*,
+    applying DeepLog workflow logic to flag the chain capture-from-foreign-app -> local persistence ->
+    bulk egress. Unlike credential beaconing, the egress here is larger and follows messaging/email use.
+    A complete capture->persist->bulk-exfil chain tied to messaging apps indicates active data collection.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days (event-centered around messaging/email use)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM logcat WHERE pkg NOT IN allowlist | SEQUENCE: text_event/commit(source_pkg IN messaging|email)
+      -> file_write(''/data/data/''+pkg+''/(files|databases)/*'') -> bulk_net_egress | ALERT priority=high'
+- question: Do outbound connections from a device with a non-allowlisted keyboard exceed the 99th percentile
+    of historical outbound size, especially to a destination with no device history, immediately after
+    messaging/email use?
+  context: 'Tactic: Collection (TA0035). Bulk collection produces larger, more variable egress (10 KB-1
+    MB/connection) than low-volume C2 beaconing. Analyze Zeek conn.log outbound Volume (orig_bytes) and
+    alert when a connection''s orig_bytes exceeds the device''s 99th percentile of historical (30-day)
+    outbound sizes, especially to a destination with no device history; score priority by deviation magnitude
+    and destination reputation. Add Frequency (collection-egress bursts/hour) and State (failed/blocked
+    connections, NXDOMAIN, HTTP 4xx) metrics, and contrast with RITA beacon scoring to distinguish bulk
+    collection (large, bursty, post-app-use) from low-volume C2. A large post-messaging upload to an unseen
+    low-reputation domain is a strong positive.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 30 days for baseline; alert on current
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'FROM conn.log WHERE device HAS non_allowlisted_kbd | BASELINE 30d: p99_orig_bytes per device
+      | ALERT WHERE orig_bytes > p99 AND dest NOT IN device_history AND occurs_after messaging_use | score=f(deviation,
+      dest_reputation); contrast RITA beacon_score to rule out C2'
+- question: Does an app's API transition profile (message/contact reads -> file I/O -> network) diverge
+    from benign apps, and do post-messaging input-capture callbacks exceed the device's 95th percentile?
+  context: 'Tactic: Collection (TA0035). Collection spyware shows a distinctive API grammar: reading message/contact
+    stores, writing to local files, then networking. Apply MaMaDroid Markov-chain modeling to flag apps
+    whose API transition profile (message/contact reads -> file I/O -> network) diverges from benign apps,
+    and DeepLog frequency baselining to alert when post-messaging input-capture callbacks/min exceed the
+    device''s 95th percentile. The combination separates genuine bulk-collection behavior from normal
+    keyboard assistance. A divergent transition profile plus a callback burst right after messaging use
+    indicates active collection.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Markov + log-frequency pseudocode
+    query: model=MaMaDroid.fit(benign); ALERT WHERE transition_divergence(app, sequence='msg/contact_read->file_io->network')
+      > threshold | AND DeepLog.freq(post_messaging input callbacks/min) > device_p95
+- question: Across all managed devices, do unsupervised clustering and autoencoder scoring of connection
+    features reveal a small cluster of large uploads to rare domains attributable to a common malicious
+    app?
+  context: 'Tactic: Collection (TA0035). Fleet-wide clustering can surface a coordinated spyware campaign.
+    Run unsupervised anomaly detection over all managed devices'' connection features (orig_bytes, duration,
+    protocol, dest port, dest-IP prevalence) using DBSCAN plus the Kitsune autoencoder-ensemble (threshold
+    = training-phase 99th-percentile reconstruction error). Investigate small clusters with high mean
+    orig_bytes to rare domains; correlate with MDM logs and AiDroid relational embeddings to identify
+    the common malicious app. Surface the top-3 contributing features in each alert per XMal. A tight
+    cluster of high-volume uploads to rare domains across several devices, traceable to one app, indicates
+    a fleet-wide collection campaign.'
+  answer_sources:
+  - MDM Application Inventory Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek http.log
+  - Zeek dns.log
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Clustering + autoencoder pseudocode
+    query: X = conn_features[orig_bytes,duration,proto,dport,dest_ip_prevalence] over all devices; clusters=DBSCAN(X);
+      ae_score=Kitsune.score(X) > train_p99 | INVESTIGATE small clusters WHERE mean(orig_bytes) high AND
+      dest rare | correlate MDM + AiDroid embeddings -> common_app; emit XMal top3_features
+- question: Was an app granted SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE for screen-scraping/overlay
+    capture, and is it absent from the allow-list?
+  context: 'Tactic: Collection (TA0035). For collection, overlay/accessibility capability enables screen
+    scraping and screenshot capture of sensitive apps. Generate a medium-priority alert from MDM Application
+    Permission Logs whenever an app is granted SYSTEM_ALERT_WINDOW or BIND_ACCESSIBILITY_SERVICE; escalate
+    to high priority if the package is not allow-listed. Enrich package and signing certificate against
+    threat intel and internal inventory. This deterministic floor follows the GUI-confusion capability
+    analysis of ''What the App is That?''. A non-allowlisted grant is the trigger for the behavioral and
+    network checks that confirm screen-content collection.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: FROM mdm_app_permissions WHERE permission IN ('SYSTEM_ALERT_WINDOW','BIND_ACCESSIBILITY_SERVICE')
+      | priority=medium | IF package NOT IN allowlist THEN priority=high | ENRICH signing_cert + package
+      vs threat_intel + inventory
+- question: Does a non-allowlisted accessibility/overlay app read foreground content from sensitive apps
+    (banking/email) via node traversal or overlays, write captured content to its container, and then
+    egress it?
+  context: 'Tactic: Collection (TA0035). Screen scraping harvests on-screen data from banking and email
+    apps. Per ''What the App is That?'' and the TaintDroid source-to-sink rule, deterministically alert
+    when a non-allowlisted accessibility/overlay app reads foreground content from sensitive apps via
+    accessibility node traversal or draws TYPE_APPLICATION_OVERLAY over them and then writes captured
+    content to its container followed by network egress; apply DeepLog workflow logic to flag this out-of-order
+    capture->persist->exfil chain. A complete chain over banking/email apps indicates active sensitive-content
+    collection rather than benign accessibility use.'
+  answer_sources:
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days (event-centered)
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'FROM logcat WHERE pkg NOT IN allowlist | SEQUENCE: (accessibility_node_traversal OF sensitive_app
+      OR addView TYPE_APPLICATION_OVERLAY over sensitive_app) -> file_write(container) -> net_egress |
+      ALERT priority=high'
+- question: For a non-allowlisted app granted overlay/accessibility permissions, does outbound traffic
+    exceed the 95th percentile of baseline orig_bytes to a domain absent from the baseline, consistent
+    with screen-content exfiltration?
+  context: 'Tactic: Collection (TA0035). Exfiltrated screenshots/scraped text produce unusually large
+    payloads (e.g., orig_bytes > 50 KB) shortly after capture. For any non-allowlisted app granted these
+    permissions, monitor outbound Zeek conn.log traffic against a 30-day per-device baseline of orig_bytes
+    and alert when a connection exceeds the 95th percentile AND the destination domain (dns.log) is absent
+    from the baseline. Add State metrics: failed/blocked connections, TLS handshake failures (ssl.log),
+    and NXDOMAIN/HTTP 4xx as distinct exfil-failure signals, deriving cutoffs from site-specific percentiles
+    to control false positives from legitimate large uploads. A large upload to a new domain within 60
+    minutes of overlay capture is a strong positive.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 30 days for baseline; alert on current
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'BASELINE 30d per device: p95_orig_bytes | ALERT WHERE orig_bytes > p95 AND dest_domain NOT
+      IN baseline | COUNT tls_fail(ssl.log), blocked, NXDOMAIN, http_4xx as exfil_failure; tune cutoffs
+      to site percentiles'
+- question: Do an app's overlay-over-sensitive-app rate and post-overlay egress volume jointly exceed
+    the 99th percentile?
+  context: 'Tactic: Collection (TA0035). Joint behavioral + network anomaly scoring catches stealthy screen
+    scrapers. Use DeepLog frequency baselining to profile overlay/foreground-read events per app and the
+    Kitsune incremental traffic statistics (byte rate, jitter) to detect large-egress anomalies; alert
+    when an app''s overlay-over-sensitive-app rate and post-overlay egress volume jointly exceed the 99th
+    percentile. Requiring both conditions reduces false positives from apps that legitimately overlay
+    but never exfiltrate, or that upload large files without scraping. A coincident overlay burst and
+    large egress spike is a strong positive for screen-content collection.'
+  answer_sources:
+  - android:logcat
+  - Zeek conn.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Stats pseudocode
+    query: overlay_rate = DeepLog.freq(overlay_over_sensitive/min per app); egress = Kitsune.stats(byte_rate,
+      jitter) post_overlay | ALERT WHERE overlay_rate > p99 AND post_overlay_egress_volume > p99 (joint)
+- question: Does the refined explainable classifier, augmented with data-collection permissions co-occurring
+    with accessibility, assign a high spyware/collection risk score to the app?
+  context: 'Tactic: Collection (TA0035). Refine the explainable classifier from the Credential-Access
+    PIR to score spyware/collection behavior by adding features for data-collection permissions (READ_CONTACTS,
+    READ_SMS, READ_EXTERNAL_STORAGE) co-occurring with BIND_ACCESSIBILITY_SERVICE, using the Drebin feature
+    space and the XMal attention model so alerts surface the top-3 contributing features; fuse with AiDroid
+    fleet-level relational signals. A risk score > 0.85 triggers automated device isolation and a critical
+    incident for forensic confirmation of sensitive-data collection. The co-occurrence of broad data-read
+    permissions with accessibility distinguishes collection spyware from a single-purpose phishing overlay;
+    the explanation guides forensic triage.'
+  answer_sources:
+  - MDM Application Permission Logs
+  - android:logcat
+  - iOS:unifiedlog
+  - Zeek conn.log
+  - Zeek ssl.log
+  - Zeek dns.log
+  - 'NAI: MDM/EMM servers, Network egress points (e.g., corporate WiFi gateways, VPN concentrators), Managed
+    mobile endpoints (iOS/Android)'
+  range: Last 90 days
+  queries:
+  - technology: ML/Explainable classifier pseudocode
+    query: score, top3 = clf(features=Drebin + {READ_CONTACTS,READ_SMS,READ_EXTERNAL_STORAGE co-occurring
+      BIND_ACCESSIBILITY_SERVICE}, model='Drebin+XMal'); fuse(AiDroid relational); ALERT WHERE score>0.85
+      => isolate_device + critical_incident; emit top3_features
