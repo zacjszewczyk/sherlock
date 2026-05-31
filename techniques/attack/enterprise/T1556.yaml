@@ -1,0 +1,890 @@
+name: 'T1556: Modify Authentication Process'
+id: a9ae0d73-110e-4d03-808a-78591ff6aae2
+description: Investigate whether an adversary has modified an authentication mechanism to harvest credentials,
+  bypass authentication, or maintain persistent access across Windows (LSASS, LSA Notification/Security
+  packages, password filters, Credential Guard/RunAsPPL/WDigest settings, reversible-encryption and GPO
+  authentication policies), Linux (PAM configuration files and pam_*.so modules), macOS (SecurityAgentPlugins
+  and the authorization database), network authentication protocols (NTLM/Kerberos downgrade and logon-without-network-auth
+  bypasses, including MFA bypass), and cloud identity providers / IAM control planes (MFA/conditional-access
+  weakening, rogue federation or SAML trust, backdoor access keys). The playbook spans the Defense Impairment,
+  Persistence, and Credential Access tactics and combines symbolic-logic correlation, statistical baselining/change-point
+  detection, and machine-learning models (forecasting, one-class/isolation, graph-provenance, and new-edge
+  methods) so an analyst can triage suspected authentication-process tampering across endpoint, network,
+  and cloud telemetry.
+type: technique
+related:
+- tactic_id: TA0112
+  tactic_name: Defense Impairment
+- tactic_id: TA0003
+  tactic_name: Persistence
+- tactic_id: TA0006
+  tactic_name: Credential Access
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Has any DLL written into C:\Windows\System32\ been loaded into lsass.exe such that its hash
+    matches a known-malicious authentication-tampering tool, the loading process is not services.exe/wininit.exe/TrustedInstaller.exe,
+    lsass.exe loaded a new non-OS module, or lsass.exe spawned a child process?
+  context: This targets adversaries capturing credentials (Credential Access) or planting a persistent
+    LSASS module (Persistence) by introducing a malicious DLL into the authentication core. Join Sysmon
+    Event ID 11 file-creation events in System32 with Sysmon Event ID 7 image-load events where ImageLoaded
+    equals that path and Image is lsass.exe, within a 5-minute window. Alert if the file hash is on a
+    known-malicious feed OR the loader is not a trusted OS installer. As a first-party floor needing no
+    feed, lsass.exe should never load arbitrary non-OS modules nor spawn child processes (Sysmon Event
+    ID 1), so flag either unconditionally. A positive result is strong evidence of LSASS credential-harvesting;
+    a negative result still leaves rare/packed-DLL and forecast methods below.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controllers, ADFS Servers, Privileged Access Workstations (PAWs); specifically the `C:\Windows\System32\`
+    directory and the `lsass.exe` process space.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'create=Sysmon(EID=11, TargetFilename matches ''C:\\Windows\\System32\\*.dll'')
+
+      load=Sysmon(EID=7, Image=''lsass.exe'', ImageLoaded=create.TargetFilename) within 5m of create
+
+      alert if load AND (hash(create) in TI_known_bad OR create.parent NOT in {services.exe,wininit.exe,TrustedInstaller.exe})
+
+      also alert if Sysmon(EID=1, ParentImage=''lsass.exe'')  // lsass should never spawn children'
+- question: Among all DLLs loaded by lsass.exe, which are enterprise-wide rare or show high entropy consistent
+    with packing?
+  context: Sophisticated actors avoid known hashes, so a prevalence/entropy floor catches novel LSASS
+    modules (Credential Access / Persistence). For every Sysmon Event ID 7 load into lsass.exe, compute
+    the enterprise-wide prevalence (stack count) of each file hash and alert when it appears on < 1% of
+    monitored endpoints. Compute Shannon entropy and flag values > 7.0 (probable packing). Use the median-absolute-deviation
+    modified Z-score (|score| > 3.5) instead of mean/stdev so batch patching of legitimate modules does
+    not mask a single malicious outlier. A rare, high-entropy DLL in lsass on a Domain Controller is a
+    high-priority lead.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controllers, ADFS Servers, Privileged Access Workstations (PAWs); specifically the `C:\Windows\System32\`
+    directory and the `lsass.exe` process space.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'loads=Sysmon(EID=7, Image=''lsass.exe'')
+
+      prev[hash]=count_distinct(host where hash loaded)/total_hosts
+
+      entropy=shannon(file_bytes)
+
+      alert if prev[hash] < 0.01 OR entropy > 7.0
+
+      score=0.6745*(x-median)/MAD ; flag |score|>3.5'
+- question: Does the hourly count of unique new DLLs loaded by lsass.exe on a host exceed its forecast
+    confidence interval, and did the loading process also obtain a PROCESS_VM_READ handle to lsass.exe?
+  context: Forecasting catches abnormal bursts of new module activity in the authentication core that
+    simple thresholds miss (Credential Access / Persistence). Train a time-series/forecasting model on
+    the hourly count of unique new DLLs loaded by lsass.exe per host and alert when observed exceeds the
+    upper confidence interval, especially on Domain Controllers. Use an Isolation Forest / One-Class SVM
+    over module features (path rarity, signer, entropy, load time) to isolate per-event drivers and surface
+    the top-3 contributing features in the alert. Validate true positives by checking whether the loading
+    process also acquired a PROCESS_VM_READ (0x1000) handle to lsass.exe (Sysmon Event ID 10).
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: Domain Controllers, ADFS Servers, Privileged Access Workstations (PAWs); specifically the `C:\Windows\System32\`
+    directory and the `lsass.exe` process space.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'series=hourly_count(unique new DLLs loaded by lsass per host)
+
+      forecast=Holt-Winters(series); alert if observed > forecast.upper_ci
+
+      score=IsolationForest/OCSVM(features=[path_rarity,signer,entropy,load_time])
+
+      enrich: any Sysmon(EID=10, TargetImage=''lsass.exe'', GrantedAccess & 0x1000) by same SourceImage'
+- question: Was the LSA 'Notification Packages' or 'Security Packages' registry value modified to add
+    a DLL path that is not on the version-controlled allowlist of legitimate LSA providers?
+  context: Registering a DLL as an LSA Notification (password filter) or Security package makes LSASS
+    load it on every boot, giving the adversary persistent credential capture (Persistence + Credential
+    Access). Trigger on a registry set event (Sysmon Event ID 13 or Windows Event ID 4657) for HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Notification
+    Packages or \Security Packages, parse the new value, extract all DLL paths, and alert if any path
+    is absent from a version-controlled allowlist of legitimate LSA package DLLs. Any addition on a Domain
+    Controller is especially serious. Equivalent prebuilt password-filter/security-package tamper rules
+    ship in Elastic and Splunk content.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers; specifically the registry hives at `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\`.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "e=reg_set(Sysmon EID=13 OR WinEvent 4657, TargetObject in {'...\\\\Lsa\\\\Notification Packages','...\\\
+      \\Lsa\\\\Security Packages'})\nfor dll in parse_multisz(e.Details):\n  if dll not in LSA_allowlist:\
+      \ alert(host=e.host, dll=dll, sev=high)"
+- question: Is a newly added LSA-package DLL rare for the server role, or did any LSA-key change occur
+    on a Domain Controller outside a maintenance window, or has the per-day rate of LSA-key edits shifted
+    abruptly?
+  context: Statistical floors catch LSA tampering that evades an allowlist gap (Persistence + Credential
+    Access). Baseline the set of DLLs in the LSA Notification/Security Packages keys per server role (DC,
+    web, file). Alert on any modification introducing a new DLL with role-prevalence below 5%, or ANY
+    change on a Domain Controller outside a designated maintenance window (a state/frequency floor). Track
+    the per-day count of LSA-key modifications and apply change-point detection (CUSUM/PELT) to flag an
+    abrupt rate shift indicating coordinated tampering.
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers; specifically the registry hives at `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\`.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline role_prev[role][dll]
+
+      alert if new_dll role_prev < 0.05
+
+      alert if host.role==''DC'' AND change_time NOT in maint_window
+
+      cpd=PELT(daily_count(LSA_key_mods)); alert on changepoint'
+- question: Does an LSA-package registry modification deviate from the model of legitimate package updates
+    (modifying parent process, user context, time of day, new-DLL signature/age)?
+  context: 'A One-Class SVM learns what legitimate LSA package maintenance looks like and flags anomalies
+    (Persistence + Credential Access). Train it on features of legitimate modifications: modifying parent
+    process (e.g. TrustedInstaller.exe), user context, time of day, and the signature/age of the new DLL.
+    Classify anomalies and surface the top-3 features driving the score so an analyst can quickly judge
+    whether the change was operator-driven patching or adversary tampering.'
+  answer_sources:
+  - Windows Event ID 4657
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Windows Servers; specifically the registry hives at `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\`.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'model=OneClassSVM(features=[parent_proc,user,hour,new_dll_signed,new_dll_age])
+
+      score=model.decision_function(event)
+
+      if anomalous: alert(top3_features(event))'
+- question: For each successful network/RDP logon (Event ID 4624, Type 3 or 10), is there a matching Kerberos
+    or NTLM record in Zeek within +/-5 seconds, and is any single source using multiple distinct explicit
+    credentials (Event ID 4648) to reach multiple destinations?
+  context: A successful logon with no corresponding on-the-wire authentication suggests the authentication
+    process was bypassed (Defense Impairment) to gain access without valid protocol exchange. For each
+    4624 (Type 3/10), sub-search Zeek krb.log/ntlm.log for an event where client IP equals the Source
+    Network Address and destination is the target server within +/-5 seconds; alert if none exists. Additionally
+    flag hosts where one source uses many distinct explicit credentials via Event ID 4648 to reach multiple
+    destinations within a window, a lateral-movement / bypass pattern.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - Zeek krb.log
+  - Zeek ntlm.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Bastion Hosts; specifically network traffic logs at ingress/egress
+    points and Windows Security Event Logs on destination servers.'
+  range: Last 90 days; correlate logon and network records within a +/-5 second window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for logon in WinEvent(4624, LogonType in {3,10}):\n  netauth=Zeek(krb.log|ntlm.log where id.orig_h=logon.SourceNetworkAddress\
+      \ and id.resp_h=logon.host, t within +/-5s)\n  if not netauth: alert('auth bypass', logon)\nflag\
+      \ src where distinct creds in WinEvent(4648) >= N to multiple dst within window"
+- question: Has the ratio of successful network logons to corresponding Kerberos/NTLM messages on a critical
+    server breached its baseline, or has an account's failed-logon rate fallen while successes rise?
+  context: If logons succeed without proportional protocol traffic, an authentication bypass is likely
+    (Defense Impairment). Per critical server, baseline the hourly ratio of successful network logons
+    (4624 Type 3) to Kerberos TGS-REQ / NTLM AUTHENTICATE messages (Zeek) and alert when it exceeds 3
+    standard deviations or modified Z-score > 3.5 of the moving average. As an explicit failure-mode signal,
+    separately profile failed-logon rate (Event ID 4625) plus TGT/TGS failures; a falling failure rate
+    combined with rising success on an account can indicate a bypass that no longer requires real credential
+    validation.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - Zeek krb.log
+  - Zeek ntlm.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Bastion Hosts; specifically network traffic logs at ingress/egress
+    points and Windows Security Event Logs on destination servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ratio=count(4624 Type3 per server per hr)/count(Zeek TGS-REQ+NTLM AUTH)
+
+      mz=0.6745*(ratio-median)/MAD ; alert if mz>3.5
+
+      also track 4625_rate/4624_rate per account ; alert on sudden drop to ~0 failures'
+- question: Does a source->destination->account authentication triple appear for the first time (new edge)
+    without matching network authentication?
+  context: New-edge modeling surfaces never-before-seen authentication relationships that a bypass would
+    create (Defense Impairment). Treat authentication events as a graph/sequence and flag first-time source->destination->account
+    triples that lack matching network auth using a Bayesian new-edge model. Complement with an attention-based
+    RNN over logon sequences that exposes the top-3 contributing fields (account, source host, logon type,
+    time) in the alert text so analysts can judge whether the new relationship is benign onboarding or
+    a forged session.
+  answer_sources:
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - Zeek krb.log
+  - Zeek ntlm.log
+  - 'NAI: Domain Controllers, VPN Concentrators, Bastion Hosts; specifically network traffic logs at ingress/egress
+    points and Windows Security Event Logs on destination servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'edges=(src,dst,account) from 4624
+
+      p_new=BayesianNewEdge(edges)
+
+      alert if p_new high AND no Zeek krb/ntlm match
+
+      rnn=AttentionRNN(logon_seq); emit top3 fields'
+- question: Was LsaCfgFlags set to DWORD 2 (disabling Credential Guard), RunAsPPL cleared, or Negotiate/wdigest
+    UseLogonCredential set to 1?
+  context: Disabling Credential Guard, LSASS protected-process-light (RunAsPPL), or re-enabling WDigest
+    plaintext credentials are classic defense-impairment steps that re-expose credentials to dumping (Defense
+    Impairment, enabling Credential Access). Raise a high-severity alert if HKLM\SYSTEM\CurrentControlSet\Control\Lsa\LsaCfgFlags
+    is set to DWORD 2 (Sysmon Event ID 13 or Windows Event ID 4657); also alert when RunAsPPL is cleared
+    or Negotiate / 'wdigest UseLogonCredential' is set to 1. Comparable defense-impairment rules ship
+    in Splunk and Elastic content. Note the change requires a reboot (Event ID 4608) to take effect, which
+    is a useful corroborating signal.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4608
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: System Registry Hives on all Windows endpoints and servers with Credential Guard enabled, particularly
+    Domain Controllers and Privileged Access Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert if reg_set(LsaCfgFlags)==2
+
+      alert if reg_set(RunAsPPL)==0 or deleted
+
+      alert if reg_set(''wdigest\\UseLogonCredential'')==1 or reg_set(''Lsa\\Negotiate'')==1
+
+      enrich with subsequent WinEvent(4608) reboot'
+- question: Which hosts deviate from the expected LsaCfgFlags baseline, and is there a coordinated fleet-wide
+    downgrade over time?
+  context: A one-host change may be benign, but a coordinated downgrade across many hosts is an adversary
+    disabling protections at scale (Defense Impairment). Periodically audit LsaCfgFlags across endpoints
+    and compare to an expected-state baseline (1=enabled, 0=unsupported). Alert on any host deviating
+    from baseline and count deviations over time, applying change-point detection to flag an abrupt, fleet-wide
+    drop in protected hosts.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4608
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: System Registry Hives on all Windows endpoints and servers with Credential Guard enabled, particularly
+    Domain Controllers and Privileged Access Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'audit LsaCfgFlags per host vs expected_state
+
+      alert per host where state != expected
+
+      series=count(hosts with CG disabled per day); cpd=CUSUM(series); alert on changepoint'
+- question: Does the event sequence around an LsaCfgFlags/RunAsPPL modification (initiating process then
+    reboot) match a rare, suspicious ordering?
+  context: Sequence modeling catches the specific chain non-standard process -> key modification -> reboot
+    that a stealthy actor uses to disable Credential Guard (Defense Impairment). Correlate the LsaCfgFlags/RunAsPPL
+    modification with the initiating process (reg.exe, powershell.exe) and the subsequent reboot, and
+    score the event sequence with an LSTM log-sequence model (DeepLog-style) that flags rare orderings.
+    A reboot driven by an interactive script rather than scheduled maintenance is a strong lead.
+  answer_sources:
+  - Windows Event ID 4657
+  - Windows Event ID 4608
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: System Registry Hives on all Windows endpoints and servers with Credential Guard enabled, particularly
+    Domain Controllers and Privileged Access Workstations.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq=[init_proc -> reg_set(LsaCfgFlags/RunAsPPL) -> reboot(4608)]
+
+      model=DeepLog(LSTM)
+
+      if seq not in top-k predicted: alert(seq, init_proc)'
+- question: Did lsass.exe or winlogon.exe load an unsigned/invalidly-signed DLL, or was a GPO modified
+    (Event ID 5136) to weaken an authentication policy such as LM-hash storage or NTLM level?
+  context: Unsigned modules in authentication processes and domain-wide policy weakening are direct authentication-process
+    modifications (Defense Impairment + Persistence + Credential Access). Alert on Sysmon Event ID 7 loads
+    into lsass.exe/winlogon.exe where Signed='false' and SignatureStatus != 'Valid'. Separately, alert
+    on GPO modifications (Event ID 5136) where AttributeLDAPDisplayName relates to authentication policy
+    (LM hash storage, NTLM level, NoLMHash) and the new value weakens security. Equivalent policy-weakening
+    detections exist in Splunk and Elastic content.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 5136
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers (for GPO changes), all Windows Endpoints and Servers (for image loads), Group
+    Policy Management Console.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert if Sysmon(EID=7, Image in {lsass.exe,winlogon.exe}, Signed=''false'' OR SignatureStatus!=''Valid'')
+
+      alert if WinEvent(5136, AttributeLDAPDisplayName in auth_policy_attrs AND new_value weakens)'
+- question: Is a DLL loaded by lsass.exe rare across endpoints, or has the rate of security-sensitive
+    GPO edits burst outside maintenance windows?
+  context: Rarity and rate floors catch tampering that lacks a clean signature signal (Defense Impairment
+    + Persistence). Baseline all DLLs loaded by lsass.exe and flag any newly observed DLL present on <
+    0.5% of endpoints using a robust modified Z-score. For GPO changes, baseline the per-day rate of security-sensitive
+    policy edits and alert on a burst outside maintenance windows using change-point detection. A cluster
+    of policy edits at an odd hour by one admin is a high-value lead.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 5136
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers (for GPO changes), all Windows Endpoints and Servers (for image loads), Group
+    Policy Management Console.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prev[dll]=hosts_with_dll/total ; alert if new_dll and prev<0.005 (modified-Z)
+
+      series=daily_count(security GPO edits); cpd=PELT(series); alert on burst outside maint_window'
+- question: Does a GPO change score as high-risk given the user, time, specific policy modified, and whether
+    it weakens or strengthens security?
+  context: A supervised risk model prioritizes the GPO edits most likely to be malicious authentication
+    weakening (Defense Impairment + Persistence). Classify GPO change events with a Random Forest / gradient-boosting
+    model using user, time of day, the specific policy modified, and a weaken/strengthen categorical.
+    Emit high-risk alerts that list the top-3 contributing features so analysts can validate intent before
+    the change propagates domain-wide.
+  answer_sources:
+  - Sysmon Event ID 7
+  - Windows Event ID 5136
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers (for GPO changes), all Windows Endpoints and Servers (for image loads), Group
+    Policy Management Console.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X=[user,hour,policy_id,weaken_flag]
+
+      model=RandomForest/XGBoost
+
+      risk=model.predict_proba(X); if risk high: alert(top3_features)'
+- question: For every successful remote logon (Event ID 4624, Type 10) by an MFA-enforced user, is there
+    a matching MFA-provider success from the same source IP within 60 seconds, and did any non-allowlisted
+    process read lsass.exe memory (GrantedAccess includes 0x1000)?
+  context: An RDP logon for an MFA-enforced user with no MFA-provider success indicates an MFA bypass
+    (Defense Impairment / Persistence), while non-allowlisted PROCESS_VM_READ on lsass.exe indicates credential
+    dumping (Credential Access). Require a matching MFA-provider success from the same source IP within
+    60 seconds of the 4624; alert if none exists. Also alert on any lsass.exe access (Sysmon Event ID
+    10) where GrantedAccess includes 0x1000 (PROCESS_VM_READ) and SourceImage is not allowlisted.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Service Authentication Logs (e.g., Azure AD), Domain Controllers, Privileged
+    Endpoints.'
+  range: Last 90 days; MFA correlation within a 60 second window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "for logon in WinEvent(4624, Type=10, user in MFA_enforced):\n  mfa=MFAlog(success, src_ip=logon.SourceNetworkAddress,\
+      \ within 60s)\n  if not mfa: alert('MFA bypass', logon)\nalert if Sysmon(EID=10, TargetImage='lsass.exe',\
+      \ GrantedAccess & 0x1000) AND SourceImage not in allowlist"
+- question: Which processes accessing lsass.exe are statistically rare for the host type, and has any
+    account's MFA challenge-failure rate suddenly dropped to zero?
+  context: Profiling lsass accessors surfaces rare credential-dumping tools (Credential Access), and MFA
+    failure-rate collapse signals a successful bypass (Defense Impairment). Build a frequency distribution
+    of SourceImage processes accessing lsass.exe by host type and flag accessors in the bottom 5th percentile
+    using a robust modified Z-score so rare-but-benign maintenance tools are scored fairly. As a failure-mode
+    signal, track the per-user ratio of MFA challenge failures to successes; a sudden drop to zero failures
+    on a previously-challenged account suggests an MFA bypass.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Service Authentication Logs (e.g., Azure AD), Domain Controllers, Privileged
+    Endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'dist=freq(SourceImage accessing lsass per host_type)
+
+      flag accessors in bottom 5th pct (modified-Z)
+
+      track mfa_fail/mfa_success per user; alert on abrupt drop to 0 failures'
+- question: Do lsass.exe access events cluster into a distinct outlier group when described by SourceImage,
+    GrantedAccess, parent process, and user?
+  context: Clustering separates routine lsass interactions from anomalous credential-access attempts (Credential
+    Access). Cluster lsass.exe access events on features SourceImage, GrantedAccess, parent process, and
+    user and treat noise points as candidates. An Isolation Forest / One-Class SVM provides robust, explainable
+    per-event scoring with top-feature attribution so analysts can see why an event was flagged.
+  answer_sources:
+  - Sysmon Event ID 10
+  - Windows Event ID 4624
+  - Windows Event ID 4625
+  - Zeek conn.log
+  - 'NAI: VPN Concentrators, Cloud Service Authentication Logs (e.g., Azure AD), Domain Controllers, Privileged
+    Endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'events=Sysmon(EID=10, TargetImage=''lsass.exe'')
+
+      labels=DBSCAN(features=[SourceImage,GrantedAccess,parent,user])
+
+      score=IsolationForest/OCSVM(features); alert noise/outliers with top features'
+- question: Is there a single-process chain (by ProcessGUID) of process creation -> file creation in System32
+    with a hash matching a known credential-harvesting DLL -> registry modification adding that DLL to
+    an LSA package?
+  context: 'This catches the complete Mimikatz-style memssp/LSA-package install in one correlated chain
+    (Credential Access + Persistence). Chain events by ProcessGUID: process creation (Sysmon 1) -> file
+    creation (Sysmon 11) in System32 whose hash matches a known credential-harvesting DLL -> registry
+    modification (Sysmon 13) to an HKLM\SYSTEM\...\Lsa\* key adding that file path. Equivalent LSA password-filter
+    abuse detections are published in Splunk and Elastic content. A complete chain is high-confidence
+    malicious.'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Member Servers, System Registry Hives, File System (`C:\Windows\System32\`).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "chain by ProcessGUID:\n p=Sysmon(1) -> f=Sysmon(11, path in System32, hash in known_credtheft)\
+      \ -> r=Sysmon(13, TargetObject like '...\\\\Lsa\\\\%', Details contains f.path)\nif p->f->r: alert(sev=critical)"
+- question: Does a newly registered LSA-package DLL have high Shannon entropy, and was the gap between
+    file write and registry registration suspiciously short?
+  context: High entropy plus a machine-speed write-to-register gap distinguishes automated malware from
+    human administration (Credential Access + Persistence). Compute Shannon entropy of new DLLs written
+    to System32 and alert when a DLL registered as an LSA package has entropy in the top 95th percentile
+    or above a fixed 7.2. Record file size (volume) and the time-delta between file write and registry
+    edit (frequency), flagging sub-second sequences as machine-driven.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Member Servers, System Registry Hives, File System (`C:\Windows\System32\`).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for new_dll registered as LSA package:\n  if entropy(new_dll) >= max(pct95, 7.2): flag\n \
+      \ dt=reg_edit_time - file_write_time; if dt < 1s: flag('machine-driven')"
+- question: Does a supervised classifier label a newly registered LSA package as malicious based on file
+    properties, writing/registering processes, and write-to-register timing?
+  context: An XGBoost classifier fuses many weak signals into a high-precision verdict on LSA-package
+    installs (Credential Access + Persistence). Train it to label newly registered LSA packages malicious
+    using file properties (entropy, size, signature), the writing process, the registry-modifying process,
+    and the write-to-register time delta. Output the top-3 features per prediction for explainability
+    so analysts can validate the call.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Member Servers, System Registry Hives, File System (`C:\Windows\System32\`).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X=[entropy,size,signed,writer_proc,reg_proc,write_to_register_dt]
+
+      model=XGBoost
+
+      label=model.predict(X); if malicious: alert(top3_features)'
+- question: Was a user's userAccountControl changed to add 'Password not required' or 'Store password
+    using reversible encryption', or was Set-ADUser/Set-ADAccountControl -AllowReversiblePasswordEncryption
+    executed?
+  context: Enabling reversible password encryption or removing the password requirement makes credentials
+    recoverable in cleartext, a persistent credential-access foothold (Persistence + Credential Access).
+    Raise a high-priority alert for Event ID 4738 where userAccountControl adds 'Password not required'
+    or 'Store password using reversible encryption', and correlate with PowerShell (Event ID 4104) Set-ADUser
+    / Set-ADAccountControl -AllowReversiblePasswordEncryption $true. Comparable analytics ship in open
+    Splunk content.
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4738
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Active Directory Database (NTDS.dit), Group Policy Objects.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'alert if WinEvent(4738, userAccountControl adds {PASSWD_NOTREQD, ENCRYPTED_TEXT_PWD_ALLOWED})
+
+      correlate WinEvent(4104, script contains ''AllowReversiblePasswordEncryption $true'' OR ''Set-ADAccountControl'')'
+- question: Has the per-admin or per-host rate of userAccountControl modifications spiked or shifted abruptly?
+  context: A burst of userAccountControl edits beyond an admin's norm signals automated abuse or account
+    takeover (Persistence + Credential Access). Baseline the per-day rate of userAccountControl modifications
+    per admin and per source host and alert when the count exceeds 3 standard deviations (or modified
+    Z-score > 3.5) or when change-point detection finds an abrupt regime shift. This catches scripted
+    weakening across many accounts.
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4738
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Active Directory Database (NTDS.dit), Group Policy Objects.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series=daily_count(4738 uac_mods per admin, per host)
+
+      mz=0.6745*(x-median)/MAD; alert if mz>3.5
+
+      cpd=PELT(series); alert on changepoint'
+- question: Is an administrator's account-modification behavior inconsistent with their peer group or
+    role (e.g., normally only creates users, suddenly enables reversible encryption on a privileged account)?
+  context: Peer-group/UEBA modeling detects role-inconsistent administrative behavior that signals compromise
+    or insider abuse (Persistence + Credential Access). Flag an admin who normally only creates users
+    but suddenly enables reversible encryption on a privileged account, surfacing the deviating fields
+    for triage. Graph-embedding provenance models can corroborate by detecting the rare account->object->attribute
+    subgraph.
+  answer_sources:
+  - Windows Event ID 5136
+  - Windows Event ID 4738
+  - Windows Event ID 4104
+  - 'NAI: Domain Controllers, Active Directory Database (NTDS.dit), Group Policy Objects.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ueba=PeerGroupModel(admin_actions)
+
+      if action inconsistent_with role/peers: alert(deviating_fields)
+
+      corroborate=GraphEmbedding(account->object->attribute) rare-subgraph score'
+- question: Does a single ProcessGUID chain show process creation -> DLL file creation -> registry registration
+    of that DLL as an LSA Notification Package or Password Filter, all within 60 seconds?
+  context: A tight, single-process chain installing an LSA package is the core persistence/credential-capture
+    behavior regardless of the specific tool (Persistence + Credential Access). Build a correlation rule
+    triggering when process creation (Sysmon 1) is followed by DLL file creation (Sysmon 11) and then
+    a registry set (Sysmon 13) for an LSA package pointing to that DLL, all within 60 seconds and by the
+    same Process GUID. The speed and self-containment of the chain are what make it suspicious.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Critical Servers, System Registry Hives, Temporary/User Profile Directories
+    (as staging locations).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "chain by ProcessGUID within 60s:\n Sysmon(1) -> Sysmon(11, *.dll) -> Sysmon(13, TargetObject\
+      \ like '...\\\\Lsa\\\\%Packages', Details contains dll)\nalert if all three present"
+- question: Is the process initiating the DLL-write-then-LSA-registration chain rare across the enterprise?
+  context: Rarity of the initiator raises confidence that the LSA-package install is malicious rather
+    than legitimate patching (Persistence + Credential Access). Compute enterprise-wide prevalence of
+    the initiating process image; if prevalence < 5% raise the alert risk score. Use median-absolute-deviation
+    prevalence scoring so widely deployed admin tools are not unfairly penalized while a rare one-off
+    binary is escalated.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Critical Servers, System Registry Hives, Temporary/User Profile Directories
+    (as staging locations).'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'prev[proc]=hosts_with_proc/total_hosts
+
+      if prev[proc] < 0.05: risk_score += weight (MAD-based)'
+- question: Does the host provenance graph contain the small, linear, high-velocity subgraph Process ->
+    writes -> DLL -> modifies -> LSA key?
+  context: Graph-based detection recognizes the structural signature of LSA-package installation and reconstructs
+    surrounding context for triage (Persistence + Credential Access). Build a host provenance graph (process/file/registry
+    nodes; write/modify edges) and detect the small, linear, high-velocity subgraph (Process -> writes
+    -> DLL -> modifies -> LSA key) at node level with a GNN such as ThreaTrace, or via temporal graph
+    reconstruction with KAIROS, which also reconstructs the surrounding attack graph for explainability.
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: Domain Controllers, Critical Servers, System Registry Hives, Temporary/User Profile Directories
+    (as staging locations).'
+  range: Last 90 days
+  queries:
+  - technology: EDR/Graph pseudocode
+    query: 'G=provenance_graph(process,file,registry nodes; write/modify edges)
+
+      ThreaTrace.node_score(G) OR KAIROS.temporal_reconstruct(G)
+
+      alert on subgraph: proc -writes-> dll -modifies-> LSA_key'
+- question: Is there a successful NTLMv1 authentication or a successful Kerberos ticket using a weak etype
+    (RC4-HMAC/0x17), correlated with a recent authentication-modification alert on the host?
+  context: Protocol downgrade to NTLMv1 or RC4 weakens authentication so credentials/hashes can be cracked
+    or relayed (Defense Impairment + Credential Access). Alert when Zeek ntlm.log shows success=T with
+    NTLM 'v1', or krb.log shows a successful ticket using a weak etype (RC4-HMAC/0x17), correlated with
+    a recent authentication-modification alert on the source/destination host. The correlation links the
+    on-wire downgrade to a host-level tampering event.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ntlm.log
+  - Zeek krb.log
+  - Zeek files.log
+  - 'NAI: Network traffic to/from Domain Controllers, network traffic to external/untrusted networks,
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'alert if ntlm.log.success==T AND ntlm.version==''v1''
+
+      alert if krb.log.success AND etype in {0x17 RC4-HMAC}
+
+      join with recent host auth-modification alert (src/dst)'
+- question: Has the share of weak authentication versions (NTLMv1 / RC4-HMAC) exceeded ~1% of authentications
+    in a one-hour window, or shifted abruptly?
+  context: A rise in weak-protocol use across the environment signals a coordinated downgrade (Defense
+    Impairment + Credential Access). Baseline the distribution of NTLM versions and Kerberos etypes (expect
+    NTLMv2/AES256 > 99%). Alert when NTLMv1 or RC4-HMAC exceeds ~1% of authentications over a 1-hour window,
+    using change-point detection to catch the abrupt downgrade and the modified Z-score for robust thresholding.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ntlm.log
+  - Zeek krb.log
+  - Zeek files.log
+  - 'NAI: Network traffic to/from Domain Controllers, network traffic to external/untrusted networks,
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/Stats pseudocode
+    query: 'p_weak=count(NTLMv1 OR RC4)/count(all_auth) per 1h
+
+      alert if p_weak > 0.01
+
+      cpd=CUSUM(p_weak series); mz>3.5 threshold'
+- question: Is outbound byte volume from an authentication server anomalous, or are there new destination
+    edges from a Domain Controller?
+  context: Post-tampering, adversaries exfiltrate harvested credentials; volume and new-edge anomalies
+    catch this (Credential Access / exfiltration follow-on). Apply time-series anomaly detection to outbound
+    total_bytes (Zeek conn.log) from authentication servers; a credential-exfiltration spike violating
+    daily/weekly seasonality is flagged. Treat new destination edges from a DC as first-time edges with
+    a Bayesian new-edge model, since DCs should rarely initiate novel outbound connections.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek ntlm.log
+  - Zeek krb.log
+  - Zeek files.log
+  - 'NAI: Network traffic to/from Domain Controllers, network traffic to external/untrusted networks,
+    network choke points.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/ML pseudocode
+    query: 'series=outbound total_bytes from auth_servers (conn.log)
+
+      forecast=seasonal_model; alert if observed > upper_ci
+
+      new_edge=BayesianNewEdge(DC -> external_dst); alert if first-seen'
+- question: Was any file under /etc/pam.d/ or a pam_*.so module under /lib*/security/ written, renamed,
+    or newly added by a process other than the package manager, or not present on the allowlist?
+  context: Modifying PAM configs or shared objects implants credential capture or an authentication bypass
+    (e.g. pam_permit.so / backdoor module) for persistent Linux access (Persistence + Credential Access).
+    Use auditd watches (-w /etc/pam.d/ -p wa, -w /lib/x86_64-linux-gnu/security/ -p wa) and alert on any
+    write/rename to PAM configs or pam_*.so, or on a new module not in a version-controlled allowlist,
+    where the writing process is not the package manager (dpkg/rpm/apt/yum). Comparable Linux PAM-tamper
+    rules ship in Elastic content.
+  answer_sources:
+  - auditd SYSCALL (open, write, rename)
+  - auditd PATH
+  - Sysmon for Linux Event ID 11
+  - osquery file_events
+  - 'NAI: Linux servers, bastion/jump hosts, SSH-facing systems, IdP/RADIUS servers; specifically `/etc/pam.d/`,
+    `/etc/security/`, and `/lib/x86_64-linux-gnu/security/` (or `/lib64/security/`).'
+  range: Last 90 days
+  queries:
+  - technology: auditd/Rule pseudocode
+    query: 'watch: -w /etc/pam.d/ -p wa ; -w /lib/x86_64-linux-gnu/security/ -p wa
+
+      alert if SYSCALL(open/write/rename) on PAM path AND exe NOT in {dpkg,rpm,apt,yum}
+
+      alert if new pam_*.so not in allowlist'
+- question: Do authentication daemons (sshd, login, sudo) exhibit unseen system-call sequences, or has
+    the rate of /etc/pam.d/ edits changed outside a maintenance window?
+  context: Behavioral baselining of auth daemons and config-change rates catches PAM tampering and its
+    runtime effects (Persistence + Credential Access). Model the normal short system-call sequences of
+    sshd/login/sudo and alert when the fraction of unseen sequences exceeds a baseline threshold (Forrest
+    et al. sequence-anomaly method). Separately baseline the per-host rate of /etc/pam.d/ edits and alert
+    on any change outside a maintenance window (state floor) or a rate change-point.
+  answer_sources:
+  - auditd SYSCALL (open, write, rename)
+  - auditd PATH
+  - Sysmon for Linux Event ID 11
+  - osquery file_events
+  - 'NAI: Linux servers, bastion/jump hosts, SSH-facing systems, IdP/RADIUS servers; specifically `/etc/pam.d/`,
+    `/etc/security/`, and `/lib/x86_64-linux-gnu/security/` (or `/lib64/security/`).'
+  range: Last 90 days
+  queries:
+  - technology: auditd/Stats pseudocode
+    query: 'seqs=short_syscall_ngrams(sshd,login,sudo)
+
+      alert if frac(unseen seqs) > threshold
+
+      cpd=PELT(daily_count(/etc/pam.d edits)); alert outside maint_window'
+- question: Does auditd/Sysmon-for-Linux provenance show a PAM module load or write producing a rare process/file
+    subgraph?
+  context: Graph models detect anomalous PAM provenance and reconstruct context for triage (Persistence
+    + Credential Access). Feed auditd / Sysmon-for-Linux provenance into a node-level GNN (ThreaTrace)
+    or whole-system temporal model (KAIROS) to flag a PAM module load or write that produces a rare process/file
+    subgraph, with reconstructed surrounding context so an analyst can confirm the implant path.
+  answer_sources:
+  - auditd SYSCALL (open, write, rename)
+  - auditd PATH
+  - Sysmon for Linux Event ID 11
+  - osquery file_events
+  - 'NAI: Linux servers, bastion/jump hosts, SSH-facing systems, IdP/RADIUS servers; specifically `/etc/pam.d/`,
+    `/etc/security/`, and `/lib/x86_64-linux-gnu/security/` (or `/lib64/security/`).'
+  range: Last 90 days
+  queries:
+  - technology: EDR/Graph pseudocode
+    query: 'G=provenance(auditd/sysmon-linux)
+
+      ThreaTrace.node_score(G) OR KAIROS.temporal(G)
+
+      alert on rare subgraph touching PAM config/module'
+- question: Was a bundle added or modified under /Library/Security/SecurityAgentPlugins/, or were authorization-database
+    rules (e.g. system.login.console) changed by a process that is not an approved MDM/installer?
+  context: Adding a SecurityAgentPlugin or weakening authorizationdb rules lets an adversary hook the
+    macOS login/authorization flow to capture credentials or bypass authentication (Persistence + Credential
+    Access). Alert on creation/modification of bundles under /Library/Security/SecurityAgentPlugins/ or
+    changes to authorization-database rules (e.g. security authorizationdb write system.login.console)
+    where the responsible process is not an approved MDM/installer; require code-signing validation and
+    an allowlist of legitimate plugins. Comparable macOS authorization-plugin rules ship in Elastic content.
+  answer_sources:
+  - macOS Unified Log
+  - ESF (Endpoint Security Framework) file events
+  - osquery file_events
+  - osquery authorization_mechanisms
+  - 'NAI: macOS endpoints and servers, especially privileged/admin workstations; specifically `/Library/Security/SecurityAgentPlugins/`,
+    `/var/db/auth.db`, and the `system.login.console` authorization rule.'
+  range: Last 90 days
+  queries:
+  - technology: macOS/Rule pseudocode
+    query: 'alert if ESF/unifiedlog file_event on /Library/Security/SecurityAgentPlugins/* AND responsible_proc
+      NOT in approved_MDM/installer
+
+      alert if ''security authorizationdb write system.login.console''
+
+      validate codesign; check plugin allowlist'
+- question: Is a newly added SecurityAgentPlugin or authorization rule rare across the fleet, and has
+    the plugin/rule modification rate shifted abruptly?
+  context: Fleet-wide prevalence and change-point analysis catch coordinated macOS authorization tampering
+    (Persistence + Credential Access). Maintain a per-fleet baseline of installed SecurityAgentPlugins
+    and authorization rules; alert on any addition with prevalence < 1% across the fleet, and apply change-point
+    detection to plugin/rule modification rates to catch coordinated changes that a per-host rule would
+    miss.
+  answer_sources:
+  - macOS Unified Log
+  - ESF (Endpoint Security Framework) file events
+  - osquery file_events
+  - osquery authorization_mechanisms
+  - 'NAI: macOS endpoints and servers, especially privileged/admin workstations; specifically `/Library/Security/SecurityAgentPlugins/`,
+    `/var/db/auth.db`, and the `system.login.console` authorization rule.'
+  range: Last 90 days
+  queries:
+  - technology: macOS/Stats pseudocode
+    query: 'prev[plugin]=hosts_with_plugin/total; alert if prev<0.01
+
+      cpd=PELT(daily_count(plugin/rule mods)); alert on changepoint'
+- question: Do macOS authorization/loginwindow events and plugin-load provenance contain outliers when
+    scored by plugin path, signer, and modifying process?
+  context: Outlier scoring of authorization-flow events surfaces malicious plugin loads (Persistence +
+    Credential Access). Cluster authorization/loginwindow events and plugin-load provenance, then flag
+    noise/outliers with an Isolation Forest / One-Class SVM and surface the top contributing features
+    (plugin path, signer, modifying process) for triage.
+  answer_sources:
+  - macOS Unified Log
+  - ESF (Endpoint Security Framework) file events
+  - osquery file_events
+  - osquery authorization_mechanisms
+  - 'NAI: macOS endpoints and servers, especially privileged/admin workstations; specifically `/Library/Security/SecurityAgentPlugins/`,
+    `/var/db/auth.db`, and the `system.login.console` authorization rule.'
+  range: Last 90 days
+  queries:
+  - technology: macOS/ML pseudocode
+    query: 'events=authorization/loginwindow + plugin_load provenance
+
+      score=IsolationForest/OCSVM(features=[plugin_path,signer,modifying_proc])
+
+      alert outliers with top features'
+- question: Did a control-plane event weaken cloud authentication (AWS UpdateAccountPasswordPolicy/UpdateLoginProfile/CreateAccessKey
+    on privileged identities, Entra ID conditional-access/MFA disablement, new domain federation or SAML
+    IdP trust, Okta sign-on/MFA policy edits) outside an approved change process?
+  context: Weakening cloud IdP/IAM authentication, adding a rogue federation/trust, or minting backdoor
+    credentials grants durable unauthorized access to SaaS/IaaS (Persistence + Defense Impairment). Alert
+    on AWS UpdateAccountPasswordPolicy/UpdateLoginProfile/CreateAccessKey on privileged identities, Entra
+    ID conditional-access/MFA policy disablement, new domain federation or SAML IdP trust, and Okta sign-on/MFA
+    policy edits, where the actor is outside an approved change process. Equivalent IdP/IAM detections
+    ship in Splunk and Elastic content.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD / Entra ID Audit Logs
+  - Microsoft 365 Unified Audit Log
+  - Okta System Log
+  - 'NAI: Cloud IdP/IAM control planes (Entra ID, AWS IAM, Okta, Google Workspace); authentication-policy,
+    federation/trust, and MFA configuration objects.'
+  range: Last 90 days
+  queries:
+  - technology: Cloud/Rule pseudocode
+    query: 'alert if CloudTrail in {UpdateAccountPasswordPolicy,UpdateLoginProfile,CreateAccessKey} on
+      privileged identity
+
+      alert if Entra conditional-access/MFA disabled OR new domain federation/SAML trust
+
+      alert if Okta sign-on/MFA policy edit
+
+      filter: actor NOT in approved_change_process'
+- question: Is an identity-policy change the first such administrative action for that principal, or part
+    of a volume/frequency spike, and did MFA challenge/denial events drop afterward?
+  context: 'First-seen and rate analysis catch the cloud admin actions adversaries use to weaken authentication
+    (Persistence + Defense Impairment). Baseline per-principal rates of identity-policy changes and flag
+    first-seen administrative API actions per principal, plus volume/frequency spikes via modified Z-score
+    and abrupt shifts via change-point detection. Profile authentication failure rates separately: a policy
+    change followed by a drop in MFA challenge/denial events for an identity indicates a successful weakening.'
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD / Entra ID Audit Logs
+  - Microsoft 365 Unified Audit Log
+  - Okta System Log
+  - 'NAI: Cloud IdP/IAM control planes (Entra ID, AWS IAM, Okta, Google Workspace); authentication-policy,
+    federation/trust, and MFA configuration objects.'
+  range: Last 90 days
+  queries:
+  - technology: Cloud/Stats pseudocode
+    query: 'first_seen[principal][api]: alert if first admin action
+
+      mz=modified_z(rate of identity-policy changes); alert if >3.5
+
+      cpd=changepoint(series)
+
+      alert if MFA_denial_rate drops after policy change'
+- question: Does an identity-graph principal->action->target relationship appear as a new/rare edge for
+    that actor?
+  context: Identity-graph modeling flags anomalous administrative relationships that signal account takeover
+    or insider abuse in the cloud (Persistence + Defense Impairment). Model identity-graph behavior (principal
+    -> action -> target) and flag new/rare edges with a Bayesian new-edge model; UEBA/peer-group scoring
+    should surface the top-3 contributing factors (actor, action, target sensitivity) in the alert text
+    so analysts can rapidly assess whether the change is legitimate.
+  answer_sources:
+  - AWS CloudTrail
+  - Azure AD / Entra ID Audit Logs
+  - Microsoft 365 Unified Audit Log
+  - Okta System Log
+  - 'NAI: Cloud IdP/IAM control planes (Entra ID, AWS IAM, Okta, Google Workspace); authentication-policy,
+    federation/trust, and MFA configuration objects.'
+  range: Last 90 days
+  queries:
+  - technology: Cloud/ML pseudocode
+    query: 'edges=(principal,action,target)
+
+      p_new=BayesianNewEdge(edges)
+
+      ueba=PeerGroup(principal); alert if rare with top3 factors'
