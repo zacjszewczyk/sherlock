@@ -1,0 +1,339 @@
+name: 'T1423: Network Service Scanning'
+id: c31adf15-990a-47a8-a135-845ab36c8b5a
+description: >-
+  Investigate whether a compromised or rogue mobile device (Android or iOS) is being used to perform network
+  service scanning against the internal enterprise network, reached either over local connectivity (corporate
+  Wi-Fi) or through a VPN. This playbook helps an analyst hunt for the network-visible artifacts of port
+  and vulnerability scanning originating from mobile device IP space: a single device fanning out to a
+  statistically significant number of unique internal destination IPs (horizontal scan) or unique ports
+  on a single host (vertical scan), elevated ratios of failed or rejected TCP connection states (S0, REJ,
+  RSTO, RSTR, RSTOS0) versus established (SF) sessions, hits against decoy canary IPs/ports, Zeek scan
+  notices, known scanner User-Agents and signatures (Nmap, masscan, ZGrab), high-entropy probe payloads,
+  and flows that supervised or unsupervised models classify as scanning. It combines deterministic rules,
+  statistical baselining (per-device and peer-group), sequential hypothesis testing (Threshold Random
+  Walk), and machine-learning detectors so detection never depends on a single method, and surfaces explainable
+  feature drivers for fast SOC triage.
+type: technique
+related:
+- tactic_id: TA0032
+  tactic_name: Discovery
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: >-
+    Did any IP address from a mobile device subnet (corporate Wi-Fi or VPN address pool) connect to a
+    designated network canary IP or canary port on a production server, even once?
+  context: >-
+    Canary (decoy) IPs and ports are deployed to receive no legitimate traffic whatsoever, so any connection
+    to them from a mobile device is conclusive evidence of unauthorized reconnaissance rather than ordinary
+    use. In the Discovery tactic, an adversary operating from a compromised phone has no map of the internal
+    network and will inevitably touch decoy assets while enumerating services. Build a deterministic rule
+    that fires a high-priority alert on a single hit from mobile Wi-Fi/VPN ranges to a canary, and bound
+    any incidental noise with engine-level rate/track primitives (Suricata threshold/rate_filter tracked
+    by source). A positive result is high-confidence and should trigger immediate device isolation and
+    identity review; a negative result alone does not clear the device, since a careful actor may avoid
+    the decoys.
+  answer_sources:
+  - Zeek conn.log
+  - DHCP Server Logs
+  - VPN Server Logs
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, VPN concentrators, DHCP servers
+  range: Last 90 days, with real-time alerting on any single hit.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      alert when src_ip in mobile_wifi_or_vpn_ranges and (dst_ip in canary_ips or dst_port in canary_ports);
+
+      rate_filter track by_src, count N, seconds S to bound noise;
+
+      output src_ip, device_id, dst_ip, dst_port, timestamp.
+- question: >-
+    For each mobile device, does the count of unique internal destination IPs (horizontal fan-out) or
+    unique destination ports on a single host (vertical fan-out) in a short window exceed both its own
+    historical baseline and the behavior of its mobile peer group?
+  context: >-
+    Out-degree / distinct-host fan-out is the canonical, robust signal of network service scanning: a
+    scanner contacts many destinations or many ports in a small time window, whereas a benign client talks
+    to a handful of known services. For every mobile source IP, compute every 5 minutes the unique destination
+    IP count (horizontal) and unique destination ports on a single host (vertical) from Zeek conn.log,
+    then compare against a 30-day rolling per-device baseline and the cross-device distribution. Alert
+    when a count exceeds 3 standard deviations above the device mean AND sits in the 99th percentile across
+    all mobile devices for that window, which controls false positives by requiring both self-anomaly
+    and peer-anomaly. Tracking first-time (new) source-destination edges adds a principled complementary
+    signal because scanning creates many novel edges. This directly serves Discovery by catching the enumeration
+    step before the adversary pivots to exploitation.
+  answer_sources:
+  - Zeek conn.log
+  - DHCP Server Logs
+  - VPN Server Logs
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, VPN concentrators, DHCP servers
+  range: Last 90 days, with 5-minute scoring windows over a 30-day rolling baseline.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      per src_ip, per 5min: u_dst_ip=distinct(dst_ip); u_dst_port=distinct(dst_port per dst_ip);
+
+      baseline=rolling_30d_mean_std(src_ip);
+
+      alert when (u_dst_ip > mean+3*std or u_dst_port > mean+3*std) and value >= p99(all_mobile, window);
+
+      also flag count(new_src_dst_edges) high; output src_ip, u_dst_ip, u_dst_port, new_edges.
+- question: >-
+    When applying a Threshold Random Walk sequential hypothesis test to each mobile device's first-contact
+    connections, does the accumulated likelihood ratio cross the scanner-decision boundary?
+  context: >-
+    Threshold Random Walk (TRW) treats each first-contact connection from a mobile IP to a new host/port
+    as a Bernoulli trial: success when the connection establishes (Zeek state 'SF') and failure when it
+    does not ('S0','REJ','RSTOS0' or no response). The log-likelihood ratio is accumulated via Wald's
+    Sequential Probability Ratio Test, and the source is declared a scanner once the statistic crosses
+    the upper bound derived from target error rates (alpha=0.01, beta=0.01). Because scanners overwhelmingly
+    hit non-listening hosts/ports, they accrue failures quickly and are flagged after only ~4-5 observations
+    with provable error bounds, and the method is robust to slow or randomized scans that defeat simple
+    rate thresholds. For Discovery this provides a mathematically defensible, low-false-positive scanner
+    verdict; a crossing of the upper bound is strong evidence, while crossing the lower bound confirms
+    benign behavior.
+  answer_sources:
+  - Zeek conn.log
+  - DHCP Server Logs
+  - VPN Server Logs
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, VPN concentrators, DHCP servers
+  range: Last 90 days, evaluated continuously on first-contact connections.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for each src_ip: on each first_contact(dst_host_port):
+        trial = success if conn_state=='SF' else failure;  # failure: S0,REJ,RSTOS0,no-response
+        LLR += log(P(outcome|scanner)/P(outcome|benign));
+        if LLR >= upper_bound(alpha=0.01,beta=0.01): declare scanner;
+        elif LLR <= lower_bound: declare benign;
+      output src_ip, observations, LLR, verdict.
+- question: >-
+    Does an unsupervised model (DBSCAN and Isolation Forest) flag a mobile device's daily flow-behavior
+    feature vector as an outlier consistent with scanning, and which features drove the score?
+  context: >-
+    Daily, build a per-device feature vector from 24 hours of Zeek conn.log including unique destination
+    IP count, unique destination port count, ratio of successful ('SF') to failed ('S0','REJ') connections,
+    mean flow bytes/s, orig/resp byte ratio, and destination-port entropy (features drawn from CICFlowMeter
+    scan studies). Score these vectors in parallel with density-based clustering (DBSCAN) and an unsupervised
+    outlier model (Isolation Forest), running alongside the deterministic rules so detection never depends
+    solely on the model. Crucially, each alert must list the top-3 contributing features (e.g., 'unique_dst_ip=842,
+    fail_ratio=0.94, port_entropy=6.7') so analysts can triage, following explainable-NIDS practice. For
+    Discovery this catches scanning profiles that evade fixed thresholds and adapts to drift; an outlier
+    verdict with high fan-out and failure features warrants device review, while normal clustering supports
+    a benign conclusion.
+  answer_sources:
+  - Zeek conn.log
+  - DHCP Server Logs
+  - VPN Server Logs
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, VPN concentrators, DHCP servers
+  range: Last 90 days, with daily (24h) feature aggregation and model scoring.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      daily per device: features=[u_dst_ip,u_dst_port,sf_to_fail_ratio,mean_bytes_per_s,orig_resp_byte_ratio,dst_port_entropy];
+
+      dbscan_label = DBSCAN(features); iso_score = IsolationForest(features);
+
+      alert when dbscan_label==noise or iso_score>=threshold;
+
+      output device_id, iso_score, top3_contributing_features.
+- question: >-
+    Did a single mobile source IP generate more than 20 rejected/reset TCP connection logs (state 'REJ'
+    or 'RSTO') to one destination host within a 1-minute window?
+  context: >-
+    A burst of rejected or reset connections to a single host is a hallmark of an active host firewall
+    or non-listening service rejecting probes during a vertical scan. Build a deterministic real-time
+    rule that alerts when a mobile source IP produces more than 20 connection logs with state 'REJ' or
+    'RSTO' to a single destination within a 1-minute window, implemented with rate/threshold filters (track
+    by_src, count 20, seconds 60). Connection-rate and failed-attempt thresholds are standard intrusion-detection
+    scan primitives that provide a reliable, explainable floor beneath the statistical and ML detectors.
+    In the Discovery tactic this catches the moment a compromised phone probes a firewalled internal host;
+    a positive result is a concrete, actionable indicator, while the absence of bursts does not rule out
+    slow or distributed scanning.
+  answer_sources:
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, Network firewalls
+  range: Last 90 days, with real-time 1-minute window evaluation.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      alert when src_ip in mobile_ranges and count(conn_state in ['REJ','RSTO']) by (src_ip,dst_ip) within
+      60s > 20;
+
+      output src_ip, dst_ip, reject_count, window_start.
+- question: >-
+    For each mobile device, does the ratio of failed TCP connections (S0, REJ, RSTO, RSTR, RSTOS0) to
+    successful ones (SF) exceed the 98th percentile of all mobile devices or surpass 80% failure in a
+    5-minute window?
+  context: >-
+    An elevated failed-to-successful connection ratio is the foundational discriminator between scanners
+    and benign clients, because legitimate use mostly completes connections to known services while scanning
+    sprays many ports/hosts that are closed or filtered. Every 5 minutes, compute per mobile IP the ratio
+    of failed states ('S0','REJ','RSTO','RSTR','RSTOS0') to successful ('SF') from Zeek conn.log, and
+    alert when the ratio exceeds the 98th percentile across all mobile devices for the window OR is greater
+    than 0.8 (80% failure). Profile NXDOMAIN/ICMP-unreachable and blocked-connection counts as distinct
+    features rather than discarding them as noise, since they enrich the picture. For Discovery this is
+    a high-signal, low-cost statistical test; a sustained high ratio strongly suggests enumeration, while
+    a low ratio is consistent with normal client behavior.
+  answer_sources:
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, Network firewalls
+  range: Last 90 days, with 5-minute scoring windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      per src_ip per 5min: fail=sum(state in ['S0','REJ','RSTO','RSTR','RSTOS0']); succ=sum(state=='SF');
+
+      ratio=fail/max(succ,1);
+
+      alert when ratio > p98(all_mobile, window) or ratio > 0.8;
+
+      also track nxdomain_count, icmp_unreachable_count, blocked_count; output src_ip, ratio, counts.
+- question: >-
+    Does an online time-series anomaly detector trained on at least 30 days of history flag a statistically
+    significant spike in a mobile device's per-minute failed-connection-state counts?
+  context: >-
+    Feed the per-minute count of failed connection states ('S0','REJ','RSTO', etc.) per mobile device
+    into a time-series/online anomaly detector trained on at least 30 days of history (Seasonal-Hybrid
+    ESD or an online autoencoder ensemble such as Kitsune). Alert on statistically significant deviations
+    from the learned forecast and confidence interval, running this in parallel with the deterministic
+    rule so detection never depends solely on the model. Each alert must report the top contributing windows/features
+    (e.g., 'REJ spike 50x baseline at 14:03') for analyst triage. This approach catches scanning bursts
+    that respect normal absolute thresholds but represent a dramatic departure from a device's own seasonal
+    pattern, which is valuable in Discovery where adversary enumeration produces sharp, time-localized
+    failure spikes; a forecast breach warrants investigation, while behavior inside the confidence band
+    supports a benign read.
+  answer_sources:
+  - Zeek conn.log
+  - >-
+    NAI: Internal network segments accessible by mobile devices (e.g., corporate Wi-Fi, VPN address pools),
+    Core network switches, Network firewalls
+  range: Last 90 days, with per-minute series and >=30 days of training history.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      series = per_minute_count(failed_states) per device;
+
+      model = SeasonalHybridESD_or_Kitsune(train>=30d);
+
+      forecast,ci = model.predict(series);
+
+      alert when observed outside ci (significant);
+
+      output device_id, spike_window, observed_vs_baseline, top_features.
+- question: >-
+    Did Zeek raise a 'Scan::Port_Scan' or 'Scan::Address_Scan' notice for a mobile source IP, or did http.log/signatures.log
+    match known scanner User-Agents or signatures (Nmap Scripting Engine, masscan, ZGrab)?
+  context: >-
+    Zeek's built-in scan detection and signature matching provide direct, high-confidence indicators of
+    scanning tradecraft. Trigger a high-priority alert immediately on a 'Scan::Port_Scan' or 'Scan::Address_Scan'
+    notice in Zeek notice.log where src_ip falls within a known mobile IP range, and on Zeek http.log/signatures.log
+    matches for known scanner User-Agents or signatures ('Nmap Scripting Engine','masscan','ZGrab'). Maintain
+    these signatures from a curated, version-controlled rule corpus (Sigma) and back them with Suricata
+    content/rate rules. In the Discovery tactic this surfaces both the network-behavior verdict from Zeek's
+    policy scripts and the tool fingerprints left by off-the-shelf scanners; a match is strong evidence
+    of active enumeration, though sophisticated actors may strip or randomize User-Agents, so absence
+    of a match does not exonerate a device.
+  answer_sources:
+  - Zeek notice.log
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek signatures.log
+  - >-
+    NAI: Network tap or span port monitoring the ingress/egress of mobile device network segments (Wi-Fi,
+    VPN).
+  range: Last 90 days, with real-time notice/signature alerting.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: >-
+      alert when notice.note in ['Scan::Port_Scan','Scan::Address_Scan'] and src_ip in mobile_ranges;
+
+      or http.user_agent matches ['Nmap Scripting Engine','masscan','ZGrab'];
+
+      or signatures.log sig_id in scanner_signatures;
+
+      output src_ip, note_or_sig, dst, timestamp.
+- question: >-
+    For TCP sessions from mobile IPs that Zeek labels protocol 'OTH', does the Shannon entropy of the
+    first 64 payload bytes stay sustained above the 98th percentile of all mobile devices, suggesting
+    obfuscated or randomized probes?
+  context: >-
+    Some scanning and probing traffic uses obfuscated or randomized payloads that do not match a known
+    protocol, which Zeek labels as 'OTH'. For such TCP sessions from mobile IPs, compute the Shannon entropy
+    of the first 64 payload bytes; sustained high entropy can indicate encrypted, packed, or randomized
+    probe content. Alert when a device's mean payload entropy over a 5-minute window exceeds the 98th
+    percentile of all mobile devices, noting that entropy above roughly 7.2 is the established threshold
+    separating encrypted/packed content from native bytes. For Discovery this catches probing that hides
+    behind non-standard payloads and evades signature matching; a sustained high-entropy reading from
+    a device that should be running ordinary apps is suspicious and merits correlation with fan-out and
+    failure-ratio signals, while normal entropy supports a benign interpretation.
+  answer_sources:
+  - Zeek notice.log
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek signatures.log
+  - >-
+    NAI: Network tap or span port monitoring the ingress/egress of mobile device network segments (Wi-Fi,
+    VPN).
+  range: Last 90 days, with 5-minute entropy aggregation windows.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: >-
+      for tcp sessions where zeek.service=='OTH' and src_ip in mobile_ranges:
+        H = shannon_entropy(first_64_payload_bytes);
+      per device per 5min: meanH = mean(H);
+
+      alert when meanH > p98(all_mobile, window)  # ref threshold ~7.2;
+
+      output src_ip, meanH, session_count.
+- question: >-
+    Does a supervised classifier (Random Forest / Gradient Boosting) label flows from a mobile IP as scanning,
+    corroborated by an unsupervised drift-robust model, and what are the top features behind the verdict?
+  context: >-
+    Train a Random Forest / Gradient Boosting classifier on labeled flow data containing benign traffic
+    and known scanning, using Zeek conn.log / CICFlowMeter features (duration, proto, service, orig_bytes,
+    resp_bytes, conn_state, history, SYN-only flag counts, flow bytes/s); RF on a compact feature subset
+    gives high precision and recall for scan classification. For mobile-origin specificity, augment training
+    with phone-collected flow captures (CICAndMal2017). Deploy alongside an unsupervised model robust
+    to drift and poisoning (One-Class SVM / Isolation Forest with LIME) and surface the top-3 features
+    driving each classification in the alert text. In the Discovery tactic this provides a learned, generalizing
+    detector that complements the deterministic and statistical layers; agreement between the supervised
+    verdict and unsupervised outlier score raises confidence that a mobile device is scanning, while explainable
+    features let analysts validate against legitimate activity.
+  answer_sources:
+  - Zeek notice.log
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek signatures.log
+  - >-
+    NAI: Network tap or span port monitoring the ingress/egress of mobile device network segments (Wi-Fi,
+    VPN).
+  range: Last 90 days for scoring, with periodic retraining on labeled data.
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: >-
+      features = conn_log_or_cicflowmeter([duration,proto,service,orig_bytes,resp_bytes,conn_state,history,syn_only_count,flow_bytes_s]);
+
+      rf_pred = RandomForest_or_GBM.predict(features);
+
+      unsup = OneClassSVM_or_IsolationForest(features);
+
+      alert when rf_pred=='scan' and unsup==outlier;
+
+      output src_ip, rf_prob, unsup_score, top3_features(LIME/SHAP).
