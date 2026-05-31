@@ -1,0 +1,666 @@
+name: 'T1548.005: Abuse Elevation Control Mechanism: Temporary Elevated Cloud Access'
+id: cd5f07b1-8e46-4cff-bcd9-e44193e1427c
+description: Investigate whether an adversary has obtained temporarily elevated access to cloud resources
+  by abusing just-in-time access, account/service-account impersonation, role pass-through, or domain-wide
+  delegation primitives across IaaS (AWS, GCP, Azure), Office Suite (M365/Exchange Online), and Identity
+  Provider (Entra ID, Google Workspace) environments. This playbook helps an analyst hunt for control-plane
+  elevation API calls (AWS AssumeRole/PassRole, GCP generateAccessToken/signJwt/actAs, Exchange ApplicationImpersonation),
+  anomalous role/token parameters such as overlong session durations or first-seen role ARNs, impersonation
+  and delegation grant abuse (GCP serviceAccountTokenCreator, Workspace domain-wide delegation, M365 mailbox
+  delegation), elevation requests from anomalous source IPs/geos/times, bursts of denied elevation/enumeration
+  calls, high-risk post-escalation action sequences, logging tampering correlated with elevation, and
+  anomalous outbound network flows from temporarily-accessed cloud resources. It correlates cloud audit
+  logs with host telemetry (Windows Event IDs 4688/4624/4663/1102) and network telemetry (Zeek conn/dns/ssl
+  logs) to determine whether temporary elevated cloud access has been abused for privilege escalation.
+type: technique
+related:
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there cloud control-plane temporary-elevation API calls (AWS sts:AssumeRole/iam:PassRole
+    paired with resource creation, GCP serviceAccounts.getAccessToken/signJwt/actAs, or Entra/Exchange
+    ApplicationImpersonation role assignment) recorded in cloud audit logs, and do they match the known
+    abusable privilege-escalation combinations?
+  context: 'Temporary-elevation primitives are the core of this technique: a principal requests a role,
+    token, or impersonation right that is distinct from the permissions it normally holds. Watch for AssumeRole/PassRole
+    paired with service creation (lambda:CreateFunction, ec2:RunInstances, glue:CreateDevEndpoint, cloudformation:CreateStack)
+    because these let an attacker pass a privileged role onto a resource they control and inherit its
+    access. In GCP, getAccessToken/signJwt/actAs mint credentials for a service account; in Entra/Exchange,
+    ApplicationImpersonation lets a service principal act as users. A positive result is a control-plane
+    event whose principal, target role/service-account ARN, source IP, and userAgent indicate elevation
+    beyond the principal''s baseline; emit those fields for triage. Validate rules against emulated telemetry
+    (Stratus Red Team) to reduce false negatives. This is tactic-specific to Privilege Escalation: the
+    adversary is reaching for higher-level permissions via cloud features rather than exploiting a host
+    vulnerability.'
+  answer_sources:
+  - AWS CloudTrail (AssumeRole, PassRole, GetSessionToken)
+  - Google Cloud Audit Logs / Workspace Audit (generateAccessToken, signJwt, serviceAccounts.actAs)
+  - Azure AD/Entra ID audit logs, M365 Unified Audit Log
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Cloud control-plane audit pipelines, user workstations, developer endpoints, CI/CD pipeline
+    servers, and network egress points.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "cloud_audit\n| where (provider=='aws' and (eventName in ('AssumeRole','PassRole') ) and relatedEvent\
+      \ in ('CreateFunction','RunInstances','CreateDevEndpoint','CreateStack'))\n   or (provider=='gcp'\
+      \ and methodName in ('GenerateAccessToken','SignJwt','serviceAccounts.actAs'))\n   or (provider\
+      \ in ('entra','exchange') and (role=='ApplicationImpersonation'))\n| project principal, targetRoleArn=targetRole,\
+      \ sourceIPAddress, userAgent, eventName\n| where targetRoleArn not in (baseline_roles[principal])\n\
+      | alert"
+- question: Can temporary-elevation cloud audit events be correlated to a cloud CLI process on a host
+    (Windows Event ID 4688 for aws.exe/az.cmd/gcloud.cmd) and the originating network flow (Zeek conn.log)
+    by source IP within a tight time window?
+  context: Attributing a cloud elevation back to the host and operator that issued it sharply increases
+    confidence and supports response. Join Windows Event ID 4688 events where the process is a known cloud
+    CLI (aws.exe, az.cmd, gcloud.cmd) with Zeek conn.log by source IP within a 5-second window, then correlate
+    to the matching CloudTrail/Audit AssumeRole/PassRole/generateAccessToken event by source IP and identity.
+    A positive result ties an elevation request to a specific endpoint and user; alert when the resulting
+    role/token request is unexpected for that host, or when the source IP matches a high-confidence threat-intel
+    feed. A negative result (no host match) may indicate the request came from outside managed infrastructure,
+    itself worth scrutiny. For Privilege Escalation this confirms who reached for elevated cloud permissions
+    and from where.
+  answer_sources:
+  - AWS CloudTrail (AssumeRole, PassRole, GetSessionToken)
+  - Google Cloud Audit Logs / Workspace Audit (generateAccessToken, signJwt, serviceAccounts.actAs)
+  - Azure AD/Entra ID audit logs, M365 Unified Audit Log
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Cloud control-plane audit pipelines, user workstations, developer endpoints, CI/CD pipeline
+    servers, and network egress points.'
+  range: Last 90 days; pivot with a 5-second correlation window around each elevation event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'evt4688 = win_4688 | where process in (''aws.exe'',''az.cmd'',''gcloud.cmd'')
+
+      conn = zeek_conn
+
+      join evt4688, conn on src_ip within 5s
+
+      join cloud_audit on (src_ip, identity) where eventName in (''AssumeRole'',''PassRole'',''GenerateAccessToken'')
+
+      | where roleOrToken not in expected_for(host) or src_ip in ti_feed
+
+      | alert with principal, host, process, targetRole, src_ip'
+- question: For each principal, is the current (assumed-role ARN, target service account, impersonated
+    user, API action) tuple a first-seen combination versus a 30-90 day baseline?
+  context: Adversaries who abuse temporary elevation frequently request roles, target accounts, or actions
+    the legitimate identity has never used. Per principal, baseline the set of (assumed-role ARN, target
+    service account, impersonated user, API action) tuples over a 30-90 day lookback and alert on first-seen
+    combinations (the Netflix CloudTrail Anomaly Detector / Splunk 'Cloud API Calls From Previously Unseen
+    User Roles' approach). Surface the top-3 reasons (new role, new target, new action) in alert text
+    so an analyst can quickly judge novelty. A positive result is a never-before-seen elevation combination
+    for that identity; benign causes include new projects or onboarding, so corroborate with source IP/time.
+    For Privilege Escalation, first-seen elevation tuples are a high-value lead on permission abuse.
+  answer_sources:
+  - AWS CloudTrail (AssumeRole, PassRole, GetSessionToken)
+  - Google Cloud Audit Logs / Workspace Audit (generateAccessToken, signJwt, serviceAccounts.actAs)
+  - Azure AD/Entra ID audit logs, M365 Unified Audit Log
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Cloud control-plane audit pipelines, user workstations, developer endpoints, CI/CD pipeline
+    servers, and network egress points.'
+  range: Last 90 days (baseline 30-90 day lookback per principal)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = cloud_audit[last 90d] | group by principal -> set(roleArn,targetSA,impersonatedUser,action)\n\
+      today = cloud_audit[now] \n| where (principal, roleArn,targetSA,impersonatedUser,action) not in\
+      \ baseline\n| annotate reasons = which_fields_new(...) | top 3 reasons\n| alert"
+- question: Does a supervised classifier scoring cloud elevation events with host context flag the event
+    as likely-malicious based on API action, role/account novelty, source IP reputation, ASN/geo, requested
+    duration, userAgent, and host process?
+  context: Rule and baseline logic miss novel abuse; a supervised model generalizes across feature combinations.
+    Train a Random Forest/XGBoost classifier on labeled CloudTrail/Audit events plus host context using
+    features such as API action, role/account novelty, source IP reputation, source ASN/geo, requested
+    duration, userAgent, and host process, using the rare-function population-analysis design from Elastic's
+    CloudTrail ML work; emit the top-3 contributing features with each score so analysts understand the
+    verdict. A high score with contributing features like 'new role + bad IP reputation + long duration'
+    is strong evidence of elevation abuse. For Privilege Escalation this provides a holistic, learned
+    signal across cloud and host telemetry.
+  answer_sources:
+  - AWS CloudTrail (AssumeRole, PassRole, GetSessionToken)
+  - Google Cloud Audit Logs / Workspace Audit (generateAccessToken, signJwt, serviceAccounts.actAs)
+  - Azure AD/Entra ID audit logs, M365 Unified Audit Log
+  - Windows Event ID 4688
+  - Zeek conn.log
+  - 'NAI: Cloud control-plane audit pipelines, user workstations, developer endpoints, CI/CD pipeline
+    servers, and network egress points.'
+  range: Last 90 days (model trained on >=90 days labeled history)
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [api_action, role_novelty, ip_reputation, asn, geo, durationSeconds, userAgent,
+      host_process]
+
+      model = RandomForest/XGBoost.train(labeled_cloudtrail_with_host_context)
+
+      score = model.predict_proba(event.features)
+
+      if score > threshold: alert(event, top3=model.explain(event))'
+- question: Do cloud audit requestParameters or Windows Event ID 4688 command lines contain temporary-elevation
+    keywords (assume-role, get-session-token, impersonate-service-account, Get-AzAccessToken, PassRole,
+    generateAccessToken, signJwt) or the known abusable API combinations?
+  context: Many elevation actions are visible either as audit requestParameters or as CLI command lines
+    on the host. Match cloud audit requestParameters and Windows Event ID 4688 command lines for elevation
+    keywords (assume-role, get-session-token, impersonate-service-account, Get-AzAccessToken, PassRole,
+    generateAccessToken, signJwt) and the abusable AWS API combinations documented by Rhino Security Labs.
+    Alert with the full command line, target ARN, and identity context. A positive result is explicit
+    use of an elevation primitive; corroborate the principal and target to judge intent. This is tactic-specific
+    to Privilege Escalation because these verbs are precisely how an actor acquires short-term elevated
+    cloud privileges.
+  answer_sources:
+  - AWS CloudTrail (requestParameters.durationSeconds, roleArn)
+  - Google Cloud Audit Logs (token lifetime, scopes)
+  - Windows Event ID 4688
+  - 'NAI: Cloud audit pipelines, user workstations, servers with cloud SDKs/CLIs installed, and systems
+    managed by infrastructure-as-code.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'kw = /assume-role|get-session-token|impersonate-service-account|Get-AzAccessToken|PassRole|generateAccessToken|signJwt/i
+
+      (cloud_audit.requestParameters matches kw) or (win_4688.CommandLine matches kw)
+
+      | project identity, CommandLine, requestParameters, targetArn
+
+      | alert'
+- question: Is the requested session/token duration an outlier (above the 95th percentile or a hard high-water
+    mark like AWS 12h/43200s), or is the role ARN/target account first-seen, for a given identity-role
+    pair?
+  context: Overlong sessions and never-before-used roles are classic signs of elevation abuse aiming to
+    maximize a foothold. Per identity-role pair, maintain the distribution of requested durationSeconds/token
+    lifetime and the set of seen role ARNs/target accounts. Flag durations above the 95th percentile or
+    a hard high-water mark (e.g., AWS 12h / 43200s) and any first-seen ARN. Use the median-absolute-deviation
+    modified Z-score so periodic batch automation does not distort thresholds. A positive result is an
+    unusually long-lived or novel-target token; benign causes include legitimate long-running jobs, so
+    confirm against the role's normal usage. For Privilege Escalation, a long-duration elevated token
+    gives an attacker durable elevated access.
+  answer_sources:
+  - AWS CloudTrail (requestParameters.durationSeconds, roleArn)
+  - Google Cloud Audit Logs (token lifetime, scopes)
+  - Windows Event ID 4688
+  - 'NAI: Cloud audit pipelines, user workstations, servers with cloud SDKs/CLIs installed, and systems
+    managed by infrastructure-as-code.'
+  range: Last 90 days (per identity-role distribution)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per (identity, roleArn): dur = requestParameters.durationSeconds
+
+      mad_z = 0.6745*(dur - median(dur))/MAD(dur)
+
+      if dur > p95(dur) or dur >= 43200 or mad_z > 3.5 or roleArn not in seen_roles[identity]: alert'
+- question: Does an unsupervised autoencoder trained on benign role-assumption/token-creation parameters
+    produce high reconstruction error for the current request's parameter combination?
+  context: Some anomalous parameter combinations are not captured by single-feature thresholds. Train
+    an unsupervised autoencoder on tokenized role-assumption/token-creation parameters (action, target
+    ARN, duration, scopes, userAgent) from benign administrative activity; high reconstruction error flags
+    anomalous combinations. Combine with the rare-function population approach from Elastic's CloudTrail
+    ML work and surface the top-3 reconstruction-error features. A high reconstruction error indicates
+    the request looks unlike normal administrative elevation; analysts review the contributing features.
+    For Privilege Escalation this detects subtle, multi-field anomalies in how an identity requests elevated
+    access.
+  answer_sources:
+  - AWS CloudTrail (requestParameters.durationSeconds, roleArn)
+  - Google Cloud Audit Logs (token lifetime, scopes)
+  - Windows Event ID 4688
+  - 'NAI: Cloud audit pipelines, user workstations, servers with cloud SDKs/CLIs installed, and systems
+    managed by infrastructure-as-code.'
+  range: Last 90 days (autoencoder trained on benign admin activity)
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = tokenize(action, targetArn, duration, scopes, userAgent)
+
+      ae = Autoencoder.train(benign_elevation_events)
+
+      err = reconstruction_error(ae, X)
+
+      if err > threshold: alert(top3=feature_errors(ae, X))'
+- question: Are impersonation/delegation primitives being granted or used - GCP IAM bindings adding serviceAccountTokenCreator
+    or serviceAccountUser, Google Workspace domain-wide delegation OAuth authorizations with new client
+    IDs/scopes, or Exchange Set-ManagementRoleAssignment -Role ApplicationImpersonation / Add-MailboxPermission
+    to a service principal?
+  context: 'Impersonation and delegation let one identity act as another, often a service account or rarely-used
+    principal, leaving little trace on the victim identity. Alert on grants and use of impersonation primitives:
+    GCP IAM bindings adding roles/iam.serviceAccountTokenCreator or serviceAccountUser, Workspace domain-wide
+    delegation OAuth token authorizations (new client ID/scopes), and Exchange Set-ManagementRoleAssignment
+    -Role ApplicationImpersonation or Add-MailboxPermission to a service principal - per Hunters'' and
+    Unit 42''s DWD research and Rhino''s GCP work. Emit the acting principal, impersonated identity, and
+    scopes. A positive result is creation or use of an impersonation capability; DWD with broad scopes
+    is especially dangerous. For Privilege Escalation these grants are direct escalation paths to act
+    as higher-privileged identities.'
+  answer_sources:
+  - Google Workspace Audit (OAuth token authorizations, client ID, scopes)
+  - Google Cloud Audit Logs (serviceAccounts.getAccessToken, actAs, setIamPolicy)
+  - M365 Unified Audit Log (Add-MailboxPermission, Set-ManagementRoleAssignment)
+  - M365 sign-in logs (service principal to mailbox)
+  - 'NAI: Identity provider audit logs, Workspace/M365 admin audit, GCP IAM policy logs, and service-account
+    activity.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: '(gcp_iam.setIamPolicy where role in (''roles/iam.serviceAccountTokenCreator'',''roles/iam.serviceAccountUser''))
+
+      or (workspace_audit.oauth_authorize where clientId new or scopes new)
+
+      or (m365_unified.cmd in (''Set-ManagementRoleAssignment'',''Add-MailboxPermission'') and role==''ApplicationImpersonation''
+      or grantee is service_principal)
+
+      | project actingPrincipal, impersonatedIdentity, scopes | alert'
+- question: Does any service account or principal impersonate an unusually large number of distinct users
+    or OAuth scopes per day (domain-wide delegation fan-out) versus its baseline?
+  context: A single service account impersonating many users - DWD fan-out - is a strong abuse signal
+    often used for mass mailbox or data access. Per service account/principal, baseline the count of distinct
+    impersonated users and OAuth scopes per day; alert when the distinct-impersonated-identity count exceeds
+    the 99th percentile or a modified Z-score (MAD) threshold. A positive result is a service account
+    suddenly fanning out across many identities; benign causes include legitimate sync/backup apps, which
+    should be allow-listed. For Privilege Escalation, fan-out reveals an attacker leveraging delegation
+    to broadly assume others' privileges.
+  answer_sources:
+  - Google Workspace Audit (OAuth token authorizations, client ID, scopes)
+  - Google Cloud Audit Logs (serviceAccounts.getAccessToken, actAs, setIamPolicy)
+  - M365 Unified Audit Log (Add-MailboxPermission, Set-ManagementRoleAssignment)
+  - M365 sign-in logs (service principal to mailbox)
+  - 'NAI: Identity provider audit logs, Workspace/M365 admin audit, GCP IAM policy logs, and service-account
+    activity.'
+  range: Last 90 days (per-principal daily baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per principal per day: n = distinct(impersonatedUser)
+
+      mad_z = 0.6745*(n - median(n_hist))/MAD(n_hist)
+
+      if n > p99(n_hist) or mad_z > 3.5: alert(principal, n, scopes)'
+- question: Does an IAM graph model flag new or rare impersonation paths (principal -> service account
+    -> resource) as anomalous edges?
+  context: 'Impersonation abuse is naturally a graph problem: who can act as whom, on what resource. Model
+    identity audit trails as a user-role-resource-action graph and score anomalous impersonation edges
+    using GNN-based IAM anomaly detection (CS-GAD and related). Flag new or rare impersonation paths (principal
+    -> service account -> resource) and surface the top-3 contributing edges/features. A positive result
+    is an unusual delegation chain that deviates from learned legitimate structure. For Privilege Escalation
+    this surfaces stealthy multi-hop escalation paths that single-event rules miss.'
+  answer_sources:
+  - Google Workspace Audit (OAuth token authorizations, client ID, scopes)
+  - Google Cloud Audit Logs (serviceAccounts.getAccessToken, actAs, setIamPolicy)
+  - M365 Unified Audit Log (Add-MailboxPermission, Set-ManagementRoleAssignment)
+  - M365 sign-in logs (service principal to mailbox)
+  - 'NAI: Identity provider audit logs, Workspace/M365 admin audit, GCP IAM policy logs, and service-account
+    activity.'
+  range: Last 90 days (graph built over rolling history)
+  queries:
+  - technology: ML/pseudocode
+    query: 'G = build_graph(identity_audit: nodes=principals,SAs,resources; edges=impersonate,actAs,access)
+
+      model = GNN.train(G_history)
+
+      scores = model.score_edges(G_current)
+
+      alert edges where score anomalous, top3=contributing_edges'
+- question: Do any temporary-elevation cloud audit events originate from a sourceIPAddress outside the
+    authorized allow-list of subnets/ASNs (corporate office, VPN, CI/CD runners)?
+  context: Legitimate elevation requests come from a known set of networks; off-list sources suggest compromise
+    or external operation. Maintain an allow-list of authorized source IP subnets/ASNs (corporate office,
+    VPN, CI/CD runners) for role-assumption and impersonation requests. Alert on any temporary-elevation
+    cloud audit event whose sourceIPAddress falls outside the allow-list; correlate with Windows Event
+    ID 4624 (logon) and Zeek conn.log to attribute on-prem-originated requests. A positive result is an
+    elevation from an unexpected network; benign causes include new VPN ranges, which should be added
+    to the allow-list. For Privilege Escalation, off-list elevation strongly suggests an adversary operating
+    from infrastructure you do not control.
+  answer_sources:
+  - AWS CloudTrail (sourceIPAddress, userAgent)
+  - Entra ID/M365 sign-in logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud audit pipelines, VPN concentrators, bastion hosts, corporate LAN/WLAN segments, and authentication
+    logs.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'elev = cloud_audit where eventName in (''AssumeRole'',''PassRole'',''GenerateAccessToken'',''ApplicationImpersonation'')
+
+      | where sourceIPAddress not in allowlist_subnets and asn not in allowlist_asns
+
+      | left join win_4624, zeek_conn on src_ip
+
+      | alert with identity, sourceIPAddress, host'
+- question: For each identity, is an elevation event anomalous in time-of-day (hour-of-day Z-score > 3)
+    or source geography (rising rolling 24h source-country entropy / new country)?
+  context: Attackers operating across time zones produce off-hours and new-geo elevation events. Per identity,
+    profile typical source ASNs, countries, and hour-of-day for elevation events. Flag access where hour-of-day
+    Z-score > 3 from the user mean, and compute rolling 24h source-country entropy; a spike indicates
+    new/unusual locations. Pair with impossible-travel and unusual-location anomalies from the Microsoft
+    Sentinel anomalies reference. A positive result is elevation at an unusual time or from a new country
+    for that identity; benign causes include travel, so corroborate with sign-in logs. For Privilege Escalation,
+    anomalous geo/time around elevation events is a high-signal lead on account abuse.
+  answer_sources:
+  - AWS CloudTrail (sourceIPAddress, userAgent)
+  - Entra ID/M365 sign-in logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud audit pipelines, VPN concentrators, bastion hosts, corporate LAN/WLAN segments, and authentication
+    logs.'
+  range: Last 90 days (per-identity geo/time profile)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per identity: hz = (event.hour - mean_hour)/std_hour
+
+      entropy = country_entropy(last 24h)
+
+      if hz > 3 or entropy_spike or new_country or impossible_travel: alert'
+- question: Does observed per-identity or per-subnet temporary-access request volume exceed the predicted
+    confidence band of a time-series forecast trained on >=30 days of history?
+  context: Sudden bursts of temporary-access requests can indicate scripted abuse; intrusions can reach
+    admin in minutes. Forecast per-identity and per-subnet temporary-access request volume with a time-series
+    model (Prophet/SARIMA) trained on >=30 days of history capturing daily/weekly cycles, alerting when
+    observed volume exceeds the predicted confidence band. A positive result is a volume spike beyond
+    expected seasonality; benign causes include legitimate batch jobs or releases. For Privilege Escalation,
+    a burst onset (minutes, per Sysdig's 8-minute intrusion) of elevation requests can mark an active
+    escalation campaign.
+  answer_sources:
+  - AWS CloudTrail (sourceIPAddress, userAgent)
+  - Entra ID/M365 sign-in logs
+  - Google Cloud Audit Logs
+  - Zeek conn.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud audit pipelines, VPN concentrators, bastion hosts, corporate LAN/WLAN segments, and authentication
+    logs.'
+  range: Last 90 days (forecast model trained on >=30 days)
+  queries:
+  - technology: ML/pseudocode
+    query: 'ts = count(temp_access_requests) per identity per hour
+
+      model = Prophet/SARIMA.fit(ts[>=30d])
+
+      pred, band = model.predict(now)
+
+      if observed > band.upper: alert(identity, observed, pred)'
+- question: Is a single identity generating a burst of denied elevation/IAM responses (CloudTrail AccessDenied/Client.UnauthorizedOperation,
+    GCP PERMISSION_DENIED, or repeated failed ApplicationImpersonation) within a short window?
+  context: Failed elevation probing frequently precedes a successful abuse path as the actor enumerates
+    what it can do. Alert when a single identity generates a burst of AccessDenied/UnauthorizedOperation/PERMISSION_DENIED
+    responses on elevation or IAM actions within a short window, following the Splunk AWS IAM AccessDenied
+    Discovery analytic. Start at >=5 distinct denied actions in 5 minutes and tune per environment. A
+    positive result is a cluster of permission denials on IAM/STS actions; benign causes include misconfigured
+    automation, which should be tuned out. For Privilege Escalation, denial bursts reveal an actor mapping
+    escalation paths before exploiting one.
+  answer_sources:
+  - AWS CloudTrail (errorCode AccessDenied, Client.UnauthorizedOperation)
+  - Google Cloud Audit Logs (PERMISSION_DENIED)
+  - Entra ID/M365 audit logs
+  - 'NAI: Cloud control-plane audit pipelines and IAM/STS API endpoints.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "cloud_audit where errorCode in ('AccessDenied','Client.UnauthorizedOperation','PERMISSION_DENIED')\n\
+      \  and (eventSource in ('iam','sts') or action like 'AssumeRole%|PassRole%|impersonate%')\n| bucket\
+      \ 5m by identity | where distinct(action) >= 5 | alert"
+- question: For each identity, does the denied-vs-successful elevation/IAM call ratio or denied count
+    per hour exceed the 99th percentile or a modified Z-score threshold?
+  context: A normally-quiet principal suddenly producing many denials is high-signal. Per identity, track
+    the ratio and count of denied vs. successful elevation/IAM calls per hour; alert when the denied count
+    exceeds the 99th percentile or a modified Z-score (MAD) threshold; derive the per-dataset threshold
+    from 30-day history. A positive result is an abnormal spike in failures for an identity that rarely
+    fails; benign causes include broken automation or expired credentials. For Privilege Escalation, this
+    statistically isolates accounts probing for elevation rights.
+  answer_sources:
+  - AWS CloudTrail (errorCode AccessDenied, Client.UnauthorizedOperation)
+  - Google Cloud Audit Logs (PERMISSION_DENIED)
+  - Entra ID/M365 audit logs
+  - 'NAI: Cloud control-plane audit pipelines and IAM/STS API endpoints.'
+  range: Last 90 days (30-day baseline per identity)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per identity per hour: denied = count(errorCode in denied_set); ratio = denied/(denied+success)
+
+      mad_z = 0.6745*(denied - median(hist))/MAD(hist)
+
+      if denied > p99(hist) or mad_z > 3.5: alert(identity, denied, ratio)'
+- question: Does a sequence model over per-session IAM/elevation API calls assign low probability to a
+    denial-heavy ordered sequence (scripted permission discovery)?
+  context: Scripted enumeration produces characteristic improbable sequences of mostly-failing IAM calls.
+    Score the ordered sequence of (mostly failing) IAM/elevation API calls per session with variable-order
+    Markov / sequence learning, as in Cloudflare's API-abuse detection; low-probability denial-heavy sequences
+    indicate scripted permission discovery. Surface the top-3 improbable transitions. A positive result
+    is a session whose API-call order is statistically unlike benign administration. For Privilege Escalation,
+    this catches automated tools systematically searching for an escalation path.
+  answer_sources:
+  - AWS CloudTrail (errorCode AccessDenied, Client.UnauthorizedOperation)
+  - Google Cloud Audit Logs (PERMISSION_DENIED)
+  - Entra ID/M365 audit logs
+  - 'NAI: Cloud control-plane audit pipelines and IAM/STS API endpoints.'
+  range: Last 90 days (per-session sequences)
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ordered(iam_calls per session)
+
+      model = VariableOrderMarkov.train(benign_sessions)
+
+      p = model.sequence_prob(seq)
+
+      if p < threshold: alert(session, top3=improbable_transitions)'
+- question: Within 15 minutes after a temporary privilege escalation, does the assumed/impersonated identity
+    or originating host perform a high-risk sequence - sensitive-object access (Windows Event ID 4663
+    on a critical share, S3/Storage GetObject on sensitive buckets) or a Zeek dns.log lookup of a C2-watchlist
+    domain?
+  context: 'Escalation is a means to an end; the actions immediately following it reveal intent. Define
+    a high-risk sequence: an elevation event (CloudTrail AssumeRole/PassRole or Windows Event ID 4688
+    with assume-role) followed within 15 minutes by sensitive-object access (Windows Event ID 4663 on
+    a ''critical'' share, S3/Storage GetObject on sensitive buckets) or a Zeek dns.log entry for a C2-watchlist
+    domain. Alert on the correlated chain by identity/host. A positive result is elevation rapidly followed
+    by sensitive access or C2 contact - strong evidence of active abuse. For Privilege Escalation, this
+    links the escalation to its impact (collection/C2).'
+  answer_sources:
+  - AWS CloudTrail / Cloud Audit Logs (post-elevation API actions)
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File servers hosting sensitive data, database servers, domain controllers, and cloud storage
+    buckets.'
+  range: Last 90 days; correlate within 15 minutes after each elevation event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'elev = elevation_events
+
+      post = (win_4663 on critical_share) or (cloud GetObject on sensitive_bucket) or (zeek_dns in c2_watchlist)
+
+      join elev, post on (identity or host) where post.time within [elev.time, elev.time+15m]
+
+      | alert with chain'
+- question: Using TF-IDF over post-elevation actions, are any actions within 30 minutes of elevation rare
+    for that identity but common in attack playbooks?
+  context: Rare-for-user-but-common-in-attacks actions stand out via TF-IDF weighting. Per identity, baseline
+    the top-N actions taken within 30 minutes of elevation; use TF-IDF to flag actions rare for that identity
+    but common in attack playbooks. A high TF-IDF score for a rare post-escalation action triggers an
+    alert; tune N and threshold from historical benign sessions. A positive result is an unusual post-elevation
+    action (e.g., mass GetObject, CreateAccessKey) for that identity. For Privilege Escalation, this prioritizes
+    the most telling deviations in what an elevated identity actually does next.
+  answer_sources:
+  - AWS CloudTrail / Cloud Audit Logs (post-elevation API actions)
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File servers hosting sensitive data, database servers, domain controllers, and cloud storage
+    buckets.'
+  range: Last 90 days (30-minute post-elevation windows)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each elevation: actions = events[identity within 30m]
+
+      tfidf = TFIDF(action; doc=identity_history; corpus=all_identities)
+
+      if max(tfidf) > threshold: alert(identity, action, tfidf)'
+- question: Does a sequence model (HMM / variable-order Markov / cloud graph) assign low probability to
+    the post-elevation action sequence performed by an identity or host?
+  context: Legitimate post-elevation behavior follows learnable patterns; deviations are suspicious. Model
+    legitimate post-elevation action sequences with a Hidden Markov Model or variable-order Markov / sequence-learning
+    (Cloudflare) and with the cloud graph approach (CS-GAD). Flag low-probability sequences and surface
+    the top-3 improbable steps. A positive result is a post-escalation action chain unlike benign administration.
+    For Privilege Escalation, this detects the broad shape of malicious behavior after elevation, beyond
+    any single action.
+  answer_sources:
+  - AWS CloudTrail / Cloud Audit Logs (post-elevation API actions)
+  - Zeek conn.log
+  - Zeek dns.log
+  - Windows Event ID 4663
+  - Windows Event ID 4688
+  - 'NAI: File servers hosting sensitive data, database servers, domain controllers, and cloud storage
+    buckets.'
+  range: Last 90 days (per-session post-elevation sequences)
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ordered(post_elevation_actions per session)
+
+      model = HMM/VOMarkov.train(benign_post_elevation)
+
+      p = model.prob(seq)
+
+      if p < threshold: alert(top3=improbable_steps)'
+- question: Within 60 minutes of a temporary privilege escalation, does a logging/defense-tampering event
+    occur for the same identity/host - Windows Event ID 1102 (audit log cleared), CloudTrail StopLogging/DeleteTrail/PutEventSelectors,
+    or command lines like wevtutil cl Security or Set-MpPreference -DisableRealtimeMonitoring $true?
+  context: Attackers who just escalated often disable logging or security tooling to evade detection.
+    High-priority alert on Windows Event ID 1102 ('audit log cleared'), CloudTrail StopLogging/DeleteTrail/PutEventSelectors
+    (logging disablement), or Windows Event ID 4688 command lines containing wevtutil cl Security or Set-MpPreference
+    -DisableRealtimeMonitoring $true, especially within 60 minutes of an elevation event for the same
+    identity/host. A positive result is logging/defense tampering tightly following elevation - a strong
+    compound indicator. For Privilege Escalation, this links newly gained privileges to their immediate
+    misuse to blind defenders.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - AWS CloudTrail (StopLogging, DeleteTrail, PutEventSelectors)
+  - 'NAI: Cloud compute instances (VMs), container orchestration platforms, and centralized logging systems.'
+  range: Last 90 days; correlate within 60 minutes of an elevation event
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'tamper = (win_1102) or (cloudtrail in (''StopLogging'',''DeleteTrail'',''PutEventSelectors''))
+      or (win_4688.CommandLine matches /wevtutil cl Security|Set-MpPreference -DisableRealtimeMonitoring
+      \$true/)
+
+      join elevation_events on (identity or host) where tamper.time within [elev.time, elev.time+60m]
+
+      | alert PRIORITY=high'
+- question: Is the time delta between a temporary access grant and a subsequent defense-evasion event
+    for the same identity/host below a threshold (e.g., 60 minutes), indicating a strong temporal link?
+  context: Rapid post-elevation tampering is consistent with minutes-scale intrusion chains. Compute the
+    time delta between a temporary access grant and a subsequent defense-evasion event for the same identity/host;
+    alert when the delta is below a threshold (e.g., 60 minutes). A small delta indicates the two events
+    are likely part of one operation; a positive result is escalation closely followed by evasion. For
+    Privilege Escalation, a short delta strengthens the inference that the escalation was adversarial
+    and is being actively exploited.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - AWS CloudTrail (StopLogging, DeleteTrail, PutEventSelectors)
+  - 'NAI: Cloud compute instances (VMs), container orchestration platforms, and centralized logging systems.'
+  range: Last 90 days (event-centered delta computation)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'for each (identity/host): delta = t(defense_evasion_event) - t(temp_access_grant)
+
+      if 0 <= delta <= 60m: alert(identity, host, delta)'
+- question: Does an LSTM sequence model over post-elevation commands/API actions flag a low-probability
+    sequence such as assume-role -> disable-antivirus -> clear-logs?
+  context: Specific malicious chains (escalate, then evade) are detectable as improbable sequences. Use
+    a sequence model (LSTM) over commands/API actions following an elevation, trained on legitimate administrative
+    sessions; flag low-probability sequences such as assume-role -> disable-antivirus -> clear-logs. Validate
+    against emulated chains from Stratus Red Team and surface the top-3 contributing steps. A positive
+    result is a learned-improbable action chain after elevation. For Privilege Escalation, this captures
+    the escalation-then-defense-evasion playbook end to end.
+  answer_sources:
+  - Windows Event ID 4688
+  - Windows Event ID 1102
+  - AWS CloudTrail (StopLogging, DeleteTrail, PutEventSelectors)
+  - 'NAI: Cloud compute instances (VMs), container orchestration platforms, and centralized logging systems.'
+  range: Last 90 days (per-session post-elevation sequences)
+  queries:
+  - technology: ML/pseudocode
+    query: 'seq = ordered(commands/api after elevation)
+
+      model = LSTM.train(benign_admin_sessions)
+
+      p = model.prob(seq)
+
+      if p < threshold: alert(top3=contributing_steps)'
+- question: Do network connections from cloud resources violate per-VPC allow-lists (non-allow-listed
+    internal destinations/ports), show protocol-port mismatches (port 53/UDP not DNS, 443/TCP without
+    a valid TLS handshake), use anonymization protocols (TOR), or match a high-confidence C2 feed?
+  context: After abusing a temporarily-accessed cloud resource, attackers may use it to reach internal
+    assets or C2 while evading egress filtering. Per VPC/resource group maintain an allow-list of permitted
+    internal destinations/ports and alert on out-of-list connections; also alert on protocol-port mismatches
+    (port 53/UDP not DNS, port 443/TCP without a valid TLS handshake in Zeek ssl.log) and known anonymization
+    protocols (TOR). Ingest a high-confidence C2 feed (updated hourly) and alert on matching destination
+    IPs/domains from cloud IP ranges. A positive result is an off-profile or malicious connection from
+    a cloud resource. For Privilege Escalation, this catches the lateral/C2 use of newly elevated cloud
+    resources.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud network egress points, VPC flow logs, cloud-to-on-premise gateways, and application servers
+    within the cloud environment.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "conn from cloud_resource\n| where dest not in allowlist[vpc] or port not in allowlist_ports[vpc]\n\
+      \   or (port==53/udp and proto!=dns) or (port==443/tcp and no ssl handshake)\n   or dest in tor_nodes\
+      \ or dest in c2_feed\n| alert"
+- question: Does per-resource outbound volume exceed a rolling 30-day mean by >3 standard deviations (or
+    MAD modified Z-score), do inter-arrival times to a destination show very low variance (heartbeat beaconing),
+    or do DNS lookups show DGA/newly-registered domain characteristics?
+  context: Exfiltration and beaconing have statistical fingerprints. Model per-resource outbound volume
+    with a rolling 30-day mean and alert above 3 standard deviations (or a modified Z-score threshold);
+    compute the standard deviation of inter-arrival times to a destination, where a very low value indicates
+    periodic machine 'heartbeat' C2; track domain age/entropy on Zeek dns.log to flag DGA and newly-registered
+    domains. A positive result is a volume spike, regular beacon, or suspicious domain from a cloud resource.
+    For Privilege Escalation, these signals indicate the elevated resource is being used for C2 or exfiltration.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud network egress points, VPC flow logs, cloud-to-on-premise gateways, and application servers
+    within the cloud environment.'
+  range: Last 90 days (rolling 30-day baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'per resource: vol z = (bytes - mean30d)/std30d; if z>3 or mad_z>3.5: alert
+
+      per (resource,dest): jitter = std(inter_arrival); if jitter < eps: alert beacon
+
+      per dns: if domain_entropy high or domain_age < 30d: alert'
+- question: Does an autoencoder trained on per-resource Zeek flow features (protocol, port, duration,
+    bytes, TLS version) flag high-reconstruction-error flows as potential C2/exfiltration?
+  context: Multivariate flow anomalies escape single-metric rules. Train an autoencoder on per-resource
+    Zeek flow features (protocol, port, duration, bytes, TLS version) and flag high-reconstruction-error
+    flows as potential C2/exfiltration; complement with rare-behavior population analysis. Surface the
+    top-3 contributing features. A positive result is a flow that looks unlike the resource's normal traffic.
+    For Privilege Escalation, this detects covert channels established from temporarily-accessed cloud
+    resources that simpler rules miss.
+  answer_sources:
+  - Zeek conn.log
+  - Zeek dns.log
+  - Zeek ssl.log
+  - Windows Event ID 4624
+  - 'NAI: Cloud network egress points, VPC flow logs, cloud-to-on-premise gateways, and application servers
+    within the cloud environment.'
+  range: Last 90 days (autoencoder trained on benign flows)
+  queries:
+  - technology: ML/pseudocode
+    query: 'X = per_resource_flow_features(proto, port, duration, bytes, tls_version)
+
+      ae = Autoencoder.train(benign_flows)
+
+      err = reconstruction_error(ae, X)
+
+      if err > threshold: alert(top3=feature_errors)'
