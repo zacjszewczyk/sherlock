@@ -1,0 +1,270 @@
+name: 'T1691.001: Command Message'
+id: 0f4ef2cf-4efc-48ae-bb26-3e008d2fd57d
+description: 'Investigate whether an adversary has blocked or suppressed OT command messages so that operator
+  actions never reach the intended PLC/RTU, inhibiting response functions that would correct a disruption
+  or unsafe condition. This playbook helps an analyst confirm command-message blocking across three failure
+  modes: (1) commands recorded at the HMI/SCADA layer that never produce a matching protocol request/response
+  or controller acknowledgment on the wire, leaving commanded state diverging from actual state; (2) firewall/host
+  policy edits on HMIs, engineering workstations, or control servers that block outbound OT protocol ports
+  or PLC subnets and cut the command path; and (3) ARP manipulation on the control network that redirects
+  or drops traffic between senders and controllers. It pairs deterministic, protocol-aware correlation
+  and invariant checks with statistical baselining (latency, ack success rate, change-rate, ARP churn)
+  and ML anomaly scoring, keeping the deterministic rules primary and using ML only to surface contributing
+  features.'
+type: technique
+related:
+- tactic_id: TA0107
+  tactic_name: Inhibit Response Function
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Are there OT commands recorded by an HMI or SCADA server that have NO matching protocol request,
+    response, or completion acknowledgment reaching the intended PLC/RTU within a short correlation window?
+  context: When an operator issues a control command, a valid DNP3/Modbus/IEC 61850 request should appear
+    on the wire and the controller should log an execution acknowledgment. By correlating HMI/SCADA command
+    events with Zeek ICS protocol logs and PLC diagnostics in a short sliding window (default 2-5s, tuned
+    to the slowest critical command class) and performing protocol-aware request/response pairing on valid
+    function codes, you can deterministically identify an unmatched pair as a blocked command. Within
+    the Inhibit Response Function tactic this is the highest-confidence signal that an operator's corrective
+    action never reached the controller, so a missing pair while the source believes the command succeeded
+    indicates command-message suppression that could leave an unsafe condition uncorrected.
+  answer_sources:
+  - Zeek (ICS Parsers)
+  - HMI Application Logs
+  - PLC Diagnostic Logs
+  - 'NAI: Control Network Zone (between HMIs/SCADA Servers and PLCs/RTUs), HMI/SCADA Server Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR each HMI_command(target_plc, fn_code, ts) \n  WINDOW = [ts, ts+5s] \n  req = Zeek_ics\
+      \ WHERE dst==target_plc AND fn_code matches AND time IN WINDOW \n  ack = PLC_diag WHERE device==target_plc\
+      \ AND completion AND time IN WINDOW \n  IF req IS NULL OR ack IS NULL THEN ALERT 'blocked command'\
+      \ target_plc, fn_code"
+  - technology: Zeek/pseudocode
+    query: "request_response_pair(dnp3|modbus|iec61850) WHERE valid_function_code; \nemit unmatched_requests\
+      \ AND missing_responses keyed by src,dst,fn_code"
+- question: Does any commanded setpoint or breaker state fail to be reflected in the corresponding actuator/telemetry
+    value within the expected bounded time, breaking a commanded-vs-actual invariant?
+  context: Invariant predicates bind a commanded value (setpoint, breaker open/close) to the actuator
+    or telemetry value that must follow within a bounded time. A dropped command leaves commanded != actual,
+    breaking the invariant and producing an explainable rule violation that names the specific tag and
+    command. Invariants are mined from operational logs so the rule set covers correlated sensor/actuator
+    pairs. For the Inhibit Response Function tactic, a broken commanded-vs-actual invariant directly demonstrates
+    that a safety/operator intervention command had no physical effect, which is exactly the outcome an
+    adversary blocking command messages seeks. A persistent divergence (not transient process lag) is
+    a positive result.
+  answer_sources:
+  - Zeek (ICS Parsers)
+  - HMI Application Logs
+  - PLC Diagnostic Logs
+  - 'NAI: Control Network Zone (between HMIs/SCADA Servers and PLCs/RTUs), HMI/SCADA Server Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "FOR each invariant (cmd_tag -> actual_tag, bound_t): \n  ON command(cmd_tag, value, ts) \n\
+      \    EXPECT actual_tag == value BY ts+bound_t \n    IF actual_tag != value AT ts+bound_t THEN ALERT\
+      \ 'invariant violation' cmd_tag, actual_tag"
+- question: Are critical command classes completing far slower than their established baseline (exceeding
+    the 99th percentile latency) while the source continues issuing commands, indicating selective blocking?
+  context: Measure elapsed time between command submission and controller acknowledgment for each critical
+    command class, and baseline the distribution over 30 days while accounting for the time-varying periodic
+    phases of SCADA polling so the baseline does not drift. Flag commands whose completion time exceeds
+    the 99th percentile while the source keeps issuing commands. In the Inhibit Response Function context,
+    selective blocking often manifests first as abnormal completion latency (delayed or never-arriving
+    acks) for specific command classes; a sharp tail-latency excursion concentrated on safety-relevant
+    commands while routine commands proceed normally suggests targeted suppression rather than general
+    network degradation.
+  answer_sources:
+  - Zeek (ICS Parsers)
+  - HMI Application Logs
+  - PLC Diagnostic Logs
+  - 'NAI: Control Network Zone (between HMIs/SCADA Servers and PLCs/RTUs), HMI/SCADA Server Endpoints'
+  range: Last 90 days (baseline 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "latency = ack_time - submit_time PER command_class \nbaseline_p99 = percentile(latency[30d],\
+      \ 99) PER class, adjusted_for_polling_phase \nALERT WHERE latency > baseline_p99 AND source_still_issuing_commands"
+- question: Has the per-target ratio of acknowledged-to-issued commands dropped sharply or accumulated
+    a persistent small decline (CUSUM) for any PLC/RTU, indicating frozen or missing acknowledgments?
+  context: 'Profile the per-target command success/fail state as a distinct signal: track the ratio of
+    acknowledged to issued commands per PLC/RTU per 5-minute window and apply a stateful CUSUM test so
+    small, persistent drops in ack rate (frozen or missing acknowledgments) accumulate and trip before
+    a single-sample threshold would. Alert when ack success rate falls sharply (e.g., >30% relative drop)
+    or the CUSUM statistic exceeds its calibrated bound. Under Inhibit Response Function, stealthy command
+    blocking may not cause a single dramatic failure but a sustained erosion of acknowledgments; CUSUM
+    is designed to catch exactly this low-and-slow degradation that a static threshold would miss.'
+  answer_sources:
+  - Zeek (ICS Parsers)
+  - HMI Application Logs
+  - PLC Diagnostic Logs
+  - 'NAI: Control Network Zone (between HMIs/SCADA Servers and PLCs/RTUs), HMI/SCADA Server Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "ack_rate[t] = acked_cmds / issued_cmds PER plc PER 5min \nS[t] = max(0, S[t-1] + (baseline_rate\
+      \ - ack_rate[t]) - slack) \nALERT WHERE ack_rate drop > 30% OR S[t] > CUSUM_bound"
+- question: Does a sequence/reconstruction model of command sessions predict a normal completion path
+    but observe missing or delayed acknowledgments, consistent with blocked command messages?
+  context: Train a sequence/reconstruction model (LSTM or 1D-CNN autoencoder) on command submission, request/response
+    timing, byte counts, and controller acknowledgment features; score command sessions higher when the
+    model predicts a normal completion path but observes missing or delayed acknowledgments. Surface the
+    top-3 contributing features (e.g., missing ack, latency, ack-rate drop) in the alert. Because ML-IDS
+    generalize poorly to unseen attacks, keep the deterministic pairing rule primary and use this model
+    as a secondary corroborating signal. For Inhibit Response Function, this catches subtle blocking patterns
+    spanning multiple session features that single-metric rules might not flag, but a positive must be
+    confirmed against the deterministic correlation result.
+  answer_sources:
+  - Zeek (ICS Parsers)
+  - HMI Application Logs
+  - PLC Diagnostic Logs
+  - 'NAI: Control Network Zone (between HMIs/SCADA Servers and PLCs/RTUs), HMI/SCADA Server Endpoints'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [submit_seq, req_resp_timing, byte_counts, ack_flags] \nscore = reconstruction_error(autoencoder(session_features))\
+      \ \nALERT WHERE score > threshold AND predicted_completion BUT ack_missing \nREPORT top3_contributing_features"
+- question: Has a firewall rule been added or modified on an HMI, engineering workstation, or SCADA server
+    that blocks or narrows outbound traffic to PLC subnets or OT protocol ports (TCP 502 Modbus, 20000
+    DNP3, 44818 EtherNet/IP), and did the command path stop reaching the PLC immediately after?
+  context: Monitor Windows Event IDs 4945 (rule listed) and 4947 (rule modified) for rules that block
+    or narrow outbound traffic to PLC subnets or OT protocol ports, then correlate the change with Zeek
+    conn.log to verify the same command path stops reaching the PLC/RTU immediately after the policy edit.
+    Allow-list expected conduits and treat any new block on an established control conduit as suspect.
+    Within Inhibit Response Function, a host-policy edit that severs the command conduit is a direct,
+    deliberate means of suppressing operator commands; correlating the policy change with an observed
+    reachability loss confirms intent and effect rather than coincidental network change.
+  answer_sources:
+  - Windows Event ID 4947
+  - Windows Event ID 4945
+  - Windows Event ID 5157
+  - Zeek conn.log
+  - 'NAI: Human-Machine Interfaces (HMIs), Engineering Workstations (EWS), Control Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "evt = WinEvent IN (4945,4947) WHERE action==block AND (dst_port IN (502,20000,44818) OR dst_subnet\
+      \ IN PLC_subnets) \nAND conduit NOT IN allowlist \nJOIN Zeek_conn WHERE same path stops_reaching_plc\
+      \ AFTER evt.time \nALERT 'OT command path blocked by firewall edit'"
+- question: Has any critical HMI/SCADA host or admin account exceeded its 99th-percentile rate of firewall
+    rule changes, or removed multiple allow rules for the same OT subnet in a short burst?
+  context: Baseline the number of firewall rule changes per host and per admin account over a 30-day window
+    per NIST OT change-control guidance, then alert when a critical HMI/SCADA server exceeds the 99th
+    percentile for firewall edits, or when a short burst removes multiple allow rules for the same OT
+    subnet. For Inhibit Response Function, OT environments are change-averse and firewall edits on control
+    hosts are rare and scheduled; an anomalous spike or a burst of allow-rule removals targeting one OT
+    subnet is a strong indicator of deliberate command suppression and warrants immediate review against
+    approved change tickets.
+  answer_sources:
+  - Windows Event ID 4947
+  - Windows Event ID 4945
+  - Windows Event ID 5157
+  - Zeek conn.log
+  - 'NAI: Human-Machine Interfaces (HMIs), Engineering Workstations (EWS), Control Servers'
+  range: Last 90 days (baseline 30 days)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "changes = count(WinEvent IN (4945,4947)) PER host PER account PER day \np99 = percentile(changes[30d],\
+      \ 99) \nALERT WHERE changes > p99 OR burst_removal(allow_rules, same_subnet) within short_window"
+- question: After a firewall edit, did successful OT connections to a PLC/RTU drop to zero or did blocked-connection
+    counts (Windows Event ID 5157) spike compared to the pre-edit baseline?
+  context: 'Profile the state/failure signal directly: count blocked outbound connections (Windows Event
+    ID 5157) and failed OT connection attempts per source-destination pair in the 10 minutes after a firewall
+    edit, and compare against the pre-edit baseline. Alert when successful OT connections to a PLC/RTU
+    drop to zero or blocked-connection counts spike immediately after a policy change. In the Inhibit
+    Response Function context, this reachability-failure profiling provides the corroborating effect that
+    confirms a firewall change actually severed the command path; a sudden zeroing of successful OT connections
+    or a 5157 spike immediately post-edit is a high-confidence indicator of command blocking.'
+  answer_sources:
+  - Windows Event ID 4947
+  - Windows Event ID 4945
+  - Windows Event ID 5157
+  - Zeek conn.log
+  - 'NAI: Human-Machine Interfaces (HMIs), Engineering Workstations (EWS), Control Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "FOR each firewall_edit(host, ts): \n  pre = success/blocked OT conns PER src-dst BEFORE ts\
+      \ \n  post = same metrics IN [ts, ts+10min] \n  ALERT WHERE post.success_to_plc == 0 OR post.blocked(5157)\
+      \ spikes vs pre"
+- question: Does a classifier of firewall modification events flag an edit that materially reduces reachability
+    to PLCs/RTUs in a way that does not match the site's normal change patterns?
+  context: Train a classifier (Random Forest) on firewall modification events using rule direction, port,
+    subnet, user, time of day, and the subsequent change in successful OT connections. Flag edits that
+    materially reduce reachability to PLCs/RTUs in a way that does not match the site's normal change
+    patterns, and surface the top-3 contributing features via feature importance in the alert. Retain
+    the deterministic rule and reachability checks as the primary signal because ML-IDS generalize poorly
+    to unseen attacks. For Inhibit Response Function, this model helps prioritize suspicious edits among
+    routine ones, but a positive should always be validated against the deterministic OT port-blocking
+    rule and reachability profiling.
+  answer_sources:
+  - Windows Event ID 4947
+  - Windows Event ID 4945
+  - Windows Event ID 5157
+  - Zeek conn.log
+  - 'NAI: Human-Machine Interfaces (HMIs), Engineering Workstations (EWS), Control Servers'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [direction, port, subnet, user, time_of_day, delta_successful_ot_conns] \nlabel\
+      \ = RandomForest.predict(firewall_edit) \nALERT WHERE label==suspicious AND reachability_reduced\
+      \ \nREPORT top3 feature_importances"
+- question: Does any Zeek arp.log reply or unsolicited announcement claim a MAC address that differs from
+    the authoritative IP-to-MAC mapping for a critical PLC, RTU, HMI, or gateway?
+  context: Maintain an authoritative mapping of critical PLC, RTU, HMI, and gateway IP-to-MAC pairs and
+    compare against Zeek arp.log; alert when a reply or unsolicited announcement claims a different MAC
+    for a static OT asset. Where static bindings are impractical, verify a claimed IP-MAC pair with an
+    active probe handshake to deterministically flag falsified pairs before traffic is redirected or dropped.
+    Under Inhibit Response Function, ARP poisoning is a stealthy in-path mechanism to drop or redirect
+    command traffic between an HMI/EWS and a controller; a MAC mismatch for a static OT asset is a deterministic,
+    high-confidence indicator that an attacker is positioning to block command delivery.
+  answer_sources:
+  - Zeek arp.log
+  - 'NAI: Control Network Switches, Control Network Gateways, Critical PLC Network Interfaces'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "FOR each arp.log entry (ip, mac, opcode): \n  IF ip IN authoritative_table AND mac != authoritative_table[ip]\
+      \ THEN \n    ALERT 'ARP spoof on OT asset' ip, claimed_mac \n  ELSE IF no_static_binding THEN active_probe_verify(ip,\
+      \ mac)"
+- question: Has any critical OT asset exceeded its baseline ARP churn (unique MACs, gratuitous ARP, MAC-to-IP
+    changes), shown a single static IP mapping to multiple MACs, or produced a burst of replies without
+    preceding requests?
+  context: Count unique MAC addresses, gratuitous ARP events, and MAC-to-IP changes for each critical
+    OT asset over a 5-minute window. Alert when any device exceeds the 99th percentile of its baseline
+    churn, when a single static IP maps to more than one MAC within the window, or on a burst of replies
+    without preceding requests - the frequency/volume signatures of ARP-based blocking. ICS networks have
+    very stable, low-churn ARP behavior, so for Inhibit Response Function any of these statistical anomalies
+    on a critical control segment strongly suggests active ARP manipulation aimed at redirecting or dropping
+    command messages.
+  answer_sources:
+  - Zeek arp.log
+  - 'NAI: Control Network Switches, Control Network Gateways, Critical PLC Network Interfaces'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "PER asset PER 5min: count(unique_macs), count(gratuitous_arp), count(mac_ip_changes), replies_without_requests\
+      \ \np99 = percentile(metric[baseline], 99) \nALERT WHERE metric > p99 OR one_ip_maps_multiple_macs\
+      \ OR reply_burst_without_requests"
+- question: Does an ARP-behavior anomaly model score any host or segment as deviating from the stable,
+    low-churn ICS baseline in a way that aligns with command-delivery failures?
+  context: Train a multi-layered model (tree ensemble or Isolation Forest plus a neural stage) on ARP
+    opcode, source/destination IP, MAC stability, reply-without-request ratio, and burst timing; score
+    hosts/segments higher when ARP behavior deviates from the stable, low-churn ICS baseline and aligns
+    with command-delivery failures. Surface the top-3 contributing features in the alert and keep authoritative
+    IP-MAC enforcement primary. For Inhibit Response Function, this model can catch subtle, multi-feature
+    ARP manipulation that simple thresholds miss, but because ML-IDS are vulnerable to adversarial evasion,
+    treat its output as corroborating evidence and confirm against the authoritative IP-MAC enforcement
+    rule.
+  answer_sources:
+  - Zeek arp.log
+  - 'NAI: Control Network Switches, Control Network Gateways, Critical PLC Network Interfaces'
+  range: Last 90 days
+  queries:
+  - technology: ML/pseudocode
+    query: "features = [arp_opcode, src_ip, dst_ip, mac_stability, reply_without_request_ratio, burst_timing]\
+      \ \nscore = IsolationForest+NN.anomaly(features) \nALERT WHERE score > threshold AND correlates_with\
+      \ command_delivery_failure \nREPORT top3_contributing_features"
