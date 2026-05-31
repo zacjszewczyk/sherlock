@@ -1,0 +1,254 @@
+name: 'D3-ANCI: Authentication Cache Invalidation'
+id: 72548b96-5e39-4a4f-a710-0cbb0a64df7d
+description: 'Investigate the effectiveness and completeness of authentication cache invalidation (credential
+  eviction) actions taken to evict an adversary from the enterprise. This playbook helps an analyst confirm
+  that targeted sessions and cached credentials (Windows credential cache, Kerberos TGT/TGS tickets, OAuth/SAML
+  tokens) were actually purged, that affected accounts were logged off, and that follow-on authenticated
+  activity for the affected account/host pairs dropped and stayed down. The strongest signals here are
+  failure-mode signals: residual or replayed authentication after the purge (post-purge TGS/TGT requests,
+  refresh-token reuse, periodic re-authentication, new authentication edges) that prove the eviction was
+  incomplete. Use the deterministic symbolic-logic checks as the floor, statistical change-point and periodicity
+  tests to verify the expected drop and surface residual access, and machine-learning models to rank and
+  prioritize probable eviction failures for immediate incident response.'
+type: technique
+related:
+- tactic_id: D3-E
+  tactic_name: Evict
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Before the eviction was issued, which target accounts actually had an active logon session
+    on the affected hosts that needed to be terminated?
+  context: 'Under the Evict tactic, you must first establish ground truth that an account had a live session
+    before you can prove invalidation worked. Identify active logons by finding Windows Event ID 4624
+    (logon) records that have no matching Event ID 4634 (logoff) or 4647 (user-initiated logoff) for the
+    same Logon ID on the target host. Logon ID is the session-lifecycle correlator: an open Logon ID means
+    the session was still alive at eviction time. A positive result (open session found) confirms there
+    is something for cache invalidation to terminate; a negative result means the session may already
+    be gone and post-eviction signals must be interpreted accordingly.'
+  answer_sources: &id001
+  - Windows Event ID 4624
+  - Windows Event ID 4634
+  - Windows Event ID 4647
+  - Windows Event ID 4768
+  - Windows Event ID 4769
+  - Zeek conn.log
+  - OAuth/SAML IdP token revocation logs
+  - 'NAI: Domain Controllers, Member Servers, User Workstations'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID=4624 host=TARGET
+
+      | join type=left LogonId [ search EID IN (4634,4647) host=TARGET ]
+
+      | where isnull(LogoffTime)
+
+      | table host, TargetUserName, LogonId, LogonTime  // open sessions pre-eviction'
+- question: After the invalidation command ran, did every active target Logon ID identified in the pre-check
+    produce a matching logoff, or did any session remain open beyond the expected window?
+  context: This is the deterministic confirmation step for the Evict tactic. For every active target Logon
+    ID found in the pre-check, require a matching Event ID 4634/4647 after the invalidation command. An
+    unmatched (still-open) Logon ID after the expected window is a deterministic failed-eviction indicator.
+    Also document tool-driven re-logon artifacts (PsExec, WMI, scheduled tasks) that could re-establish
+    a session the adversary uses to persist despite eviction. A positive result (all sessions closed)
+    confirms successful eviction; any still-open Logon ID is a hard failure that demands escalation.
+  answer_sources: *id001
+  range: Last 90 days; center the window on the invalidation command time and extend forward by the expected
+    logoff window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'target_logonids = pre_check_open_sessions
+
+      EID IN (4634,4647) host=TARGET LogonId IN target_logonids time>INVALIDATION_TIME
+
+      | stats latest(_time) as LogoffTime by LogonId
+
+      | append [ target_logonids without LogoffTime ]  // unmatched = failed eviction
+
+      | where isnull(LogoffTime)'
+- question: After the cache purge, did the targeted account/host issue any new Kerberos TGT or service-ticket
+    requests, or successful logons, that indicate cached or forged tickets survived eviction?
+  context: Residual Kerberos activity is one of the clearest proofs that authentication cache invalidation
+    failed under the Evict tactic. Monitor Event ID 4769 (service-ticket requests) and 4768 (TGT requests)
+    plus 4624 for the targeted account/host and alert on any new ticket request or successful logon inside
+    the expected lockout/replication window. Flag anomalous encryption types such as RC4 (0x17) or PAC-validation
+    failure (0x1F) that indicate forged/replayed golden/silver tickets surviving eviction. For enterprise-scope
+    eviction (krbtgt double-reset, SAML token-signing cert rotation, token revocation) hunt for forged-token
+    residual access. Any new ticket or logon after the purge is a failed-eviction signal and possible
+    forged-credential indicator.
+  answer_sources: *id001
+  range: Last 90 days; focus tightly on the post-invalidation lockout/AD replication window.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'EID IN (4768,4769,4624) account=TARGET time>INVALIDATION_TIME
+
+      | eval forged = (TicketEncryptionType=="0x17" OR ResultCode=="0x1F")
+
+      | where event_after_purge=true
+
+      | alert  // residual/replayed ticket = incomplete eviction'
+- question: For OAuth/SAML credential caches, did the token revocation succeed (HTTP 200 with all grant-derived
+    tokens invalidated), and was any access or refresh token for the revoked grant subsequently accepted?
+  context: For federated/cloud credential caches under the Evict tactic, treat a successful /revoke (HTTP
+    200 with all grant-derived tokens invalidated) as the success oracle per RFC 7009. Any subsequently
+    accepted access or refresh token for the revoked grant is a deterministic failed-eviction event. Confirm
+    the IdP enforces session-secret invalidation and reauthentication intervals (e.g., AAL2 re-prompt
+    at 12h / 30min inactivity per NIST SP 800-63B) as the expected 'must re-prompt' baseline. A positive
+    result is a clean revoke with no further token acceptance; a negative result is any post-revoke token
+    usage, indicating the adversary retained federated access.
+  answer_sources: *id001
+  range: Last 90 days; correlate revoke timestamp with subsequent token usage.
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'revoke = (idp_log action="/revoke" status=200 grant=G)
+
+      usage  = (idp_log grant=G token_accepted=true time>revoke.time)
+
+      | where usage exists  // accepted token after revoke = failed eviction
+
+      | also check reauth_interval_enforced (AAL2 12h/30min)'
+- question: How long did each session take to actually log off after the invalidation command, and did
+    any session exceed the historical 95th-percentile logoff latency or never log off at all?
+  context: Eviction completion latency quantifies how promptly the Evict action took effect. Calculate
+    time-to-logoff as the interval between the invalidation command time and the first matching Event
+    ID 4634/4647 for each target Logon ID. Track percentile bands by host class and alert when latency
+    exceeds the 95th-percentile baseline; treat unbounded latency (no logoff) as failure. Derive thresholds
+    per environment from your own logoff-latency distribution rather than fixed constants. Excessive or
+    unbounded latency suggests the invalidation propagated slowly or not at all, leaving a window of residual
+    adversary access.
+  answer_sources: *id001
+  range: Last 90 days for baseline distribution; measure per-event latency from the invalidation command.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: '| eval latency = LogoffTime - InvalidationTime
+
+      | stats p95(latency) as p95 by host_class
+
+      | where latency > p95 OR isnull(LogoffTime)
+
+      | alert  // slow or unbounded logoff = eviction failure'
+- question: After eviction, did per-user/per-host authentication and traffic volume show a clear downward
+    change point, or did it remain within the historical active band indicating an incomplete eviction?
+  context: A successful Evict action should produce a measurable, sustained drop in authenticated activity.
+    Build per-user/per-host authentication and traffic series from Event ID 4624/4769 counts and Zeek
+    conn.log bytes/session counts, then apply change-point detection (CUSUM/PELT/Bayesian online) to confirm
+    a downward step at the eviction time. Alert when no change point is detected and the level remains
+    within the historical active band, which signals incomplete eviction. Require the post-eviction volume
+    to fall by at least the historically expected percentage for terminated sessions, derived from prior
+    confirmed evictions. No detected drop means the adversary likely retains active access.
+  answer_sources: *id001
+  range: Last 90 days to establish the series baseline; evaluate the step at the eviction time.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'series = count(EID 4624,4769) + sum(zeek.conn bytes/sessions) by user,host per interval
+
+      | changepoint(method=PELT|CUSUM|BOCPD) at=EVICTION_TIME
+
+      | where no_downward_changepoint AND level within historical_active_band
+
+      | alert  // expected drop not observed = incomplete eviction'
+- question: Across all of the affected identity's authentication edges, did the post-eviction drop occur
+    jointly, and are there individual edges that failed to change and remain as residual-access candidates?
+  context: Eviction must succeed across every edge of an identity, not just one. Model each affected user-host
+    authentication pair as a time series and jointly detect the coordinated post-eviction drop across
+    the identity's edges (changepoint detection on a graph of time series), isolating individual edges
+    that fail to change as residual-access candidates while controlling false positives across many series.
+    Baseline expected edges with rare-edge probability scoring (e.g., CyberGraph) against data such as
+    the LANL Unified Host and Network dataset. An edge that does not drop while the rest of the identity's
+    edges do is a high-confidence residual-access lead under the Evict tactic.
+  answer_sources: *id001
+  range: Last 90 days for graph baseline; assess coordinated change at eviction time.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'graph = edges(user-host auth pairs) as time series
+
+      | joint_changepoint_on_graph at=EVICTION_TIME
+
+      | flag edges where no_drop AND others_dropped
+
+      | score rare_edge_probability  // surviving edge = residual access candidate'
+- question: Does the evicted account show periodic re-authentication after the purge (regular-interval
+    4624/4769), and are post-eviction Kerberos/connection failures rising without successes?
+  context: 'Periodicity distinguishes machine-driven residual access from human noise under the Evict
+    tactic. For the evicted account, test the post-eviction 4624/4769 timestamp series for periodicity
+    using periodogram/Poisson-null periodicity tests; periodic re-auth (service accounts, scheduled tasks,
+    beacons reusing cached credentials) is a strong failed-eviction signal distinct from human bursty
+    logons. Also profile failure rates (4768/4769 failure codes, blocked Zeek connections) as a distinct
+    signal: rising failures with no successes indicates the eviction worked but the adversary is retrying.
+    Regular cadence after eviction points to an automated process still wielding cached credentials.'
+  answer_sources: *id001
+  range: Last 90 days; analyze the post-eviction timestamp series for cadence.
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ts = timestamps(EID 4624,4769) account=TARGET time>INVALIDATION_TIME
+
+      | periodicity_test(method=periodogram|poisson_null)
+
+      | where periodic=true  // automated residual re-auth = failed eviction
+
+      | also: rate(4768/4769 failures, zeek blocked) rising AND successes==0 -> retrying'
+- question: Which eviction events have the highest predicted probability of failure based on session age,
+    host role, ticket-request frequency, edge novelty, and post-action connection persistence?
+  context: To prioritize incident response under the Evict tactic, train a supervised classifier on prior
+    eviction events using features such as session age, host role, ticket-request frequency, edge novelty,
+    and post-action connection persistence to predict eviction-failure probability and rank high-probability
+    failures. Keep the deterministic rules above as the floor and run the model in parallel. Surface the
+    top-3 contributing features (e.g., 'periodic 4769 for account', 'new host edge', 'open Logon ID')
+    in the alert text, not just the score, so analysts can act on explainable leads rather than an opaque
+    ranking.
+  answer_sources: *id001
+  range: Last 90 days of eviction events for scoring; retrain on labeled history.
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [session_age, host_role, ticket_req_freq, edge_novelty, post_action_persistence]
+
+      model = supervised_classifier.train(prior_eviction_events labeled fail/success)
+
+      | predict P(eviction_failure) per event
+
+      | rank desc; emit top_3_contributing_features in alert'
+- question: Among post-eviction authentication events, which new edges or resumed sequences are unexpected
+    for the identity and should be ranked as anomalous residual access?
+  context: After eviction, score post-eviction authentication using a model of expected behavior for the
+    identity and alert on unexpected edges/sequences. Temporal link prediction (GNN+RNN, e.g., Euler)
+    ranks new authentication edges for an evicted identity; self-supervised transformer sequence models
+    flag resumption of an account's authentication sequence; causal-path rarity flags a post-eviction
+    login that starts a new causal path. Cross-check forged/replayed-credential behavior alerts (golden/silver
+    ticket, overpass-the-hash) from Microsoft Defender for Identity. Under the Evict tactic, any high-ranked
+    unexpected edge or resumed sequence after eviction is a strong residual-access lead.
+  answer_sources: *id001
+  range: Last 90 days; rank authentication occurring after the eviction time.
+  queries:
+  - technology: ML/pseudocode
+    query: 'model = temporal_link_prediction(GNN+RNN) | seq_model(transformer) | causal_path_rarity
+
+      | score post_eviction_auth edges/sequences for identity
+
+      | rank unexpected_edges, resumed_sequences, new_causal_paths
+
+      | cross_check forged_credential_alerts (golden/silver, overpass-the-hash)'
+- question: Using a model trained and validated on labeled red-team authentication data, what is the classified
+    probability that each eviction failed, and which failures should be prioritized for immediate response?
+  context: This is the validated-outcome classification step for the Evict tactic. Train a supervised
+    model on prior eviction events using features such as session age, host role, ticket-request frequency,
+    and post-action connection persistence, then predict the probability of eviction failure and prioritize
+    high-probability failures for immediate incident response. Train and validate against labeled red-team
+    authentication data such as the LANL comprehensive cyber-security events dataset to ground the model
+    in realistic adversary behavior. The output is a defensible, validated ranking of suspected eviction
+    failures to drive remediation.
+  answer_sources: *id001
+  range: Last 90 days for inference; train/validate against labeled red-team datasets.
+  queries:
+  - technology: ML/pseudocode
+    query: 'features = [session_age, host_role, ticket_req_freq, post_action_persistence]
+
+      model = supervised.train(LANL labeled red-team events); validate(holdout)
+
+      | predict P(eviction_failure) per event
+
+      | prioritize high_probability_failures for IR'
