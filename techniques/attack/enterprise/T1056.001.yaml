@@ -1,0 +1,714 @@
+name: 'T1056.001: Keylogging'
+id: 92412e29-e381-4e14-8ed4-c86e59a67d90
+description: 'Investigate potential keystroke logging (keylogging) used to intercept user credentials
+  and collect sensitive input. This playbook helps an analyst hunt across the full keylogger lifecycle:
+  the installation of keylogging tooling (file/registry IOC matches, autostart/hook keys, unsigned kernel
+  drivers, suspicious service installs); the active interception of keystrokes (global keyboard hooks
+  via SetWindowsHookEx, GetAsyncKeyState polling, CreateRemoteThread injection into input-handling processes,
+  macOS Quartz event taps/TCC abuse, Linux reads of /dev/input/event*, and network-device firmware tampering);
+  the preparatory clearing of browser cookies to force reauthentication; and the staging, batching, and
+  exfiltration of captured keystrokes (high-entropy staging files/named pipes, incremental small writes,
+  low-and-slow beaconing, rare JA3 fingerprints, DNS tunneling, and file-size-to-bytes-sent correlation).
+  It spans Windows, macOS, Linux, and network devices using endpoint (Windows Event IDs, Sysmon, auditd,
+  macOS unified log) and network (Zeek, PCAP/DPI) telemetry, and pairs symbolic-logic, statistical, and
+  machine-learning methods so analysts can both detect and explain keylogging activity for credential
+  access and collection.'
+type: technique
+related:
+- tactic_id: TA0006
+  tactic_name: Credential Access
+- tactic_id: TA0009
+  tactic_name: Collection
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did any process create a file or modify a registry key/value that matches a known keylogger
+    indicator of compromise, including the autostart/hook keys (AppInit_DLLs, Winlogon Userinit/Shell,
+    Keyboard Layout) abused to load keystroke-capturing DLLs?
+  context: 'Keyloggers supporting Credential Access frequently drop a known binary or set a persistence/hook
+    registry value so their capture DLL loads into interactive sessions. Matching Sysmon file-create (EID
+    11) hashes and registry-modify (EID 13) object paths against a maintained keylogger IOC feed gives
+    a high-confidence detection; explicitly covering AppInit_DLLs, Userinit/Shell, and Keyboard Layout
+    keys catches DLL-injection persistence. A hit warrants host isolation and credential reset for users
+    of that host; no hit lowers but does not eliminate suspicion (custom/unknown tooling). Source method
+    (Symbolic Logic): Query file creation (Sysmon EID 11) and registry modification (Sysmon EID 13) events;
+    alert when a file hash or registry object path matches a maintained keylogger IOC feed. Cover keystroke-relevant
+    autostart/hook keys explicitly: `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows\AppInit_DLLs`,
+    `...\Winlogon\Userinit`/`Shell`, and `HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout\...`,
+    which are abused to load keystroke-capturing DLLs ([About Hooks, Microsoft](https://learn.microsoft.com/en-us/windows/win32/winmsg/about-hooks)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon (EventCode=11 OR EventCode=13)\n  | eval obj=coalesce(TargetFilename,TargetObject)\n\
+      \  | search (Hashes IN (keylogger_ioc_hashes) OR obj IN (keylogger_ioc_paths)\n      OR obj=\"*\\\
+      \\AppInit_DLLs*\" OR obj=\"*\\\\Winlogon\\\\Userinit*\"\n      OR obj=\"*\\\\Winlogon\\\\Shell*\"\
+      \ OR obj=\"*\\\\Keyboard Layout*\")\n  | table _time host Image obj Hashes"
+- question: Is there an anomalous spike in modifications to keylogging-relevant registry keys (e.g., AppInit_DLLs,
+    Userinit) on a host versus its own 90-day baseline, and are blocked tamper attempts being tracked
+    separately?
+  context: 'Even without an exact IOC, a sudden burst of writes to keystroke-hook persistence keys can
+    reveal Credential Access tooling being installed or reconfigured. Building a per-host 90-day daily-frequency
+    baseline and alerting beyond 3 standard deviations surfaces deviations; tracking write success (EID
+    13) versus access-denied (4657/4656) as a distinct state ensures blocked tamper attempts are not lost.
+    A spike on a normally quiet host is suspicious; baseline noise from patching is benign. Source method
+    (Statistical Method): For modifications to keylogging-relevant keys (e.g., `AppInit_DLLs`, `Userinit`),
+    build a 90-day per-host baseline of daily modification frequency (Volume/Frequency) and alert when
+    the daily count exceeds the host mean by >3 standard deviations. Track write success/failure (EID
+    13 vs. access-denied 4657/4656) as a distinct state signal so blocked tamper attempts are not lost
+    ([SwiftOnSecurity Sysmon config baseline informs included keys](https://github.com/SwiftOnSecurity/sysmon-config)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon EventCode=13 TargetObject IN (\"*AppInit_DLLs*\",\"*Userinit*\",\"*Winlogon*\"\
+      )\n  | bin _time span=1d | stats count as daily by host _time\n  | eventstats avg(daily) as mu stdev(daily)\
+      \ as sd by host\n  | where daily > mu + 3*sd\n  | append [search index=wineventlog (EventCode=4657\
+      \ OR EventCode=4656) ObjectName IN (\"*AppInit_DLLs*\",\"*Userinit*\") Accesses=\"DENIED\" | stats\
+      \ count by host]"
+- question: When scored by a Gradient Boosting Machine on registry-modification features (parent image
+    path, target path, value type, value length, signer), which modifications exceed 0.9 likelihood of
+    being keylogger-related, and what are the top SHAP features?
+  context: 'For Credential Access, an ML classifier generalizes beyond static IOCs by learning which registry-write
+    characteristics correlate with keystroke-hook installation. Feeding parent process image path, target
+    registry path, value data type/length, and signer into a GBM and alerting above 0.9 highlights novel
+    tooling; surfacing the top-3 SHAP contributors (e.g., ''AppInit_DLLs path + unsigned parent + long
+    value'') makes the alert explainable and triageable. High scores merit investigation of the parent
+    process lineage. Source method (Machine Learning): Feed registry-modification features (parent process
+    image path, target registry path, value data type, value length, signer) into a Gradient Boosting
+    Machine and alert when score >0.9. Surface the top-3 SHAP contributing features in the alert text
+    so analysts see why it fired (e.g., ''AppInit_DLLs path + unsigned parent + value length''), following
+    the explainable keylogger-classification approach in [Towards Trustworthy Keylogger Detection, Mahmud](https://arxiv.org/abs/2505.16103).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 12
+  - Sysmon Event ID 13
+  - 'NAI: User Workstations, Application Servers, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  features = [parent_image_path, target_reg_path, value_type, value_length, signer]\n\
+      \  score = gbm_model.predict_proba(features)\n  if score > 0.9: alert(top3=shap_values(features))"
+- question: Did a non-allowlisted process create a remote thread (Sysmon EID 8) or access (EID 10, PROCESS_VM_WRITE/QueryInformation)
+    an interactive input-handling process such as explorer.exe, winlogon.exe, or a browser - or on macOS
+    create an event tap after gaining TCC Accessibility, or on Linux open/read /dev/input/event*?
+  context: 'Capturing keystrokes for Credential Access often requires injecting into the process that
+    owns the input message loop, or tapping OS input services. Cross-process thread creation (EID 8) is
+    rare in benign software, making it high-fidelity; EID 10 with VM_WRITE into winlogon/explorer/browsers
+    indicates hook/thread injection. On macOS, a non-allowlisted process granted TCC Accessibility then
+    calling CGEventTapCreate is a classic keylogger pattern; on Linux, a non-input-subsystem process reading
+    /dev/input/event* reads raw keystrokes. Allowlist known injectors to cut false positives. Source method
+    (Symbolic Logic): Alert on Sysmon EID 8 (CreateRemoteThread) or EID 10 (ProcessAccess with PROCESS_VM_WRITE/QueryInformation)
+    where the target is an interactive/input-handling process (e.g., `explorer.exe`, `winlogon.exe`, browsers)
+    and the source is not on a known-good injector allowlist; cross-process thread creation is rare in
+    benign software, making EID 8 high-fidelity ([Sysmon Community Guide: CreateRemoteThread, TrustedSec](https://github.com/trustedsec/SysmonCommunityGuide/blob/master/chapters/create-remote-thread.md)).
+    On macOS, alert when a non-allowlisted process is granted TCC Accessibility and creates an event tap
+    ([Quartz Event Services, Apple](https://developer.apple.com/documentation/coregraphics/quartz_event_services));
+    on Linux, alert when a non-input-subsystem process opens/reads `/dev/input/event*` (auditd open/read).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - macos:unifiedlog
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, VDI fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon (EventCode=8 OR (EventCode=10 AND GrantedAccess IN (\"0x1438\",\"0x143a\"\
+      ,\"PROCESS_VM_WRITE\")))\n  TargetImage IN (\"*explorer.exe\",\"*winlogon.exe\",\"*chrome.exe\"\
+      ,\"*msedge.exe\",\"*firefox.exe\")\n  NOT SourceImage IN (known_good_injectors)\n  | table _time\
+      \ host SourceImage TargetImage GrantedAccess\n  ; macOS: unifiedlog subsystem=com.apple.TCC service=Accessibility\
+      \ granted AND process creates CGEventTap\n  ; Linux: auditd SYSCALL (open|read) path=/dev/input/event*\
+      \ comm NOT IN (Xorg,libinput)"
+- question: Are there processes that load user32.dll (host of SetWindowsHookEx/GetAsyncKeyState) yet have
+    no visible window or message loop and are not known interactive applications?
+  context: 'The keyboard-hook and key-state polling APIs live in user32.dll. A legitimate GUI app loading
+    user32.dll is normal, but a headless/service process loading it while running no message loop is a
+    strong sign of keystroke interception for Credential Access. Correlate Sysmon EID 7 (image load of
+    user32.dll) with the absence of a window/interactive session and exclude known interactive apps. Positive
+    results point to covert hook consumers; benign automation that legitimately uses user32 should be
+    allowlisted. Source method (Symbolic Logic): Alert when a process loads `user32.dll` (the host of
+    SetWindowsHookEx/GetAsyncKeyState) (Sysmon EID 7) yet has no visible window / message loop and is
+    not a known interactive app, isolating keystroke-API consumers from ordinary GUI apps ([About Hooks,
+    Microsoft](https://learn.microsoft.com/en-us/windows/win32/winmsg/about-hooks); [Preventing Malicious
+    Use of Keyloggers, Malla et al](https://arxiv.org/abs/2304.07594)).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - macos:unifiedlog
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, VDI fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=7 ImageLoaded=\"*\\\\user32.dll\"\n  | join ProcessGuid [search\
+      \ index=sysmon EventCode=1 | table ProcessGuid Image has_window]\n  | where has_window=\"false\"\
+      \ AND NOT Image IN (known_interactive_apps)\n  | table _time host Image ProcessGuid"
+- question: On instrumented hosts or sandboxes, do any processes' I/O write byte-rates correlate with
+    an injected synthetic keystroke stream, betraying that they transform keystroke input into proportional
+    storage writes?
+  context: 'A genuine keylogger turns keystroke input into proportional file/exfil writes. By injecting
+    a synthetic keystroke stream on an instrumented host and measuring each process''s write volume, you
+    can flag processes whose write byte-rate tracks the injected keystroke rate - a behavioral signature
+    that does not depend on signatures or IOCs, relevant to confirming Credential Access. A strong correlation
+    strongly implicates the process; no correlation clears it for that test window. Source method (Statistical
+    Method): On instrumented hosts/sandboxes, inject a synthetic keystroke stream and measure each process''s
+    I/O write Volume; flag processes whose write byte-rate correlates with the injected keystroke rate
+    (a genuine keylogger transforms input keystroke volume into proportional storage/exfil writes), per
+    the bait-injection technique of [Bait Your Hooks, Ortolani et al](https://link.springer.com/chapter/10.1007/978-3-642-15512-3_11).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - macos:unifiedlog
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, VDI fleet'
+  range: Last 7 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  inject synthetic_keystroke_stream(rate=R)\n  for proc in processes:\n    corr = pearson(proc.write_bytes_per_sec_series,\
+      \ keystroke_rate_series)\n    if corr > 0.8: alert(proc, corr)"
+- question: Does an LSTM log-key sequence model (DeepLog-style) flag an out-of-distribution event chain
+    of process-create -> user32.dll load / EID 8 injection -> small repeated file/registry writes that
+    deviates from normal Sysmon ordering?
+  context: 'Keylogging for Credential Access produces a characteristic ordering of events: a process starts,
+    loads keystroke libraries or injects a hook, then begins small repeated writes to a log/registry.
+    Training a DeepLog-style LSTM on normal Sysmon process/module/registry/network ordering lets you flag
+    the anomalous chain even when individual events look benign. Reporting the log key that broke the
+    prediction aids explainability. Out-of-distribution sequences merit deep host triage. Source method
+    (Machine Learning): Train an LSTM log-key sequence model (DeepLog-style) on normal Sysmon process/module/registry/network
+    ordering and flag the out-of-distribution chain process-create -> user32.dll load / EID 8 injection
+    -> small repeated file/registry writes; report the log key that broke the prediction for explainability
+    ([DeepLog, Du et al](https://acmccs.github.io/papers/p1285-duA.pdf)).'
+  answer_sources:
+  - Sysmon Event ID 7
+  - Sysmon Event ID 8
+  - Sysmon Event ID 10
+  - Windows Event ID 4688
+  - macos:unifiedlog
+  - auditd:SYSCALL
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, VDI fleet'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  seq = ordered_log_keys(host, window=10m)  # process_create, image_load, remote_thread,\
+      \ file_write, reg_write\n  pred = deeplog_lstm.next_key(seq[:-1])\n  if seq[-1] not in pred.topk:\
+      \ alert(host, broke_at=seq[-1], context=seq)"
+- question: Was an unsigned kernel driver loaded (Sysmon EID 6, Signed=false) whose hash is not on the
+    enterprise allowlist of legitimate unsigned drivers?
+  context: 'Kernel/driver keyloggers read the raw hardware keystroke buffer and therefore require a driver
+    load. Triggering on EID 6 where Signed is false and the hash is unknown surfaces these for Credential
+    Access. Because some legitimate niche drivers are unsigned, an allowlist prevents noise. A non-allowlisted
+    unsigned driver load on a workstation is highly suspicious and warrants immediate driver/file analysis
+    and host isolation. Source method (Symbolic Logic): Trigger on Sysmon EID 6 when ''Signed'' is false
+    and the driver hash is not on the enterprise allowlist of legitimate unsigned drivers; kernel/driver
+    keyloggers read the raw hardware keystroke buffer and require a driver load ([The Evolution of Keylogger
+    Technologies, Salas-Nino et al](https://arxiv.org/abs/2312.10445)).'
+  answer_sources:
+  - Sysmon Event ID 6
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=6 Signed=false\n  NOT Hashes IN (allowlisted_unsigned_driver_hashes)\n\
+      \  | table _time host ImageLoaded Signature Signed Hashes"
+- question: Did a host load a driver whose signer is in the bottom 5th percentile of enterprise-wide signer
+    prevalence, and are blocked/failed driver loads being counted as a separate signal?
+  context: 'Rarity is a powerful heuristic: a driver signed by a publisher almost never seen across the
+    fleet is more likely to be malicious tooling supporting Credential Access. Baseline signer prevalence
+    per host and across the enterprise from the EID 6 Signature field, then alert on bottom-5th-percentile
+    signers; separately count load failures/blocked loads as a distinct state signal so prevented attempts
+    are visible. Rare-signer loads merit reputation lookup and reverse engineering. Source method (Statistical
+    Method): Baseline signer prevalence from the EID 6 ''Signature'' field per host and across the fleet;
+    alert when a loaded driver''s signer is in the bottom 5th percentile of enterprise frequency (rarity),
+    and separately count load failures/blocked loads as a distinct state signal ([The Evolution of Keylogger
+    Technologies, Salas-Nino et al](https://arxiv.org/abs/2312.10445)).'
+  answer_sources:
+  - Sysmon Event ID 6
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon EventCode=6 | stats dc(host) as hosts by Signature\n  | eventstats perc5(hosts)\
+      \ as p5\n  | where hosts <= p5\n  | append [search index=sysmon EventCode=6 LoadResult=\"blocked\"\
+      \ | stats count by Signature host]"
+- question: Does an LSTM anomaly detector flag a statistically significant spike in hourly new service
+    installations (Windows EID 7045) not explained by scheduled deployments?
+  context: 'Driver/keylogger persistence is frequently installed as a service. Modeling hourly EID 7045
+    counts with an LSTM and alerting on spikes that deviate from learned deployment rhythms surfaces bursts
+    of new services consistent with malware install waves for Credential Access. Listing the contributing
+    hosts/timestamps focuses triage. Spikes overlapping change windows are likely benign; off-cycle spikes
+    warrant review of the installed binaries. Source method (Machine Learning): Run an LSTM anomaly detector
+    on hourly counts of new service installations (Windows EID 7045); alert on statistically significant
+    spikes not explained by scheduled deployments, and list the contributing hosts/timestamps in the alert
+    ([DeepLog, Du et al](https://acmccs.github.io/papers/p1285-duA.pdf)).'
+  answer_sources:
+  - Sysmon Event ID 6
+  - Windows Event ID 7045
+  - Windows Event ID 4697
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: User Workstations, Terminal Servers, Privileged Access Workstations, Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  ts = hourly_count(EventCode=7045)\n  resid = ts - lstm.predict(ts)\n  if resid > k*sigma:\
+      \ alert(hosts=top_contributors, times=spike_window)"
+- question: Did a process load user32.dll while its own image path is outside C:\Windows\System32 or C:\Program
+    Files and its parent is not explorer.exe/winlogon.exe?
+  context: 'user32.dll hosts the keyboard-hook APIs, so a binary running from a user-writable/odd path
+    that loads it - especially when not spawned by a normal interactive shell - is a candidate keylogger
+    for Credential Access. Correlate EID 7 (user32 load) with EID 1 (image path and parent) and filter
+    to non-standard paths with non-shell parents. Positive results point to masqueraded or dropped tooling;
+    legitimate apps in standard paths are excluded. Source method (Symbolic Logic): Alert when a process
+    loads `user32.dll` (Sysmon EID 7) while its image path (EID 1) is outside `C:\Windows\System32`/`C:\Program
+    Files` and its parent is not `explorer.exe`/`winlogon.exe`; user32.dll hosts the keyboard-hook APIs
+    ([About Hooks, Microsoft](https://learn.microsoft.com/en-us/windows/win32/winmsg/about-hooks)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=7 ImageLoaded=\"*\\\\user32.dll\"\n  | join ProcessGuid [search\
+      \ index=sysmon EventCode=1 | table ProcessGuid Image ParentImage]\n  | where NOT (Image LIKE \"\
+      C:\\\\Windows\\\\System32\\\\%\" OR Image LIKE \"C:\\\\Program Files%\")\n      AND NOT ParentImage\
+      \ IN (\"*explorer.exe\",\"*winlogon.exe\")\n  | table _time host Image ParentImage"
+- question: Are there newly written executables with Shannon entropy above 7.2 (a packing indicator) that
+    are not signed by a trusted publisher nor allowlisted, especially in temp directories with subsequent
+    small repeated writes?
+  context: 'Packed/obfuscated keyloggers exhibit high file entropy. Computing Shannon entropy on each
+    new EID 11 executable and flagging >7.2 when unsigned/unallowlisted highlights packed droppers used
+    for Credential Access; pairing with the volume signal of later small repeated writes strengthens the
+    case. High-entropy unsigned binaries in temp paths warrant detonation/analysis; signed enterprise
+    software is excluded. Source method (Statistical Method): For each new executable (Sysmon EID 11),
+    compute Shannon entropy and flag entropy >7.2 (packing indicator) when not signed by a trusted publisher
+    and not allowlisted; pair with the Volume signal of subsequent small repeated writes ([The Evolution
+    of Keylogger Technologies, Salas-Nino et al](https://arxiv.org/abs/2312.10445)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon EventCode=11 TargetFilename=\"*.exe\"\n  | eval entropy=shannon(TargetFilename)\n\
+      \  | where entropy > 7.2 AND Signed!=\"true\" AND NOT Hashes IN (allowlist)\n  | table _time host\
+      \ TargetFilename entropy"
+- question: When a One-Class SVM trained on benign user32.dll-loading processes scores live processes
+    (by parent name, command-line length, loaded-DLL count, has-window flag), which are outliers?
+  context: 'Most processes that load user32.dll are ordinary GUI apps; a one-class model learns that benign
+    profile and flags processes that deviate, catching keystroke-API consumers that masquerade as normal
+    for Credential Access. Features include parent name, command-line length, loaded-DLL count, and whether
+    the process has a window. Reporting the top-3 deviating features makes the outlier explainable. Outliers
+    warrant manual review of the process behavior. Source method (Machine Learning): Train a One-Class
+    SVM on benign profiles of processes that load `user32.dll` (parent name, command-line length, loaded-DLL
+    count, has-window flag) and flag outliers; report the top-3 deviating features in the alert ([Towards
+    Trustworthy Keylogger Detection, Mahmud](https://arxiv.org/abs/2505.16103)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 7
+  - Sysmon Event ID 11
+  - 'NAI: User Workstations, Virtual Desktop Infrastructure (VDI) fleet, Terminal Servers.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  X = [parent_name, cmdline_len, loaded_dll_count, has_window]  # procs loading user32.dll\n\
+      \  if ocsvm.decision_function(X) < 0: alert(top3=most_deviating_features(X))"
+- question: Did a non-browser, non-approved process delete files matching browser cookie paths (Sysmon
+    EID 23, TargetFilename contains 'Cookies')?
+  context: 'Adversaries clear browser cookies to force users to reauthenticate so an installed keylogger
+    captures fresh credentials quickly - a precursor behavior for Credential Access. Alerting when a process
+    other than chrome.exe/firefox.exe/msedge.exe or an approved utility deletes cookie files surfaces
+    this manipulation. A non-browser cookie wipe, especially near keylogger indicators, is highly suspicious;
+    browser-initiated cleanup is benign. Source method (Symbolic Logic): Alert when a process deletes
+    files matching browser cookie paths (Sysmon EID 23, `TargetFilename` contains ''Cookies'') and the
+    image is not `chrome.exe`/`firefox.exe`/`msedge.exe` or an approved utility; adversaries clear cookies
+    to force reauthentication so keystrokes capture fresh credentials ([Preventing Malicious Use of Keyloggers,
+    Malla et al](https://arxiv.org/abs/2304.07594)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 23
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=23 TargetFilename=\"*Cookies*\"\n  NOT Image IN (\"*chrome.exe\"\
+      ,\"*firefox.exe\",\"*msedge.exe\", approved_utilities)\n  | table _time host Image TargetFilename"
+- question: Are there files receiving more than 10 writes per minute with an average write size under
+    1KB - the volume/frequency signature of incremental keystroke logging?
+  context: 'Keystroke logs grow through many tiny appends rather than large document saves. Monitoring
+    EID 11 file-modification rate and flagging files with >10 writes/min and average write size <1KB isolates
+    this incremental-write pattern for Credential Access, particularly when it follows a cookie deletion.
+    Such write cadence is anomalous for normal saves; matching files should be pulled and inspected for
+    keystroke content. Source method (Statistical Method): Monitor file-modification rate (Sysmon EID
+    11); flag files receiving >10 writes/min with average write size <1KB (the Volume/Frequency signature
+    of incremental keystroke logging), which is anomalous for normal document saves ([Bait Your Hooks,
+    Ortolani et al](https://link.springer.com/chapter/10.1007/978-3-642-15512-3_11)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 23
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon EventCode=11\n  | bin _time span=1m | stats count as writes avg(WriteSize)\
+      \ as avgsz by host TargetFilename _time\n  | where writes > 10 AND avgsz < 1024\n  | table _time\
+      \ host TargetFilename writes avgsz"
+- question: Does a sequence/HMM model detect the chain of a non-browser cookie deletion (EID 23) -> the
+    same process creating a log file (EID 11) -> an external network connection (EID 3) within five minutes?
+  context: 'The full credential-harvesting preparation chain for Credential Access links cookie clearing,
+    log-file creation, and exfil egress by a single process in a short window. An HMM/sequence model that
+    recognizes this ordered chain raises a high-confidence alert even when each step alone is low signal.
+    Surfacing each step (deletion, log create, connection) aids analyst validation. The complete chain
+    strongly indicates active keylogging with intent to exfiltrate. Source method (Machine Learning):
+    Use an HMM/sequence model to detect the chain: non-browser cookie deletion (EID 23) -> same process
+    creates a log file (EID 11) -> external network connection (EID 3) within 5 minutes; flag the full
+    sequence and surface each step in the alert ([DeepLog, Du et al](https://acmccs.github.io/papers/p1285-duA.pdf)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 23
+  - 'NAI: User Workstations, Web Application Servers, Authentication Servers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  per ProcessGuid within 5m:\n    s1 = EID23 delete *Cookies*\n    s2 = EID11 create logfile\
+      \ (same proc)\n    s3 = EID3 external connection (same proc)\n  if s1->s2->s3: alert(chain=[s1,s2,s3])"
+- question: Did any process create a file, registry entry, or named pipe whose name matches a maintained
+    blocklist of known keylogger staging artifacts, including named-pipe patterns used to relay captured
+    keystrokes to a collector module?
+  context: 'Captured keystrokes are staged before exfiltration, often in a known file, registry value,
+    or named pipe used to pass data to a collector. Matching Sysmon EID 11/13/17 TargetFilename/TargetObject/PipeName
+    against a staging-artifact blocklist gives high-confidence detection of Collection; named-pipe patterns
+    are especially useful for catching modular C2/keylogger relays. A blocklist hit warrants tracing the
+    producing process and any consumer. Source method (Symbolic Logic): Query Sysmon EID 11/13/17 for
+    TargetFilename/TargetObject/PipeName entries that match a maintained blocklist of known keylogger
+    staging artifacts; include named-pipe patterns used to relay captured keystrokes to a collector module
+    ([Detecting Cobalt Strike via Named Pipe Analysis, WithSecure](https://labs.withsecure.com/publications/detecting-cobalt-strike-default-modules-via-named-pipe-analysis)).'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 17
+  - Sysmon Event ID 18
+  - 'NAI: All Enterprise Endpoints (Workstations and Servers), Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon (EventCode=11 OR EventCode=13 OR EventCode=17)\n  | eval obj=coalesce(TargetFilename,TargetObject,PipeName)\n\
+      \  | where obj IN (keylogger_staging_blocklist) OR PipeName IN (known_keylogger_pipe_patterns)\n\
+      \  | table _time host Image obj"
+- question: Are there named pipes (EID 17) or staging filenames (EID 11) with Shannon character entropy
+    above 3.5 created by non-system, rarely-seen processes?
+  context: 'Malware often generates random, high-entropy names for staging pipes/files. Computing character
+    entropy of EID 17 pipe names and EID 11 filenames and flagging >3.5 from non-system creators surfaces
+    randomized staging artifacts for Collection; baselining benign pipe creators ensures only anomalous
+    high-entropy names from rare creators alert. High-entropy names from unusual processes warrant investigation
+    of the staged content and its consumer. Source method (Statistical Method): Compute character (Shannon)
+    entropy of EID 17 pipe names and EID 11 staging filenames; flag entropy >3.5 created by non-system
+    processes, and baseline benign pipe creators so only anomalous high-entropy/random names from rare
+    creators alert ([Detecting Cobalt Strike via Named Pipe Analysis, WithSecure](https://labs.withsecure.com/publications/detecting-cobalt-strike-default-modules-via-named-pipe-analysis)).'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 17
+  - Sysmon Event ID 18
+  - 'NAI: All Enterprise Endpoints (Workstations and Servers), Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon (EventCode=17 OR EventCode=11)\n  | eval nm=coalesce(PipeName,TargetFilename),\
+      \ ent=shannon(nm)\n  | where ent > 3.5 AND NOT Image IN (system_processes) AND NOT Image IN (baseline_pipe_creators)\n\
+      \  | table _time host Image nm ent"
+- question: When a lexical model scores file/registry/pipe names, which staging artifacts receive a high
+    malicious-intent score even without an exact IOC match, and what n-grams/features drive that score?
+  context: 'A lexical classifier learns the character/n-gram patterns typical of malicious staging names,
+    generalizing beyond static IOCs for Collection. Scoring EID 11/13/17 names and alerting on high malicious-intent
+    scores catches novel staging artifacts; emitting the top contributing n-grams/features supports triage.
+    High-scoring names should be correlated with their creating process and downstream network activity.
+    Source method (Machine Learning): Run a lexical model scoring file/registry/pipe names; alert when
+    malicious-intent score is high even without an exact IOC match, and emit the top contributing n-grams/features
+    for triage ([Towards Trustworthy Keylogger Detection, Mahmud](https://arxiv.org/abs/2505.16103)).'
+  answer_sources:
+  - Sysmon Event ID 1
+  - Sysmon Event ID 11
+  - Sysmon Event ID 13
+  - Sysmon Event ID 17
+  - Sysmon Event ID 18
+  - 'NAI: All Enterprise Endpoints (Workstations and Servers), Domain Controllers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  for name in (file_names, reg_names, pipe_names):\n    score = lexical_model.predict(name)\n\
+      \    if score > threshold: alert(name, top_ngrams=explain(name))"
+- question: Do process GUIDs from host keylogger alerts correlate with Zeek conn.log/Sysmon EID 3 connections
+    whose destination IP is on a C2 blocklist or whose domain first appeared in Zeek dns.log within the
+    last 24 hours?
+  context: 'Linking a previously flagged keylogger process to an outbound connection to a known-bad or
+    newly-registered destination confirms the staging-to-exfil pivot of Collection. Correlate host-side
+    process GUIDs with network telemetry and alert on C2-blocklist IPs or freshly observed domains. A
+    match strongly indicates active exfiltration of captured keystrokes and should trigger containment
+    and egress blocking. Source method (Symbolic Logic): Correlate process GUIDs from host keylogger alerts
+    with Zeek conn.log/Sysmon EID 3 and alert if the destination IP is on a C2 blocklist or the domain
+    first appeared in Zeek dns.log within the last 24 hours ([Sysmon EventID 3 Network Connection, Elastic](https://www.elastic.co/docs/reference/security/prebuilt-rules/audit_policies/windows/sysmon_eventid3_network_connection)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  flagged = process_guids_from_keylogger_alerts()\n  index=sysmon EventCode=3 ProcessGuid\
+      \ IN (flagged)\n  | lookup c2_blocklist dest_ip OUTPUT match\n  | join domain [search index=zeek_dns\
+      \ | where first_seen > now()-24h | table domain]\n  | table _time host Image dest_ip domain"
+- question: Are there TLS connections whose JA3 client fingerprint has appeared on fewer than five hosts
+    enterprise-wide over the last 30 days, indicating an atypical exfil client?
+  context: 'A rare JA3 fingerprint can reveal a custom or uncommon TLS client used to exfiltrate keystrokes
+    for Collection. Building a 30-day JA3 frequency table from Zeek ssl.log and flagging hashes seen on
+    fewer than five hosts surfaces these anomalous clients. Rare JA3s warrant correlation with the originating
+    process and destination reputation; common JA3s from standard browsers are excluded. Source method
+    (Statistical Method): Build a 30-day JA3 frequency table from Zeek ssl.log and flag TLS connections
+    whose JA3 hash has appeared on fewer than five hosts enterprise-wide (rarity), indicating an atypical
+    exfil client ([JA3 TLS Fingerprinting, Salesforce](https://github.com/salesforce/ja3)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=zeek_ssl | stats dc(host) as hosts by ja3\n  | where hosts < 5\n  | join ja3 [search\
+      \ index=zeek_ssl | table _time host ja3 server_name dest_ip]\n  | table _time host ja3 server_name\
+      \ dest_ip"
+- question: Which hosts show elevated NXDOMAIN/SERVFAIL rates and high unique-subdomain counts in Zeek
+    dns.log, consistent with a keylogger trickling credentials over DNS?
+  context: 'Low-throughput DNS exfiltration of keystrokes for Collection produces many encoded, often-failing
+    lookups - a failure-mode signal distinct from raw volume. Tracking per-host NXDOMAIN/SERVFAIL rates
+    and unique-subdomain counts highlights hosts tunneling data via DNS. Elevated failed/encoded lookups
+    warrant inspection of query content and the responsible process; normal resolver noise is baselined
+    out. Source method (Statistical Method): Track per-host NXDOMAIN/SERVFAIL rates and unique-subdomain
+    counts in Zeek dns.log; a keylogger trickling credentials over DNS produces elevated failed/encoded
+    lookups, a Failure-Mode signal distinct from volume ([Detection of Low Throughput DNS Exfiltration,
+    Nadler et al](https://arxiv.org/abs/1709.08395)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=zeek_dns | stats count as q sum(eval(rcode_name IN(\"NXDOMAIN\",\"SERVFAIL\")))\
+      \ as fails dc(query) as uniq_sub by host\n  | eval fail_rate=fails/q\n  | where fail_rate > 0.3\
+      \ AND uniq_sub > 200\n  | table host q fails fail_rate uniq_sub"
+- question: Does an ensemble (Random Forest on TLS metadata, Isolation Forest on DNS metadata) score any
+    TLS/DNS traffic as likely keystroke exfiltration, and what features drive the decision?
+  context: 'Combining a Random Forest over TLS metadata (JA3/JA3S, SNI, dest IP/port) with an Isolation
+    Forest over DNS metadata (entropy, query length, request rate) detects covert exfil channels for Collection
+    that single heuristics miss. Alerting on high scores and reporting the top-3 driving features makes
+    results explainable. High-scoring flows should be correlated with host keylogger indicators for confirmation.
+    Source method (Machine Learning): Score TLS metadata (JA3/JA3S, SNI, dest IP/port) with a Random Forest,
+    and DNS metadata (entropy, query length, request rate) with an Isolation Forest; alert on high scores
+    and report the top-3 features driving the decision ([Detection of Low Throughput DNS Exfiltration,
+    Nadler et al](https://arxiv.org/abs/1709.08395); [Towards Trustworthy Keylogger Detection, Mahmud](https://arxiv.org/abs/2505.16103)).'
+  answer_sources:
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek ssl.log
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  tls_score = random_forest.predict([ja3, ja3s, sni, dest_ip, dest_port])\n  dns_score\
+      \ = isolation_forest.score([q_entropy, q_len, req_rate])\n  if tls_score>thr or dns_score>thr: alert(top3=feature_importance())"
+- question: Did a non-browser/non-approved process initiate a Sysmon EID 3 connection to a newly observed
+    domain with payload under 2KB?
+  context: 'Batched keystroke exfil for Collection is typically small and goes to freshly-stood-up infrastructure.
+    Alerting when a non-browser/non-approved process connects to a newly observed domain with payload
+    <2KB surfaces these low-volume beacons. A small connection to a newborn domain from an unexpected
+    process is suspicious and should be correlated with host keylogger indicators; established CDN/service
+    domains are excluded. Source method (Symbolic Logic): Alert when a non-browser/non-approved process
+    initiates a Sysmon EID 3 connection to a Newly Observed Domain with payload <2KB ([Sysmon EventID
+    3 Network Connection, Elastic](https://www.elastic.co/docs/reference/security/prebuilt-rules/audit_policies/windows/sysmon_eventid3_network_connection)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=3 NOT Image IN (browsers, approved_apps)\n  | join DestinationHostname\
+      \ [search index=zeek_dns | where first_seen > now()-24h | table domain]\n  | where bytes_sent <\
+      \ 2048\n  | table _time host Image DestinationHostname bytes_sent"
+- question: For each source-destination pair in Zeek conn.log over 24h, which connections show interval
+    standard deviation below 5 seconds and 95th-percentile orig_bytes under 2048 - the frequency+volume
+    signature of batched keystroke exfil?
+  context: 'Low-and-slow beacons exfiltrating keystrokes for Collection send small, regularly-timed payloads.
+    Computing connection-interval standard deviation and orig_bytes percentiles per source-destination
+    pair and flagging interval SD <5s with orig_bytes <2048 surfaces these heartbeats. Regular small beacons
+    to a single external host warrant process attribution and egress blocking; jittery bursty traffic
+    is less indicative. Source method (Statistical Method): For each source-destination pair in Zeek conn.log
+    over 24h, compute connection-interval standard deviation and 95th-percentile orig_bytes; flag low-and-slow
+    beacons with interval SD below 5s and orig_bytes <2048 (Frequency + Volume signature of batched keystroke
+    exfil) ([RITA, Active Countermeasures](https://github.com/activecm/rita)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 24 hours
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=zeek_conn | stats stdev(interval) as isd perc95(orig_bytes) as p95 count by id.orig_h\
+      \ id.resp_h\n  | where isd < 5 AND p95 < 2048 AND count > 10\n  | table id.orig_h id.resp_h isd\
+      \ p95 count"
+- question: Does an FFT of per-minute connection-count time series per source IP reveal a dominant periodic
+    peak inconsistent with benign periodic services (NTP/updates)?
+  context: 'Beaconing keyloggers exfiltrating on a schedule for Collection create a periodic signal detectable
+    in the frequency domain. Applying an FFT to per-minute connection counts per source IP and flagging
+    a dominant periodic peak surfaces hidden beacons; ranking candidates and excluding known periodic
+    services (NTP, update checks) cuts false positives. A strong periodic peak from an unexpected process
+    warrants investigation of the destination. Source method (Machine Learning): Apply FFT to per-minute
+    connection-count time series per source IP and flag a dominant periodic peak inconsistent with benign
+    services (NTP/updates); rank candidates and exclude known periodic services to cut false positives
+    ([BAYWATCH, Hu et al](https://research.ibm.com/publications/baywatch-robust-beaconing-detection-to-identify-infected-hosts-in-large-scale-enterprise-networks);
+    [RITA, Active Countermeasures](https://github.com/activecm/rita)).'
+  answer_sources:
+  - Zeek conn.log
+  - Sysmon Event ID 3
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Network Egress Points (e.g., Firewalls, Proxies), DNS Resolvers'
+  range: Last 7 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  ts = per_minute_conn_counts(src_ip)\n  spectrum = fft(ts)\n  peak = dominant_frequency(spectrum)\n\
+      \  if peak.power > thr and peak.freq not in benign_service_freqs: alert(src_ip, peak)"
+- question: Did a process write to a single hidden/temp file (Sysmon EID 11) and then make a connection
+    (EID 3 / Zeek conn.log) whose SentBytes are within 10% of that file's total size?
+  context: 'A tight match between a staged keystroke log''s size and the bytes sent in a subsequent connection
+    links collection to exfiltration for Collection. Alerting when a ProcessGuid writes a hidden/temp
+    file then sends a volume within 10% of the file size strongly evidences staged-log exfil. Such a match
+    is high-confidence and should trigger containment; investigate the file contents and destination.
+    Source method (Symbolic Logic): Alert when a ProcessGuid writes to a single hidden/temp file (Sysmon
+    EID 11) and then establishes a connection (EID 3 / Zeek conn.log) whose SentBytes are within 10% of
+    the file''s total size, linking the staged keystroke log to its exfil ([Sysmon EventID 3 Network Connection,
+    Elastic](https://www.elastic.co/docs/reference/security/prebuilt-rules/audit_policies/windows/sysmon_eventid3_network_connection)).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 2
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: ">-\n  index=sysmon EventCode=11 (Attributes=\"*hidden*\" OR TargetFilename=\"*\\\\Temp\\\\\
+      *\")\n  | stats sum(WriteSize) as fsize by ProcessGuid TargetFilename\n  | join ProcessGuid [search\
+      \ index=sysmon EventCode=3 | stats sum(bytes_sent) as sent by ProcessGuid]\n  | where abs(sent-fsize)\
+      \ < 0.1*fsize\n  | table host TargetFilename fsize sent"
+- question: For the same process, is the delta between file modification (EID 2/11) and an outbound connection
+    (EID 3) under 60 seconds with orig_bytes matching the file size within 100 bytes?
+  context: 'Immediate exfil after a staging write is the input-to-write-to-exfil physics of keylogging
+    for Collection. Correlating EID 2/11 modification times with EID 3 connections for the same process
+    and flagging deltas <60s with byte counts matching within 100 bytes catches rapid staged-log transfers.
+    A tight time and volume match is strong evidence of exfiltration; larger gaps or mismatched volumes
+    are weaker signals. Source method (Statistical Method): Correlate EID 2/11 modification times with
+    EID 3 connections for the same process; flag when the delta is <60s and orig_bytes matches file size
+    within 100 bytes (Volume correlation), the same input-to-write-to-exfil physics as bait detection
+    ([Bait Your Hooks, Ortolani et al](https://link.springer.com/chapter/10.1007/978-3-642-15512-3_11)).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 2
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: ">-\n  index=sysmon (EventCode=2 OR EventCode=11) | stats latest(_time) as wtime sum(WriteSize)\
+      \ as fsize by ProcessGuid\n  | join ProcessGuid [search index=sysmon EventCode=3 | stats min(_time)\
+      \ as ctime sum(bytes_sent) as sent by ProcessGuid]\n  | eval delta=ctime-wtime\n  | where delta>=0\
+      \ AND delta<60 AND abs(sent-fsize)<100\n  | table host ProcessGuid delta fsize sent"
+- question: Does a state machine (START -> SUSPICIOUS_FILE_WRITE -> NETWORK_CONNECTION) flag any process
+    that transitions directly from incremental file writes to an outbound transfer?
+  context: 'Modeling the staged-exfil lifecycle for Collection as an explicit state machine raises a high-severity,
+    explainable alert when a process moves from incremental suspicious writes straight to an outbound
+    connection. Including the triggering write and connection in the alert supports rapid validation.
+    A completed state transition is strong evidence of keystroke collection followed by exfiltration and
+    warrants containment. Source method (Machine Learning): Implement a state machine START -> SUSPICIOUS_FILE_WRITE
+    -> NETWORK_CONNECTION that raises a high-severity, explainable alert (with the triggering write and
+    connection) when a process transitions directly from incremental writes to outbound transfer ([DeepLog,
+    Du et al](https://acmccs.github.io/papers/p1285-duA.pdf)).'
+  answer_sources:
+  - Sysmon Event ID 11
+  - Sysmon Event ID 2
+  - Sysmon Event ID 3
+  - Zeek conn.log
+  - Zeek files.log
+  - 'NAI: User Workstations, Application Servers, Network Egress Points'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: ">-\n  state[proc] = START\n  on EID11 small_write(proc): state[proc] = SUSPICIOUS_FILE_WRITE\n\
+      \  on EID3 outbound(proc) and state[proc]==SUSPICIOUS_FILE_WRITE:\n    state[proc] = NETWORK_CONNECTION;\
+      \ alert(proc, write_evt, conn_evt)"
