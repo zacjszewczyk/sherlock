@@ -1,0 +1,1037 @@
+name: 'T1055.009: Process Injection: Proc Memory'
+id: 845a32b6-bc43-449f-baab-bc8a078e2f4e
+description: 'Investigate suspected Linux proc-memory process injection (T1055.009), in which an adversary
+  enumerates a target process''s memory layout via /proc/[pid]/maps and then overwrites its address space
+  via /proc/[pid]/mem (commonly with dd) to execute arbitrary code inside a live, often higher-privileged
+  process. This playbook helps an analyst answer whether an actor used the /proc filesystem to inject
+  code in order to evade process-based defenses (Stealth) and/or escalate privileges (Privilege Escalation).
+  It guides hunting for the high-fidelity read-then-write invariant (maps read followed by a write-capable
+  mem access where the actor is unprivileged and the target is a root-owned daemon), execve of overwrite
+  utilities (dd, sed, perl, python, gdb, strace) whose command line references /proc/*/mem or /proc/*/maps,
+  and the post-injection behavioral drift of the targeted process: unexpected shell/interpreter children,
+  first-ever outbound connections from normally network-silent daemons, suspicious DNS lookups, and sensitive-file
+  access. It combines symbolic-logic correlation rules, statistical rarity/baseline scoring, and machine-learning
+  sequence, outlier, and provenance-graph models across auditd, osquery, Sysmon for Linux, and Zeek telemetry.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0004
+  tactic_name: Privilege Escalation
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Did an unprivileged process read /proc/[pid]/maps and then perform a write-capable access
+    to /proc/[pid]/mem of a root-owned or allowlisted daemon, with the targeted PID (or its children)
+    spawning a shell/interpreter or opening a new outbound connection within ~120 seconds?
+  context: 'This correlation captures the highest-fidelity signature of proc-memory injection: the adversary
+    enumerates offsets and ROP gadgets by reading /proc/[pid]/maps, then overwrites the same region through
+    /proc/[pid]/mem (openat O_WRONLY/O_RDWR followed by write/pwrite64/lseek). Legitimate cross-process
+    /proc/*/mem writes are extremely rare, and the address-linked read-then-write invariant (enumerate,
+    then overwrite) sharply reduces false positives. Key conditions: actor euid != 0 while target uid
+    == 0 or target binary in a privileged allowlist (sshd, systemd, cron, database daemons). Confirm by
+    detecting, within 120 seconds, the target PID or immediate children executing /bin/sh, /bin/bash,
+    python, or perl (Sysmon for Linux EID 1) OR a new outbound connection (EID 3). The alert payload should
+    include actor PID/UID, target PID/UID, target executable, exact /proc paths, and byte-count written
+    so the analyst can gauge how much memory was overwritten. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question: "Has an adversary escalated privileges by injecting code
+    into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'auditd (syscall in [openat,write,pwrite64,lseek]) where path matches "/proc/*/maps" as READ
+
+      | join same host, same actor_pid, within 120s, auditd write-capable access to "/proc/*/mem" (flags
+      O_WRONLY|O_RDWR) as WRITE
+
+      | where actor_euid != 0 AND (target_uid == 0 OR target_exe in [sshd,systemd,cron,mysqld,postgres])
+
+      | join sysmon_linux (EID==1 child in [/bin/sh,/bin/bash,python,perl] OR EID==3 new_outbound) where
+      pid==target_pid OR ppid==target_pid within 120s
+
+      | emit alert(actor_pid,actor_uid,target_pid,target_uid,target_exe,proc_paths,bytes_written)'
+- question: Is the observed /proc/*/maps or /proc/*/mem access statistically anomalous for this executable,
+    user, and host role compared to learned daily/weekly baselines (write frequency, bytes written, map->mem
+    sequence rate, distinct target PIDs touched)?
+  context: 'Benign programs emit a compact, stable set of file/syscall sequences, so cross-process /proc
+    memory access stands out as extreme rarity. Build per-executable/per-user/per-host-role baselines
+    from auditd/osquery and compute: (a) frequency of /proc/*/mem writes per executable per minute, (b)
+    bytes written to /proc/*/mem (volume), (c) map->mem sequence rate, and (d) distinct target PIDs touched
+    per hour (fan-out). Flag events above the 99.9th percentile for the host role and boost severity when
+    the target is a root-owned daemon or when the map->mem transition occurs in under 30 seconds (automation).
+    Also profile failure-mode signals as distinct features: EPERM/EACCES on /proc/*/mem open/write and
+    blocked ptrace attempts, which reveal an adversary probing for an injectable target before succeeding.
+    In the context of the Stealth tactic (TA0005), this directly supports the mission question: "Has an
+    adversary escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = percentiles_by(exe,user,host_role) of\n  [mem_writes_per_min, bytes_written, map_then_mem_rate,\
+      \ distinct_target_pids_per_hour]\nscore event where any_metric > p99.9(host_role)\nboost if target_is_root_daemon\
+      \ OR map_to_mem_delta < 30s\nfeature failed_access = count(EPERM|EACCES on /proc/*/mem) , blocked_ptrace\n\
+      alert if score high"
+- question: Does a sequence/anomaly model over per-process-family syscall and file-access streams flag
+    the ordered pattern open(/proc/[pid]/maps) -> open(/proc/[pid]/mem,write) -> write/pwrite64/lseek
+    as an outlier above a tuned threshold?
+  context: 'Train an anomaly model (HMM or sequence model) over syscall/file-access sequences per Linux
+    process family, separating admin tools from service daemons. HMM syscall models achieve 76-99% detection
+    of behavioral anomalies, and adding call-stack return-address context further disambiguates hijacked
+    control flow. Score live events and alert when a process exhibits the maps-read -> mem-write -> write/pwrite64/lseek
+    sequence above the outlier threshold. Make the alert explainable by attaching the top-3 contributing
+    features (unusual syscall tokens, abnormal inter-event time deltas, the actor/target-UID pairing)
+    so an analyst can quickly judge whether this is benign debugging or genuine injection. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question: "Has an adversary escalated
+    privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = HMM_or_seq_model.fit(syscall_file_sequences group_by process_family)\nlive_score =\
+      \ model.anomaly(sequence[open(/proc/*/maps), open(/proc/*/mem,write), write|pwrite64|lseek])\nif\
+      \ live_score > tuned_threshold:\n   alert(top3_features=[unusual_tokens, time_deltas, target_uid_pairing])"
+- question: Was dd, sed, perl, python, gdb, strace, or a custom binary executed with a command line referencing
+    /proc/ and either /maps or /mem, by a non-root user, alongside contemporaneous map->mem access on
+    the same host?
+  context: 'The dd-over-/proc/[pid]/mem overwrite is the documented proc-injection primitive. Detect execve
+    of dd, sed, perl, python, gdb, strace, or custom binaries whose command line references /proc/ and
+    (/maps or /mem). To suppress benign diagnostics, require correlation: the same actor (non-root) must
+    also produce contemporaneous map->mem access on the host (auditd PATH matching). The actor/target/credential
+    correlation mirrors the proven approach for the sibling ptrace primitive. A positive result is a non-root
+    user running an overwrite utility against another process''s memory map; a negative result is an isolated,
+    well-understood diagnostic by an admin during a maintenance window. In the context of the Stealth
+    tactic (TA0005), this directly supports the mission question: "Has an adversary escalated privileges
+    by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "auditd EID==execve where exe in [dd,sed,perl,python,gdb,strace] OR custom\n  AND cmdline matches\
+      \ \"/proc/\" AND cmdline matches (\"/maps\"|\"/mem\") as UTIL\n| where actor_euid != 0\n| join auditd\
+      \ map_or_mem_access on same host within window as ACCESS\n| emit alert(actor, util_cmdline, target_pid,\
+      \ proc_paths)"
+- question: 'In the 10 minutes after a suspected map->mem sequence, does the targeted process show a behavioral
+    delta: new child-process types, new outbound destinations/ports with abnormal byte ratios, or reads
+    of sensitive files like /etc/shadow or private keys?'
+  context: 'After any suspected map->mem sequence, compute a behavioral delta for the target over the
+    next 10 minutes. Measure new child-process types (Sysmon EID 1), new outbound destinations/ports and
+    byte ratios (Sysmon EID 3 / Zeek conn.log), and sensitive-file reads (/etc/shadow, private keys) via
+    auditd. Network-silent daemons that suddenly connect are strong outliers. Score the delta with weighted
+    per-target-process rarity and alert when multiple features exceed the 99th percentile. Include success/fail
+    state (failed connects, 404/timeout) as distinct signals, since both successful and failed follow-on
+    activity corroborate injected-code execution and help an analyst reconstruct intent. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question: "Has an adversary escalated
+    privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for target_pid in suspected_map_to_mem:\n  window = [t0, t0+10m]\n  delta = {new_child_types,\
+      \ new_out_dest_ports, byte_ratio, sensitive_reads(/etc/shadow,*.key)}\n  rarity = weighted_rarity_per_target_exe(delta)\n\
+      \  alert if count(features > p99) >= 2\n  annotate success_fail(failed_connect, http_404, timeout)"
+- question: Within 15 minutes of a map->mem event, do outbound connections from a Zeek-visible host score
+    as outliers (new destination AS/geo, unusual port, beacon-like periodicity) against a per-host/per-service-role
+    egress model?
+  context: 'For Zeek-visible hosts, train a per-host/per-service-role outbound model over destination
+    AS/geo, port, byte ratios, and periodicity. When a map->mem event occurs, score outbound connections
+    in the next 15 minutes and flag outliers such as a new destination combined with beacon-like periodicity.
+    Where whole-system provenance is available, surface the actor -> /proc/mem -> target -> child -> network
+    path via provenance-graph scoring. Present a compact timeline (proc-maps read -> mem write -> outbound
+    outlier) with the top contributing edges so the analyst can immediately see the chain from injection
+    to C2 and prioritize containment of the implicated host. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question: "Has an adversary escalated privileges by injecting code
+    into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "egress_model = train_per_host_role(conn.log: dest_AS, dest_geo, port, byte_ratio, periodicity)\n\
+      on map_to_mem(host, t0):\n  for c in conn.log[host, t0..t0+15m]:\n    if egress_model.outlier(c)\
+      \ and beacon_like(c):\n       provenance.link(actor->proc_mem->target->child->c)\n       alert(timeline=[maps_read,\
+      \ mem_write, c], top_edges)"
+- question: Was dd (or sed) executed with a command line referencing /proc/ and /mem or /maps, and can
+    the targeted PID be correlated to a write-capable /proc/[pid]/mem access within 5 minutes on the same
+    host?
+  context: 'Alert on execve (auditd or Sysmon for Linux EID 1) where the process name is dd (optionally
+    sed) and the command line references /proc/ and (/mem or /maps) - the documented overwrite primitive.
+    Extract the targeted PID from the command line and correlate it to any auditd PATH/SYSCALL write-capable
+    access to /proc/[pid]/mem within 5 minutes on the same host (the address-linked write invariant).
+    Escalate if the actor euid != 0 or the target PID is a root-owned daemon. This is a focused, high-confidence
+    rule for the canonical dd-based proc injection; a positive result strongly implies an attempt to overwrite
+    another process''s memory, while the absence of a correlated mem write may indicate reconnaissance
+    only. In the context of the Stealth tactic (TA0005), this directly supports the mission question:
+    "Has an adversary escalated privileges by injecting code into a higher-privilege process using the
+    /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'execve where exe in [dd,sed] AND cmdline matches "/proc/" AND cmdline matches ("/mem"|"/maps")
+
+      | extract target_pid from cmdline
+
+      | join auditd write-capable access "/proc/<target_pid>/mem" within 5m same host
+
+      | escalate if actor_euid != 0 OR target_is_root_daemon
+
+      | alert(actor, cmdline, target_pid)'
+- question: Is a dd command line containing /proc/ statistically extreme (>99.9th percentile) versus the
+    environment baseline of dd usage by host role, with risk boosts for PID fan-out, long-running service
+    targets, or execution outside maintenance windows?
+  context: 'Benign tooling emits a stable, compact argument distribution, so a dd command line containing
+    /proc/ is extreme rarity. Maintain an environment baseline of dd usage by host role and flag any dd
+    invocation referencing /proc/ as above the 99.9th percentile. Boost risk when (a) the actor touches
+    multiple target PIDs (fan-out volume), (b) the target is a long-running service, or (c) it occurs
+    outside maintenance windows. Track failed/blocked attempts (EPERM/EACCES) as a distinct probing signal.
+    This statistical lens catches novel or obfuscated variants that a static signature might miss and
+    helps an analyst distinguish a one-off admin command from systematic injection activity. In the context
+    of the Stealth tactic (TA0005), this directly supports the mission question: "Has an adversary escalated
+    privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = arg_distribution(dd) group_by host_role
+
+      flag dd where cmdline contains "/proc/" and rank > p99.9(host_role)
+
+      boost if distinct_target_pids > 1 OR target_is_long_running_service OR outside_maintenance_window
+
+      track_probe = count(EPERM|EACCES) as distinct_signal'
+- question: After a suspicious dd/sed-to-/proc event, do the host's outbound connections over the next
+    15 minutes fall outside historical clusters when scored by an Isolation Forest or One-Class SVM over
+    Zeek conn.log features?
+  context: 'After a suspicious dd/sed-to-/proc event, score the host''s outbound traffic for the next
+    15 minutes with a one-class/clustering model (Isolation Forest or One-Class SVM) over Zeek conn.log
+    features (destination, port, periodicity, bytes), using LIME to expose the drivers. OCSVM is robust
+    under noisy or poisoned baselines. Classify connections falling outside historical clusters as outliers
+    and attach the outlier destinations and timing as post-injection C2 evidence. A positive result links
+    the memory-overwrite primitive to anomalous egress, strongly suggesting injected code is now communicating;
+    the LIME explanation lets the analyst validate which features drove the score. In the context of the
+    Stealth tactic (TA0005), this directly supports the mission question: "Has an adversary escalated
+    privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "model = IsolationForest_or_OCSVM.fit(conn.log[host]: dest, port, periodicity, bytes)\non suspicious_dd_proc(host,\
+      \ t0):\n  for c in conn.log[host, t0..t0+15m]:\n    if model.outlier(c):\n       alert(c, drivers=LIME(c),\
+      \ label=\"post-injection C2 candidate\")"
+- question: 'Can the suspicious /proc-targeting dd event be correlated to high-signal follow-ons: connections
+    to known-bad IPs (Sysmon EID 3), first-seen domain lookups (Zeek dns.log), or shell/interpreter spawns
+    from the target PID?'
+  context: 'Correlate the suspicious /proc-targeting dd event to high-signal follow-ons: Sysmon for Linux
+    EID 3 connections to known-bad IPs, Zeek dns.log queries for first-seen domains, or shell/interpreter
+    spawns from the target PID. Treat the combined sequence (proc write + follow-on) as a high-confidence
+    in-memory execution pattern matching the injection call-chain motif. This rule converts a moderate-confidence
+    overwrite signal into a high-confidence incident by requiring a meaningful next step that betrays
+    adversary objectives - command-and-control, domain resolution, or interactive control - and gives
+    the analyst a ready-made attack narrative for escalation. In the context of the Stealth tactic (TA0005),
+    this directly supports the mission question: "Has an adversary escalated privileges by injecting code
+    into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on suspicious_proc_dd(host, target_pid, t0):\n  followon = (sysmon EID==3 dest in known_bad)\n\
+      \           OR (zeek dns.log query first_seen_domain)\n           OR (sysmon EID==1 child in [sh,bash,python,perl]\
+      \ where ppid==target_pid)\n  if followon within window: alert(sequence=[proc_write, followon], confidence=high)"
+- question: For the targeted process, does a 10-minute behavior score (new child-process types, outbound
+    destination diversity/entropy, byte volume, unusual file accesses) exceed per-executable/per-host-role
+    thresholds across multiple dimensions?
+  context: 'For the targeted process (where determinable), compute a 10-minute behavior score covering
+    new child-process types, outbound destination diversity/entropy, byte volume, and unusual file accesses,
+    compared to a per-executable/per-host-role baseline. Alert when multiple dimensions exceed thresholds
+    simultaneously - for example destination entropy above the 99th percentile AND a first-time child
+    spawned. Include success/fail state (failed DNS/NXDOMAIN, failed connects) so partial or failed activity
+    still contributes signal. Requiring multi-dimensional deviation reduces noise and helps the analyst
+    confirm that the injected code is actively changing the victim process''s behavior rather than a single
+    benign anomaly. In the context of the Stealth tactic (TA0005), this directly supports the mission
+    question: "Has an adversary escalated privileges by injecting code into a higher-privilege process
+    using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_exe_per_role(child_types, dest_entropy, byte_volume, file_access)\nfor target\
+      \ in suspected:\n  score = z(child_types)+z(dest_entropy)+z(byte_volume)+z(file_access)\n  alert\
+      \ if (dest_entropy>p99 AND first_time_child) OR (>=2 dims exceed)\n  annotate fail_state(NXDOMAIN,\
+      \ failed_connect)"
+- question: When a daemon (web, database, SSH) is proximate to /proc memory-tampering signals, does a
+    per-daemon-family provenance/behavior model flag its next actions as anomalous (unusual child + unusual
+    outbound port + unusual syscall mix)?
+  context: 'Train a per-daemon-family model (web, database, SSH) over Sysmon EID 1/3 and auditd syscall
+    aggregates. Provenance-graph learners detect anomalous process/file/network paths around injection
+    without prior signatures. When a daemon is proximate to /proc memory-tampering signals, score its
+    next actions and present the top-3 anomalies - for example an unusual child process plus an unusual
+    outbound port plus an unusual syscall mix - in the alert. This unsupervised approach catches novel
+    injection campaigns against service daemons and gives the analyst an explainable, ranked list of the
+    deviations that justified the alert. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = provenance_or_behavior_model.fit(per_daemon_family: sysmon EID1/3, auditd syscall_aggregates)\n\
+      on proc_tamper_near(daemon, t0):\n  score = model.anomaly(daemon.next_actions)\n  if score high:\
+      \ alert(top3=[unusual_child, unusual_out_port, unusual_syscall_mix])"
+- question: Does a target PID that was subject to write-capable /proc/[pid]/mem access spawn a shell/interpreter
+    or reverse-shell pattern, or make a new outbound connection to a non-RFC1918 address, within 10 minutes?
+  context: 'Identify target PIDs involved in write-capable /proc/[pid]/mem access (auditd SYSCALL+PATH).
+    For each, alert if it (or its immediate children) spawns a shell/interpreter or a known reverse-shell
+    pattern (Sysmon EID 1 command-line heuristics) OR makes a new outbound connection to a non-RFC1918
+    address (Sysmon EID 3) within 10 minutes. Injected processes that were normally network-silent are
+    strong indicators, and the actor/target correlation mirrors the eBPF ptrace-injection signature. A
+    positive result indicates that injected code is now executing under the guise of a legitimate process
+    - the core stealth/evasion objective - and that the victim process should be isolated and inspected.
+    In the context of the Stealth tactic (TA0005), this directly supports the mission question: "Has an
+    adversary escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "targets = auditd write-capable \"/proc/*/mem\" -> target_pid\nfor tp in targets:\n  if (sysmon\
+      \ EID==1 child in [sh,bash,python,perl] OR matches reverse_shell_regex where pid|ppid==tp)\n   \
+      \  OR (sysmon EID==3 new_conn dst not in RFC1918 where pid==tp) within 10m:\n     alert(target_pid=tp,\
+      \ evidence)"
+- question: After a /proc mem-tampering signal involving a critical daemon (sshd, nginx, apache2, mysqld,
+    postgres, dockerd), do its child-process tree or outbound destinations/ports deviate from baseline
+    (first-ever child, new outbound port, unusual destination)?
+  context: 'For critical daemons (sshd, nginx, apache2, mysqld, postgres, dockerd), baseline the typical
+    child-process trees and outbound destinations/ports; benign daemons emit compact, stable behavior
+    sets. After any /proc mem-tampering signal involving that daemon, compute deviations such as a first-ever
+    child spawned, a new outbound port, or an unusual destination, and profile failure state (failed binds/connects).
+    Escalate when deviations cross rarity thresholds, for example a first-ever child combined with a new
+    outbound destination. This focuses scarce analyst attention on the crown-jewel daemons most likely
+    targeted for privilege escalation and persistence, and the failure-state profiling captures partially
+    successful tampering. In the context of the Stealth tactic (TA0005), this directly supports the mission
+    question: "Has an adversary escalated privileges by injecting code into a higher-privilege process
+    using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_daemon(child_tree, out_dest, out_port) for [sshd,nginx,apache2,mysqld,postgres,dockerd]\n\
+      on proc_tamper(daemon, t0):\n  dev = {first_ever_child, new_out_port, unusual_dest}\n  fail = {failed_bind,\
+      \ failed_connect}\n  escalate if first_ever_child AND new_out_dest"
+- question: When a daemon is temporally associated with /proc memory tampering, does a per-daemon-family
+    One-Class SVM or Isolation Forest (child n-grams, outbound features, syscall aggregates) score its
+    behavior as an outlier, with explainable top-3 feature deltas?
+  context: 'Train an outlier detector (One-Class SVM or Isolation Forest) per daemon family using child-process
+    n-grams, outbound features, and syscall aggregates (open/write/exec counts). OCSVM/IF with LIME provide
+    robust, explainable scoring. When a daemon is temporally associated with /proc memory tampering, score
+    its behavior in near real time and include the top-3 feature deltas that drove the score. This near-real-time,
+    explainable outlier detection lets the analyst rapidly triage whether a daemon''s post-tamper behavior
+    is genuinely anomalous, and the feature attribution supports a defensible escalation decision under
+    both stealth and privilege-escalation hypotheses. In the context of the Stealth tactic (TA0005), this
+    directly supports the mission question: "Has an adversary escalated privileges by injecting code into
+    a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = OCSVM_or_IsolationForest.fit(per_daemon_family: child_ngrams, out_features, syscall_aggregates)\n\
+      on proc_tamper_near(daemon, t0):\n  s = model.score(daemon.behavior)\n  if s outlier: alert(top3_deltas=LIME(daemon.behavior))"
+- question: When proc-injection correlations trigger, can a triage bundle be generated (actor PID, target
+    PID, target executable hash/path, recent children, recent outbound peers) with concrete validation
+    steps for the analyst?
+  context: 'When correlations trigger, generate a triage bundle containing the actor PID, target PID,
+    target executable hash/path, recent children, and recent outbound peers. Recommend validation steps
+    consistent with memory-region anomaly analysis used by high-accuracy injection detectors: compare
+    the target binary to the package baseline, inspect /proc/[pid]/maps for anomalous writable+executable
+    (W+X) regions, and confirm active sockets. This turns a detection into an actionable response by handing
+    the analyst a complete evidence package and a checklist, reducing time-to-containment and ensuring
+    the on-disk vs in-memory discrepancy (the hallmark of injection) is actually verified before closing
+    or escalating. In the context of the Stealth tactic (TA0005), this directly supports the mission question:
+    "Has an adversary escalated privileges by injecting code into a higher-privilege process using the
+    /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on correlation_trigger:\n  bundle = {actor_pid, target_pid, target_exe_hash, target_path,\
+      \ recent_children, recent_out_peers}\n  steps = [diff target_binary vs package_baseline,\n     \
+      \      read /proc/<target_pid>/maps -> flag W+X regions,\n           list active sockets for target_pid]\n\
+      \  emit triage(bundle, steps)"
+- question: Across the fleet, does change-point detection on daily counts of how often each executable
+    is implicated as a target of /proc/*/mem write activity reveal a sudden increase signaling coordinated
+    intrusion or tool reuse?
+  context: 'Across the fleet, track how often each executable is implicated as a target of /proc/*/mem
+    write activity and apply change-point detection on the daily counts. A sudden increase for a particular
+    binary or host role signals coordinated intrusion or tool reuse across multiple hosts. List the top
+    implicated hosts for response prioritization, including failed/blocked attempt counts (probing). This
+    fleet-wide view elevates the investigation from a single-host alert to a campaign-level perspective,
+    helping the analyst spot lateral spread of the same proc-injection tooling and prioritize the most-affected
+    systems for containment. In the context of the Stealth tactic (TA0005), this directly supports the
+    mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'daily = count(distinct host) where target_exe implicated in /proc/*/mem write , group_by target_exe,
+      day
+
+      cp = change_point_detect(daily)
+
+      alert exe where cp.spike
+
+      rank top_hosts by implicated_count + failed_attempt_count'
+- question: Does a sequence/provenance model consuming ordered events (/proc/*/maps read -> /proc/*/mem
+    write -> process spawn/network connect) assign a very low probability to the observed sequence and
+    reconstruct the implicated attack subgraph?
+  context: 'Build a sequence/provenance model consuming the ordered events /proc/*/maps read -> /proc/*/mem
+    write -> process spawn/network connect. Node-level provenance-graph GNNs (e.g., ThreaTrace) localize
+    and trace such host-based threats without prior attack knowledge, and graph temporal autoencoders
+    (e.g., KAIROS) automatically reconstruct the attack subgraph. Alert when the observed sequence probability
+    is very low and present a single coherent timeline - data acquisition, processing, results - with
+    the implicated nodes and edges. This gives the analyst an end-to-end, signature-free reconstruction
+    of the injection chain and the surrounding provenance, ideal for confirming both the stealth and privilege-escalation
+    hypotheses and for scoping the incident. In the context of the Stealth tactic (TA0005), this directly
+    supports the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "graph = build_provenance(events: maps_read -> mem_write -> spawn|connect)\nmodel = GNN_or_temporal_autoencoder.fit(graph)\n\
+      if model.seq_prob(observed) < epsilon:\n   subgraph = model.reconstruct(observed)\n   alert(timeline=[acquire,\
+      \ process, results], nodes=subgraph.nodes, edges=subgraph.edges)"
+- question: Did an unprivileged process read /proc/[pid]/maps and then perform a write-capable access
+    to /proc/[pid]/mem of a root-owned or allowlisted daemon, with the targeted PID (or its children)
+    spawning a shell/interpreter or opening a new outbound connection within ~120 seconds?
+  context: 'This correlation captures the highest-fidelity signature of proc-memory injection: the adversary
+    enumerates offsets and ROP gadgets by reading /proc/[pid]/maps, then overwrites the same region through
+    /proc/[pid]/mem (openat O_WRONLY/O_RDWR followed by write/pwrite64/lseek). Legitimate cross-process
+    /proc/*/mem writes are extremely rare, and the address-linked read-then-write invariant (enumerate,
+    then overwrite) sharply reduces false positives. Key conditions: actor euid != 0 while target uid
+    == 0 or target binary in a privileged allowlist (sshd, systemd, cron, database daemons). Confirm by
+    detecting, within 120 seconds, the target PID or immediate children executing /bin/sh, /bin/bash,
+    python, or perl (Sysmon for Linux EID 1) OR a new outbound connection (EID 3). The alert payload should
+    include actor PID/UID, target PID/UID, target executable, exact /proc paths, and byte-count written
+    so the analyst can gauge how much memory was overwritten. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question: "Has an adversary escalated privileges
+    by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'auditd (syscall in [openat,write,pwrite64,lseek]) where path matches "/proc/*/maps" as READ
+
+      | join same host, same actor_pid, within 120s, auditd write-capable access to "/proc/*/mem" (flags
+      O_WRONLY|O_RDWR) as WRITE
+
+      | where actor_euid != 0 AND (target_uid == 0 OR target_exe in [sshd,systemd,cron,mysqld,postgres])
+
+      | join sysmon_linux (EID==1 child in [/bin/sh,/bin/bash,python,perl] OR EID==3 new_outbound) where
+      pid==target_pid OR ppid==target_pid within 120s
+
+      | emit alert(actor_pid,actor_uid,target_pid,target_uid,target_exe,proc_paths,bytes_written)'
+- question: Is the observed /proc/*/maps or /proc/*/mem access statistically anomalous for this executable,
+    user, and host role compared to learned daily/weekly baselines (write frequency, bytes written, map->mem
+    sequence rate, distinct target PIDs touched)?
+  context: 'Benign programs emit a compact, stable set of file/syscall sequences, so cross-process /proc
+    memory access stands out as extreme rarity. Build per-executable/per-user/per-host-role baselines
+    from auditd/osquery and compute: (a) frequency of /proc/*/mem writes per executable per minute, (b)
+    bytes written to /proc/*/mem (volume), (c) map->mem sequence rate, and (d) distinct target PIDs touched
+    per hour (fan-out). Flag events above the 99.9th percentile for the host role and boost severity when
+    the target is a root-owned daemon or when the map->mem transition occurs in under 30 seconds (automation).
+    Also profile failure-mode signals as distinct features: EPERM/EACCES on /proc/*/mem open/write and
+    blocked ptrace attempts, which reveal an adversary probing for an injectable target before succeeding.
+    In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission question:
+    "Has an adversary escalated privileges by injecting code into a higher-privilege process using the
+    /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = percentiles_by(exe,user,host_role) of\n  [mem_writes_per_min, bytes_written, map_then_mem_rate,\
+      \ distinct_target_pids_per_hour]\nscore event where any_metric > p99.9(host_role)\nboost if target_is_root_daemon\
+      \ OR map_to_mem_delta < 30s\nfeature failed_access = count(EPERM|EACCES on /proc/*/mem) , blocked_ptrace\n\
+      alert if score high"
+- question: Does a sequence/anomaly model over per-process-family syscall and file-access streams flag
+    the ordered pattern open(/proc/[pid]/maps) -> open(/proc/[pid]/mem,write) -> write/pwrite64/lseek
+    as an outlier above a tuned threshold?
+  context: 'Train an anomaly model (HMM or sequence model) over syscall/file-access sequences per Linux
+    process family, separating admin tools from service daemons. HMM syscall models achieve 76-99% detection
+    of behavioral anomalies, and adding call-stack return-address context further disambiguates hijacked
+    control flow. Score live events and alert when a process exhibits the maps-read -> mem-write -> write/pwrite64/lseek
+    sequence above the outlier threshold. Make the alert explainable by attaching the top-3 contributing
+    features (unusual syscall tokens, abnormal inter-event time deltas, the actor/target-UID pairing)
+    so an analyst can quickly judge whether this is benign debugging or genuine injection. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question: "Has an
+    adversary escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = HMM_or_seq_model.fit(syscall_file_sequences group_by process_family)\nlive_score =\
+      \ model.anomaly(sequence[open(/proc/*/maps), open(/proc/*/mem,write), write|pwrite64|lseek])\nif\
+      \ live_score > tuned_threshold:\n   alert(top3_features=[unusual_tokens, time_deltas, target_uid_pairing])"
+- question: Was dd, sed, perl, python, gdb, strace, or a custom binary executed with a command line referencing
+    /proc/ and either /maps or /mem, by a non-root user, alongside contemporaneous map->mem access on
+    the same host?
+  context: 'The dd-over-/proc/[pid]/mem overwrite is the documented proc-injection primitive. Detect execve
+    of dd, sed, perl, python, gdb, strace, or custom binaries whose command line references /proc/ and
+    (/maps or /mem). To suppress benign diagnostics, require correlation: the same actor (non-root) must
+    also produce contemporaneous map->mem access on the host (auditd PATH matching). The actor/target/credential
+    correlation mirrors the proven approach for the sibling ptrace primitive. A positive result is a non-root
+    user running an overwrite utility against another process''s memory map; a negative result is an isolated,
+    well-understood diagnostic by an admin during a maintenance window. In the context of the Privilege
+    Escalation tactic (TA0004), this directly supports the mission question: "Has an adversary escalated
+    privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "auditd EID==execve where exe in [dd,sed,perl,python,gdb,strace] OR custom\n  AND cmdline matches\
+      \ \"/proc/\" AND cmdline matches (\"/maps\"|\"/mem\") as UTIL\n| where actor_euid != 0\n| join auditd\
+      \ map_or_mem_access on same host within window as ACCESS\n| emit alert(actor, util_cmdline, target_pid,\
+      \ proc_paths)"
+- question: 'In the 10 minutes after a suspected map->mem sequence, does the targeted process show a behavioral
+    delta: new child-process types, new outbound destinations/ports with abnormal byte ratios, or reads
+    of sensitive files like /etc/shadow or private keys?'
+  context: 'After any suspected map->mem sequence, compute a behavioral delta for the target over the
+    next 10 minutes. Measure new child-process types (Sysmon EID 1), new outbound destinations/ports and
+    byte ratios (Sysmon EID 3 / Zeek conn.log), and sensitive-file reads (/etc/shadow, private keys) via
+    auditd. Network-silent daemons that suddenly connect are strong outliers. Score the delta with weighted
+    per-target-process rarity and alert when multiple features exceed the 99th percentile. Include success/fail
+    state (failed connects, 404/timeout) as distinct signals, since both successful and failed follow-on
+    activity corroborate injected-code execution and help an analyst reconstruct intent. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question: "Has an
+    adversary escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for target_pid in suspected_map_to_mem:\n  window = [t0, t0+10m]\n  delta = {new_child_types,\
+      \ new_out_dest_ports, byte_ratio, sensitive_reads(/etc/shadow,*.key)}\n  rarity = weighted_rarity_per_target_exe(delta)\n\
+      \  alert if count(features > p99) >= 2\n  annotate success_fail(failed_connect, http_404, timeout)"
+- question: Within 15 minutes of a map->mem event, do outbound connections from a Zeek-visible host score
+    as outliers (new destination AS/geo, unusual port, beacon-like periodicity) against a per-host/per-service-role
+    egress model?
+  context: 'For Zeek-visible hosts, train a per-host/per-service-role outbound model over destination
+    AS/geo, port, byte ratios, and periodicity. When a map->mem event occurs, score outbound connections
+    in the next 15 minutes and flag outliers such as a new destination combined with beacon-like periodicity.
+    Where whole-system provenance is available, surface the actor -> /proc/mem -> target -> child -> network
+    path via provenance-graph scoring. Present a compact timeline (proc-maps read -> mem write -> outbound
+    outlier) with the top contributing edges so the analyst can immediately see the chain from injection
+    to C2 and prioritize containment of the implicated host. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question: "Has an adversary escalated privileges
+    by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - linux:osquery (process events; /proc/*/maps access)
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - Zeek conn.log
+  - 'NAI: Critical Linux servers (e.g., database servers, web servers), Crown Jewel application hosts,
+    Kubernetes nodes'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "egress_model = train_per_host_role(conn.log: dest_AS, dest_geo, port, byte_ratio, periodicity)\n\
+      on map_to_mem(host, t0):\n  for c in conn.log[host, t0..t0+15m]:\n    if egress_model.outlier(c)\
+      \ and beacon_like(c):\n       provenance.link(actor->proc_mem->target->child->c)\n       alert(timeline=[maps_read,\
+      \ mem_write, c], top_edges)"
+- question: Was dd (or sed) executed with a command line referencing /proc/ and /mem or /maps, and can
+    the targeted PID be correlated to a write-capable /proc/[pid]/mem access within 5 minutes on the same
+    host?
+  context: 'Alert on execve (auditd or Sysmon for Linux EID 1) where the process name is dd (optionally
+    sed) and the command line references /proc/ and (/mem or /maps) - the documented overwrite primitive.
+    Extract the targeted PID from the command line and correlate it to any auditd PATH/SYSCALL write-capable
+    access to /proc/[pid]/mem within 5 minutes on the same host (the address-linked write invariant).
+    Escalate if the actor euid != 0 or the target PID is a root-owned daemon. This is a focused, high-confidence
+    rule for the canonical dd-based proc injection; a positive result strongly implies an attempt to overwrite
+    another process''s memory, while the absence of a correlated mem write may indicate reconnaissance
+    only. In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission
+    question: "Has an adversary escalated privileges by injecting code into a higher-privilege process
+    using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'execve where exe in [dd,sed] AND cmdline matches "/proc/" AND cmdline matches ("/mem"|"/maps")
+
+      | extract target_pid from cmdline
+
+      | join auditd write-capable access "/proc/<target_pid>/mem" within 5m same host
+
+      | escalate if actor_euid != 0 OR target_is_root_daemon
+
+      | alert(actor, cmdline, target_pid)'
+- question: Is a dd command line containing /proc/ statistically extreme (>99.9th percentile) versus the
+    environment baseline of dd usage by host role, with risk boosts for PID fan-out, long-running service
+    targets, or execution outside maintenance windows?
+  context: 'Benign tooling emits a stable, compact argument distribution, so a dd command line containing
+    /proc/ is extreme rarity. Maintain an environment baseline of dd usage by host role and flag any dd
+    invocation referencing /proc/ as above the 99.9th percentile. Boost risk when (a) the actor touches
+    multiple target PIDs (fan-out volume), (b) the target is a long-running service, or (c) it occurs
+    outside maintenance windows. Track failed/blocked attempts (EPERM/EACCES) as a distinct probing signal.
+    This statistical lens catches novel or obfuscated variants that a static signature might miss and
+    helps an analyst distinguish a one-off admin command from systematic injection activity. In the context
+    of the Privilege Escalation tactic (TA0004), this directly supports the mission question: "Has an
+    adversary escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'baseline = arg_distribution(dd) group_by host_role
+
+      flag dd where cmdline contains "/proc/" and rank > p99.9(host_role)
+
+      boost if distinct_target_pids > 1 OR target_is_long_running_service OR outside_maintenance_window
+
+      track_probe = count(EPERM|EACCES) as distinct_signal'
+- question: After a suspicious dd/sed-to-/proc event, do the host's outbound connections over the next
+    15 minutes fall outside historical clusters when scored by an Isolation Forest or One-Class SVM over
+    Zeek conn.log features?
+  context: 'After a suspicious dd/sed-to-/proc event, score the host''s outbound traffic for the next
+    15 minutes with a one-class/clustering model (Isolation Forest or One-Class SVM) over Zeek conn.log
+    features (destination, port, periodicity, bytes), using LIME to expose the drivers. OCSVM is robust
+    under noisy or poisoned baselines. Classify connections falling outside historical clusters as outliers
+    and attach the outlier destinations and timing as post-injection C2 evidence. A positive result links
+    the memory-overwrite primitive to anomalous egress, strongly suggesting injected code is now communicating;
+    the LIME explanation lets the analyst validate which features drove the score. In the context of the
+    Privilege Escalation tactic (TA0004), this directly supports the mission question: "Has an adversary
+    escalated privileges by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "model = IsolationForest_or_OCSVM.fit(conn.log[host]: dest, port, periodicity, bytes)\non suspicious_dd_proc(host,\
+      \ t0):\n  for c in conn.log[host, t0..t0+15m]:\n    if model.outlier(c):\n       alert(c, drivers=LIME(c),\
+      \ label=\"post-injection C2 candidate\")"
+- question: 'Can the suspicious /proc-targeting dd event be correlated to high-signal follow-ons: connections
+    to known-bad IPs (Sysmon EID 3), first-seen domain lookups (Zeek dns.log), or shell/interpreter spawns
+    from the target PID?'
+  context: 'Correlate the suspicious /proc-targeting dd event to high-signal follow-ons: Sysmon for Linux
+    EID 3 connections to known-bad IPs, Zeek dns.log queries for first-seen domains, or shell/interpreter
+    spawns from the target PID. Treat the combined sequence (proc write + follow-on) as a high-confidence
+    in-memory execution pattern matching the injection call-chain motif. This rule converts a moderate-confidence
+    overwrite signal into a high-confidence incident by requiring a meaningful next step that betrays
+    adversary objectives - command-and-control, domain resolution, or interactive control - and gives
+    the analyst a ready-made attack narrative for escalation. In the context of the Privilege Escalation
+    tactic (TA0004), this directly supports the mission question: "Has an adversary escalated privileges
+    by injecting code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on suspicious_proc_dd(host, target_pid, t0):\n  followon = (sysmon EID==3 dest in known_bad)\n\
+      \           OR (zeek dns.log query first_seen_domain)\n           OR (sysmon EID==1 child in [sh,bash,python,perl]\
+      \ where ppid==target_pid)\n  if followon within window: alert(sequence=[proc_write, followon], confidence=high)"
+- question: For the targeted process, does a 10-minute behavior score (new child-process types, outbound
+    destination diversity/entropy, byte volume, unusual file accesses) exceed per-executable/per-host-role
+    thresholds across multiple dimensions?
+  context: 'For the targeted process (where determinable), compute a 10-minute behavior score covering
+    new child-process types, outbound destination diversity/entropy, byte volume, and unusual file accesses,
+    compared to a per-executable/per-host-role baseline. Alert when multiple dimensions exceed thresholds
+    simultaneously - for example destination entropy above the 99th percentile AND a first-time child
+    spawned. Include success/fail state (failed DNS/NXDOMAIN, failed connects) so partial or failed activity
+    still contributes signal. Requiring multi-dimensional deviation reduces noise and helps the analyst
+    confirm that the injected code is actively changing the victim process''s behavior rather than a single
+    benign anomaly. In the context of the Privilege Escalation tactic (TA0004), this directly supports
+    the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_exe_per_role(child_types, dest_entropy, byte_volume, file_access)\nfor target\
+      \ in suspected:\n  score = z(child_types)+z(dest_entropy)+z(byte_volume)+z(file_access)\n  alert\
+      \ if (dest_entropy>p99 AND first_time_child) OR (>=2 dims exceed)\n  annotate fail_state(NXDOMAIN,\
+      \ failed_connect)"
+- question: When a daemon (web, database, SSH) is proximate to /proc memory-tampering signals, does a
+    per-daemon-family provenance/behavior model flag its next actions as anomalous (unusual child + unusual
+    outbound port + unusual syscall mix)?
+  context: 'Train a per-daemon-family model (web, database, SSH) over Sysmon EID 1/3 and auditd syscall
+    aggregates. Provenance-graph learners detect anomalous process/file/network paths around injection
+    without prior signatures. When a daemon is proximate to /proc memory-tampering signals, score its
+    next actions and present the top-3 anomalies - for example an unusual child process plus an unusual
+    outbound port plus an unusual syscall mix - in the alert. This unsupervised approach catches novel
+    injection campaigns against service daemons and gives the analyst an explainable, ranked list of the
+    deviations that justified the alert. In the context of the Privilege Escalation tactic (TA0004), this
+    directly supports the mission question: "Has an adversary escalated privileges by injecting code into
+    a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd (syscall=execve; command line containing /proc/*/mem or /proc/*/maps)
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: All Linux endpoints and servers, especially those running custom or sensitive applications,
+    DNS resolvers'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = provenance_or_behavior_model.fit(per_daemon_family: sysmon EID1/3, auditd syscall_aggregates)\n\
+      on proc_tamper_near(daemon, t0):\n  score = model.anomaly(daemon.next_actions)\n  if score high:\
+      \ alert(top3=[unusual_child, unusual_out_port, unusual_syscall_mix])"
+- question: Does a target PID that was subject to write-capable /proc/[pid]/mem access spawn a shell/interpreter
+    or reverse-shell pattern, or make a new outbound connection to a non-RFC1918 address, within 10 minutes?
+  context: 'Identify target PIDs involved in write-capable /proc/[pid]/mem access (auditd SYSCALL+PATH).
+    For each, alert if it (or its immediate children) spawns a shell/interpreter or a known reverse-shell
+    pattern (Sysmon EID 1 command-line heuristics) OR makes a new outbound connection to a non-RFC1918
+    address (Sysmon EID 3) within 10 minutes. Injected processes that were normally network-silent are
+    strong indicators, and the actor/target correlation mirrors the eBPF ptrace-injection signature. A
+    positive result indicates that injected code is now executing under the guise of a legitimate process
+    - the core stealth/evasion objective - and that the victim process should be isolated and inspected.
+    In the context of the Privilege Escalation tactic (TA0004), this directly supports the mission question:
+    "Has an adversary escalated privileges by injecting code into a higher-privilege process using the
+    /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "targets = auditd write-capable \"/proc/*/mem\" -> target_pid\nfor tp in targets:\n  if (sysmon\
+      \ EID==1 child in [sh,bash,python,perl] OR matches reverse_shell_regex where pid|ppid==tp)\n   \
+      \  OR (sysmon EID==3 new_conn dst not in RFC1918 where pid==tp) within 10m:\n     alert(target_pid=tp,\
+      \ evidence)"
+- question: After a /proc mem-tampering signal involving a critical daemon (sshd, nginx, apache2, mysqld,
+    postgres, dockerd), do its child-process tree or outbound destinations/ports deviate from baseline
+    (first-ever child, new outbound port, unusual destination)?
+  context: 'For critical daemons (sshd, nginx, apache2, mysqld, postgres, dockerd), baseline the typical
+    child-process trees and outbound destinations/ports; benign daemons emit compact, stable behavior
+    sets. After any /proc mem-tampering signal involving that daemon, compute deviations such as a first-ever
+    child spawned, a new outbound port, or an unusual destination, and profile failure state (failed binds/connects).
+    Escalate when deviations cross rarity thresholds, for example a first-ever child combined with a new
+    outbound destination. This focuses scarce analyst attention on the crown-jewel daemons most likely
+    targeted for privilege escalation and persistence, and the failure-state profiling captures partially
+    successful tampering. In the context of the Privilege Escalation tactic (TA0004), this directly supports
+    the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = per_daemon(child_tree, out_dest, out_port) for [sshd,nginx,apache2,mysqld,postgres,dockerd]\n\
+      on proc_tamper(daemon, t0):\n  dev = {first_ever_child, new_out_port, unusual_dest}\n  fail = {failed_bind,\
+      \ failed_connect}\n  escalate if first_ever_child AND new_out_dest"
+- question: When a daemon is temporally associated with /proc memory tampering, does a per-daemon-family
+    One-Class SVM or Isolation Forest (child n-grams, outbound features, syscall aggregates) score its
+    behavior as an outlier, with explainable top-3 feature deltas?
+  context: 'Train an outlier detector (One-Class SVM or Isolation Forest) per daemon family using child-process
+    n-grams, outbound features, and syscall aggregates (open/write/exec counts). OCSVM/IF with LIME provide
+    robust, explainable scoring. When a daemon is temporally associated with /proc memory tampering, score
+    its behavior in near real time and include the top-3 feature deltas that drove the score. This near-real-time,
+    explainable outlier detection lets the analyst rapidly triage whether a daemon''s post-tamper behavior
+    is genuinely anomalous, and the feature attribution supports a defensible escalation decision under
+    both stealth and privilege-escalation hypotheses. In the context of the Privilege Escalation tactic
+    (TA0004), this directly supports the mission question: "Has an adversary escalated privileges by injecting
+    code into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = OCSVM_or_IsolationForest.fit(per_daemon_family: child_ngrams, out_features, syscall_aggregates)\n\
+      on proc_tamper_near(daemon, t0):\n  s = model.score(daemon.behavior)\n  if s outlier: alert(top3_deltas=LIME(daemon.behavior))"
+- question: When proc-injection correlations trigger, can a triage bundle be generated (actor PID, target
+    PID, target executable hash/path, recent children, recent outbound peers) with concrete validation
+    steps for the analyst?
+  context: 'When correlations trigger, generate a triage bundle containing the actor PID, target PID,
+    target executable hash/path, recent children, and recent outbound peers. Recommend validation steps
+    consistent with memory-region anomaly analysis used by high-accuracy injection detectors: compare
+    the target binary to the package baseline, inspect /proc/[pid]/maps for anomalous writable+executable
+    (W+X) regions, and confirm active sockets. This turns a detection into an actionable response by handing
+    the analyst a complete evidence package and a checklist, reducing time-to-containment and ensuring
+    the on-disk vs in-memory discrepancy (the hallmark of injection) is actually verified before closing
+    or escalating. In the context of the Privilege Escalation tactic (TA0004), this directly supports
+    the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "on correlation_trigger:\n  bundle = {actor_pid, target_pid, target_exe_hash, target_path,\
+      \ recent_children, recent_out_peers}\n  steps = [diff target_binary vs package_baseline,\n     \
+      \      read /proc/<target_pid>/maps -> flag W+X regions,\n           list active sockets for target_pid]\n\
+      \  emit triage(bundle, steps)"
+- question: Across the fleet, does change-point detection on daily counts of how often each executable
+    is implicated as a target of /proc/*/mem write activity reveal a sudden increase signaling coordinated
+    intrusion or tool reuse?
+  context: 'Across the fleet, track how often each executable is implicated as a target of /proc/*/mem
+    write activity and apply change-point detection on the daily counts. A sudden increase for a particular
+    binary or host role signals coordinated intrusion or tool reuse across multiple hosts. List the top
+    implicated hosts for response prioritization, including failed/blocked attempt counts (probing). This
+    fleet-wide view elevates the investigation from a single-host alert to a campaign-level perspective,
+    helping the analyst spot lateral spread of the same proc-injection tooling and prioritize the most-affected
+    systems for containment. In the context of the Privilege Escalation tactic (TA0004), this directly
+    supports the mission question: "Has an adversary escalated privileges by injecting code into a higher-privilege
+    process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'daily = count(distinct host) where target_exe implicated in /proc/*/mem write , group_by target_exe,
+      day
+
+      cp = change_point_detect(daily)
+
+      alert exe where cp.spike
+
+      rank top_hosts by implicated_count + failed_attempt_count'
+- question: Does a sequence/provenance model consuming ordered events (/proc/*/maps read -> /proc/*/mem
+    write -> process spawn/network connect) assign a very low probability to the observed sequence and
+    reconstruct the implicated attack subgraph?
+  context: 'Build a sequence/provenance model consuming the ordered events /proc/*/maps read -> /proc/*/mem
+    write -> process spawn/network connect. Node-level provenance-graph GNNs (e.g., ThreaTrace) localize
+    and trace such host-based threats without prior attack knowledge, and graph temporal autoencoders
+    (e.g., KAIROS) automatically reconstruct the attack subgraph. Alert when the observed sequence probability
+    is very low and present a single coherent timeline - data acquisition, processing, results - with
+    the implicated nodes and edges. This gives the analyst an end-to-end, signature-free reconstruction
+    of the injection chain and the surrounding provenance, ideal for confirming both the stealth and privilege-escalation
+    hypotheses and for scoping the incident. In the context of the Privilege Escalation tactic (TA0004),
+    this directly supports the mission question: "Has an adversary escalated privileges by injecting code
+    into a higher-privilege process using the /proc filesystem?"'
+  answer_sources:
+  - Linux Auditd
+  - Sysmon for Linux Event ID 1
+  - Sysmon for Linux Event ID 3
+  - linux:osquery (process events; /proc/*/maps access)
+  - 'NAI: Application servers, developer workstations, systems with access to sensitive data repositories'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "graph = build_provenance(events: maps_read -> mem_write -> spawn|connect)\nmodel = GNN_or_temporal_autoencoder.fit(graph)\n\
+      if model.seq_prob(observed) < epsilon:\n   subgraph = model.reconstruct(observed)\n   alert(timeline=[acquire,\
+      \ process, results], nodes=subgraph.nodes, edges=subgraph.edges)"
