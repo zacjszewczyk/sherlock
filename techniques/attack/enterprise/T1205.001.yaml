@@ -1,0 +1,1792 @@
+name: 'T1205.001: Traffic Signaling: Port Knocking'
+id: 527e59cd-8627-464e-be38-51bbaac62298
+description: 'Investigate whether an adversary is using Port Knocking (T1205.001) traffic signaling to
+  hide and activate ports for persistence or command and control across Windows, Linux, macOS, and network
+  devices. This playbook helps an analyst detect the full knock chain: a short, ordered burst of failed
+  connections to distinct closed ports (inbound or as an outbound ''reverse knock''), the dynamic firewall
+  rule change or newly-listening port that follows on the targeted host, and the first successful connection
+  or management session that the knock unlocks. It combines network evidence (Zeek conn.log and dns.log,
+  NSM flow, network-device syslog) with endpoint evidence (Windows 4688/4946/4950/5154, Sysmon 1/3, auditd)
+  and CTI enrichment (threat-intel, anonymizer, and C2 feeds). For each question it offers a deterministic
+  symbolic-logic check, a statistical/baseline method, and a machine-learning approach so the analyst
+  can confirm port-knocking used for Stealth, Command and Control, and Persistence, including knock-conditioned
+  beaconing, long-lived interactive C2 sessions, and SYNful Knock-style network-device implants.'
+type: technique
+related:
+- tactic_id: TA0005
+  tactic_name: Stealth
+- tactic_id: TA0011
+  tactic_name: Command and Control
+- tactic_id: TA0003
+  tactic_name: Persistence
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Is a single external source touching a short ordered run of distinct closed ports (3 to 10
+    distinct destination ports, conn_state REJ/RSTO/S0, zero SF) on one internal host inside a 30-second
+    window, where that source IP also appears on a high-confidence threat-intelligence feed?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. This is
+    the canonical inbound port-knock signature: a deterministic, failure-only burst against a small set
+    of closed ports that primes a host-based firewall pinhole. Filter Zeek conn.log to failed connection
+    states (REJ, RSTO, S0), apply a 30-second sliding window grouped by (src_ip, dst_ip), count distinct
+    dst_port, and require the burst be 100% failed (no SF to the same host in-window). Fire when the distinct-port
+    count is between 3 and 10 AND the source matches your highest-fidelity CTI list. The 3-10 floor is
+    the documented knock-sequence length; tune MinSeqLen/MaxSeqLen per environment but never delete the
+    floor or you will drown in benign single-port retries. A positive result with a CTI hit is a strong,
+    actionable lead; a positive structure without CTI should be downgraded but retained for correlation
+    with later evidence (firewall change, first successful connect). [Method: Match knock sequences to
+    threat intel (Symbolic Logic)]'
+  answer_sources: &id001
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, DMZ Network Segments, Cloud VPC Flow Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from zeek_conn where conn_state in (''REJ'',''RSTO'',''S0'')
+
+      | window 30s sliding by src_ip,dst_ip
+
+      | stats dcount(dst_port) as nports, count(eval(conn_state==''SF'')) as nsf by src_ip,dst_ip,window
+
+      | where nports>=3 and nports<=10 and nsf==0
+
+      | lookup threat_intel_high_conf on src_ip
+
+      | where ti_match==true | alert'
+  - technology: Zeek/pseudocode
+    query: 'knock = filter(conn.log, conn_state in {REJ,RSTO,S0})
+
+      group knock by (id.orig_h,id.resp_h) within 30s
+
+      if distinct(id.resp_p) in [3,10] and count(SF)==0 and in_intel(id.orig_h): raise(''knock+CTI'')'
+- question: Across the gateway, which source IPs exhibit a statistically anomalous failed-connection walk
+    (a sequential-probability-ratio verdict after ~4-5 failures) combined with a high knock-score driven
+    by failed-burst frequency and a high-entropy destination-port sequence?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Pure signatures
+    miss novel sequences, so model each source''s connection outcomes as a random walk and apply a Threshold
+    Random Walk / sequential probability ratio test on the failed-to-successful ratio so a verdict fires
+    after roughly 4-5 failures with bounded false positives. In parallel compute a per-IP knock score
+    from failed-burst frequency (bursts/min) and the Shannon entropy of the dst_port sequence, and flag
+    IPs in the 99th percentile of knock score with entropy > 2.0 (ordered, varied closed ports rather
+    than a single repeated port). Derive the percentile cutoff from a rolling 30-day per-gateway baseline
+    so the threshold adapts to the site. A high SPRT-positive, high-entropy, high-frequency source is
+    a likely knocker even with no CTI match. [Method: Score rare, high-entropy knock behavior (Statistical
+    Method)]'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = pctl_30d(knock_score, 99) by gateway\nfor src in sources:\n  sprt = trw(failed,success)\
+      \  # accept H1 ~4-5 failures\n  ks = freq(failed_bursts) ; ent = shannon(dst_port_seq)\n  if sprt=='malicious'\
+      \ and ks>=baseline and ent>2.0: alert(src, observed=ks, ent)"
+- question: When an ordered connection sequence is scored by a trained RNN/LSTM, does it classify as a
+    malicious port-knock (P>0.9) rather than benign scanning, and what top-3 features (distinct-port count,
+    failed-ratio, inter-arrival) drove that call?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Ordered
+    knocks differ from broad scans in their structure: a short, ordered, low-volume run with consistent
+    inter-arrival timing versus a wide, fan-out sweep. Train an RNN/LSTM on ordered sequences using timestamp-delta,
+    dst_port, TCP flags, and conn_state as features to discriminate ordered knocks from benign scanning,
+    training the benign class only on validated normal flows. Elevate when P(malicious knock) > 0.9 and
+    surface the top-3 contributing features via per-prediction attribution so an analyst can sanity-check
+    the verdict. A high-confidence classification with sensible attribution (e.g., tight distinct-port
+    count, near-100% failed-ratio, regular inter-arrival) is a strong indicator; a low-confidence or oddly-attributed
+    score should be triaged with the symbolic and statistical checks. [Method: Classify sequences with
+    an RNN (Machine Learning)]'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = order_by_time(conn[src,dst]); X = [dt,dst_port,tcp_flags,conn_state]
+
+      p = lstm_knock.predict(X)
+
+      if p>0.9: alert(src,dst, p, top3=explain(lstm_knock,X))'
+- question: Has any monitored endpoint executed a known port-knocking/SPA daemon, its configuration file,
+    or a libpcap/raw-socket sniffer used to observe knock packets (e.g., knockd, fwknopd, knockd.conf,
+    tcpdump, tshark) as seen in process-creation telemetry?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. The most
+    direct evidence of a knock implant is the daemon itself or the sniffer it uses to watch for trigger
+    packets. Maintain a watchlist of knock/SPA binaries and configs (knockd, fwknopd, knockd.conf) plus
+    libpcap/raw-socket consumers (tcpdump, tshark) that such daemons use to observe the signal. Match
+    Windows Event ID 4688 and Sysmon EID 1 on NewProcessName, Image, CommandLine, OriginalFileName, or
+    Hashes and trigger on any hit. On Windows these tools are unusual outside of admin/IR contexts, so
+    a hit on a server or workstation is high-value; confirm by checking the parent process, signer, and
+    whether the host also shows the network knock structure or a new listening port. [Method: Alert on
+    known knock daemons (Symbolic Logic)]'
+  answer_sources: &id002
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Critical Server Subnets, Domain Controllers, User Workstation VLANs, Endpoint Detection and
+    Response (EDR) platform logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'watch = {knockd,knockd.exe,fwknopd,fwknopd.exe,knockd.conf,tcpdump,tshark,WinDivert}
+
+      from (win4688 or sysmon1)
+
+      | where lower(Image) in watch or match(CommandLine, watch) or OriginalFileName in watch or Hashes
+      in known_knock_hashes
+
+      | alert host,user,ParentImage,CommandLine'
+- question: Among new process executions, which command lines are both enterprise-rare (99.9th percentile
+    by frequency over 30 days) AND contain knock/firewall tokens such as 'knock', 'fwknop', '--passwd',
+    'iptables -A', 'firewall-cmd', or pcap filter expressions?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Adversaries
+    rename binaries, so rarity plus token content beats name-matching alone. Baseline command-line frequency
+    enterprise-wide over 30 days; for each new 4688/EID1 record compute a rarity score and flag the 99.9th
+    percentile that also contains knock/firewall tokens or pcap filter expressions. Report the observed
+    count versus baseline mean in the alert so the analyst sees how unusual the command truly is. A vanishingly
+    rare command line that manipulates firewall rules or installs a packet filter on a server that has
+    never run such commands is a strong lead, especially when paired with the network knock evidence.
+    [Method: Score rare knock-related command lines (Statistical Method)]'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "freq = count_30d(cmdline_norm) by enterprise\nfor e in (win4688|sysmon1):\n  rscore = rarity(e.CommandLine,\
+      \ freq)\n  if rscore>=pctl(99.9) and contains(e.CommandLine,{knock,fwknop,'--passwd','iptables -A','firewall-cmd',pcap_filter}):\n\
+      \    alert(e, observed=cnt, baseline_mean=mean)"
+- question: When new executions are scored by a one-class SVM / Isolation Forest trained on legitimate
+    command lines, which port/firewall-related executions are flagged as anomalies, and what top-3 tokens
+    drove the score?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Token lists
+    are brittle against obfuscation, so learn the shape of normal command lines and flag outliers. Train
+    a one-class SVM / Isolation Forest on 30 days of legitimate command lines, score new executions, and
+    flag port/firewall-related anomalies, surfacing the top-3 driving tokens via LIME-style attribution.
+    This catches novel knock tooling and encoded invocations that token rules miss. A strong anomaly whose
+    attribution points at firewall/port manipulation or packet capture is worth pivoting on; benign-but-rare
+    admin scripts will surface too, so corroborate with the network and firewall-change evidence before
+    escalating. [Method: Detect anomalous command lines with SVM (Machine Learning)]'
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = ocsvm.fit(legit_cmdlines_30d)\nfor e in new_exec:\n  s = model.score(vectorize(e.CommandLine))\n\
+      \  if s<thr and firewall_or_port_related(e): alert(e, top3=lime(model,e))"
+- question: Within 5 seconds of the final attempt in a suspected inbound knock burst, did the targeted
+    host add/modify a Windows Firewall rule (Event ID 4946/4950), open a new listening port (Event ID
+    5154), or have a process begin listening (Sysmon EID 3)?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. The defining
+    behavior of knockd/fwknop is to insert a dynamic firewall pinhole immediately after a valid sequence
+    and before the first allowed connection. Alert when a suspected knock (a Zeek conn.log failed burst)
+    is followed within 5 seconds by Windows Event ID 4946/4950/5154 or Sysmon EID 3 on the same targeted
+    host. Keep the 5-second floor and widen only with measured clock skew between the network sensor and
+    the endpoint. This temporal join is one of the highest-confidence detections in the playbook: a failed
+    knock burst that immediately precedes a firewall rule add and a new listener on the same host is very
+    hard to explain benignly. [Method: Correlate knocks with firewall events (Symbolic Logic)]'
+  answer_sources: &id003
+  - Zeek conn.log
+  - Windows Event ID 5154
+  - Windows Event ID 4946
+  - Windows Event ID 4950
+  - Sysmon Event ID 3
+  - 'NAI: Firewall Management Interfaces, Critical Application Servers, Endpoint Devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # failed burst per (src,dst)
+
+      fw = (win4946|win4950|win5154|sysmon3) by host,time
+
+      join knock to fw on dst_host where fw.time - knock.last_attempt <= 5s
+
+      | alert dst_host, src_ip, fw.rule, fw.port'
+- question: Does a host show a change-point step in its firewall-rule-add rate or a newly-listening port
+    that breaks from its own established baseline (detected via CUSUM/PELT/Bayesian online change-point),
+    beyond a mean+3sigma backstop?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. A fixed
+    mean+3sigma threshold misreacts to bursty admin activity, so model each host''s firewall-change/listener-start
+    time-series and apply change-point detection (CUSUM, PELT, or Bayesian online) to flag a knock-induced
+    step change in rule-add rate or a newly-listening port with bounded false positives. Retain mean+3sigma
+    as a deterministic backstop. A host that has been stable for weeks and then exhibits a sudden, sustained
+    shift in firewall mutations or a brand-new listener is suspicious, particularly when the shift coincides
+    with inbound failed-connection bursts. Report the detected change-point time so it can be aligned
+    with network evidence. [Method: Flag anomalous firewall changes (Statistical Method)]'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ts = per_host_count(fw_rule_add | listener_start) by minute
+
+      cp = changepoint(ts, method=''PELT|CUSUM|BOCPD'')
+
+      if cp.detected and ts.post > mean+3*std: alert(host, cp_time=cp.t, rate_pre, rate_post)'
+- question: Modeling hosts/IPs/processes as nodes and knock-attempt, firewall-change, and listener-start
+    as edges, does a knock-attempt edge connect via a short path to a firewall-change or listener-start
+    edge on the same host within the window?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Graph reasoning
+    links events that simple joins miss and yields an explainable path. Model events as a graph (nodes:
+    hosts/IPs/processes; edges: knock-attempt, firewall-change, listener-start). On a knock-attempt edge,
+    search for a short path to a firewall-change/listener-start edge on the same host within the window
+    and report the discovered path (the top-3 edges) as the explanation. A short, time-ordered path of
+    knock -> firewall-change -> listener on one host is the full attack chain made visible; the path itself
+    becomes the analyst''s evidence and pivot set. [Method: Graph knock-to-listener paths (Machine Learning)]'
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Graph/pseudocode
+    query: "G = build_graph(knock_edges, fw_change_edges, listener_edges)\nfor k in knock_edges:\n  path\
+      \ = shortest_path(G, k, target={fw_change,listener}, same_host=True, within=window)\n  if path and\
+      \ len(path)<=3: alert(host, path)"
+- question: Does a knock sequence (3 to 10 failed connections to distinct closed ports within 30 seconds,
+    no SF in-window) originate from an IP listed by CTI as an anonymization service such as a TOR exit,
+    public proxy, or commercial VPN?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Adversaries
+    frequently knock from anonymizing infrastructure to mask origin. Detect the knock structure (3-10
+    failed connections to distinct closed ports within 30s, failure-dominated) and join src_ip against
+    anonymizer CTI feeds, alerting whenever a knock source matches a listed anonymization service. Legitimate
+    users rarely arrive at internal closed ports via TOR/VPN exit nodes in a deterministic failed burst,
+    so the combination of knock structure plus anonymizer origin is a meaningful escalation even absent
+    other evidence. Keep the anonymizer feed fresh, since exit-node lists churn rapidly. [Method: Join
+    knock sequences with anonymizer feeds (Symbolic Logic)]'
+  answer_sources: &id004
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Egress Network Filters, Proxy Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # 3-10 distinct ports, 30s, 0 SF
+
+      | lookup anonymizer_cti on src_ip
+
+      | where anon_type in (''tor_exit'',''proxy'',''vpn'') | alert src_ip,dst,anon_type'
+- question: Among knock sources, which fall in the 99th percentile of ASN/country rarity (over a 30-day
+    baseline) AND also carry a genuine failure-dominated SPRT verdict, so only rare-anonymizer-ASN, truly-failing
+    bursts escalate?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Enrich
+    knock sources with geo/ASN and, over a 30-day baseline, compute the rarity of each ASN/country pair,
+    flagging the 99th percentile. Combine this with the failed/successful SPRT (Threshold Random Walk)
+    verdict so that only genuine failure-dominated bursts from rare anonymizer ASNs escalate, suppressing
+    benign traffic from common networks. This catches knockers using less-known VPN/hosting ASNs that
+    may not yet be on an explicit anonymizer feed. Report the ASN, country, and observed rarity so the
+    analyst can judge whether the origin is plausible for the targeted asset. [Method: Score rare ASN/country
+    pairs (Statistical Method)]'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(count_by(asn,country),99)\nfor k in knock_bursts:\n  if rarity(k.asn,k.country)>=p99\
+      \ and trw(k.failed,k.success)=='malicious':\n    alert(k.src_ip, asn=k.asn, country=k.country)"
+- question: When a Random Forest classifies suspected knock sources using CTI presence, ASN, reverse-DNS
+    patterns, and history, which are labeled anonymizers, and what top-3 features drove the classification?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Some anonymizers
+    are not on any feed, so learn their fingerprint. Train a Random Forest to classify IPs as anonymizers
+    using CTI presence, ASN, reverse-DNS patterns (e.g., tor/vpn/host naming), and historical behavior;
+    score suspected knock sources and report the top-3 features behind each classification. A knock source
+    classified as an anonymizer with strong, sensible feature attribution corroborates intent to hide
+    origin; pair it with the knock-structure and post-knock connection evidence to confirm an actual activation
+    rather than reconnaissance. [Method: Classify anonymizer sources (Machine Learning)]'
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feat = [cti_present,asn,rdns_pattern,history]\nfor k in knock_sources:\n  y = rf_anon.predict(feat(k))\n\
+      \  if y=='anonymizer': alert(k, top3=feature_importance(rf_anon,feat(k)))"
+- question: Did a successful TCP connection (conn_state SF) land on a (host,port) pair that has accepted
+    no connections in the last 30 days, within 10 seconds of 3 or more failed attempts (REJ/S0) from the
+    same source to different ports on that host?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. The payoff
+    of knocking is the first successful connection to a port that was previously closed. Track (host,port)
+    pairs with successful SF over the last 30 days; when a new SF occurs on an unseen pair, require at
+    least 3 preceding failed attempts (REJ/S0) from the same source within 30s before firing. This captures
+    the closed->open state transition central to knocking and avoids alerting on normal new services that
+    lack a preceding failed burst. A new SF on a never-before-seen port immediately following a same-source
+    failed burst is the open-pinhole-then-connect signature and warrants immediate investigation of what
+    now listens on that port. [Method: Base new connections against recent history (Symbolic Logic)]'
+  answer_sources: &id005
+  - Zeek conn.log
+  - 'NAI: DMZ Servers, Externally-facing Application Gateways, Network Taps'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "seen = set((host,port) with SF in last_30d)\nfor c in zeek_conn where conn_state=='SF' and\
+      \ (c.resp_h,c.resp_p) not in seen:\n  pre = count(failed REJ/S0 from c.orig_h to c.resp_h other\
+      \ ports within 30s before c)\n  if pre>=3: alert(c.resp_h, c.resp_p, c.orig_h)"
+- question: For each host, how surprising is a new SF on an unfamiliar port given a preceding failed burst
+    (probability above mean+3sigma), with the burst itself confirmed by the TRW failed/successful walk?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Profile
+    each host''s listening ports over 30 days and compute the conditional probability of a new SF on an
+    unfamiliar port given a preceding failed burst; flag events whose surprise exceeds mean+3sigma, and
+    confirm the preceding burst with the Threshold Random Walk failed/successful test. This grades the
+    novelty of the opened port rather than treating all new ports equally, so a connection to a port the
+    host has never offered, immediately after a failing burst, scores highest. Report the surprise score
+    and the confirming TRW verdict so analysts can prioritize the most improbable activations. [Method:
+    Score rare post-knock connections (Statistical Method)]'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "p_port = port_profile_30d(host)\nfor c in SF on host:\n  surprise = -log(p_port[c.resp_p]\
+      \ given preceding_failed_burst)\n  if surprise > mean+3*std and trw(burst)=='malicious': alert(host,c.resp_p,surprise)"
+- question: When an Isolation Forest / autoencoder scores benign connection 5-tuples and volume features,
+    which SF anomalies are temporally linked to 3 or more failed knocks within 30s, and what top-3 features
+    (port novelty, failed-ratio, byte volume) explain them?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Train an
+    Isolation Forest / autoencoder on benign connection 5-tuples (src_ip, dst_ip, dst_port, proto, conn_state)
+    plus volume features (orig_bytes/resp_bytes); when an SF anomaly is temporally linked to >=3 failed
+    knocks within 30s, classify it as a successful knock and surface the top-3 features (e.g., port novelty,
+    failed-ratio, byte volume) via attribution. This learns the host''s normal connection manifold and
+    flags the unusual post-knock session even when the port number alone looks ordinary. A high anomaly
+    score tied to a preceding failed burst, with attribution pointing at port novelty and failed-ratio,
+    is a strong successful-knock indicator. [Method: Flag anomalies with Isolation Forest (Machine Learning)]'
+  answer_sources: *id005
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = iforest.fit(benign_5tuples_volume_30d)\nfor c in SF:\n  s = model.score([src,dst,dport,proto,state,obytes,rbytes])\n\
+      \  if s anomalous and preceding_failed_knocks(c)>=3 within 30s:\n    alert(c, top3=explain(model,c))"
+- question: Did an internal host send a reverse knock (more than 3 failed connections to distinct ports
+    on one external IP within 10 seconds) followed within 30 seconds by an inbound connection from that
+    same external IP, where the IP/domain matches C2 threat intel?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Knocking
+    also runs outbound: an internal implant signals an external controller, which then connects back on
+    a dynamically opened port. Detect outbound knock sequences (>3 failed connections to distinct ports
+    within 10s) followed within 30s by an inbound connection from the same external IP, and alert when
+    that IP/domain matches C2 threat intel. This is a covert traffic-signaling trigger and is especially
+    concerning because it originates from inside the network, implying a host is already compromised.
+    Even without a CTI hit, the outbound-knock-then-inbound-connect pattern is anomalous and should be
+    retained for the rarity and classifier checks. [Method: Correlate reverse knocks to CTI (Symbolic
+    Logic)]'
+  answer_sources: &id006
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress points of the network, DNS Resolvers, Core Network Switches'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "out = filter(conn.log, local_orig and conn_state in {REJ,RSTO,S0})\ngroup out by (orig_h,resp_h)\
+      \ within 10s\nif distinct(resp_p)>3:\n  inb = inbound(resp_h -> orig_h) within 30s\n  if inb and\
+      \ in_c2_intel(resp_h or dns_name(resp_h)): alert(orig_h,resp_h)"
+- question: Which external knock destinations fall in the 99.9th percentile of rarity (frequency, ASN,
+    country, first-seen) over 30 days, and do associated dns.log queries show an elevated NXDOMAIN/failed-resolution
+    rate?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Compute
+    rarity (frequency, ASN, country, first-seen) for outbound knock destinations over 30 days and flag
+    the 99.9th percentile; separately profile the NXDOMAIN/failed-resolution rate of associated dns.log
+    queries as a distinct low-and-slow failure-mode signal. A first-seen destination in a rare ASN/country
+    that an internal host suddenly reverse-knocks is suspicious, and a spike in failed resolutions can
+    indicate domain-generation or staging behavior around the same beacon. Report the rarity drivers and
+    the resolution-failure rate so analysts can separate new-but-benign SaaS from genuinely novel infrastructure.
+    [Method: Score knocked destinations by rarity (Statistical Method)]'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(score(freq,asn,country,first_seen),99.9)\nfor d in knock_dests:\n  if rarity(d)>=p999:\
+      \ alert(d, drivers)\nnxd = rate(dns.log rcode==NXDOMAIN by host) ; if nxd>baseline: enrich(alert)"
+- question: When a classifier trained on dns/conn features (query/answer ratio, TTL, entropy, duration,
+    byte counts) scores a reverse-knock destination, is it labeled C2 with high confidence, and what top-3
+    features drove the verdict?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Train a
+    classifier on combined dns/conn features (query/answer ratio, TTL, entropy, duration, byte counts)
+    and alert when a reverse-knock destination is classified C2 with high confidence, reporting the top-3
+    features. This fuses naming/resolution behavior with flow shape to distinguish controller infrastructure
+    from benign external services. A high-confidence C2 label on the target of an internal reverse knock,
+    with attribution pointing at low TTL, high query entropy, or beacon-like duration/byte profiles, strongly
+    suggests an established outbound C2 channel and should be escalated for host containment. [Method:
+    Classify reverse knock targets (Machine Learning)]'
+  answer_sources: *id006
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = join(dns_features(dest), conn_features(dest))
+
+      y,p = c2_clf.predict_proba(feat)
+
+      if y==''C2'' and p>0.9: alert(dest, top3=explain(c2_clf,feat))'
+- question: Does an inbound knock from an external IP repeatedly trigger a short-lived outbound connection
+    (within 60 seconds) back to that same IP, recurring at a regular ~3500-3700 second interval at least
+    three times?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. After a
+    knock activates a channel, implants often beacon back on a fixed cadence. Track knock-beacon events
+    (an inbound knock followed by an outbound connection to the same IP within 60s) and alert when the
+    same IP pair repeats every 3500-3700 seconds at least three times. Keep the explicit interval and
+    count floors so a single coincidence does not fire. A knock-conditioned beacon that recurs near-hourly
+    with low jitter is a classic C2 heartbeat and confirms an active, controlled implant rather than one-off
+    reconnaissance. [Method: Record periodic knock-beacon pairs (Symbolic Logic)]'
+  answer_sources: &id007
+  - Zeek conn.log
+  - 'NAI: Network Egress Points, Internal Network Segments, Firewall Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'pairs = events where inbound_knock(ip) then outbound(host->ip) within 60s
+
+      | stats list(interval) as iv by (host,ip)
+
+      | where count(iv where 3500<=iv<=3700) >= 3 | alert host,ip'
+- question: Among (src,dst) outbound flow pairs, which knock-preceded pairs fall in the lowest 1st percentile
+    of inter-arrival jitter (coefficient of variation), after suppressing benign periodic services?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Group outbound
+    flows by (src,dst), compute the inter-arrival coefficient of variation/jitter, and alert when knock-preceded
+    pairs fall in the lowest 1st percentile of jitter, suppressing benign periodic services using empirical
+    periodicity baselines and RITA-style CV/skew scoring. Extremely regular timing is the hallmark of
+    automated beaconing rather than human-driven traffic. Because some legitimate services (NTP, update
+    checks, telemetry) are also periodic, the suppression list is essential; the strongest signal is a
+    knock-conditioned, ultra-low-jitter pair to an otherwise-unexplained destination. Report the CV and
+    skew so the analyst can judge regularity. [Method: Flag low-jitter knock-enabled pairs (Statistical
+    Method)]'
+  answer_sources: *id007
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for (s,d) in outbound_pairs:\n  cv = std(iat)/mean(iat); skew = skewness(iat)\n  if knock_preceded(s,d)\
+      \ and cv <= pctl(jitter,1) and (s,d) not in benign_periodic:\n    alert(s,d, cv, skew)"
+- question: Does FFT/autocorrelation of the outbound timestamps for a knock-triggered flow reveal a strong
+    periodic component aligned with the knock events, and what dominant period and power explain it?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Apply FFT/autocorrelation
+    to outbound timestamps and alert when a strong periodic component aligns with knock events, using
+    a noise-robust periodicity pipeline (e.g., BAYWATCH-style) that survives jitter and missing intervals.
+    Report the dominant period and power as the explanation. Frequency-domain analysis detects beacons
+    that time-domain jitter checks miss when an adversary adds randomization, since the underlying cadence
+    still produces a spectral peak. A strong spectral peak that lines up with knock activations is robust
+    evidence of an automated knock-and-beacon channel; the reported period/power gives analysts a concrete
+    signature to hunt elsewhere. [Method: FFT/autocorrelation on knock-triggered flows (Machine Learning)]'
+  answer_sources: *id007
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts = outbound_timestamps(host->ip)
+
+      spec = fft(diff(ts)) ; peak,power = dominant(spec)
+
+      if power>thr and aligns(peak, knock_events): alert(host,ip, period=peak, power=power)'
+- question: Immediately after a successful knock, is there a connection on a non-standard port that lasts
+    over 5 minutes with a history string showing bidirectional data ('d'/'D') yet transfers under 10 KB
+    total?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Interactive
+    C2 over a knock-opened port looks like a long, quiet, two-way session. Identify post-knock connections
+    that last longer than 5 minutes, have a history string containing ''d''/''D'' (data both directions),
+    and transfer less than 10 KB total, then alert. Retain the duration, history, and byte floors. A long-lived,
+    low-volume, bidirectional session on an unusual port that opened right after a knock is consistent
+    with a hands-on-keyboard shell or a low-rate control channel, in stark contrast to bulk transfers
+    or short request/response flows. This is a high-value confirmation that the opened pinhole is being
+    used interactively. [Method: Validate long-lived post-knock sessions (Symbolic Logic)]'
+  answer_sources: &id008
+  - Zeek conn.log
+  - 'NAI: Critical Server Subnets, Developer Workstations, Network Security Monitoring Sensors'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for c in conn.log where post_knock(c):\n  if c.duration>300 and ('d' in c.history or 'D' in\
+      \ c.history) and (c.orig_bytes+c.resp_bytes)<10240 and nonstandard(c.resp_p):\n    alert(c)"
+- question: Which post-knock connections exceed the 98th percentile of duration-to-bytes ratio against
+    baseline, using long-connection and low-data scoring on Zeek conn.log?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Baseline
+    duration/byte ratios for post-knock connections and alert above the 98th percentile, using RITA-style
+    long-connection and low-data scoring; report the observed ratio versus baseline. A session that stays
+    open far longer than the data it carries would justify is the statistical fingerprint of an idle-but-held
+    control channel. Grading by ratio rather than absolute duration adapts to environments where some
+    legitimate long connections exist, so the alert highlights the connections most disproportionately
+    long for their payload. Pair with the symbolic floors to confirm bidirectionality and port novelty.
+    [Method: Flag high duration-to-bytes ratios (Statistical Method)]'
+  answer_sources: *id008
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for c in post_knock_conns:\n  ratio = c.duration / max(c.orig_bytes+c.resp_bytes,1)\n  if\
+      \ ratio >= pctl(ratio_baseline,98): alert(c, observed=ratio, baseline=mean)"
+- question: When a Gradient Boosting / one-class model scores duration, byte volume, history string, and
+    inter-packet timing, is a post-knock connection labeled interactive C2, and what top-3 features drove
+    the score?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Train a
+    Gradient Boosting / one-class model on duration, byte volume, history string, and inter-packet timing
+    to label interactive C2, surfacing the top-3 features driving the score. Inter-packet timing in particular
+    separates human-driven interactive sessions (bursty, irregular keystroke-like timing) from automated
+    transfers. A post-knock connection classified as interactive C2 with attribution pointing at long
+    duration, low volume, and human-like inter-packet gaps is strong evidence of a live operator on a
+    knock-opened port and should trigger host investigation and likely containment. [Method: Classify
+    interactive C2 connections (Machine Learning)]'
+  answer_sources: *id008
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = [duration,bytes,history_vec,interpacket_stats]
+
+      y,p = c2_session_clf.predict(feat(c))
+
+      if y==''interactive_c2'' and p>0.9: alert(c, top3=explain(c2_session_clf,feat(c)))'
+- question: On a router/switch, is a series of denied/closed flows to distinct ports from one source (NSM:Flow)
+    followed within the time window by a config/ACL change, line-vty transport-input change, or telnet/ssh/http(s)
+    enable in syslog, then a successful management session from that same source?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Network-device
+    implants such as SYNful Knock activate management access only after a crafted trigger. Alert when
+    a series of denied/closed flows to distinct ports from one src_ip (NSM:Flow) is followed within the
+    time window by a config/ACL change, line-vty transport-input change, or telnet/ssh/http(s) enable
+    in networkdevice:syslog, then a successful management session from the same source. This crafted-trigger-then-activate-then-login
+    chain on an infrastructure device is extremely high-value because routers and switches are rarely
+    re-knocked benignly and compromise grants broad control. Treat any complete chain as a likely device
+    implant. [Method: Correlate device knock to config change (Symbolic Logic)]'
+  answer_sources: &id009
+  - networkdevice:syslog
+  - NSM:Flow
+  - 'NAI: Network Device Management Plane, Router/Switch Control Plane, Out-of-Band Management Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = denied_flows(NSM_Flow) grouped by src_ip, distinct dst_port within window
+
+      cfg = syslog where (acl_change|vty_transport_change|enable_telnet|enable_ssh|enable_http)
+
+      join knock->cfg->mgmt_login(same src) within window | alert device,src_ip,cfg.event'
+- question: Per device, do crafted trigger packets show out-of-distribution TCP sequence/ACK values, or
+    do denied-flow bursts exceed a change-point shift versus the device's baseline frequency?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Profile
+    per-device denied-flow frequency and the distribution of TCP sequence/ACK values; flag crafted packets
+    with out-of-distribution seq/ack (a storage covert channel) or denied-flow bursts exceeding a change-point
+    shift. Some device knocks encode the trigger in header fields rather than port order, so modeling
+    seq/ack distributions catches signals that port-sequence rules miss, while change-point detection
+    on denied-flow rate catches volumetric trigger bursts. Report the anomalous field values or the change-point
+    so analysts can correlate with any subsequent config change or management login on the device. [Method:
+    Score anomalous trigger packets (Statistical Method)]'
+  answer_sources: *id009
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "seq_dist = profile(seq,ack) per device\nfor pkt in trigger_candidates:\n  if outlier(pkt.seq,seq_dist)\
+      \ or outlier(pkt.ack): alert(device, pkt)\ncp = changepoint(denied_flow_rate(device)); if cp.detected:\
+      \ alert(device, cp_time=cp.t)"
+- question: When an anomaly model trained on benign device config-event sequences scores a new sequence,
+    does it flag a rare enable-service-then-first-login chain, and what top-3 contributing events explain
+    it?
+  context: 'In the context of Stealth (TA0005), port knocking keeps the triggered port closed to ordinary
+    scanners and buries the activation traffic inside everyday failed-connection noise, so this check
+    is about surfacing the concealed signal that an adversary is relying on to stay invisible. Train an
+    anomaly model on benign device config-event sequences and flag rare enable-service-then-first-login
+    chains, reporting the top-3 contributing events. Legitimate device administration follows well-worn
+    change patterns, so a sequence that enables a management service and is immediately followed by a
+    first-ever login from a new source is an outlier worth surfacing. The model captures order and rarity
+    that static rules miss; a flagged enable-then-login chain with sensible event attribution on a core
+    router/switch is a strong indicator of implant activation and should be triaged against the flow-based
+    knock evidence. [Method: Detect rare management enablement (Machine Learning)]'
+  answer_sources: *id009
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = seq_anomaly.fit(benign_config_event_seqs)\nfor seq in device_event_seqs:\n  if model.anomalous(seq)\
+      \ and pattern(seq)=='enable_service->first_login':\n    alert(device, top3=explain(model,seq))"
+- question: Is a single external source touching a short ordered run of distinct closed ports (3 to 10
+    distinct destination ports, conn_state REJ/RSTO/S0, zero SF) on one internal host inside a 30-second
+    window, where that source IP also appears on a high-confidence threat-intelligence feed?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. This is the canonical inbound port-knock signature: a deterministic, failure-only
+    burst against a small set of closed ports that primes a host-based firewall pinhole. Filter Zeek conn.log
+    to failed connection states (REJ, RSTO, S0), apply a 30-second sliding window grouped by (src_ip,
+    dst_ip), count distinct dst_port, and require the burst be 100% failed (no SF to the same host in-window).
+    Fire when the distinct-port count is between 3 and 10 AND the source matches your highest-fidelity
+    CTI list. The 3-10 floor is the documented knock-sequence length; tune MinSeqLen/MaxSeqLen per environment
+    but never delete the floor or you will drown in benign single-port retries. A positive result with
+    a CTI hit is a strong, actionable lead; a positive structure without CTI should be downgraded but
+    retained for correlation with later evidence (firewall change, first successful connect). [Method:
+    Match knock sequences to threat intel (Symbolic Logic)]'
+  answer_sources: &id010
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, DMZ Network Segments, Cloud VPC Flow Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from zeek_conn where conn_state in (''REJ'',''RSTO'',''S0'')
+
+      | window 30s sliding by src_ip,dst_ip
+
+      | stats dcount(dst_port) as nports, count(eval(conn_state==''SF'')) as nsf by src_ip,dst_ip,window
+
+      | where nports>=3 and nports<=10 and nsf==0
+
+      | lookup threat_intel_high_conf on src_ip
+
+      | where ti_match==true | alert'
+  - technology: Zeek/pseudocode
+    query: 'knock = filter(conn.log, conn_state in {REJ,RSTO,S0})
+
+      group knock by (id.orig_h,id.resp_h) within 30s
+
+      if distinct(id.resp_p) in [3,10] and count(SF)==0 and in_intel(id.orig_h): raise(''knock+CTI'')'
+- question: Across the gateway, which source IPs exhibit a statistically anomalous failed-connection walk
+    (a sequential-probability-ratio verdict after ~4-5 failures) combined with a high knock-score driven
+    by failed-burst frequency and a high-entropy destination-port sequence?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Pure signatures miss novel sequences, so model each source''s connection outcomes
+    as a random walk and apply a Threshold Random Walk / sequential probability ratio test on the failed-to-successful
+    ratio so a verdict fires after roughly 4-5 failures with bounded false positives. In parallel compute
+    a per-IP knock score from failed-burst frequency (bursts/min) and the Shannon entropy of the dst_port
+    sequence, and flag IPs in the 99th percentile of knock score with entropy > 2.0 (ordered, varied closed
+    ports rather than a single repeated port). Derive the percentile cutoff from a rolling 30-day per-gateway
+    baseline so the threshold adapts to the site. A high SPRT-positive, high-entropy, high-frequency source
+    is a likely knocker even with no CTI match. [Method: Score rare, high-entropy knock behavior (Statistical
+    Method)]'
+  answer_sources: *id010
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = pctl_30d(knock_score, 99) by gateway\nfor src in sources:\n  sprt = trw(failed,success)\
+      \  # accept H1 ~4-5 failures\n  ks = freq(failed_bursts) ; ent = shannon(dst_port_seq)\n  if sprt=='malicious'\
+      \ and ks>=baseline and ent>2.0: alert(src, observed=ks, ent)"
+- question: When an ordered connection sequence is scored by a trained RNN/LSTM, does it classify as a
+    malicious port-knock (P>0.9) rather than benign scanning, and what top-3 features (distinct-port count,
+    failed-ratio, inter-arrival) drove that call?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Ordered knocks differ from broad scans in their structure: a short, ordered, low-volume
+    run with consistent inter-arrival timing versus a wide, fan-out sweep. Train an RNN/LSTM on ordered
+    sequences using timestamp-delta, dst_port, TCP flags, and conn_state as features to discriminate ordered
+    knocks from benign scanning, training the benign class only on validated normal flows. Elevate when
+    P(malicious knock) > 0.9 and surface the top-3 contributing features via per-prediction attribution
+    so an analyst can sanity-check the verdict. A high-confidence classification with sensible attribution
+    (e.g., tight distinct-port count, near-100% failed-ratio, regular inter-arrival) is a strong indicator;
+    a low-confidence or oddly-attributed score should be triaged with the symbolic and statistical checks.
+    [Method: Classify sequences with an RNN (Machine Learning)]'
+  answer_sources: *id010
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = order_by_time(conn[src,dst]); X = [dt,dst_port,tcp_flags,conn_state]
+
+      p = lstm_knock.predict(X)
+
+      if p>0.9: alert(src,dst, p, top3=explain(lstm_knock,X))'
+- question: Has any monitored endpoint executed a known port-knocking/SPA daemon, its configuration file,
+    or a libpcap/raw-socket sniffer used to observe knock packets (e.g., knockd, fwknopd, knockd.conf,
+    tcpdump, tshark) as seen in process-creation telemetry?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. The most direct evidence of a knock implant is the daemon itself or the sniffer it
+    uses to watch for trigger packets. Maintain a watchlist of knock/SPA binaries and configs (knockd,
+    fwknopd, knockd.conf) plus libpcap/raw-socket consumers (tcpdump, tshark) that such daemons use to
+    observe the signal. Match Windows Event ID 4688 and Sysmon EID 1 on NewProcessName, Image, CommandLine,
+    OriginalFileName, or Hashes and trigger on any hit. On Windows these tools are unusual outside of
+    admin/IR contexts, so a hit on a server or workstation is high-value; confirm by checking the parent
+    process, signer, and whether the host also shows the network knock structure or a new listening port.
+    [Method: Alert on known knock daemons (Symbolic Logic)]'
+  answer_sources: &id011
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Critical Server Subnets, Domain Controllers, User Workstation VLANs, Endpoint Detection and
+    Response (EDR) platform logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'watch = {knockd,knockd.exe,fwknopd,fwknopd.exe,knockd.conf,tcpdump,tshark,WinDivert}
+
+      from (win4688 or sysmon1)
+
+      | where lower(Image) in watch or match(CommandLine, watch) or OriginalFileName in watch or Hashes
+      in known_knock_hashes
+
+      | alert host,user,ParentImage,CommandLine'
+- question: Among new process executions, which command lines are both enterprise-rare (99.9th percentile
+    by frequency over 30 days) AND contain knock/firewall tokens such as 'knock', 'fwknop', '--passwd',
+    'iptables -A', 'firewall-cmd', or pcap filter expressions?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Adversaries rename binaries, so rarity plus token content beats name-matching alone.
+    Baseline command-line frequency enterprise-wide over 30 days; for each new 4688/EID1 record compute
+    a rarity score and flag the 99.9th percentile that also contains knock/firewall tokens or pcap filter
+    expressions. Report the observed count versus baseline mean in the alert so the analyst sees how unusual
+    the command truly is. A vanishingly rare command line that manipulates firewall rules or installs
+    a packet filter on a server that has never run such commands is a strong lead, especially when paired
+    with the network knock evidence. [Method: Score rare knock-related command lines (Statistical Method)]'
+  answer_sources: *id011
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "freq = count_30d(cmdline_norm) by enterprise\nfor e in (win4688|sysmon1):\n  rscore = rarity(e.CommandLine,\
+      \ freq)\n  if rscore>=pctl(99.9) and contains(e.CommandLine,{knock,fwknop,'--passwd','iptables -A','firewall-cmd',pcap_filter}):\n\
+      \    alert(e, observed=cnt, baseline_mean=mean)"
+- question: When new executions are scored by a one-class SVM / Isolation Forest trained on legitimate
+    command lines, which port/firewall-related executions are flagged as anomalies, and what top-3 tokens
+    drove the score?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Token lists are brittle against obfuscation, so learn the shape of normal command
+    lines and flag outliers. Train a one-class SVM / Isolation Forest on 30 days of legitimate command
+    lines, score new executions, and flag port/firewall-related anomalies, surfacing the top-3 driving
+    tokens via LIME-style attribution. This catches novel knock tooling and encoded invocations that token
+    rules miss. A strong anomaly whose attribution points at firewall/port manipulation or packet capture
+    is worth pivoting on; benign-but-rare admin scripts will surface too, so corroborate with the network
+    and firewall-change evidence before escalating. [Method: Detect anomalous command lines with SVM (Machine
+    Learning)]'
+  answer_sources: *id011
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = ocsvm.fit(legit_cmdlines_30d)\nfor e in new_exec:\n  s = model.score(vectorize(e.CommandLine))\n\
+      \  if s<thr and firewall_or_port_related(e): alert(e, top3=lime(model,e))"
+- question: Within 5 seconds of the final attempt in a suspected inbound knock burst, did the targeted
+    host add/modify a Windows Firewall rule (Event ID 4946/4950), open a new listening port (Event ID
+    5154), or have a process begin listening (Sysmon EID 3)?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. The defining behavior of knockd/fwknop is to insert a dynamic firewall pinhole immediately
+    after a valid sequence and before the first allowed connection. Alert when a suspected knock (a Zeek
+    conn.log failed burst) is followed within 5 seconds by Windows Event ID 4946/4950/5154 or Sysmon EID
+    3 on the same targeted host. Keep the 5-second floor and widen only with measured clock skew between
+    the network sensor and the endpoint. This temporal join is one of the highest-confidence detections
+    in the playbook: a failed knock burst that immediately precedes a firewall rule add and a new listener
+    on the same host is very hard to explain benignly. [Method: Correlate knocks with firewall events
+    (Symbolic Logic)]'
+  answer_sources: &id012
+  - Zeek conn.log
+  - Windows Event ID 5154
+  - Windows Event ID 4946
+  - Windows Event ID 4950
+  - Sysmon Event ID 3
+  - 'NAI: Firewall Management Interfaces, Critical Application Servers, Endpoint Devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # failed burst per (src,dst)
+
+      fw = (win4946|win4950|win5154|sysmon3) by host,time
+
+      join knock to fw on dst_host where fw.time - knock.last_attempt <= 5s
+
+      | alert dst_host, src_ip, fw.rule, fw.port'
+- question: Does a host show a change-point step in its firewall-rule-add rate or a newly-listening port
+    that breaks from its own established baseline (detected via CUSUM/PELT/Bayesian online change-point),
+    beyond a mean+3sigma backstop?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. A fixed mean+3sigma threshold misreacts to bursty admin activity, so model each host''s
+    firewall-change/listener-start time-series and apply change-point detection (CUSUM, PELT, or Bayesian
+    online) to flag a knock-induced step change in rule-add rate or a newly-listening port with bounded
+    false positives. Retain mean+3sigma as a deterministic backstop. A host that has been stable for weeks
+    and then exhibits a sudden, sustained shift in firewall mutations or a brand-new listener is suspicious,
+    particularly when the shift coincides with inbound failed-connection bursts. Report the detected change-point
+    time so it can be aligned with network evidence. [Method: Flag anomalous firewall changes (Statistical
+    Method)]'
+  answer_sources: *id012
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ts = per_host_count(fw_rule_add | listener_start) by minute
+
+      cp = changepoint(ts, method=''PELT|CUSUM|BOCPD'')
+
+      if cp.detected and ts.post > mean+3*std: alert(host, cp_time=cp.t, rate_pre, rate_post)'
+- question: Modeling hosts/IPs/processes as nodes and knock-attempt, firewall-change, and listener-start
+    as edges, does a knock-attempt edge connect via a short path to a firewall-change or listener-start
+    edge on the same host within the window?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Graph reasoning links events that simple joins miss and yields an explainable path.
+    Model events as a graph (nodes: hosts/IPs/processes; edges: knock-attempt, firewall-change, listener-start).
+    On a knock-attempt edge, search for a short path to a firewall-change/listener-start edge on the same
+    host within the window and report the discovered path (the top-3 edges) as the explanation. A short,
+    time-ordered path of knock -> firewall-change -> listener on one host is the full attack chain made
+    visible; the path itself becomes the analyst''s evidence and pivot set. [Method: Graph knock-to-listener
+    paths (Machine Learning)]'
+  answer_sources: *id012
+  range: Last 90 days
+  queries:
+  - technology: Graph/pseudocode
+    query: "G = build_graph(knock_edges, fw_change_edges, listener_edges)\nfor k in knock_edges:\n  path\
+      \ = shortest_path(G, k, target={fw_change,listener}, same_host=True, within=window)\n  if path and\
+      \ len(path)<=3: alert(host, path)"
+- question: Does a knock sequence (3 to 10 failed connections to distinct closed ports within 30 seconds,
+    no SF in-window) originate from an IP listed by CTI as an anonymization service such as a TOR exit,
+    public proxy, or commercial VPN?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Adversaries frequently knock from anonymizing infrastructure to mask origin. Detect
+    the knock structure (3-10 failed connections to distinct closed ports within 30s, failure-dominated)
+    and join src_ip against anonymizer CTI feeds, alerting whenever a knock source matches a listed anonymization
+    service. Legitimate users rarely arrive at internal closed ports via TOR/VPN exit nodes in a deterministic
+    failed burst, so the combination of knock structure plus anonymizer origin is a meaningful escalation
+    even absent other evidence. Keep the anonymizer feed fresh, since exit-node lists churn rapidly. [Method:
+    Join knock sequences with anonymizer feeds (Symbolic Logic)]'
+  answer_sources: &id013
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Egress Network Filters, Proxy Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # 3-10 distinct ports, 30s, 0 SF
+
+      | lookup anonymizer_cti on src_ip
+
+      | where anon_type in (''tor_exit'',''proxy'',''vpn'') | alert src_ip,dst,anon_type'
+- question: Among knock sources, which fall in the 99th percentile of ASN/country rarity (over a 30-day
+    baseline) AND also carry a genuine failure-dominated SPRT verdict, so only rare-anonymizer-ASN, truly-failing
+    bursts escalate?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Enrich knock sources with geo/ASN and, over a 30-day baseline, compute the rarity
+    of each ASN/country pair, flagging the 99th percentile. Combine this with the failed/successful SPRT
+    (Threshold Random Walk) verdict so that only genuine failure-dominated bursts from rare anonymizer
+    ASNs escalate, suppressing benign traffic from common networks. This catches knockers using less-known
+    VPN/hosting ASNs that may not yet be on an explicit anonymizer feed. Report the ASN, country, and
+    observed rarity so the analyst can judge whether the origin is plausible for the targeted asset. [Method:
+    Score rare ASN/country pairs (Statistical Method)]'
+  answer_sources: *id013
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(count_by(asn,country),99)\nfor k in knock_bursts:\n  if rarity(k.asn,k.country)>=p99\
+      \ and trw(k.failed,k.success)=='malicious':\n    alert(k.src_ip, asn=k.asn, country=k.country)"
+- question: When a Random Forest classifies suspected knock sources using CTI presence, ASN, reverse-DNS
+    patterns, and history, which are labeled anonymizers, and what top-3 features drove the classification?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Some anonymizers are not on any feed, so learn their fingerprint. Train a Random
+    Forest to classify IPs as anonymizers using CTI presence, ASN, reverse-DNS patterns (e.g., tor/vpn/host
+    naming), and historical behavior; score suspected knock sources and report the top-3 features behind
+    each classification. A knock source classified as an anonymizer with strong, sensible feature attribution
+    corroborates intent to hide origin; pair it with the knock-structure and post-knock connection evidence
+    to confirm an actual activation rather than reconnaissance. [Method: Classify anonymizer sources (Machine
+    Learning)]'
+  answer_sources: *id013
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feat = [cti_present,asn,rdns_pattern,history]\nfor k in knock_sources:\n  y = rf_anon.predict(feat(k))\n\
+      \  if y=='anonymizer': alert(k, top3=feature_importance(rf_anon,feat(k)))"
+- question: Did a successful TCP connection (conn_state SF) land on a (host,port) pair that has accepted
+    no connections in the last 30 days, within 10 seconds of 3 or more failed attempts (REJ/S0) from the
+    same source to different ports on that host?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. The payoff of knocking is the first successful connection to a port that was previously
+    closed. Track (host,port) pairs with successful SF over the last 30 days; when a new SF occurs on
+    an unseen pair, require at least 3 preceding failed attempts (REJ/S0) from the same source within
+    30s before firing. This captures the closed->open state transition central to knocking and avoids
+    alerting on normal new services that lack a preceding failed burst. A new SF on a never-before-seen
+    port immediately following a same-source failed burst is the open-pinhole-then-connect signature and
+    warrants immediate investigation of what now listens on that port. [Method: Base new connections against
+    recent history (Symbolic Logic)]'
+  answer_sources: &id014
+  - Zeek conn.log
+  - 'NAI: DMZ Servers, Externally-facing Application Gateways, Network Taps'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "seen = set((host,port) with SF in last_30d)\nfor c in zeek_conn where conn_state=='SF' and\
+      \ (c.resp_h,c.resp_p) not in seen:\n  pre = count(failed REJ/S0 from c.orig_h to c.resp_h other\
+      \ ports within 30s before c)\n  if pre>=3: alert(c.resp_h, c.resp_p, c.orig_h)"
+- question: For each host, how surprising is a new SF on an unfamiliar port given a preceding failed burst
+    (probability above mean+3sigma), with the burst itself confirmed by the TRW failed/successful walk?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Profile each host''s listening ports over 30 days and compute the conditional probability
+    of a new SF on an unfamiliar port given a preceding failed burst; flag events whose surprise exceeds
+    mean+3sigma, and confirm the preceding burst with the Threshold Random Walk failed/successful test.
+    This grades the novelty of the opened port rather than treating all new ports equally, so a connection
+    to a port the host has never offered, immediately after a failing burst, scores highest. Report the
+    surprise score and the confirming TRW verdict so analysts can prioritize the most improbable activations.
+    [Method: Score rare post-knock connections (Statistical Method)]'
+  answer_sources: *id014
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "p_port = port_profile_30d(host)\nfor c in SF on host:\n  surprise = -log(p_port[c.resp_p]\
+      \ given preceding_failed_burst)\n  if surprise > mean+3*std and trw(burst)=='malicious': alert(host,c.resp_p,surprise)"
+- question: When an Isolation Forest / autoencoder scores benign connection 5-tuples and volume features,
+    which SF anomalies are temporally linked to 3 or more failed knocks within 30s, and what top-3 features
+    (port novelty, failed-ratio, byte volume) explain them?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Train an Isolation Forest / autoencoder on benign connection 5-tuples (src_ip, dst_ip,
+    dst_port, proto, conn_state) plus volume features (orig_bytes/resp_bytes); when an SF anomaly is temporally
+    linked to >=3 failed knocks within 30s, classify it as a successful knock and surface the top-3 features
+    (e.g., port novelty, failed-ratio, byte volume) via attribution. This learns the host''s normal connection
+    manifold and flags the unusual post-knock session even when the port number alone looks ordinary.
+    A high anomaly score tied to a preceding failed burst, with attribution pointing at port novelty and
+    failed-ratio, is a strong successful-knock indicator. [Method: Flag anomalies with Isolation Forest
+    (Machine Learning)]'
+  answer_sources: *id014
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = iforest.fit(benign_5tuples_volume_30d)\nfor c in SF:\n  s = model.score([src,dst,dport,proto,state,obytes,rbytes])\n\
+      \  if s anomalous and preceding_failed_knocks(c)>=3 within 30s:\n    alert(c, top3=explain(model,c))"
+- question: Did an internal host send a reverse knock (more than 3 failed connections to distinct ports
+    on one external IP within 10 seconds) followed within 30 seconds by an inbound connection from that
+    same external IP, where the IP/domain matches C2 threat intel?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Knocking also runs outbound: an internal implant signals an external controller,
+    which then connects back on a dynamically opened port. Detect outbound knock sequences (>3 failed
+    connections to distinct ports within 10s) followed within 30s by an inbound connection from the same
+    external IP, and alert when that IP/domain matches C2 threat intel. This is a covert traffic-signaling
+    trigger and is especially concerning because it originates from inside the network, implying a host
+    is already compromised. Even without a CTI hit, the outbound-knock-then-inbound-connect pattern is
+    anomalous and should be retained for the rarity and classifier checks. [Method: Correlate reverse
+    knocks to CTI (Symbolic Logic)]'
+  answer_sources: &id015
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress points of the network, DNS Resolvers, Core Network Switches'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "out = filter(conn.log, local_orig and conn_state in {REJ,RSTO,S0})\ngroup out by (orig_h,resp_h)\
+      \ within 10s\nif distinct(resp_p)>3:\n  inb = inbound(resp_h -> orig_h) within 30s\n  if inb and\
+      \ in_c2_intel(resp_h or dns_name(resp_h)): alert(orig_h,resp_h)"
+- question: Which external knock destinations fall in the 99.9th percentile of rarity (frequency, ASN,
+    country, first-seen) over 30 days, and do associated dns.log queries show an elevated NXDOMAIN/failed-resolution
+    rate?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Compute rarity (frequency, ASN, country, first-seen) for outbound knock destinations
+    over 30 days and flag the 99.9th percentile; separately profile the NXDOMAIN/failed-resolution rate
+    of associated dns.log queries as a distinct low-and-slow failure-mode signal. A first-seen destination
+    in a rare ASN/country that an internal host suddenly reverse-knocks is suspicious, and a spike in
+    failed resolutions can indicate domain-generation or staging behavior around the same beacon. Report
+    the rarity drivers and the resolution-failure rate so analysts can separate new-but-benign SaaS from
+    genuinely novel infrastructure. [Method: Score knocked destinations by rarity (Statistical Method)]'
+  answer_sources: *id015
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(score(freq,asn,country,first_seen),99.9)\nfor d in knock_dests:\n  if rarity(d)>=p999:\
+      \ alert(d, drivers)\nnxd = rate(dns.log rcode==NXDOMAIN by host) ; if nxd>baseline: enrich(alert)"
+- question: When a classifier trained on dns/conn features (query/answer ratio, TTL, entropy, duration,
+    byte counts) scores a reverse-knock destination, is it labeled C2 with high confidence, and what top-3
+    features drove the verdict?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Train a classifier on combined dns/conn features (query/answer ratio, TTL, entropy,
+    duration, byte counts) and alert when a reverse-knock destination is classified C2 with high confidence,
+    reporting the top-3 features. This fuses naming/resolution behavior with flow shape to distinguish
+    controller infrastructure from benign external services. A high-confidence C2 label on the target
+    of an internal reverse knock, with attribution pointing at low TTL, high query entropy, or beacon-like
+    duration/byte profiles, strongly suggests an established outbound C2 channel and should be escalated
+    for host containment. [Method: Classify reverse knock targets (Machine Learning)]'
+  answer_sources: *id015
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = join(dns_features(dest), conn_features(dest))
+
+      y,p = c2_clf.predict_proba(feat)
+
+      if y==''C2'' and p>0.9: alert(dest, top3=explain(c2_clf,feat))'
+- question: Does an inbound knock from an external IP repeatedly trigger a short-lived outbound connection
+    (within 60 seconds) back to that same IP, recurring at a regular ~3500-3700 second interval at least
+    three times?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. After a knock activates a channel, implants often beacon back on a fixed cadence.
+    Track knock-beacon events (an inbound knock followed by an outbound connection to the same IP within
+    60s) and alert when the same IP pair repeats every 3500-3700 seconds at least three times. Keep the
+    explicit interval and count floors so a single coincidence does not fire. A knock-conditioned beacon
+    that recurs near-hourly with low jitter is a classic C2 heartbeat and confirms an active, controlled
+    implant rather than one-off reconnaissance. [Method: Record periodic knock-beacon pairs (Symbolic
+    Logic)]'
+  answer_sources: &id016
+  - Zeek conn.log
+  - 'NAI: Network Egress Points, Internal Network Segments, Firewall Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'pairs = events where inbound_knock(ip) then outbound(host->ip) within 60s
+
+      | stats list(interval) as iv by (host,ip)
+
+      | where count(iv where 3500<=iv<=3700) >= 3 | alert host,ip'
+- question: Among (src,dst) outbound flow pairs, which knock-preceded pairs fall in the lowest 1st percentile
+    of inter-arrival jitter (coefficient of variation), after suppressing benign periodic services?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Group outbound flows by (src,dst), compute the inter-arrival coefficient of variation/jitter,
+    and alert when knock-preceded pairs fall in the lowest 1st percentile of jitter, suppressing benign
+    periodic services using empirical periodicity baselines and RITA-style CV/skew scoring. Extremely
+    regular timing is the hallmark of automated beaconing rather than human-driven traffic. Because some
+    legitimate services (NTP, update checks, telemetry) are also periodic, the suppression list is essential;
+    the strongest signal is a knock-conditioned, ultra-low-jitter pair to an otherwise-unexplained destination.
+    Report the CV and skew so the analyst can judge regularity. [Method: Flag low-jitter knock-enabled
+    pairs (Statistical Method)]'
+  answer_sources: *id016
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for (s,d) in outbound_pairs:\n  cv = std(iat)/mean(iat); skew = skewness(iat)\n  if knock_preceded(s,d)\
+      \ and cv <= pctl(jitter,1) and (s,d) not in benign_periodic:\n    alert(s,d, cv, skew)"
+- question: Does FFT/autocorrelation of the outbound timestamps for a knock-triggered flow reveal a strong
+    periodic component aligned with the knock events, and what dominant period and power explain it?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Apply FFT/autocorrelation to outbound timestamps and alert when a strong periodic
+    component aligns with knock events, using a noise-robust periodicity pipeline (e.g., BAYWATCH-style)
+    that survives jitter and missing intervals. Report the dominant period and power as the explanation.
+    Frequency-domain analysis detects beacons that time-domain jitter checks miss when an adversary adds
+    randomization, since the underlying cadence still produces a spectral peak. A strong spectral peak
+    that lines up with knock activations is robust evidence of an automated knock-and-beacon channel;
+    the reported period/power gives analysts a concrete signature to hunt elsewhere. [Method: FFT/autocorrelation
+    on knock-triggered flows (Machine Learning)]'
+  answer_sources: *id016
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts = outbound_timestamps(host->ip)
+
+      spec = fft(diff(ts)) ; peak,power = dominant(spec)
+
+      if power>thr and aligns(peak, knock_events): alert(host,ip, period=peak, power=power)'
+- question: Immediately after a successful knock, is there a connection on a non-standard port that lasts
+    over 5 minutes with a history string showing bidirectional data ('d'/'D') yet transfers under 10 KB
+    total?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Interactive C2 over a knock-opened port looks like a long, quiet, two-way session.
+    Identify post-knock connections that last longer than 5 minutes, have a history string containing
+    ''d''/''D'' (data both directions), and transfer less than 10 KB total, then alert. Retain the duration,
+    history, and byte floors. A long-lived, low-volume, bidirectional session on an unusual port that
+    opened right after a knock is consistent with a hands-on-keyboard shell or a low-rate control channel,
+    in stark contrast to bulk transfers or short request/response flows. This is a high-value confirmation
+    that the opened pinhole is being used interactively. [Method: Validate long-lived post-knock sessions
+    (Symbolic Logic)]'
+  answer_sources: &id017
+  - Zeek conn.log
+  - 'NAI: Critical Server Subnets, Developer Workstations, Network Security Monitoring Sensors'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for c in conn.log where post_knock(c):\n  if c.duration>300 and ('d' in c.history or 'D' in\
+      \ c.history) and (c.orig_bytes+c.resp_bytes)<10240 and nonstandard(c.resp_p):\n    alert(c)"
+- question: Which post-knock connections exceed the 98th percentile of duration-to-bytes ratio against
+    baseline, using long-connection and low-data scoring on Zeek conn.log?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Baseline duration/byte ratios for post-knock connections and alert above the 98th
+    percentile, using RITA-style long-connection and low-data scoring; report the observed ratio versus
+    baseline. A session that stays open far longer than the data it carries would justify is the statistical
+    fingerprint of an idle-but-held control channel. Grading by ratio rather than absolute duration adapts
+    to environments where some legitimate long connections exist, so the alert highlights the connections
+    most disproportionately long for their payload. Pair with the symbolic floors to confirm bidirectionality
+    and port novelty. [Method: Flag high duration-to-bytes ratios (Statistical Method)]'
+  answer_sources: *id017
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for c in post_knock_conns:\n  ratio = c.duration / max(c.orig_bytes+c.resp_bytes,1)\n  if\
+      \ ratio >= pctl(ratio_baseline,98): alert(c, observed=ratio, baseline=mean)"
+- question: When a Gradient Boosting / one-class model scores duration, byte volume, history string, and
+    inter-packet timing, is a post-knock connection labeled interactive C2, and what top-3 features drove
+    the score?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Train a Gradient Boosting / one-class model on duration, byte volume, history string,
+    and inter-packet timing to label interactive C2, surfacing the top-3 features driving the score. Inter-packet
+    timing in particular separates human-driven interactive sessions (bursty, irregular keystroke-like
+    timing) from automated transfers. A post-knock connection classified as interactive C2 with attribution
+    pointing at long duration, low volume, and human-like inter-packet gaps is strong evidence of a live
+    operator on a knock-opened port and should trigger host investigation and likely containment. [Method:
+    Classify interactive C2 connections (Machine Learning)]'
+  answer_sources: *id017
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = [duration,bytes,history_vec,interpacket_stats]
+
+      y,p = c2_session_clf.predict(feat(c))
+
+      if y==''interactive_c2'' and p>0.9: alert(c, top3=explain(c2_session_clf,feat(c)))'
+- question: On a router/switch, is a series of denied/closed flows to distinct ports from one source (NSM:Flow)
+    followed within the time window by a config/ACL change, line-vty transport-input change, or telnet/ssh/http(s)
+    enable in syslog, then a successful management session from that same source?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Network-device implants such as SYNful Knock activate management access only after
+    a crafted trigger. Alert when a series of denied/closed flows to distinct ports from one src_ip (NSM:Flow)
+    is followed within the time window by a config/ACL change, line-vty transport-input change, or telnet/ssh/http(s)
+    enable in networkdevice:syslog, then a successful management session from the same source. This crafted-trigger-then-activate-then-login
+    chain on an infrastructure device is extremely high-value because routers and switches are rarely
+    re-knocked benignly and compromise grants broad control. Treat any complete chain as a likely device
+    implant. [Method: Correlate device knock to config change (Symbolic Logic)]'
+  answer_sources: &id018
+  - networkdevice:syslog
+  - NSM:Flow
+  - 'NAI: Network Device Management Plane, Router/Switch Control Plane, Out-of-Band Management Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = denied_flows(NSM_Flow) grouped by src_ip, distinct dst_port within window
+
+      cfg = syslog where (acl_change|vty_transport_change|enable_telnet|enable_ssh|enable_http)
+
+      join knock->cfg->mgmt_login(same src) within window | alert device,src_ip,cfg.event'
+- question: Per device, do crafted trigger packets show out-of-distribution TCP sequence/ACK values, or
+    do denied-flow bursts exceed a change-point shift versus the device's baseline frequency?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Profile per-device denied-flow frequency and the distribution of TCP sequence/ACK
+    values; flag crafted packets with out-of-distribution seq/ack (a storage covert channel) or denied-flow
+    bursts exceeding a change-point shift. Some device knocks encode the trigger in header fields rather
+    than port order, so modeling seq/ack distributions catches signals that port-sequence rules miss,
+    while change-point detection on denied-flow rate catches volumetric trigger bursts. Report the anomalous
+    field values or the change-point so analysts can correlate with any subsequent config change or management
+    login on the device. [Method: Score anomalous trigger packets (Statistical Method)]'
+  answer_sources: *id018
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "seq_dist = profile(seq,ack) per device\nfor pkt in trigger_candidates:\n  if outlier(pkt.seq,seq_dist)\
+      \ or outlier(pkt.ack): alert(device, pkt)\ncp = changepoint(denied_flow_rate(device)); if cp.detected:\
+      \ alert(device, cp_time=cp.t)"
+- question: When an anomaly model trained on benign device config-event sequences scores a new sequence,
+    does it flag a rare enable-service-then-first-login chain, and what top-3 contributing events explain
+    it?
+  context: 'In the context of Command and Control (TA0011), the knock sequence is the covert trigger that
+    opens or initiates the C2 channel, so this check is about tying the knock to the controller communication
+    that follows it. Train an anomaly model on benign device config-event sequences and flag rare enable-service-then-first-login
+    chains, reporting the top-3 contributing events. Legitimate device administration follows well-worn
+    change patterns, so a sequence that enables a management service and is immediately followed by a
+    first-ever login from a new source is an outlier worth surfacing. The model captures order and rarity
+    that static rules miss; a flagged enable-then-login chain with sensible event attribution on a core
+    router/switch is a strong indicator of implant activation and should be triaged against the flow-based
+    knock evidence. [Method: Detect rare management enablement (Machine Learning)]'
+  answer_sources: *id018
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = seq_anomaly.fit(benign_config_event_seqs)\nfor seq in device_event_seqs:\n  if model.anomalous(seq)\
+      \ and pattern(seq)=='enable_service->first_login':\n    alert(device, top3=explain(model,seq))"
+- question: Is a single external source touching a short ordered run of distinct closed ports (3 to 10
+    distinct destination ports, conn_state REJ/RSTO/S0, zero SF) on one internal host inside a 30-second
+    window, where that source IP also appears on a high-confidence threat-intelligence feed?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. This is the canonical inbound port-knock
+    signature: a deterministic, failure-only burst against a small set of closed ports that primes a host-based
+    firewall pinhole. Filter Zeek conn.log to failed connection states (REJ, RSTO, S0), apply a 30-second
+    sliding window grouped by (src_ip, dst_ip), count distinct dst_port, and require the burst be 100%
+    failed (no SF to the same host in-window). Fire when the distinct-port count is between 3 and 10 AND
+    the source matches your highest-fidelity CTI list. The 3-10 floor is the documented knock-sequence
+    length; tune MinSeqLen/MaxSeqLen per environment but never delete the floor or you will drown in benign
+    single-port retries. A positive result with a CTI hit is a strong, actionable lead; a positive structure
+    without CTI should be downgraded but retained for correlation with later evidence (firewall change,
+    first successful connect). [Method: Match knock sequences to threat intel (Symbolic Logic)]'
+  answer_sources: &id019
+  - Zeek conn.log
+  - 'NAI: Internet Gateway Firewall, DMZ Network Segments, Cloud VPC Flow Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'from zeek_conn where conn_state in (''REJ'',''RSTO'',''S0'')
+
+      | window 30s sliding by src_ip,dst_ip
+
+      | stats dcount(dst_port) as nports, count(eval(conn_state==''SF'')) as nsf by src_ip,dst_ip,window
+
+      | where nports>=3 and nports<=10 and nsf==0
+
+      | lookup threat_intel_high_conf on src_ip
+
+      | where ti_match==true | alert'
+  - technology: Zeek/pseudocode
+    query: 'knock = filter(conn.log, conn_state in {REJ,RSTO,S0})
+
+      group knock by (id.orig_h,id.resp_h) within 30s
+
+      if distinct(id.resp_p) in [3,10] and count(SF)==0 and in_intel(id.orig_h): raise(''knock+CTI'')'
+- question: Across the gateway, which source IPs exhibit a statistically anomalous failed-connection walk
+    (a sequential-probability-ratio verdict after ~4-5 failures) combined with a high knock-score driven
+    by failed-burst frequency and a high-entropy destination-port sequence?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Pure signatures miss novel sequences,
+    so model each source''s connection outcomes as a random walk and apply a Threshold Random Walk / sequential
+    probability ratio test on the failed-to-successful ratio so a verdict fires after roughly 4-5 failures
+    with bounded false positives. In parallel compute a per-IP knock score from failed-burst frequency
+    (bursts/min) and the Shannon entropy of the dst_port sequence, and flag IPs in the 99th percentile
+    of knock score with entropy > 2.0 (ordered, varied closed ports rather than a single repeated port).
+    Derive the percentile cutoff from a rolling 30-day per-gateway baseline so the threshold adapts to
+    the site. A high SPRT-positive, high-entropy, high-frequency source is a likely knocker even with
+    no CTI match. [Method: Score rare, high-entropy knock behavior (Statistical Method)]'
+  answer_sources: *id019
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline = pctl_30d(knock_score, 99) by gateway\nfor src in sources:\n  sprt = trw(failed,success)\
+      \  # accept H1 ~4-5 failures\n  ks = freq(failed_bursts) ; ent = shannon(dst_port_seq)\n  if sprt=='malicious'\
+      \ and ks>=baseline and ent>2.0: alert(src, observed=ks, ent)"
+- question: When an ordered connection sequence is scored by a trained RNN/LSTM, does it classify as a
+    malicious port-knock (P>0.9) rather than benign scanning, and what top-3 features (distinct-port count,
+    failed-ratio, inter-arrival) drove that call?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Ordered knocks differ from broad scans
+    in their structure: a short, ordered, low-volume run with consistent inter-arrival timing versus a
+    wide, fan-out sweep. Train an RNN/LSTM on ordered sequences using timestamp-delta, dst_port, TCP flags,
+    and conn_state as features to discriminate ordered knocks from benign scanning, training the benign
+    class only on validated normal flows. Elevate when P(malicious knock) > 0.9 and surface the top-3
+    contributing features via per-prediction attribution so an analyst can sanity-check the verdict. A
+    high-confidence classification with sensible attribution (e.g., tight distinct-port count, near-100%
+    failed-ratio, regular inter-arrival) is a strong indicator; a low-confidence or oddly-attributed score
+    should be triaged with the symbolic and statistical checks. [Method: Classify sequences with an RNN
+    (Machine Learning)]'
+  answer_sources: *id019
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'seq = order_by_time(conn[src,dst]); X = [dt,dst_port,tcp_flags,conn_state]
+
+      p = lstm_knock.predict(X)
+
+      if p>0.9: alert(src,dst, p, top3=explain(lstm_knock,X))'
+- question: Has any monitored endpoint executed a known port-knocking/SPA daemon, its configuration file,
+    or a libpcap/raw-socket sniffer used to observe knock packets (e.g., knockd, fwknopd, knockd.conf,
+    tcpdump, tshark) as seen in process-creation telemetry?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. The most direct evidence of a knock
+    implant is the daemon itself or the sniffer it uses to watch for trigger packets. Maintain a watchlist
+    of knock/SPA binaries and configs (knockd, fwknopd, knockd.conf) plus libpcap/raw-socket consumers
+    (tcpdump, tshark) that such daemons use to observe the signal. Match Windows Event ID 4688 and Sysmon
+    EID 1 on NewProcessName, Image, CommandLine, OriginalFileName, or Hashes and trigger on any hit. On
+    Windows these tools are unusual outside of admin/IR contexts, so a hit on a server or workstation
+    is high-value; confirm by checking the parent process, signer, and whether the host also shows the
+    network knock structure or a new listening port. [Method: Alert on known knock daemons (Symbolic Logic)]'
+  answer_sources: &id020
+  - Windows Event ID 4688
+  - Sysmon Event ID 1
+  - 'NAI: Critical Server Subnets, Domain Controllers, User Workstation VLANs, Endpoint Detection and
+    Response (EDR) platform logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'watch = {knockd,knockd.exe,fwknopd,fwknopd.exe,knockd.conf,tcpdump,tshark,WinDivert}
+
+      from (win4688 or sysmon1)
+
+      | where lower(Image) in watch or match(CommandLine, watch) or OriginalFileName in watch or Hashes
+      in known_knock_hashes
+
+      | alert host,user,ParentImage,CommandLine'
+- question: Among new process executions, which command lines are both enterprise-rare (99.9th percentile
+    by frequency over 30 days) AND contain knock/firewall tokens such as 'knock', 'fwknop', '--passwd',
+    'iptables -A', 'firewall-cmd', or pcap filter expressions?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Adversaries rename binaries, so rarity
+    plus token content beats name-matching alone. Baseline command-line frequency enterprise-wide over
+    30 days; for each new 4688/EID1 record compute a rarity score and flag the 99.9th percentile that
+    also contains knock/firewall tokens or pcap filter expressions. Report the observed count versus baseline
+    mean in the alert so the analyst sees how unusual the command truly is. A vanishingly rare command
+    line that manipulates firewall rules or installs a packet filter on a server that has never run such
+    commands is a strong lead, especially when paired with the network knock evidence. [Method: Score
+    rare knock-related command lines (Statistical Method)]'
+  answer_sources: *id020
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "freq = count_30d(cmdline_norm) by enterprise\nfor e in (win4688|sysmon1):\n  rscore = rarity(e.CommandLine,\
+      \ freq)\n  if rscore>=pctl(99.9) and contains(e.CommandLine,{knock,fwknop,'--passwd','iptables -A','firewall-cmd',pcap_filter}):\n\
+      \    alert(e, observed=cnt, baseline_mean=mean)"
+- question: When new executions are scored by a one-class SVM / Isolation Forest trained on legitimate
+    command lines, which port/firewall-related executions are flagged as anomalies, and what top-3 tokens
+    drove the score?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Token lists are brittle against obfuscation,
+    so learn the shape of normal command lines and flag outliers. Train a one-class SVM / Isolation Forest
+    on 30 days of legitimate command lines, score new executions, and flag port/firewall-related anomalies,
+    surfacing the top-3 driving tokens via LIME-style attribution. This catches novel knock tooling and
+    encoded invocations that token rules miss. A strong anomaly whose attribution points at firewall/port
+    manipulation or packet capture is worth pivoting on; benign-but-rare admin scripts will surface too,
+    so corroborate with the network and firewall-change evidence before escalating. [Method: Detect anomalous
+    command lines with SVM (Machine Learning)]'
+  answer_sources: *id020
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = ocsvm.fit(legit_cmdlines_30d)\nfor e in new_exec:\n  s = model.score(vectorize(e.CommandLine))\n\
+      \  if s<thr and firewall_or_port_related(e): alert(e, top3=lime(model,e))"
+- question: Within 5 seconds of the final attempt in a suspected inbound knock burst, did the targeted
+    host add/modify a Windows Firewall rule (Event ID 4946/4950), open a new listening port (Event ID
+    5154), or have a process begin listening (Sysmon EID 3)?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. The defining behavior of knockd/fwknop
+    is to insert a dynamic firewall pinhole immediately after a valid sequence and before the first allowed
+    connection. Alert when a suspected knock (a Zeek conn.log failed burst) is followed within 5 seconds
+    by Windows Event ID 4946/4950/5154 or Sysmon EID 3 on the same targeted host. Keep the 5-second floor
+    and widen only with measured clock skew between the network sensor and the endpoint. This temporal
+    join is one of the highest-confidence detections in the playbook: a failed knock burst that immediately
+    precedes a firewall rule add and a new listener on the same host is very hard to explain benignly.
+    [Method: Correlate knocks with firewall events (Symbolic Logic)]'
+  answer_sources: &id021
+  - Zeek conn.log
+  - Windows Event ID 5154
+  - Windows Event ID 4946
+  - Windows Event ID 4950
+  - Sysmon Event ID 3
+  - 'NAI: Firewall Management Interfaces, Critical Application Servers, Endpoint Devices'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # failed burst per (src,dst)
+
+      fw = (win4946|win4950|win5154|sysmon3) by host,time
+
+      join knock to fw on dst_host where fw.time - knock.last_attempt <= 5s
+
+      | alert dst_host, src_ip, fw.rule, fw.port'
+- question: Does a host show a change-point step in its firewall-rule-add rate or a newly-listening port
+    that breaks from its own established baseline (detected via CUSUM/PELT/Bayesian online change-point),
+    beyond a mean+3sigma backstop?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. A fixed mean+3sigma threshold misreacts
+    to bursty admin activity, so model each host''s firewall-change/listener-start time-series and apply
+    change-point detection (CUSUM, PELT, or Bayesian online) to flag a knock-induced step change in rule-add
+    rate or a newly-listening port with bounded false positives. Retain mean+3sigma as a deterministic
+    backstop. A host that has been stable for weeks and then exhibits a sudden, sustained shift in firewall
+    mutations or a brand-new listener is suspicious, particularly when the shift coincides with inbound
+    failed-connection bursts. Report the detected change-point time so it can be aligned with network
+    evidence. [Method: Flag anomalous firewall changes (Statistical Method)]'
+  answer_sources: *id021
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'ts = per_host_count(fw_rule_add | listener_start) by minute
+
+      cp = changepoint(ts, method=''PELT|CUSUM|BOCPD'')
+
+      if cp.detected and ts.post > mean+3*std: alert(host, cp_time=cp.t, rate_pre, rate_post)'
+- question: Modeling hosts/IPs/processes as nodes and knock-attempt, firewall-change, and listener-start
+    as edges, does a knock-attempt edge connect via a short path to a firewall-change or listener-start
+    edge on the same host within the window?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Graph reasoning links events that simple
+    joins miss and yields an explainable path. Model events as a graph (nodes: hosts/IPs/processes; edges:
+    knock-attempt, firewall-change, listener-start). On a knock-attempt edge, search for a short path
+    to a firewall-change/listener-start edge on the same host within the window and report the discovered
+    path (the top-3 edges) as the explanation. A short, time-ordered path of knock -> firewall-change
+    -> listener on one host is the full attack chain made visible; the path itself becomes the analyst''s
+    evidence and pivot set. [Method: Graph knock-to-listener paths (Machine Learning)]'
+  answer_sources: *id021
+  range: Last 90 days
+  queries:
+  - technology: Graph/pseudocode
+    query: "G = build_graph(knock_edges, fw_change_edges, listener_edges)\nfor k in knock_edges:\n  path\
+      \ = shortest_path(G, k, target={fw_change,listener}, same_host=True, within=window)\n  if path and\
+      \ len(path)<=3: alert(host, path)"
+- question: Does a knock sequence (3 to 10 failed connections to distinct closed ports within 30 seconds,
+    no SF in-window) originate from an IP listed by CTI as an anonymization service such as a TOR exit,
+    public proxy, or commercial VPN?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Adversaries frequently knock from anonymizing
+    infrastructure to mask origin. Detect the knock structure (3-10 failed connections to distinct closed
+    ports within 30s, failure-dominated) and join src_ip against anonymizer CTI feeds, alerting whenever
+    a knock source matches a listed anonymization service. Legitimate users rarely arrive at internal
+    closed ports via TOR/VPN exit nodes in a deterministic failed burst, so the combination of knock structure
+    plus anonymizer origin is a meaningful escalation even absent other evidence. Keep the anonymizer
+    feed fresh, since exit-node lists churn rapidly. [Method: Join knock sequences with anonymizer feeds
+    (Symbolic Logic)]'
+  answer_sources: &id022
+  - Zeek conn.log
+  - 'NAI: Internet Gateway, Egress Network Filters, Proxy Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = knock_bursts(zeek_conn)  # 3-10 distinct ports, 30s, 0 SF
+
+      | lookup anonymizer_cti on src_ip
+
+      | where anon_type in (''tor_exit'',''proxy'',''vpn'') | alert src_ip,dst,anon_type'
+- question: Among knock sources, which fall in the 99th percentile of ASN/country rarity (over a 30-day
+    baseline) AND also carry a genuine failure-dominated SPRT verdict, so only rare-anonymizer-ASN, truly-failing
+    bursts escalate?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Enrich knock sources with geo/ASN and,
+    over a 30-day baseline, compute the rarity of each ASN/country pair, flagging the 99th percentile.
+    Combine this with the failed/successful SPRT (Threshold Random Walk) verdict so that only genuine
+    failure-dominated bursts from rare anonymizer ASNs escalate, suppressing benign traffic from common
+    networks. This catches knockers using less-known VPN/hosting ASNs that may not yet be on an explicit
+    anonymizer feed. Report the ASN, country, and observed rarity so the analyst can judge whether the
+    origin is plausible for the targeted asset. [Method: Score rare ASN/country pairs (Statistical Method)]'
+  answer_sources: *id022
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(count_by(asn,country),99)\nfor k in knock_bursts:\n  if rarity(k.asn,k.country)>=p99\
+      \ and trw(k.failed,k.success)=='malicious':\n    alert(k.src_ip, asn=k.asn, country=k.country)"
+- question: When a Random Forest classifies suspected knock sources using CTI presence, ASN, reverse-DNS
+    patterns, and history, which are labeled anonymizers, and what top-3 features drove the classification?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Some anonymizers are not on any feed,
+    so learn their fingerprint. Train a Random Forest to classify IPs as anonymizers using CTI presence,
+    ASN, reverse-DNS patterns (e.g., tor/vpn/host naming), and historical behavior; score suspected knock
+    sources and report the top-3 features behind each classification. A knock source classified as an
+    anonymizer with strong, sensible feature attribution corroborates intent to hide origin; pair it with
+    the knock-structure and post-knock connection evidence to confirm an actual activation rather than
+    reconnaissance. [Method: Classify anonymizer sources (Machine Learning)]'
+  answer_sources: *id022
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "feat = [cti_present,asn,rdns_pattern,history]\nfor k in knock_sources:\n  y = rf_anon.predict(feat(k))\n\
+      \  if y=='anonymizer': alert(k, top3=feature_importance(rf_anon,feat(k)))"
+- question: Did a successful TCP connection (conn_state SF) land on a (host,port) pair that has accepted
+    no connections in the last 30 days, within 10 seconds of 3 or more failed attempts (REJ/S0) from the
+    same source to different ports on that host?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. The payoff of knocking is the first
+    successful connection to a port that was previously closed. Track (host,port) pairs with successful
+    SF over the last 30 days; when a new SF occurs on an unseen pair, require at least 3 preceding failed
+    attempts (REJ/S0) from the same source within 30s before firing. This captures the closed->open state
+    transition central to knocking and avoids alerting on normal new services that lack a preceding failed
+    burst. A new SF on a never-before-seen port immediately following a same-source failed burst is the
+    open-pinhole-then-connect signature and warrants immediate investigation of what now listens on that
+    port. [Method: Base new connections against recent history (Symbolic Logic)]'
+  answer_sources: &id023
+  - Zeek conn.log
+  - 'NAI: DMZ Servers, Externally-facing Application Gateways, Network Taps'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "seen = set((host,port) with SF in last_30d)\nfor c in zeek_conn where conn_state=='SF' and\
+      \ (c.resp_h,c.resp_p) not in seen:\n  pre = count(failed REJ/S0 from c.orig_h to c.resp_h other\
+      \ ports within 30s before c)\n  if pre>=3: alert(c.resp_h, c.resp_p, c.orig_h)"
+- question: For each host, how surprising is a new SF on an unfamiliar port given a preceding failed burst
+    (probability above mean+3sigma), with the burst itself confirmed by the TRW failed/successful walk?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Profile each host''s listening ports
+    over 30 days and compute the conditional probability of a new SF on an unfamiliar port given a preceding
+    failed burst; flag events whose surprise exceeds mean+3sigma, and confirm the preceding burst with
+    the Threshold Random Walk failed/successful test. This grades the novelty of the opened port rather
+    than treating all new ports equally, so a connection to a port the host has never offered, immediately
+    after a failing burst, scores highest. Report the surprise score and the confirming TRW verdict so
+    analysts can prioritize the most improbable activations. [Method: Score rare post-knock connections
+    (Statistical Method)]'
+  answer_sources: *id023
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "p_port = port_profile_30d(host)\nfor c in SF on host:\n  surprise = -log(p_port[c.resp_p]\
+      \ given preceding_failed_burst)\n  if surprise > mean+3*std and trw(burst)=='malicious': alert(host,c.resp_p,surprise)"
+- question: When an Isolation Forest / autoencoder scores benign connection 5-tuples and volume features,
+    which SF anomalies are temporally linked to 3 or more failed knocks within 30s, and what top-3 features
+    (port novelty, failed-ratio, byte volume) explain them?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Train an Isolation Forest / autoencoder
+    on benign connection 5-tuples (src_ip, dst_ip, dst_port, proto, conn_state) plus volume features (orig_bytes/resp_bytes);
+    when an SF anomaly is temporally linked to >=3 failed knocks within 30s, classify it as a successful
+    knock and surface the top-3 features (e.g., port novelty, failed-ratio, byte volume) via attribution.
+    This learns the host''s normal connection manifold and flags the unusual post-knock session even when
+    the port number alone looks ordinary. A high anomaly score tied to a preceding failed burst, with
+    attribution pointing at port novelty and failed-ratio, is a strong successful-knock indicator. [Method:
+    Flag anomalies with Isolation Forest (Machine Learning)]'
+  answer_sources: *id023
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = iforest.fit(benign_5tuples_volume_30d)\nfor c in SF:\n  s = model.score([src,dst,dport,proto,state,obytes,rbytes])\n\
+      \  if s anomalous and preceding_failed_knocks(c)>=3 within 30s:\n    alert(c, top3=explain(model,c))"
+- question: Did an internal host send a reverse knock (more than 3 failed connections to distinct ports
+    on one external IP within 10 seconds) followed within 30 seconds by an inbound connection from that
+    same external IP, where the IP/domain matches C2 threat intel?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Knocking also runs outbound: an internal
+    implant signals an external controller, which then connects back on a dynamically opened port. Detect
+    outbound knock sequences (>3 failed connections to distinct ports within 10s) followed within 30s
+    by an inbound connection from the same external IP, and alert when that IP/domain matches C2 threat
+    intel. This is a covert traffic-signaling trigger and is especially concerning because it originates
+    from inside the network, implying a host is already compromised. Even without a CTI hit, the outbound-knock-then-inbound-connect
+    pattern is anomalous and should be retained for the rarity and classifier checks. [Method: Correlate
+    reverse knocks to CTI (Symbolic Logic)]'
+  answer_sources: &id024
+  - Zeek conn.log
+  - Zeek dns.log
+  - 'NAI: Egress points of the network, DNS Resolvers, Core Network Switches'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "out = filter(conn.log, local_orig and conn_state in {REJ,RSTO,S0})\ngroup out by (orig_h,resp_h)\
+      \ within 10s\nif distinct(resp_p)>3:\n  inb = inbound(resp_h -> orig_h) within 30s\n  if inb and\
+      \ in_c2_intel(resp_h or dns_name(resp_h)): alert(orig_h,resp_h)"
+- question: Which external knock destinations fall in the 99.9th percentile of rarity (frequency, ASN,
+    country, first-seen) over 30 days, and do associated dns.log queries show an elevated NXDOMAIN/failed-resolution
+    rate?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Compute rarity (frequency, ASN, country,
+    first-seen) for outbound knock destinations over 30 days and flag the 99.9th percentile; separately
+    profile the NXDOMAIN/failed-resolution rate of associated dns.log queries as a distinct low-and-slow
+    failure-mode signal. A first-seen destination in a rare ASN/country that an internal host suddenly
+    reverse-knocks is suspicious, and a spike in failed resolutions can indicate domain-generation or
+    staging behavior around the same beacon. Report the rarity drivers and the resolution-failure rate
+    so analysts can separate new-but-benign SaaS from genuinely novel infrastructure. [Method: Score knocked
+    destinations by rarity (Statistical Method)]'
+  answer_sources: *id024
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "rarity = pctl_30d(score(freq,asn,country,first_seen),99.9)\nfor d in knock_dests:\n  if rarity(d)>=p999:\
+      \ alert(d, drivers)\nnxd = rate(dns.log rcode==NXDOMAIN by host) ; if nxd>baseline: enrich(alert)"
+- question: When a classifier trained on dns/conn features (query/answer ratio, TTL, entropy, duration,
+    byte counts) scores a reverse-knock destination, is it labeled C2 with high confidence, and what top-3
+    features drove the verdict?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Train a classifier on combined dns/conn
+    features (query/answer ratio, TTL, entropy, duration, byte counts) and alert when a reverse-knock
+    destination is classified C2 with high confidence, reporting the top-3 features. This fuses naming/resolution
+    behavior with flow shape to distinguish controller infrastructure from benign external services. A
+    high-confidence C2 label on the target of an internal reverse knock, with attribution pointing at
+    low TTL, high query entropy, or beacon-like duration/byte profiles, strongly suggests an established
+    outbound C2 channel and should be escalated for host containment. [Method: Classify reverse knock
+    targets (Machine Learning)]'
+  answer_sources: *id024
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = join(dns_features(dest), conn_features(dest))
+
+      y,p = c2_clf.predict_proba(feat)
+
+      if y==''C2'' and p>0.9: alert(dest, top3=explain(c2_clf,feat))'
+- question: Does an inbound knock from an external IP repeatedly trigger a short-lived outbound connection
+    (within 60 seconds) back to that same IP, recurring at a regular ~3500-3700 second interval at least
+    three times?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. After a knock activates a channel, implants
+    often beacon back on a fixed cadence. Track knock-beacon events (an inbound knock followed by an outbound
+    connection to the same IP within 60s) and alert when the same IP pair repeats every 3500-3700 seconds
+    at least three times. Keep the explicit interval and count floors so a single coincidence does not
+    fire. A knock-conditioned beacon that recurs near-hourly with low jitter is a classic C2 heartbeat
+    and confirms an active, controlled implant rather than one-off reconnaissance. [Method: Record periodic
+    knock-beacon pairs (Symbolic Logic)]'
+  answer_sources: &id025
+  - Zeek conn.log
+  - 'NAI: Network Egress Points, Internal Network Segments, Firewall Logs'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'pairs = events where inbound_knock(ip) then outbound(host->ip) within 60s
+
+      | stats list(interval) as iv by (host,ip)
+
+      | where count(iv where 3500<=iv<=3700) >= 3 | alert host,ip'
+- question: Among (src,dst) outbound flow pairs, which knock-preceded pairs fall in the lowest 1st percentile
+    of inter-arrival jitter (coefficient of variation), after suppressing benign periodic services?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Group outbound flows by (src,dst), compute
+    the inter-arrival coefficient of variation/jitter, and alert when knock-preceded pairs fall in the
+    lowest 1st percentile of jitter, suppressing benign periodic services using empirical periodicity
+    baselines and RITA-style CV/skew scoring. Extremely regular timing is the hallmark of automated beaconing
+    rather than human-driven traffic. Because some legitimate services (NTP, update checks, telemetry)
+    are also periodic, the suppression list is essential; the strongest signal is a knock-conditioned,
+    ultra-low-jitter pair to an otherwise-unexplained destination. Report the CV and skew so the analyst
+    can judge regularity. [Method: Flag low-jitter knock-enabled pairs (Statistical Method)]'
+  answer_sources: *id025
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for (s,d) in outbound_pairs:\n  cv = std(iat)/mean(iat); skew = skewness(iat)\n  if knock_preceded(s,d)\
+      \ and cv <= pctl(jitter,1) and (s,d) not in benign_periodic:\n    alert(s,d, cv, skew)"
+- question: Does FFT/autocorrelation of the outbound timestamps for a knock-triggered flow reveal a strong
+    periodic component aligned with the knock events, and what dominant period and power explain it?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Apply FFT/autocorrelation to outbound
+    timestamps and alert when a strong periodic component aligns with knock events, using a noise-robust
+    periodicity pipeline (e.g., BAYWATCH-style) that survives jitter and missing intervals. Report the
+    dominant period and power as the explanation. Frequency-domain analysis detects beacons that time-domain
+    jitter checks miss when an adversary adds randomization, since the underlying cadence still produces
+    a spectral peak. A strong spectral peak that lines up with knock activations is robust evidence of
+    an automated knock-and-beacon channel; the reported period/power gives analysts a concrete signature
+    to hunt elsewhere. [Method: FFT/autocorrelation on knock-triggered flows (Machine Learning)]'
+  answer_sources: *id025
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts = outbound_timestamps(host->ip)
+
+      spec = fft(diff(ts)) ; peak,power = dominant(spec)
+
+      if power>thr and aligns(peak, knock_events): alert(host,ip, period=peak, power=power)'
+- question: Immediately after a successful knock, is there a connection on a non-standard port that lasts
+    over 5 minutes with a history string showing bidirectional data ('d'/'D') yet transfers under 10 KB
+    total?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Interactive C2 over a knock-opened port
+    looks like a long, quiet, two-way session. Identify post-knock connections that last longer than 5
+    minutes, have a history string containing ''d''/''D'' (data both directions), and transfer less than
+    10 KB total, then alert. Retain the duration, history, and byte floors. A long-lived, low-volume,
+    bidirectional session on an unusual port that opened right after a knock is consistent with a hands-on-keyboard
+    shell or a low-rate control channel, in stark contrast to bulk transfers or short request/response
+    flows. This is a high-value confirmation that the opened pinhole is being used interactively. [Method:
+    Validate long-lived post-knock sessions (Symbolic Logic)]'
+  answer_sources: &id026
+  - Zeek conn.log
+  - 'NAI: Critical Server Subnets, Developer Workstations, Network Security Monitoring Sensors'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: "for c in conn.log where post_knock(c):\n  if c.duration>300 and ('d' in c.history or 'D' in\
+      \ c.history) and (c.orig_bytes+c.resp_bytes)<10240 and nonstandard(c.resp_p):\n    alert(c)"
+- question: Which post-knock connections exceed the 98th percentile of duration-to-bytes ratio against
+    baseline, using long-connection and low-data scoring on Zeek conn.log?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Baseline duration/byte ratios for post-knock
+    connections and alert above the 98th percentile, using RITA-style long-connection and low-data scoring;
+    report the observed ratio versus baseline. A session that stays open far longer than the data it carries
+    would justify is the statistical fingerprint of an idle-but-held control channel. Grading by ratio
+    rather than absolute duration adapts to environments where some legitimate long connections exist,
+    so the alert highlights the connections most disproportionately long for their payload. Pair with
+    the symbolic floors to confirm bidirectionality and port novelty. [Method: Flag high duration-to-bytes
+    ratios (Statistical Method)]'
+  answer_sources: *id026
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "for c in post_knock_conns:\n  ratio = c.duration / max(c.orig_bytes+c.resp_bytes,1)\n  if\
+      \ ratio >= pctl(ratio_baseline,98): alert(c, observed=ratio, baseline=mean)"
+- question: When a Gradient Boosting / one-class model scores duration, byte volume, history string, and
+    inter-packet timing, is a post-knock connection labeled interactive C2, and what top-3 features drove
+    the score?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Train a Gradient Boosting / one-class
+    model on duration, byte volume, history string, and inter-packet timing to label interactive C2, surfacing
+    the top-3 features driving the score. Inter-packet timing in particular separates human-driven interactive
+    sessions (bursty, irregular keystroke-like timing) from automated transfers. A post-knock connection
+    classified as interactive C2 with attribution pointing at long duration, low volume, and human-like
+    inter-packet gaps is strong evidence of a live operator on a knock-opened port and should trigger
+    host investigation and likely containment. [Method: Classify interactive C2 connections (Machine Learning)]'
+  answer_sources: *id026
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'feat = [duration,bytes,history_vec,interpacket_stats]
+
+      y,p = c2_session_clf.predict(feat(c))
+
+      if y==''interactive_c2'' and p>0.9: alert(c, top3=explain(c2_session_clf,feat(c)))'
+- question: On a router/switch, is a series of denied/closed flows to distinct ports from one source (NSM:Flow)
+    followed within the time window by a config/ACL change, line-vty transport-input change, or telnet/ssh/http(s)
+    enable in syslog, then a successful management session from that same source?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Network-device implants such as SYNful
+    Knock activate management access only after a crafted trigger. Alert when a series of denied/closed
+    flows to distinct ports from one src_ip (NSM:Flow) is followed within the time window by a config/ACL
+    change, line-vty transport-input change, or telnet/ssh/http(s) enable in networkdevice:syslog, then
+    a successful management session from the same source. This crafted-trigger-then-activate-then-login
+    chain on an infrastructure device is extremely high-value because routers and switches are rarely
+    re-knocked benignly and compromise grants broad control. Treat any complete chain as a likely device
+    implant. [Method: Correlate device knock to config change (Symbolic Logic)]'
+  answer_sources: &id027
+  - networkdevice:syslog
+  - NSM:Flow
+  - 'NAI: Network Device Management Plane, Router/Switch Control Plane, Out-of-Band Management Segments'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'knock = denied_flows(NSM_Flow) grouped by src_ip, distinct dst_port within window
+
+      cfg = syslog where (acl_change|vty_transport_change|enable_telnet|enable_ssh|enable_http)
+
+      join knock->cfg->mgmt_login(same src) within window | alert device,src_ip,cfg.event'
+- question: Per device, do crafted trigger packets show out-of-distribution TCP sequence/ACK values, or
+    do denied-flow bursts exceed a change-point shift versus the device's baseline frequency?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Profile per-device denied-flow frequency
+    and the distribution of TCP sequence/ACK values; flag crafted packets with out-of-distribution seq/ack
+    (a storage covert channel) or denied-flow bursts exceeding a change-point shift. Some device knocks
+    encode the trigger in header fields rather than port order, so modeling seq/ack distributions catches
+    signals that port-sequence rules miss, while change-point detection on denied-flow rate catches volumetric
+    trigger bursts. Report the anomalous field values or the change-point so analysts can correlate with
+    any subsequent config change or management login on the device. [Method: Score anomalous trigger packets
+    (Statistical Method)]'
+  answer_sources: *id027
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "seq_dist = profile(seq,ack) per device\nfor pkt in trigger_candidates:\n  if outlier(pkt.seq,seq_dist)\
+      \ or outlier(pkt.ack): alert(device, pkt)\ncp = changepoint(denied_flow_rate(device)); if cp.detected:\
+      \ alert(device, cp_time=cp.t)"
+- question: When an anomaly model trained on benign device config-event sequences scores a new sequence,
+    does it flag a rare enable-service-then-first-login chain, and what top-3 contributing events explain
+    it?
+  context: 'In the context of Persistence (TA0003), port knocking conceals a dormant backdoor listener
+    that the adversary re-opens on demand to regain a foothold across reboots and credential changes,
+    so this check is about catching that on-demand re-activation. Train an anomaly model on benign device
+    config-event sequences and flag rare enable-service-then-first-login chains, reporting the top-3 contributing
+    events. Legitimate device administration follows well-worn change patterns, so a sequence that enables
+    a management service and is immediately followed by a first-ever login from a new source is an outlier
+    worth surfacing. The model captures order and rarity that static rules miss; a flagged enable-then-login
+    chain with sensible event attribution on a core router/switch is a strong indicator of implant activation
+    and should be triaged against the flow-based knock evidence. [Method: Detect rare management enablement
+    (Machine Learning)]'
+  answer_sources: *id027
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "model = seq_anomaly.fit(benign_config_event_seqs)\nfor seq in device_event_seqs:\n  if model.anomalous(seq)\
+      \ and pattern(seq)=='enable_service->first_login':\n    alert(device, top3=explain(model,seq))"
