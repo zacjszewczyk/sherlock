@@ -1,0 +1,444 @@
+name: 'T1541: Foreground Persistence'
+id: 51df655f-025b-4a66-93df-7b5536d8b8b0
+description: Investigate potential abuse of Android foreground services (startForeground()/startForegroundService()/ServiceCompat.startForeground())
+  used to maintain continuous sensor access and persistence on corporate mobile devices. Beginning in
+  Android 9, idle background apps lose access to sensors such as the camera, microphone, and location;
+  malicious apps evade this by promoting themselves to a foreground service behind a persistent notification,
+  thereby retaining sensor access and avoiding the low-memory killer. This playbook helps an analyst hunt
+  for non-allowlisted or untrusted apps that declare FOREGROUND_SERVICE permissions (including the Android
+  14 typed variants), detect sensor access while the device is locked or without recent user interaction
+  or where the accessed sensor mismatches the declared foregroundServiceType, baseline service runtime/restart
+  behavior, and identify the resulting network behavior - long-lived low-and-slow C2 channels, low-entropy
+  periodic beaconing, connections to known C2/exfiltration infrastructure, and anomalous outbound upload
+  volumes - across both the Persistence (TA0028) and Defense Evasion (TA0030) tactics.
+type: technique
+related:
+- tactic_id: TA0028
+  tactic_name: Persistence
+- tactic_id: TA0030
+  tactic_name: Defense Evasion
+contributors:
+- Zachary Szewczyk
+created: '2026-05-31'
+modified: '2026-05-31'
+version: '1.0'
+tags: none
+questions:
+- question: Which newly installed Android applications declare the FOREGROUND_SERVICE permission (or the
+    Android 14 typed variants FOREGROUND_SERVICE_CAMERA/MICROPHONE/LOCATION) in their manifest but are
+    NOT on the corporate allowlist of approved foreground-service apps?
+  context: A legitimate foreground service declares a specific foregroundServiceType bound to a user-visible
+    notification, but adversaries pursuing Persistence abuse startForeground() to keep running and retain
+    sensor access. By querying MDM application inventories for newly installed apps and parsing their
+    manifests for android.permission.FOREGROUND_SERVICE and the typed Android 14 permissions, the analyst
+    surfaces any app that requests this capability while not appearing on a pre-defined allowlist. A positive
+    result (permission present and package not allowlisted) is a high-priority indicator that an unsanctioned
+    app may be establishing foreground persistence on a corporate device; a negative result means foreground-service
+    usage is accounted for by approved software.
+  answer_sources: &id001
+  - MDM Application Manifest Scan
+  - Android Logcat
+  - MobileEDR OS API Execution
+  - MobileEDR Sensor Access
+  - 'NAI: Mobile Device Management (MDM) servers; corporate application store and vetting pipeline; log
+    aggregation platform ingesting Android Logcat data.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=mdm_app_inventory event=install
+
+      | where manifest_permissions IN ("FOREGROUND_SERVICE","FOREGROUND_SERVICE_CAMERA","FOREGROUND_SERVICE_MICROPHONE","FOREGROUND_SERVICE_LOCATION")
+
+      | lookup fgs_allowlist package_name OUTPUT allowlisted
+
+      | where isnull(allowlisted)
+
+      | eval priority="high" | table device_id, package_name, signer, install_source, manifest_permissions'
+- question: Are any applications requesting FOREGROUND_SERVICE installed via sideloading, signed by an
+    untrusted certificate, or installed outside the managed corporate app store?
+  context: 'Trusted provenance is a strong filter: enterprise app-vetting/MDM controls (NIST SP 800-124r2)
+    expect managed apps to come from the corporate store and be signed by recognized certificates. An
+    app that requests FOREGROUND_SERVICE yet was sideloaded or signed by an unknown certificate is far
+    more likely to be abusing foreground persistence. The analyst enriches each detection with MDM app-source
+    and signer metadata to confirm provenance. A positive result (untrusted source or signer) elevates
+    the alert; trusted provenance lowers it but does not by itself exonerate behavioral abuse.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=mdm_app_inventory manifest_permissions="FOREGROUND_SERVICE*"
+
+      | eval untrusted = (install_source!="managed_store") OR (signer NOT IN trusted_signers) OR (sideloaded=true)
+
+      | where untrusted=true
+
+      | table device_id, package_name, install_source, signer, sideloaded'
+- question: Is any foreground service accessing the camera, microphone, or location while the screen is
+    locked, while the app has had no foreground UI interaction in the last N minutes, or where the accessed
+    sensor does not match the declared foregroundServiceType?
+  context: 'This is the core abuse pattern (Sutter, Black Hat EU 2019) enabled by the Android 9 background-sensor
+    restriction: an app promotes to a foreground service to retain sensor access it should not have. The
+    analyst correlates MobileEDR OS API execution (startForeground) with sensor-access telemetry and flags
+    reads that occur while the device is locked, after a window of no user interaction, or where the sensor
+    type contradicts the declared foregroundServiceType (e.g. a ''mediaPlayback'' service opening the
+    microphone). A positive result is a high-confidence indication of covert sensor capture; a negative
+    result indicates sensor use aligns with active user interaction and declared type.'
+  answer_sources: *id001
+  range: Last 90 days; correlate startForeground events with sensor-access events in a +/- 15 minute window
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=mobileedr (api=startForeground OR api=startForegroundService) as svc
+
+      | join device_id [search source=mobileedr event=sensor_access sensor IN ("camera","microphone","location")]
+
+      | where (screen_state="locked") OR (mins_since_last_ui_interaction > N) OR (sensor NOT MATCH declared_foreground_service_type)
+
+      | eval priority="high" | table device_id, package_name, sensor, screen_state, declared_foreground_service_type'
+- question: Does any application's foreground-service runtime duration exceed the 99th percentile for
+    its application category (e.g. Navigation, Media) computed over a rolling 30-day fleet baseline?
+  context: Persistence abuse often manifests as a service that stays foregrounded far longer than peers
+    in the same functional category. Rather than a fixed threshold, the analyst groups foreground-service
+    events by app category from Android Logcat and MobileEDR application-state data and derives a per-fleet/category
+    99th-percentile runtime over 30 days. An app whose service runtime exceeds its category's 99th percentile
+    warrants a medium-priority alert, since abnormally long-lived services are characteristic of foreground
+    persistence (per-app behavioral baselining, Andromaly). A positive result flags an outlier; a negative
+    result places runtime within normal category bounds.
+  answer_sources: *id001
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (android_logcat, mobileedr) event=foreground_service
+
+      | stats max(service_runtime_sec) as runtime by device_id, package_name, app_category, day
+
+      | eventstats perc99(runtime) as p99_runtime by app_category
+
+      | where runtime > p99_runtime
+
+      | eval priority="medium" | table device_id, package_name, app_category, runtime, p99_runtime'
+- question: Has any application shown a sustained step increase in foreground-service restart frequency
+    (low-memory-killer survivals) or a rising rate of failed camera/microphone opens (sensor busy/denied)
+    over a 30-day window?
+  context: An app fighting to remain alive will restart its foreground service repeatedly after low-memory
+    kills, and persistent attempts to grab a busy sensor produce repeated failed opens - both are distinct
+    failure-state signals of persistence abuse. The analyst baselines per-app restart counts/minute and
+    failed-sensor-open rates over 30 days and uses CUSUM/PELT change-point detection (Aminikhanghahi &
+    Cook) to find the onset of an abnormal step. A positive result (sustained increase or repeated failed
+    opens while still foregrounded) indicates aggressive persistence; a negative result reflects stable,
+    expected lifecycle behavior.
+  answer_sources: *id001
+  range: Last 30 days
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'source IN (android_logcat, mobileedr) event IN (service_restart, sensor_open_failed)
+
+      | timechart span=1h count(eval(event="service_restart")) as restarts count(eval(event="sensor_open_failed"))
+      as failed_opens by package_name
+
+      | apply change_point(restarts) as cp_restart, change_point(failed_opens) as cp_fail  // CUSUM/PELT
+
+      | where cp_restart=1 OR cp_fail=1
+
+      | table package_name, device_id, restarts, failed_opens'
+- question: When a new application requesting FOREGROUND_SERVICE is scored by a supervised classifier
+    on static/MDM metadata, does its malicious probability exceed the quarantine threshold (0.9)?
+  context: Static and MDM metadata features - permission count, FOREGROUND_SERVICE+sensor permission combinations,
+    app source, signer, user ratings, and age on store - are strong discriminators of malicious apps (Drebin,
+    DL-Droid). The analyst trains a Random Forest classifier and scores each new foreground-service app,
+    surfacing the top-3 contributing features in the alert text for explainability. If the malicious probability
+    exceeds 0.9 the playbook triggers an MDM quarantine action and a critical incident. A high probability
+    is a strong automated verdict; a low probability indicates the app's metadata profile resembles benign
+    software.
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'features = [permission_count, has_fgs_camera, has_fgs_mic, has_fgs_location, app_source, signer_reputation,
+      user_rating, store_age_days]
+
+      p = random_forest.predict_proba(features)
+
+      if p >= 0.9: emit_alert(severity="critical", top3=explain(features)); mdm.quarantine(package_name)'
+- question: Do an application's OS-API call sequences exhibit low-probability transition chains (e.g.
+    Service lifecycle -> startForeground -> Camera/AudioRecord/LocationManager -> network socket) when
+    modeled against a benign Markov-chain baseline?
+  context: 'Foreground-persistence spyware follows a characteristic behavioral arc: it promotes to a foreground
+    service, opens a sensor, then ships data over a socket. By abstracting MobileEDR OS-API execution
+    to the package/family level and modeling benign call-graph transitions as a Markov chain (MaMaDroid),
+    the analyst can flag low-probability transition chains that match this spyware pattern and report
+    the offending transitions for triage. A positive result (improbable benign transition) highlights
+    anomalous behavioral flow; a negative result means the call sequence is consistent with benign apps
+    in that family.'
+  answer_sources: *id001
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "seq = abstract_api_calls(mobileedr_events, level=\"family\")\nfor transition in seq.transitions():\n\
+      \   prob = markov_benign.transition_prob(transition)\n   if prob < threshold: flag(transition)\n\
+      if chain_matches(seq, [\"Service\",\"startForeground\",\"Camera|AudioRecord|LocationManager\",\"\
+      Socket\"]): emit_alert(transitions=flagged)"
+- question: Are any mobile devices maintaining TCP connections lasting longer than 4 hours (14400 seconds)
+    to a destination IP that matches threat intelligence for known command-and-control servers?
+  context: Foreground persistence often exists to hold open a long-lived command-and-control channel.
+    The analyst joins Zeek conn.log with MDM inventory to attribute IPs to mobile devices, then alerts
+    when a connection from a mobile IP exceeds 14400 seconds duration and the destination (id.resp_h)
+    matches a known-C2 intel feed, enriching with the associated DNS query from Zeek dns.log. A positive
+    result is a high-confidence C2 finding tying a long-lived session to known-bad infrastructure; a negative
+    result means long sessions are not directed at known C2 (though they may still warrant statistical
+    review).
+  answer_sources: &id002
+  - Zeek conn.log
+  - Zeek dns.log
+  - MDM device inventory
+  - 'NAI: Network sensors monitoring corporate Wi-Fi and VPN egress points; core DNS resolvers; MDM servers
+    for IP-to-device mapping.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'conn = read(conn.log) | join mdm_inventory on id.orig_h=device_ip
+
+      | where duration > 14400 AND id.resp_h IN ti_known_c2
+
+      | lookup dns.log query by id.resp_h
+
+      | emit_alert(priority="high", device, id.resp_h, duration, dns_query)'
+- question: Does any new connection from a mobile device exceed that device's 95th-percentile connection
+    duration while its total byte count (orig_bytes + resp_bytes) falls below the device's 5th-percentile
+    baseline?
+  context: Long-lived, low-data connections are a core 'low and slow' C2 signal (RITA). For each mobile
+    device the analyst builds a 30-day baseline from Zeek conn.log and computes the 95th percentile for
+    duration and the 5th percentile for total bytes. A new connection that is simultaneously longer than
+    the duration percentile and lighter than the byte percentile earns a medium-priority alert, because
+    it resembles a channel held open with minimal traffic. A positive result indicates a held-open low-throughput
+    session; a negative result is a connection consistent with normal duration/volume behavior.
+  answer_sources: *id002
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: Zeek/pseudocode
+    query: "baseline: per device_ip -> p95_dur=perc95(duration), p05_bytes=perc05(orig_bytes+resp_bytes)\
+      \ over 30d\nnew conn: if duration > p95_dur[device] AND (orig_bytes+resp_bytes) < p05_bytes[device]:\n\
+      \   emit_alert(priority=\"medium\", device, id.resp_h, duration, total_bytes)"
+- question: Does any connection's duration-to-byte ratio exceed the 99th percentile of a rolling 30-day
+    baseline maintained per device and per destination ASN?
+  context: The duration-to-byte ratio captures 'time spent connected relative to data moved' - an unusually
+    high ratio means a long session moving very little data, consistent with the held-open channels analyzed
+    by RITA. The analyst computes this ratio per connection and maintains a rolling 30-day baseline keyed
+    by device and destination ASN, alerting when the ratio exceeds the 99th percentile. Scoping the baseline
+    by ASN reduces false positives from legitimately long-lived CDN/cloud sessions. A positive result
+    flags an unusually long-lived, low-throughput session; a negative result keeps the ratio within normal
+    bounds for that device/ASN.
+  answer_sources: *id002
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'ratio = duration / max(orig_bytes+resp_bytes, 1)
+
+      baseline: per (device_ip, resp_asn) -> p99_ratio over 30d
+
+      if ratio > p99_ratio[device, resp_asn]: emit_alert(device, id.resp_h, resp_asn, ratio)'
+- question: Does the hourly count of long-duration (>1hr) and low-byte (<1KB) connections from a device
+    show a statistically significant anomaly or change point under time-series and periodicity analysis?
+  context: Aggregating low-and-slow connections into an hourly time series lets the analyst detect the
+    emergence of a covert channel even when individual connections look unremarkable. From Zeek conn.log
+    the analyst builds, per device, an hourly count of connections that are both long-duration (>1hr)
+    and low-byte (<1KB), then applies a time-series anomaly/change-point algorithm (S-H-ESD; Aminikhanghahi
+    & Cook) plus FFT-based periodicity scoring (BAYWATCH). Significant deviations generate an alert that
+    includes the deviating hour, the baseline, and the observed value. A positive result indicates an
+    emerging or periodic low-and-slow pattern; a negative result shows the series within expected variation.
+  answer_sources: *id002
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'ts = hourly_count(conn where duration>3600 AND (orig_bytes+resp_bytes)<1024) by device
+
+      anomalies = SH_ESD(ts); periodic = fft_periodicity(ts)
+
+      if anomalies OR periodic.significant: emit_alert(device, hour, baseline, observed)'
+- question: Are any mobile devices issuing HTTP requests with malware-associated or generic user-agents
+    (e.g. Dalvik/2.1.0 or null) to destination domains that are less than 30 days old?
+  context: Apps evading background restrictions via foreground persistence frequently beacon to freshly
+    registered C2 domains using default or spoofed user-agents. The analyst scans Zeek http.log for requests
+    from mobile IPs whose user_agent matches known malware signatures or is a generic client, and cross-references
+    the destination domain age from Zeek dns.log. When the domain is younger than 30 days the alert priority
+    is escalated. A positive result (suspicious UA + young domain) is a strong evasion/C2 indicator; a
+    negative result indicates the UA and domain reputation are unremarkable.
+  answer_sources: &id003
+  - Zeek conn.log
+  - Zeek http.log
+  - Zeek dns.log
+  - 'NAI: Network sensors at traffic egress points; core DNS resolvers; network taps monitoring Wi-Fi
+    access points for mobile devices.'
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'http = read(http.log) | where id.orig_h IN mobile_ips AND (user_agent IN malware_ua_sigs OR
+      user_agent IN ("Dalvik/2.1.0","-",""))
+
+      | lookup domain_age(host) as age_days
+
+      | eval priority = if(age_days < 30, "high", "medium")
+
+      | table device, host, user_agent, age_days, priority'
+- question: For mobile device-to-destination pairs with more than 10 connections in a 1-hour window, is
+    the Shannon entropy of connection inter-arrival times below 1.5, indicating machine-generated beaconing?
+  context: Human activity is bursty and irregular; automated C2 beaconing produces highly regular timing
+    and therefore low entropy. Using Zeek conn.log the analyst groups connections by source mobile IP
+    and destination IP in 1-hour windows, and for groups with over 10 connections computes the Shannon
+    entropy of inter-arrival time deltas, alerting when entropy falls below 1.5. To stay robust to jitter
+    the entropy is complemented with coefficient-of-variation/MAD and FFT periodicity scoring (RITA, BAYWATCH).
+    A positive result (low entropy / strong periodicity) indicates beaconing; a negative result reflects
+    irregular, likely human-driven timing.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'groups = conn.log group by (id.orig_h in mobile_ips, id.resp_h), window=1h having count>10
+
+      deltas = diff(sort(ts)) ; H = shannon_entropy(deltas)
+
+      cv = stdev(deltas)/mean(deltas) ; per = fft_periodicity(deltas)
+
+      if H < 1.5 OR per.significant: emit_alert(device, id.resp_h, H, cv)'
+- question: Has the inter-arrival entropy for a device-destination pair dropped below the 5th percentile
+    of its 30-day baseline while the destination is newly observed for that device?
+  context: A fixed entropy threshold can miss devices whose normal traffic is already fairly regular,
+    so the analyst maintains a 30-day baseline of inter-arrival entropy per device-destination pair and
+    alerts when current entropy falls below the 5th percentile of that baseline AND the destination is
+    newly observed for that device. The onset is treated as a change point (Aminikhanghahi & Cook). The
+    combination of a sudden drop toward machine-like regularity and a brand-new destination strongly suggests
+    an evasive beacon. A positive result indicates a newly established, abnormally regular channel; a
+    negative result shows entropy within historical norms.
+  answer_sources: *id003
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: "baseline: per (device, dest) -> p05_entropy over 30d\ncur_H = shannon_entropy(inter_arrivals(device,dest))\n\
+      if cur_H < p05_entropy[device,dest] AND dest NOT IN seen_dests[device]:\n   emit_alert(device, dest,\
+      \ cur_H, p05_entropy)  // change-point onset"
+- question: Does a device's rate of NXDOMAIN responses or failed/rejected connections (conn_state S0/REJ/RSTO)
+    exceed its 95th-percentile baseline, suggesting a beacon retrying dead or rotating C2?
+  context: A persistent beacon whose C2 is offline or rotating generates a distinct excess of failed DNS
+    resolutions and aborted/rejected connections. The analyst baselines per-device rates of NXDOMAIN responses
+    (Zeek dns.log) and failed connection states (conn.log conn_state in S0/REJ/RSTO) and alerts when the
+    failure rate exceeds the device's 95th-percentile baseline, using flow-state features as in CICAndMal2017.
+    A positive result indicates persistent retrying against unreachable infrastructure - a hallmark of
+    evasive beaconing; a negative result shows failure rates within normal noise.
+  answer_sources: *id003
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: Zeek/pseudocode
+    query: 'fails = count(dns.log rcode=NXDOMAIN) + count(conn.log conn_state IN (S0,REJ,RSTO)) per device
+      per hour
+
+      baseline: per device -> p95_fail over 30d
+
+      if fails > p95_fail[device]: emit_alert(device, fails, p95_fail)'
+- question: When hourly mobile-device connections are featurized and clustered with DBSCAN, which connections
+    are flagged as noise/outliers relative to normal behavior clusters?
+  context: Unsupervised clustering can isolate connections that do not fit any normal behavior pattern
+    without needing labeled malware. On an hourly basis the analyst featurizes connections from mobile
+    devices using Zeek conn.log attributes (duration, orig_bytes, resp_bytes, id.resp_p) plus the standard
+    deviation of inter-arrival times to the same destination (flow-only approach of CorrNetDroid), applies
+    DBSCAN, and flags noise points as anomalies, reporting the top contributing flow features for each.
+    A positive result (noise point) marks a connection that deviates from all normal clusters; a negative
+    result means the connection falls inside an established benign cluster.
+  answer_sources: *id003
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: 'X = featurize(conn.log[mobile], cols=[duration, orig_bytes, resp_bytes, id.resp_p, stdev_interarrival])
+
+      labels = DBSCAN(eps, min_samples).fit_predict(X)
+
+      for c where label == -1: emit_alert(connection=c, top_features=feature_contrib(c))'
+- question: Is any application using a foreground service communicating with a destination IP present
+    in a threat-intelligence feed of known exfiltration endpoints or anonymous file-sharing services?
+  context: Foreground persistence frequently exists to exfiltrate captured sensor data. The analyst builds
+    a real-time correlation rule joining MDM application data (mapping device IP to running foreground
+    services) with Zeek conn.log, and raises a high-priority alert when a foreground-service app talks
+    to a destination IP that matches a known-exfiltration / anonymous file-sharing intel feed. A positive
+    result directly ties an evasive foreground service to known-bad egress infrastructure; a negative
+    result means current foreground-service egress is not to known exfiltration endpoints (statistical
+    checks still apply).
+  answer_sources: &id004
+  - MDM Application Runtime Logs
+  - Zeek conn.log
+  - 'NAI: MDM management servers for application runtime context; network sensors monitoring corporate
+    Wi-Fi and VPN connections from mobile devices.'
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: "mdm_fgs = mdm_runtime where foreground_service=true | fields device_ip, package_name\n| join\
+      \ device_ip [search source=zeek_conn] \n| where id.resp_h IN ti_exfil_endpoints\n| emit_alert(priority=\"\
+      high\", device, package_name, id.resp_h)"
+- question: Where information-flow telemetry is available, does data read from a sensor source (camera,
+    microphone, location) by a foreground service propagate to a network sink?
+  context: Source-to-sink information-flow tracking is the highest-fidelity exfiltration signal because
+    it ties a specific sensor read to a network send even when the payload is encrypted (TaintDroid).
+    Where MTD/instrumentation provides information-flow telemetry, the analyst alerts when sensor sources
+    read by a foreground service reach a network sink. A positive result is near-conclusive evidence of
+    covert sensor-data exfiltration via foreground persistence; a negative result (or absence of telemetry)
+    does not exonerate but requires falling back to volumetric/behavioral methods.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'source=mtd_taint flow_source IN ("camera","microphone","location") AND flow_sink="network"
+
+      | where service_state="foreground"
+
+      | emit_alert(priority="high", device, package_name, flow_source, dest)'
+- question: Is any foreground-service application sending data to domains categorized as consumer file
+    storage or paste sites that are not on the enterprise allowlist?
+  context: Exfiltration commonly rides on legitimate-looking consumer storage and paste services. The
+    analyst alerts when a foreground-service app sends data to domains categorized as consumer file storage
+    or paste sites that are absent from the enterprise allowlist, enriching with destination category
+    from DNS and proxy categorization (consistent with per-app VPN / secure-web-gateway egress controls
+    in NIST SP 800-124r2). A positive result indicates an evasive upload channel to unsanctioned storage;
+    a negative result means egress destinations are within sanctioned categories.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/Rule pseudocode
+    query: 'mdm_fgs = mdm_runtime where foreground_service=true
+
+      | join device_ip [search source=proxy OR source=zeek_dns]
+
+      | where url_category IN ("file_storage","paste_site") AND domain NOT IN enterprise_allowlist
+
+      | emit_alert(device, package_name, domain, url_category)'
+- question: Does any application's daily outbound byte volume (orig_bytes) on a device exceed 3 standard
+    deviations above its own 30-day historical mean for that device?
+  context: Bulk exfiltration shows up as a spike in an app's daily upload volume relative to its own history.
+    For each unique application on each device the analyst builds a 30-day rolling baseline of the daily
+    sum of outbound bytes (orig_bytes) from Zeek conn.log, computes the mean and standard deviation, and
+    raises a medium-priority alert when daily upload volume exceeds mean + 3 standard deviations (app/device
+    volume baselining validated in Andromaly and on labeled flows in CICAndMal2017). A positive result
+    flags an upload-volume anomaly; a negative result keeps volume within the app's normal range.
+  answer_sources: *id004
+  range: Last 30 days (rolling baseline)
+  queries:
+  - technology: SIEM/Stats pseudocode
+    query: 'daily = sum(orig_bytes) by device_id, package_name, day  (from zeek_conn joined to mdm app
+      map)
+
+      baseline: per (device_id, package_name) -> mean, std over 30d
+
+      if daily > mean + 3*std: emit_alert(priority="medium", device, package_name, daily, mean, std)'
+- question: When a regression model predicts a device's expected daily upload volume from contextual features,
+    does the actual volume produce a sustained large positive residual?
+  context: Context-aware prediction reduces false positives by accounting for legitimate drivers of upload
+    volume. The analyst trains a Gradient Boosting Regressor to predict expected daily upload volume per
+    device from features such as user role, device type, day of week, and app category, then monitors
+    prediction residuals (trained/validated on labeled mobile flow features per CICAndMal2017 and the
+    flow-only discriminators of CorrNetDroid). A sustained large positive residual - actual far above
+    predicted - triggers a high-severity alert that includes predicted vs. actual volume and the top contributing
+    features. A positive result indicates upload volume unexplained by normal context; a small residual
+    indicates volume consistent with expectation.
+  answer_sources: *id004
+  range: Last 90 days
+  queries:
+  - technology: SIEM/ML pseudocode
+    query: "features = [user_role, device_type, day_of_week, app_category]\npredicted = gbr.predict(features)\
+      \ ; residual = actual_daily_upload - predicted\nif residual > k*sigma_residual for sustained window:\n\
+      \   emit_alert(severity=\"high\", device, predicted, actual_daily_upload, top_features=explain(features))"
